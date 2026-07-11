@@ -1,8 +1,10 @@
 name: Pages
 
 on:
-  push:
-    branches: [ main ]
+  # Deferred: GitHub Pages is unavailable on a PRIVATE repo on this plan, so the
+  # push trigger is disabled to avoid a failing check on every commit. It is
+  # re-enabled when the repo goes public (P4); the real WebAssembly build replaces
+  # the placeholder at P5 (see ROADMAP.md). Manual dispatch only until then.
   workflow_dispatch:
 
 permissions:
