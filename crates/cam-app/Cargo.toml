@@ -1,0 +1,13 @@
+[package]
+name = "cam-app"
+description = "OpenCAMStudio — CAM application for CNC toolpath generation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "opencamstudio"
+path = "src/main.rs"

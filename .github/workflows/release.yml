@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags: [ "v*" ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }} --bin opencamstudio
+      - name: Package
+        shell: bash
+        run: |
+          bin=opencamstudio
+          [ "${{ matrix.os }}" = "windows-latest" ] && bin=opencamstudio.exe
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/$bin" dist/
+          cp README.md LICENSE dist/
+          tar -czf "opencamstudio-${{ matrix.target }}.tar.gz" -C dist .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opencamstudio-${{ matrix.target }}
+          path: opencamstudio-${{ matrix.target }}.tar.gz
+
+# NOTE: Linux AppImage packaging and attaching assets to the GitHub Release land
+# once there is a GUI to package (P5). For now the platform tarballs above are the
+# stub artifacts that prove the pipeline.

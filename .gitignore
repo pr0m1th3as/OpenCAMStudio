@@ -1,0 +1,8 @@
+# Build output
+/target
+
+# Backups / editor cruft
+**/*.rs.bk
+*.pdb
+
+# Cargo.lock IS committed — this is an application workspace.

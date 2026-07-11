@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+license = "GPL-3.0-only"
+authors = ["Andreas Bertsatos <abertsatos@biol.uoa.gr>"]
+repository = "https://github.com/pr0m1th3as/OpenCAMStudio"
+
+# Shared dependencies are declared here as phases introduce them, e.g.
+# [workspace.dependencies]
+# i_overlay = "..."
