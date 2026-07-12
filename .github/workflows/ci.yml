@@ -27,6 +27,27 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  gui-build:
+    name: gui build (iced + wgpu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: System libraries (X11/Wayland/GL/Vulkan/font)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libx11-dev libxkbcommon-dev libwayland-dev \
+            libxcursor-dev libxrandr-dev libxi-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libfontconfig1-dev
+      - name: Clippy (gui + gpu)
+        run: cargo clippy -p cam-app --features gui -- -D warnings
+      - name: Build (gui + gpu)
+        run: cargo build -p cam-app --features gui
+
   licenses:
     name: license check (GPLv3-compat)
     runs-on: ubuntu-latest

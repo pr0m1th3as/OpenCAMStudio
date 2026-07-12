@@ -18,5 +18,7 @@ gpu = ["dep:wgpu", "dep:bytemuck"]
 [dependencies]
 cam-geo = { path = "../cam-geo" }
 cam-cldata = { path = "../cam-cldata" }
-wgpu = { version = "30", optional = true }
+# Pinned to iced 0.14's wgpu so cam-render's renderer can share types with the
+# iced shader-widget viewport (one wgpu in the tree).
+wgpu = { version = "27", optional = true }
 bytemuck = { version = "1", features = ["derive"], optional = true }

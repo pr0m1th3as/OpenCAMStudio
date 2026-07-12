@@ -1,12 +1,22 @@
 //! OpenCAMStudio application entry point.
 //!
-//! P0 skeleton: prints a banner so the workspace has a runnable binary and the
-//! CI/release pipelines have something to build. The real `iced` shell arrives
-//! at P5 (see `ROADMAP.md`).
+//! The default build is headless (the tested [`cam_app::AppController`]); the
+//! interactive desktop app is behind the `gui` feature:
+//!
+//! ```text
+//! cargo run -p cam-app --features gui
+//! ```
 
+#[cfg(feature = "gui")]
+fn main() -> iced::Result {
+    cam_app::gui::run()
+}
+
+#[cfg(not(feature = "gui"))]
 fn main() {
     println!(
-        "OpenCAMStudio {} — CAM for CNC toolpath generation (P0 skeleton)",
+        "OpenCAMStudio {} — headless build. Launch the desktop app with:\n    \
+         cargo run -p cam-app --features gui",
         env!("CARGO_PKG_VERSION")
     );
 }

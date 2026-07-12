@@ -81,8 +81,8 @@ impl LineRenderer {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("cam-render pipeline layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
         });
 
         let vertex_layout = wgpu::VertexBufferLayout {
@@ -108,7 +108,7 @@ impl LineRenderer {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[Some(vertex_layout)],
+                buffers: &[vertex_layout],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -127,7 +127,7 @@ impl LineRenderer {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
+            multiview: None,
             cache: None,
         });
 

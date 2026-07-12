@@ -11,3 +11,21 @@ repository.workspace = true
 [[bin]]
 name = "opencamstudio"
 path = "src/main.rs"
+
+[features]
+# The headless app controller builds and tests with no default features. The
+# `gui` feature adds the iced desktop shell (and the wgpu renderer), which needs
+# a graphics/windowing stack to run.
+default = []
+gui = ["dep:iced", "dep:wgpu", "cam-render/gpu"]
+
+[dependencies]
+cam-geo = { path = "../cam-geo" }
+cam-cldata = { path = "../cam-cldata" }
+cam-model = { path = "../cam-model" }
+cam-toolpath = { path = "../cam-toolpath" }
+cam-post = { path = "../cam-post" }
+cam-import = { path = "../cam-import" }
+cam-render = { path = "../cam-render" }
+iced = { version = "0.14", features = ["wgpu"], optional = true }
+wgpu = { version = "27", optional = true }
