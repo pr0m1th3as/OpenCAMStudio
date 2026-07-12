@@ -22,6 +22,7 @@ name = "cam-model"
 version = "0.0.1"
 dependencies = [
  "cam-cldata",
+ "cam-geo",
 ]
 
 [[package]]
@@ -30,6 +31,16 @@ version = "0.0.1"
 dependencies = [
  "cam-cldata",
  "cam-model",
+]
+
+[[package]]
+name = "cam-toolpath"
+version = "0.0.1"
+dependencies = [
+ "cam-cldata",
+ "cam-geo",
+ "cam-model",
+ "cam-post",
 ]
 
 [[package]]

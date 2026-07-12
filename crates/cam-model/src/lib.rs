@@ -13,7 +13,12 @@
 //! by swapping the [`Machine`] it is handed. Keeping them separate is a core
 //! design rule (see `ARCHITECTURE.md`).
 
+mod document;
+
 pub use cam_cldata::Point3;
+pub use document::{
+    Comp, Document, Heights, Operation, ProfileOp, Setup, Side, Stock, SCHEMA_VERSION,
+};
 
 /// An axis-aligned working volume, in millimetres, in the machine/WCS frame.
 #[derive(Clone, Copy, Debug, PartialEq)]

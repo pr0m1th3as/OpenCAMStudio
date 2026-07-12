@@ -1,0 +1,17 @@
+[package]
+name = "cam-toolpath"
+description = "OpenCAMStudio — toolpath strategies: consume geometry, emit CL-data"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+cam-geo = { path = "../cam-geo" }
+cam-cldata = { path = "../cam-cldata" }
+cam-model = { path = "../cam-model" }
+
+[dev-dependencies]
+cam-post = { path = "../cam-post" }

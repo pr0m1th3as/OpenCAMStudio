@@ -1,0 +1,150 @@
+//! The document model (P3 first-light slice).
+//!
+//! A [`Document`] carries a schema version and one [`Setup`]. A [`Setup`] fixes
+//! the **heights** (the safety planes), a **stock** description, the available
+//! tools, and an ordered list of **operations**. This is deliberately small —
+//! enough to drive first light (a profile → G-code) — and grows toward the full
+//! `Project → Setup → Stock → Operation → Tool` tree as later phases need it.
+
+use cam_geo::Contour;
+
+use crate::Tool;
+
+/// The document schema version. Bumped when the on-disk model format changes;
+/// present from the start so save-files are versioned before there is a loader.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// The safety planes for a setup, all **absolute Z in millimetres**. By
+/// convention WCS Z0 is the top of stock, so `top_of_stock` is usually `0.0`.
+///
+/// Heights are first-class (a core design rule): unsafe Z is a primary hazard
+/// and must never be implicit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Heights {
+    /// Z for rapid traverses between features — the highest, safest plane.
+    pub clearance: f64,
+    /// Z to retract to between passes within a feature (lower than clearance).
+    pub retract: f64,
+    /// Z of the top of the stock (cutting starts here).
+    pub top_of_stock: f64,
+}
+
+impl Heights {
+    /// A sensible default: clearance and retract above a stock top at Z0.
+    pub fn new(clearance: f64, retract: f64, top_of_stock: f64) -> Self {
+        Self {
+            clearance,
+            retract,
+            top_of_stock,
+        }
+    }
+}
+
+/// A description of the raw material. The first-light slice models only a
+/// rectangular block; `from-model + offsets` stock arrives with the kernel.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Stock {
+    /// An axis-aligned block spanning `[min, max]` in each axis (mm).
+    Box { min: [f64; 3], max: [f64; 3] },
+}
+
+/// Which side of a profiled chain the tool runs on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    /// Tool outside the closed chain (leaves the enclosed region intact) — the
+    /// usual choice for cutting a part free of stock.
+    Outside,
+    /// Tool inside the closed chain (removes the enclosed region) — e.g. opening
+    /// a hole or slot to size.
+    Inside,
+    /// Tool centre exactly on the chain (engraving/scribing).
+    On,
+}
+
+/// How cutter-radius compensation is applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Comp {
+    /// We compute the offset geometry ourselves (kernel-independent). The only
+    /// mode for first light.
+    Computed,
+    /// Left-hand control compensation (`G41`) — deferred to a later phase.
+    ControlLeft,
+    /// Right-hand control compensation (`G42`) — deferred to a later phase.
+    ControlRight,
+}
+
+/// A 2.5-D profiling operation: follow a closed chain at an offset, in stepdown
+/// passes, down to a depth.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProfileOp {
+    /// Operation id (0-based within the setup); stamped onto every emitted tag.
+    pub id: u32,
+    /// Tool number to select from the setup's tool list.
+    pub tool: u32,
+    /// The closed chain to profile, in the part/WCS frame.
+    pub chain: Contour,
+    /// Which side of the chain the tool runs on.
+    pub side: Side,
+    /// How radius compensation is applied.
+    pub comp: Comp,
+    /// Absolute Z of the final (deepest) pass.
+    pub depth: f64,
+    /// Maximum depth removed per pass (mm, > 0).
+    pub stepdown: f64,
+    /// Cutting feed, mm/min.
+    pub feed: f64,
+    /// Plunge feed, mm/min.
+    pub plunge_feed: f64,
+}
+
+/// An operation in a setup. An enum so a setup holds a heterogeneous, ordered
+/// list; only profiling exists at first light.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Operation {
+    /// A profiling operation.
+    Profile(ProfileOp),
+}
+
+impl Operation {
+    /// The operation's id.
+    pub fn id(&self) -> u32 {
+        match self {
+            Operation::Profile(op) => op.id,
+        }
+    }
+}
+
+/// A machining setup: one fixturing of the stock, its safety planes, and the
+/// ordered operations performed in it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Setup {
+    /// Human-readable name.
+    pub name: String,
+    /// Safety planes.
+    pub heights: Heights,
+    /// The raw stock.
+    pub stock: Stock,
+    /// Tools available in this setup.
+    pub tools: Vec<Tool>,
+    /// Operations, in execution order.
+    pub operations: Vec<Operation>,
+}
+
+/// The top-level document: a schema version and a setup.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Document {
+    /// Schema version this document conforms to.
+    pub schema_version: u32,
+    /// The setup.
+    pub setup: Setup,
+}
+
+impl Document {
+    /// Wrap a setup in a document stamped with the current [`SCHEMA_VERSION`].
+    pub fn new(setup: Setup) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            setup,
+        }
+    }
+}

@@ -192,6 +192,12 @@ impl Program {
         self.steps.push(step);
     }
 
+    /// Append every step of `other`, consuming it — used to splice per-operation
+    /// fragments into a whole-job program.
+    pub fn extend(&mut self, other: Program) {
+        self.steps.extend(other.steps);
+    }
+
     /// The steps, in execution order.
     pub fn steps(&self) -> &[Step] {
         &self.steps
