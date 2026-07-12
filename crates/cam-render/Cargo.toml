@@ -1,0 +1,22 @@
+[package]
+name = "cam-render"
+description = "OpenCAMStudio — viewport scene model and wgpu renderer (part/stock/backplot)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+# The pure scene model and geometry→vertex mapping build with no default
+# features and are fully unit-testable without a GPU. The `gpu` feature adds the
+# wgpu renderer, which needs a graphics stack to run.
+default = []
+gpu = ["dep:wgpu", "dep:bytemuck"]
+
+[dependencies]
+cam-geo = { path = "../cam-geo" }
+cam-cldata = { path = "../cam-cldata" }
+wgpu = { version = "30", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }

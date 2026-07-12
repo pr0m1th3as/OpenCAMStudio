@@ -14,11 +14,13 @@
 //! design rule (see `ARCHITECTURE.md`).
 
 mod document;
+mod history;
 
 pub use cam_cldata::Point3;
 pub use document::{
     Comp, Document, Heights, Operation, ProfileOp, Setup, Side, Stock, SCHEMA_VERSION,
 };
+pub use history::History;
 
 /// An axis-aligned working volume, in millimetres, in the machine/WCS frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
