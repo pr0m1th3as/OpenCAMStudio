@@ -1,0 +1,13 @@
+[package]
+name = "cam-post"
+description = "OpenCAMStudio — post-processors: lower controller-neutral CL-data to G-code"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+cam-cldata = { path = "../cam-cldata" }
+cam-model = { path = "../cam-model" }
