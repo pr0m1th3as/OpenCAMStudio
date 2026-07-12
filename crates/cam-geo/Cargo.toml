@@ -1,0 +1,12 @@
+[package]
+name = "cam-geo"
+description = "OpenCAMStudio — robust 2D toolpath geometry (offset/boolean/slice); the kernel-independent CAM heart"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+i_overlay = "7"
