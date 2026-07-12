@@ -1,0 +1,17 @@
+[package]
+name = "cam-sim"
+description = "OpenCAMStudio — material-removal simulation and toolpath verification"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+cam-cldata = { path = "../cam-cldata" }
+cam-geo = { path = "../cam-geo" }
+
+[dev-dependencies]
+cam-model = { path = "../cam-model" }
+cam-toolpath = { path = "../cam-toolpath" }

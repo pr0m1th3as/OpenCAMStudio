@@ -455,6 +455,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cam-sim"
+version = "0.0.1"
+dependencies = [
+ "cam-cldata",
+ "cam-geo",
+ "cam-model",
+ "cam-toolpath",
+]
+
+[[package]]
 name = "cam-toolpath"
 version = "0.0.1"
 dependencies = [
