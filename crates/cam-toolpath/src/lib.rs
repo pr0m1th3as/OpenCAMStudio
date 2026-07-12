@@ -16,7 +16,10 @@
 //!   ([`JobEnv`] in, [`StrategyResult`] out), so extracting the trait into a
 //!   `cdylib` plugin ABI later is cheap.
 
+mod drill;
+mod face;
 mod plan;
+mod pocket;
 mod profile;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,7 +28,10 @@ use std::sync::Arc;
 use cam_cldata::Program;
 use cam_model::{Heights, Tool};
 
+pub use drill::DrillStrategy;
+pub use face::FaceStrategy;
 pub use plan::build_job;
+pub use pocket::PocketStrategy;
 pub use profile::ProfileStrategy;
 
 /// Severity of a [`Diagnostic`].

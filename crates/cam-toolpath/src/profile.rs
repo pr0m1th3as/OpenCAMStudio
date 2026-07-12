@@ -211,7 +211,7 @@ fn emit_loop(
 
 /// The absolute Z of each stepdown pass, from just below `top` down to `depth`
 /// (inclusive), never stepping more than `stepdown` at a time.
-fn depth_levels(top: f64, depth: f64, stepdown: f64) -> Vec<f64> {
+pub(crate) fn depth_levels(top: f64, depth: f64, stepdown: f64) -> Vec<f64> {
     let mut levels = Vec::new();
     if depth >= top {
         return levels;

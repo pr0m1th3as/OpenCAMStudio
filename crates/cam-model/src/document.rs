@@ -97,12 +97,86 @@ pub struct ProfileOp {
     pub plunge_feed: f64,
 }
 
+/// A drilling operation: a set of holes taken to a depth, optionally pecked and
+/// dwelled. It is emitted as a Tier-2 cycle intent, so each post lowers it per
+/// its capabilities (canned `G83` on Fanuc, explicit pecks on grbl).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DrillOp {
+    /// Operation id.
+    pub id: u32,
+    /// Tool number.
+    pub tool: u32,
+    /// Hole positions in the part/WCS frame.
+    pub points: Vec<[f64; 2]>,
+    /// Absolute Z of the hole bottom.
+    pub depth: f64,
+    /// Peck increment (mm, > 0); `None` drills straight.
+    pub peck: Option<f64>,
+    /// Dwell at the bottom, seconds; `None` for no dwell.
+    pub dwell: Option<f64>,
+    /// Plunge feed, mm/min.
+    pub feed: f64,
+}
+
+/// A 2.5-D pocket-clearing operation: remove all material inside a closed
+/// boundary (leaving any islands standing), in concentric offset rings, in
+/// stepdown passes, down to a depth.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PocketOp {
+    /// Operation id.
+    pub id: u32,
+    /// Tool number.
+    pub tool: u32,
+    /// The closed pocket boundary.
+    pub boundary: Contour,
+    /// Closed islands to leave uncut (holes within the pocket).
+    pub islands: Vec<Contour>,
+    /// Absolute Z of the pocket floor.
+    pub depth: f64,
+    /// Maximum depth removed per pass (mm, > 0).
+    pub stepdown: f64,
+    /// Radial stepover between concentric rings (mm, > 0).
+    pub stepover: f64,
+    /// Cutting feed, mm/min.
+    pub feed: f64,
+    /// Plunge feed, mm/min.
+    pub plunge_feed: f64,
+}
+
+/// A facing operation: clear the top of the stock over a boundary with parallel
+/// passes, in stepdown passes, down to a depth.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FaceOp {
+    /// Operation id.
+    pub id: u32,
+    /// Tool number.
+    pub tool: u32,
+    /// The area to face (usually the stock outline).
+    pub boundary: Contour,
+    /// Absolute Z of the faced surface.
+    pub depth: f64,
+    /// Maximum depth removed per pass (mm, > 0).
+    pub stepdown: f64,
+    /// Lateral stepover between parallel passes (mm, > 0).
+    pub stepover: f64,
+    /// Cutting feed, mm/min.
+    pub feed: f64,
+    /// Plunge feed, mm/min.
+    pub plunge_feed: f64,
+}
+
 /// An operation in a setup. An enum so a setup holds a heterogeneous, ordered
-/// list; only profiling exists at first light.
+/// list.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Operation {
     /// A profiling operation.
     Profile(ProfileOp),
+    /// A drilling operation.
+    Drill(DrillOp),
+    /// A pocket-clearing operation.
+    Pocket(PocketOp),
+    /// A facing operation.
+    Face(FaceOp),
 }
 
 impl Operation {
@@ -110,6 +184,9 @@ impl Operation {
     pub fn id(&self) -> u32 {
         match self {
             Operation::Profile(op) => op.id,
+            Operation::Drill(op) => op.id,
+            Operation::Pocket(op) => op.id,
+            Operation::Face(op) => op.id,
         }
     }
 }

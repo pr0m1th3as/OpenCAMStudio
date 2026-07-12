@@ -12,8 +12,12 @@
 //! that has one, or **expanded to explicit `G0`/`G1` pecks** by one that does not
 //! (grbl). See [`grbl::GrblPost`].
 
+mod fanuc;
 mod grbl;
+mod words;
+mod writer;
 
+pub use fanuc::FanucPost;
 pub use grbl::GrblPost;
 
 use core::fmt;

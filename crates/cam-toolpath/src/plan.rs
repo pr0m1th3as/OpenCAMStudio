@@ -8,7 +8,10 @@
 use cam_cldata::{Coolant, Program, SpindleDir, Step};
 use cam_model::{Document, Operation};
 
-use crate::{CancelToken, Diagnostic, JobEnv, ProfileStrategy, Strategy, StrategyResult};
+use crate::{
+    CancelToken, Diagnostic, DrillStrategy, FaceStrategy, JobEnv, PocketStrategy, ProfileStrategy,
+    Strategy, StrategyResult,
+};
 
 /// Assemble a whole-job [`Program`] from a [`Document`].
 ///
@@ -84,11 +87,17 @@ pub fn build_job(
 fn compute(operation: &Operation, env: &JobEnv, cancel: &CancelToken) -> StrategyResult {
     match operation {
         Operation::Profile(op) => ProfileStrategy::new(op.clone()).compute(env, cancel),
+        Operation::Drill(op) => DrillStrategy::new(op.clone()).compute(env, cancel),
+        Operation::Pocket(op) => PocketStrategy::new(op.clone()).compute(env, cancel),
+        Operation::Face(op) => FaceStrategy::new(op.clone()).compute(env, cancel),
     }
 }
 
 fn operation_tool(operation: &Operation) -> u32 {
     match operation {
         Operation::Profile(op) => op.tool,
+        Operation::Drill(op) => op.tool,
+        Operation::Pocket(op) => op.tool,
+        Operation::Face(op) => op.tool,
     }
 }
