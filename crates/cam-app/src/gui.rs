@@ -16,7 +16,7 @@ use cam_model::{Envelope, Machine, Point3};
 use cam_render::{Scene, Vertex, PART};
 use cam_toolpath::{CancelToken, Severity};
 
-use crate::{AppController, JobParams};
+use crate::AppController;
 
 /// A small sample part (rectangle + circular hole) so the app is useful without
 /// a file dialog on first run.
@@ -60,7 +60,8 @@ enum Message {
     ToolDiameter(String),
     Depth(String),
     Stepdown(String),
-    Run,
+    /// Commit the edited fields (one undo step) and recompute the toolpath.
+    Apply,
     Export,
     Undo,
     Redo,
@@ -107,43 +108,18 @@ impl App {
     fn update(&mut self, message: Message) -> iced::Task<Message> {
         match message {
             Message::OpenSample => match self.controller.open_dxf(SAMPLE_DXF, "sample.dxf") {
-                Ok(n) => self.status = format!("Imported {n} region(s). Set parameters and Run."),
+                Ok(n) => {
+                    self.status = format!("Imported {n} region(s).");
+                    self.rerun();
+                }
                 Err(e) => self.status = format!("Import failed: {e}"),
             },
-            Message::ToolDiameter(v) => {
-                self.tool_diameter = v.clone();
-                if let Ok(d) = v.parse::<f64>() {
-                    self.controller
-                        .edit_params(|p: &mut JobParams| p.tool_diameter = d);
-                }
-            }
-            Message::Depth(v) => {
-                self.depth = v.clone();
-                if let Ok(d) = v.parse::<f64>() {
-                    self.controller.edit_params(|p: &mut JobParams| p.depth = d);
-                }
-            }
-            Message::Stepdown(v) => {
-                self.stepdown = v.clone();
-                if let Ok(d) = v.parse::<f64>() {
-                    self.controller
-                        .edit_params(|p: &mut JobParams| p.stepdown = d);
-                }
-            }
-            Message::Run => {
-                let outcome = self.controller.run(&CancelToken::new());
-                let errors = outcome
-                    .diagnostics
-                    .iter()
-                    .filter(|d| d.severity == Severity::Error)
-                    .count();
-                let strips = outcome.scene.strips.len();
-                self.status = if errors > 0 {
-                    format!("Run produced {errors} error(s) — see diagnostics.")
-                } else {
-                    format!("Ran OK: {strips} backplot/outline strips. Export when ready.")
-                };
-            }
+            // Field edits only touch the local text buffer; nothing is applied or
+            // recomputed until Apply/Run so undo has one step per real change.
+            Message::ToolDiameter(v) => self.tool_diameter = v,
+            Message::Depth(v) => self.depth = v,
+            Message::Stepdown(v) => self.stepdown = v,
+            Message::Apply => self.apply_and_run(),
             Message::Export => match self.controller.export_nc() {
                 Ok(nc) => self.status = format!("Exported {} lines of G-code.", nc.lines().count()),
                 Err(e) => self.status = format!("Export blocked: {e:?}"),
@@ -151,17 +127,63 @@ impl App {
             Message::Undo => {
                 if self.controller.undo() {
                     self.sync_fields();
-                    self.status = "Undid last change.".to_string();
+                    self.rerun();
+                    self.status = format!("Undid change. {}", self.status);
+                } else {
+                    self.status = "Nothing to undo.".to_string();
                 }
             }
             Message::Redo => {
                 if self.controller.redo() {
                     self.sync_fields();
-                    self.status = "Redid change.".to_string();
+                    self.rerun();
+                    self.status = format!("Redid change. {}", self.status);
+                } else {
+                    self.status = "Nothing to redo.".to_string();
                 }
             }
         }
         iced::Task::none()
+    }
+
+    /// Parse the edited fields, commit them as one undoable change if they differ
+    /// from the current parameters, and recompute.
+    fn apply_and_run(&mut self) {
+        let (Ok(tool), Ok(depth), Ok(stepdown)) = (
+            self.tool_diameter.parse::<f64>(),
+            self.depth.parse::<f64>(),
+            self.stepdown.parse::<f64>(),
+        ) else {
+            self.status = "A parameter field is not a valid number.".to_string();
+            return;
+        };
+        let mut target = *self.controller.params();
+        target.tool_diameter = tool;
+        target.depth = depth;
+        target.stepdown = stepdown;
+        if target != *self.controller.params() {
+            self.controller.edit_params(|p| *p = target);
+        }
+        self.rerun();
+    }
+
+    /// Recompute the toolpath for the current parameters and report the result.
+    fn rerun(&mut self) {
+        if self.controller.regions().is_empty() {
+            self.status = "Open a part first.".to_string();
+            return;
+        }
+        let outcome = self.controller.run(&CancelToken::new());
+        let errors = outcome
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .count();
+        self.status = if errors > 0 {
+            format!("{errors} error(s) — see diagnostics.")
+        } else {
+            "Toolpath ready. Export when you like.".to_string()
+        };
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -170,6 +192,7 @@ impl App {
                 text(label.to_string()).width(Length::Fixed(110.0)),
                 text_input("", value)
                     .on_input(on_change)
+                    .on_submit(Message::Apply)
                     .width(Length::Fixed(90.0)),
             ]
             .spacing(8)
@@ -183,6 +206,7 @@ impl App {
             field("Tool ⌀ (mm)", &self.tool_diameter, Message::ToolDiameter),
             field("Depth (mm)", &self.depth, Message::Depth),
             field("Stepdown (mm)", &self.stepdown, Message::Stepdown),
+            text("Press Enter or Run to apply.").size(11),
             gap(8.0),
             row![
                 button("Undo").on_press(Message::Undo),
@@ -190,7 +214,7 @@ impl App {
             ]
             .spacing(8),
             row![
-                button("Run").on_press(Message::Run),
+                button("Run").on_press(Message::Apply),
                 button("Export .nc").on_press(Message::Export),
             ]
             .spacing(8),
