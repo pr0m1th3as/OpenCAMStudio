@@ -39,6 +39,7 @@
 //! ```
 
 mod arc;
+mod arcfit;
 mod boolean;
 mod clip;
 mod contour;
@@ -50,6 +51,7 @@ mod polyline;
 mod stroke;
 
 pub use arc::Arc;
+pub use arcfit::{fit_arcs, PathSeg};
 pub use boolean::{difference, intersection, union};
 pub use clip::clip_path;
 pub use contour::Contour;

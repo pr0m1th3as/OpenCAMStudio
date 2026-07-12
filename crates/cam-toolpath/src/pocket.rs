@@ -158,18 +158,7 @@ fn emit_ring(prog: &mut Program, pts: &[Point], op: &PocketOp, h: &Heights, z: f
         feed: op.plunge_feed,
         tag: plunge,
     });
-    for p in &pts[1..] {
-        prog.push(Step::Linear {
-            to: Point3::new(p.x, p.y, z),
-            feed: op.feed,
-            tag: cut,
-        });
-    }
-    prog.push(Step::Linear {
-        to: Point3::new(start.x, start.y, z),
-        feed: op.feed,
-        tag: cut,
-    });
+    crate::emit::cut_loop(prog, pts, op.feed, cut, z);
     prog.push(Step::Rapid {
         to: Point3::new(start.x, start.y, h.clearance),
         tag: retract,

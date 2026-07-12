@@ -1,7 +1,7 @@
 //! The profiling strategy: follow a closed chain at a tool-radius offset, in
 //! stepdown passes, down to depth.
 
-use cam_cldata::{MoveKind, Point3, Program, Step, Tag};
+use cam_cldata::{CutterComp, MoveKind, Point3, Program, Step, Tag};
 use cam_geo::{offset, JoinStyle, Polygon};
 use cam_model::{Comp, Heights, ProfileOp, Side};
 
@@ -72,15 +72,6 @@ impl Strategy for ProfileStrategy {
                 ..Default::default()
             };
         }
-        if op.comp != Comp::Computed {
-            diagnostics.push(Diagnostic::warning(format!(
-                "operation {}: only computed compensation is supported; \
-                 treating control comp as computed",
-                op.id
-            )));
-        }
-
-        // Offset the chain to the tool-centre path.
         let region = match Polygon::new(op.chain.clone()) {
             Ok(p) => p,
             Err(e) => {
@@ -94,11 +85,22 @@ impl Strategy for ProfileStrategy {
                 };
             }
         };
-        let signed = match op.side {
-            Side::Outside => tool.radius(),
-            Side::Inside => -tool.radius(),
-            Side::On => 0.0,
+
+        // Computed comp offsets the geometry ourselves; control comp keeps the
+        // path on the contour and lets the controller (G41/G42) do the offset.
+        let (signed, comp) = match op.comp {
+            Comp::Computed => {
+                let s = match op.side {
+                    Side::Outside => tool.radius(),
+                    Side::Inside => -tool.radius(),
+                    Side::On => 0.0,
+                };
+                (s, None)
+            }
+            Comp::ControlLeft => (0.0, Some(CutterComp::Left(op.tool))),
+            Comp::ControlRight => (0.0, Some(CutterComp::Right(op.tool))),
         };
+
         let loops = if signed == 0.0 {
             vec![region]
         } else {
@@ -143,6 +145,7 @@ impl Strategy for ProfileStrategy {
                 op,
                 &env.heights,
                 &levels,
+                comp,
             );
         }
 
@@ -155,12 +158,14 @@ impl Strategy for ProfileStrategy {
 }
 
 /// Emit approach, stepdown passes, and retract for one closed tool-path loop.
+/// When `comp` is set, the cut is bracketed by controller cutter compensation.
 fn emit_loop(
     prog: &mut Program,
     pts: &[cam_geo::Point],
     op: &ProfileOp,
     h: &Heights,
     levels: &[f64],
+    comp: Option<CutterComp>,
 ) {
     if pts.len() < 3 {
         return;
@@ -182,24 +187,19 @@ fn emit_loop(
     });
 
     for &z in levels {
-        // Plunge to this level, then cut the loop and close it.
+        // Plunge to this level, then cut the loop (arcs refitted) and close it.
         prog.push(Step::Linear {
             to: Point3::new(start.x, start.y, z),
             feed: op.plunge_feed,
             tag: plunge,
         });
-        for p in &pts[1..] {
-            prog.push(Step::Linear {
-                to: Point3::new(p.x, p.y, z),
-                feed: op.feed,
-                tag: cut,
-            });
+        if let Some(c) = comp {
+            prog.push(Step::CutterComp(c));
         }
-        prog.push(Step::Linear {
-            to: Point3::new(start.x, start.y, z),
-            feed: op.feed,
-            tag: cut,
-        });
+        crate::emit::cut_loop(prog, pts, op.feed, cut, z);
+        if comp.is_some() {
+            prog.push(Step::CutterComp(CutterComp::Off));
+        }
     }
 
     // Retract clear of the part.

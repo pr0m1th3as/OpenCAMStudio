@@ -6,7 +6,7 @@
 //! `G83`/`G82`/`G81` cycle and a `G80` to cancel it. Same neutral CL-data, very
 //! different G-code — the capabilities model doing real work.
 
-use cam_cldata::{Coolant, DrillCycle, Point3, Program, SpindleDir, Step};
+use cam_cldata::{Coolant, CutterComp, DrillCycle, Point3, Program, SpindleDir, Step};
 use cam_model::Machine;
 
 use crate::words::{compact, num, sanitize};
@@ -76,6 +76,11 @@ impl Post for FanucPost {
                     .to_string(),
                 ),
                 Step::ToolChange { tool } => w.line(format!("T{tool} M6")),
+                Step::CutterComp(c) => w.line(match c {
+                    CutterComp::Off => "G40".to_string(),
+                    CutterComp::Left(d) => format!("G41 D{d}"),
+                    CutterComp::Right(d) => format!("G42 D{d}"),
+                }),
                 // Fanuc dwell is in seconds via X.
                 Step::Dwell { seconds } => w.line(format!("G4 X{}", compact(*seconds, 3))),
                 Step::Rapid { to, .. } => w.rapid(*to)?,

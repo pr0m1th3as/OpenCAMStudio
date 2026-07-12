@@ -17,6 +17,7 @@
 //!   `cdylib` plugin ABI later is cheap.
 
 mod drill;
+mod emit;
 mod face;
 mod plan;
 mod pocket;

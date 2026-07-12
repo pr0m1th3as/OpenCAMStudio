@@ -9,7 +9,7 @@
 //! Output is **modal** (see [`crate::writer::Writer`]): idiomatic and
 //! deterministic (golden-file friendly).
 
-use cam_cldata::{Coolant, DrillCycle, Point3, Program, SpindleDir, Step};
+use cam_cldata::{Coolant, CutterComp, DrillCycle, Point3, Program, SpindleDir, Step};
 use cam_model::Machine;
 
 use crate::words::{compact, sanitize};
@@ -75,6 +75,13 @@ impl Post for GrblPost {
                     .to_string(),
                 ),
                 Step::ToolChange { tool } => w.line(format!("T{tool} M6")),
+                // grbl has no cutter compensation; control comp cannot be lowered.
+                Step::CutterComp(CutterComp::Left(_) | CutterComp::Right(_)) => {
+                    return Err(PostError::Unsupported(
+                        "cutter radius compensation (G41/G42)".to_string(),
+                    ));
+                }
+                Step::CutterComp(CutterComp::Off) => {}
                 Step::Dwell { seconds } => w.line(format!("G4 P{}", compact(*seconds, 3))),
                 Step::Rapid { to, .. } => w.rapid(*to)?,
                 Step::Linear { to, feed, .. } => w.feed_move(*to, *feed)?,

@@ -111,6 +111,19 @@ pub enum ArcDir {
     Ccw,
 }
 
+/// Cutter-radius compensation state, applied by the *controller* (not computed
+/// into the geometry). A post that lacks the capability must reject it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CutterComp {
+    /// Cancel compensation (`G40`).
+    Off,
+    /// Compensate to the left of travel (`G41`), reading the tool offset from
+    /// the given register.
+    Left(u32),
+    /// Compensate to the right of travel (`G42`).
+    Right(u32),
+}
+
 /// Tier-2 drilling cycle intent.
 ///
 /// The tool visits each XY point in [`points`](DrillCycle::points), starting from
@@ -169,6 +182,8 @@ pub enum Step {
     ToolChange { tool: u32 },
     /// A free-text comment for the operator/backplot.
     Comment(String),
+    /// Set the controller's cutter-radius compensation (`G40`/`G41`/`G42`).
+    CutterComp(CutterComp),
     /// A Tier-2 drilling cycle intent (lowered per post capabilities).
     Drill(DrillCycle),
 }
