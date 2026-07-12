@@ -1,0 +1,18 @@
+[package]
+name = "cam-import"
+description = "OpenCAMStudio — read CAD geometry (DXF) into cam-geo contours and regions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+cam-geo = { path = "../cam-geo" }
+
+[dev-dependencies]
+cam-cldata = { path = "../cam-cldata" }
+cam-model = { path = "../cam-model" }
+cam-toolpath = { path = "../cam-toolpath" }
+cam-post = { path = "../cam-post" }

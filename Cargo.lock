@@ -18,6 +18,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cam-import"
+version = "0.0.1"
+dependencies = [
+ "cam-cldata",
+ "cam-geo",
+ "cam-model",
+ "cam-post",
+ "cam-toolpath",
+]
+
+[[package]]
 name = "cam-model"
 version = "0.0.1"
 dependencies = [
