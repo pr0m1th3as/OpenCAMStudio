@@ -13,7 +13,7 @@ use iced::widget::{button, column, container, row, scrollable, shader, text, tex
 use iced::{Alignment, Element, Length};
 
 use cam_model::{Envelope, Machine, Point3};
-use cam_render::Vertex;
+use cam_render::{Scene, Vertex, PART};
 use cam_toolpath::{CancelToken, Severity};
 
 use crate::{AppController, JobParams};
@@ -33,7 +33,12 @@ const SAMPLE_DXF: &str = "\
 pub fn run() -> iced::Result {
     iced::application(App::new, App::update, App::view)
         .title("OpenCAMStudio")
+        .theme(theme)
         .run()
+}
+
+fn theme(_state: &App) -> iced::Theme {
+    iced::Theme::Dark
 }
 
 /// A fixed vertical gap.
@@ -234,10 +239,18 @@ struct Viewport {
 
 impl Viewport {
     fn new(controller: &AppController) -> Self {
-        let scene = controller
-            .outcome()
-            .map(|o| o.scene.clone())
-            .unwrap_or_default();
+        // After a run, show the full backplot; before it, at least show the
+        // imported part outlines so opening a file is visibly reflected.
+        let scene = match controller.outcome() {
+            Some(outcome) => outcome.scene.clone(),
+            None => {
+                let mut scene = Scene::new();
+                for region in controller.regions() {
+                    scene.add_region(region, PART);
+                }
+                scene
+            }
+        };
         Self {
             vertices: Arc::new(scene.line_vertices()),
             bounds: scene.bounds(),
