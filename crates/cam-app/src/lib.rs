@@ -11,7 +11,7 @@
 
 mod controller;
 
-pub use controller::{AppController, ExportError, JobParams, RunOutcome};
+pub use controller::{AppController, ExportError, JobParams, RunOutcome, Selection};
 
 #[cfg(feature = "gui")]
 pub mod gui;

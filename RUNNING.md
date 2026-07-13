@@ -51,16 +51,30 @@ LIBGL_ALWAYS_SOFTWARE=1 WGPU_BACKEND=gl cargo run -p cam-app --features gui
 
 ### Using the app
 
-The window has a control panel on the left and a `wgpu` viewport on the right.
+The window has a **toolbar** across the top and four **resizable, dockable
+panes** below (drag a pane's title bar to rearrange; drag a border to resize):
 
-1. **Open sample part** — loads a built-in rectangle-with-a-hole (no file dialog
-   yet; file loading is the next increment). The viewport frames the geometry.
-2. Adjust **Tool ⌀**, **Depth**, **Stepdown**. Each edit is undoable.
-3. **Run** — computes the toolpath. The viewport shows the backplot colored by
+- **Project** (left) — the document tree: Setup, Stock, Tools, and Operations.
+  Click a node to select it; the selected node is marked with `▸`.
+- **Viewport** (centre) — the `wgpu` backplot and the simulated stock.
+- **Inspector** (right) — editable fields for the *selected* node.
+- **Output** (bottom) — the status line and run diagnostics.
+
+Workflow:
+
+1. **Open sample** — loads a built-in rectangle-with-a-hole (no file dialog yet;
+   file loading is the next increment). The tree fills with two profile
+   operations and the viewport frames the geometry.
+2. Select a node in **Project**, then edit its fields in **Inspector**:
+   - a **Setup** exposes Clearance / Retract / Top of stock;
+   - a **Tool** exposes its diameter;
+   - an **Operation** exposes Depth / Stepdown / (Stepover) / Feed / Plunge feed.
+   Press **Enter** or **Apply** to commit — each Apply is one undo step and
+   recomputes the toolpath.
+3. **Run** — recomputes for the current document. The backplot is colored by
    move kind: green = cutting, yellow = rapid/link, red = plunge; the part
-   outline is drawn in light grey. Any problems appear under **Diagnostics**
-   (e.g. a tool too large to open the hole).
-4. **Undo / Redo** — step through parameter changes.
+   outline is light grey. Problems appear in **Output** (e.g. a tool too large).
+4. **Undo / Redo** — step through document edits.
 5. **Show stock / Hide stock** — overlays the *simulated* stock surface (the
    material left after the toolpath cuts) under the backplot, shaded so the
    pocket walls and stepdowns read. Available after a **Run**.
@@ -72,15 +86,17 @@ The window has a control panel on the left and a `wgpu` viewport on the right.
 Because the GUI is the one part that cannot be verified by automated tests, the
 things worth eyeballing:
 
-- The window opens and the sample part frames correctly in the viewport.
-- After **Run**, the backplot draws — an outer rounded-rectangle tool path, an
-  inner loop around the hole, colored as above.
-- Setting **Tool ⌀** to `12` and pressing **Run** produces a "tool too large"
-  diagnostic and blocks export (the 6 mm-radius tool can't open the 10 mm hole).
-- **Undo** restores the previous parameter and the backplot updates on the next
-  **Run**.
+- The window opens with all four panes; the sample part frames in the viewport
+  and the tree shows Setup / Stock / Tools / two Operations.
+- Selecting **Operation 0** shows its Depth/Stepdown/Feed in the Inspector;
+  changing **Depth** to `-8` and pressing **Apply** updates the backplot.
+- Selecting the **Tool** and setting ⌀ to `12`, then **Apply**, produces a
+  "tool too large" diagnostic in **Output** and blocks export (the 6 mm-radius
+  tool can't open the 10 mm hole).
+- **Undo** restores the previous value and the backplot updates.
 - **Show stock** overlays a shaded grey surface with the pockets/holes carved
   out; the colored backplot stays visible on top. **Hide stock** removes it.
+- Dragging a pane's title bar re-docks it; dragging a border resizes.
 
 ## Notes
 

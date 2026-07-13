@@ -1,9 +1,10 @@
 //! The headless application controller.
 //!
 //! All of the app's behaviour lives here, with no GUI dependency: open a DXF,
-//! adjust job parameters (undoably), run the strategies, build the viewport
-//! scene, and export G-code. The iced shell is a thin view over this — so the
-//! app's logic is unit-tested exactly like the rest of the pipeline.
+//! hold an editable [`Document`] with a [`Selection`], adjust the selected node
+//! (undoably), run the strategies, build the viewport scene, simulate the stock,
+//! and export G-code. The iced shell is a thin view over this — so the app's
+//! logic is unit-tested exactly like the rest of the pipeline.
 
 use cam_geo::Polygon;
 use cam_import::{read_dxf_str, ImportError, ImportOptions};
@@ -18,8 +19,9 @@ use cam_sim::{simulate, SimOptions};
 use cam_cldata::{Program, SpindleDir};
 use cam_toolpath::{build_job, CancelToken, Diagnostic, Severity};
 
-/// The user-tunable parameters of the job. A single global set is applied to
-/// every profiled contour — enough for the first interactive vertical.
+/// Seed defaults for a freshly-imported document: the values every generated
+/// operation and the setup's heights start from. Once a document exists, editing
+/// happens on the document, not here.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct JobParams {
     pub tool_diameter: f64,
@@ -47,6 +49,21 @@ impl Default for JobParams {
             top_of_stock: 0.0,
         }
     }
+}
+
+/// Which node of the document is currently selected — what the tree highlights
+/// and the inspector edits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Selection {
+    /// The setup itself (its heights).
+    #[default]
+    Setup,
+    /// The raw stock.
+    Stock,
+    /// A tool in the setup's tool list, by index.
+    Tool(usize),
+    /// An operation, by its id.
+    Operation(u32),
 }
 
 /// The result of a run: the CL-data program, its diagnostics, the viewport
@@ -93,19 +110,25 @@ impl From<PostError> for ExportError {
 pub struct AppController {
     machine: Machine,
     regions: Vec<Polygon>,
-    params: History<JobParams>,
+    document: History<Document>,
+    defaults: JobParams,
+    selection: Selection,
     source_name: String,
     outcome: Option<RunOutcome>,
     nc: Option<String>,
 }
 
 impl AppController {
-    /// A fresh controller for `machine`, with default parameters and no geometry.
+    /// A fresh controller for `machine`, with an empty "Untitled" document and no
+    /// geometry.
     pub fn new(machine: Machine) -> Self {
+        let defaults = JobParams::default();
         Self {
             machine,
             regions: Vec::new(),
-            params: History::new(JobParams::default()),
+            document: History::new(empty_document(&defaults)),
+            defaults,
+            selection: Selection::default(),
             source_name: String::new(),
             outcome: None,
             nc: None,
@@ -117,9 +140,30 @@ impl AppController {
         &self.machine
     }
 
-    /// The current job parameters.
-    pub fn params(&self) -> &JobParams {
-        self.params.current()
+    /// The current document.
+    pub fn document(&self) -> &Document {
+        self.document.current()
+    }
+
+    /// The seed defaults used when a document is generated on import.
+    pub fn defaults(&self) -> &JobParams {
+        &self.defaults
+    }
+
+    /// The current selection.
+    pub fn selection(&self) -> Selection {
+        self.selection
+    }
+
+    /// Select a node. Clamped to a valid target: an out-of-range tool or a
+    /// missing operation falls back to the setup.
+    pub fn select(&mut self, selection: Selection) {
+        self.selection = match selection {
+            Selection::Tool(i) if i < self.document.current().setup.tools.len() => selection,
+            Selection::Operation(id) if self.operation(id).is_some() => selection,
+            Selection::Setup | Selection::Stock => selection,
+            _ => Selection::Setup,
+        };
     }
 
     /// The imported regions.
@@ -142,36 +186,94 @@ impl AppController {
         self.nc.as_deref()
     }
 
-    /// Load geometry from DXF text, replacing any current drawing. Returns the
-    /// number of regions imported. Clears the run/undo state for a clean start.
+    /// The operation with `id`, if present.
+    pub fn operation(&self, id: u32) -> Option<&Operation> {
+        self.document
+            .current()
+            .setup
+            .operations
+            .iter()
+            .find(|o| o.id() == id)
+    }
+
+    /// The currently-selected operation, if an operation is selected.
+    pub fn selected_operation(&self) -> Option<&Operation> {
+        match self.selection {
+            Selection::Operation(id) => self.operation(id),
+            _ => None,
+        }
+    }
+
+    /// Load geometry from DXF text, replacing any current drawing. Generates a
+    /// fresh editable document (an outside profile per boundary, an inside
+    /// profile per hole) from the seed defaults. Returns the number of regions.
     pub fn open_dxf(&mut self, text: &str, name: impl Into<String>) -> Result<usize, ImportError> {
         let import = read_dxf_str(text, &ImportOptions::default())?;
         self.regions = import.regions;
         self.source_name = name.into();
-        self.params = History::new(*self.params.current());
+        let document = self.generate_document();
+        self.document = History::new(document);
+        self.selection = self
+            .document
+            .current()
+            .setup
+            .operations
+            .first()
+            .map(|op| Selection::Operation(op.id()))
+            .unwrap_or(Selection::Setup);
         self.invalidate();
         Ok(self.regions.len())
     }
 
-    /// Edit the job parameters as one undoable change. Any stale run is dropped.
-    pub fn edit_params(&mut self, f: impl FnOnce(&mut JobParams)) {
-        self.params.edit(f);
+    /// Edit the setup's heights as one undoable change.
+    pub fn edit_heights(&mut self, f: impl FnOnce(&mut Heights)) {
+        self.document.edit(|doc| f(&mut doc.setup.heights));
         self.invalidate();
     }
 
-    /// Undo the last parameter edit.
+    /// Edit a tool as one undoable change. A no-op if the index is out of range.
+    pub fn edit_tool(&mut self, index: usize, f: impl FnOnce(&mut Tool)) {
+        let in_range = index < self.document.current().setup.tools.len();
+        if !in_range {
+            return;
+        }
+        self.document.edit(|doc| f(&mut doc.setup.tools[index]));
+        self.invalidate();
+    }
+
+    /// Edit the selected operation as one undoable change. A no-op unless an
+    /// operation is selected.
+    pub fn edit_selected_operation(&mut self, f: impl FnOnce(&mut Operation)) {
+        let Selection::Operation(id) = self.selection else {
+            return;
+        };
+        let mut edited = false;
+        self.document.edit(|doc| {
+            if let Some(op) = doc.setup.operations.iter_mut().find(|o| o.id() == id) {
+                f(op);
+                edited = true;
+            }
+        });
+        if edited {
+            self.invalidate();
+        }
+    }
+
+    /// Undo the last document edit.
     pub fn undo(&mut self) -> bool {
-        let changed = self.params.undo();
+        let changed = self.document.undo();
         if changed {
+            self.reconcile_selection();
             self.invalidate();
         }
         changed
     }
 
-    /// Redo an undone parameter edit.
+    /// Redo an undone document edit.
     pub fn redo(&mut self) -> bool {
-        let changed = self.params.redo();
+        let changed = self.document.redo();
         if changed {
+            self.reconcile_selection();
             self.invalidate();
         }
         changed
@@ -179,32 +281,26 @@ impl AppController {
 
     /// Whether an undo / redo is available.
     pub fn can_undo(&self) -> bool {
-        self.params.can_undo()
+        self.document.can_undo()
     }
     pub fn can_redo(&self) -> bool {
-        self.params.can_redo()
+        self.document.can_redo()
     }
 
-    /// Run the strategies for the current geometry and parameters, producing the
-    /// program, diagnostics, and viewport scene. Returns a reference to the
-    /// outcome. `cancel` allows a long run to be aborted.
+    /// Run the strategies for the current document, producing the program,
+    /// diagnostics, viewport scene, and simulated stock. Returns a reference to
+    /// the outcome. `cancel` allows a long run to be aborted.
     pub fn run(&mut self, cancel: &CancelToken) -> &RunOutcome {
-        let document = self.build_document();
-        let (program, diagnostics) = build_job(
-            &document,
-            self.params.current().spindle_rpm,
-            SpindleDir::Cw,
-            cancel,
-        );
+        let document = self.document.current();
+        let (program, diagnostics) =
+            build_job(document, self.defaults.spindle_rpm, SpindleDir::Cw, cancel);
 
         let mut scene = Scene::from_program(&program);
         for region in &self.regions {
             scene.add_region(region, PART);
         }
 
-        let p = *self.params.current();
-        let (stock_vertices, stock_indices) =
-            self.simulate_stock(&program, p.top_of_stock, p.depth, p.tool_diameter);
+        let (stock_vertices, stock_indices) = self.simulate_stock(&program);
 
         self.nc = None;
         self.outcome = Some(RunOutcome {
@@ -215,38 +311,6 @@ impl AppController {
             stock_indices,
         });
         self.outcome.as_ref().unwrap()
-    }
-
-    /// Simulate material removal for `program` and triangulate the remaining
-    /// stock into render-ready vertices + indices. Returns empty buffers when
-    /// there is no stock (no geometry loaded).
-    fn simulate_stock(
-        &self,
-        program: &Program,
-        top: f64,
-        depth: f64,
-        tool_diameter: f64,
-    ) -> (Vec<MeshVertex>, Vec<u32>) {
-        let (min, max) = self.stock_bounds(top, depth);
-        if min[0] >= max[0] || min[1] >= max[1] {
-            return (Vec::new(), Vec::new());
-        }
-        // Aim for ~200 cells across the larger side, bounded so a big part stays
-        // cheap and a small one stays crisp.
-        let span = (max[0] - min[0]).max(max[1] - min[1]);
-        let resolution = (span / 200.0).clamp(0.25, 2.0);
-        let sim = simulate(
-            program,
-            min,
-            max,
-            &SimOptions {
-                resolution,
-                tool_radius: tool_diameter / 2.0,
-            },
-        );
-        let surface = sim.field.to_mesh();
-        let vertices = mesh_vertices(&surface.positions, &surface.normals);
-        (vertices, surface.indices)
     }
 
     /// Post the most recent run to grbl G-code, caching and returning it. Fails
@@ -265,10 +329,44 @@ impl AppController {
         Ok(self.nc.as_deref().unwrap())
     }
 
-    /// Turn the current geometry + parameters into a document: an outside profile
-    /// for each region's boundary and an inside profile for each of its holes.
-    fn build_document(&self) -> Document {
-        let p = *self.params.current();
+    /// Simulate material removal for `program` and triangulate the remaining
+    /// stock into render-ready vertices + indices. Returns empty buffers when
+    /// there is no stock (no geometry loaded).
+    fn simulate_stock(&self, program: &Program) -> (Vec<MeshVertex>, Vec<u32>) {
+        let Stock::Box { min, max } = self.document.current().setup.stock;
+        if min[0] >= max[0] || min[1] >= max[1] {
+            return (Vec::new(), Vec::new());
+        }
+        let tool_diameter = self
+            .document
+            .current()
+            .setup
+            .tools
+            .first()
+            .map(|t| t.diameter)
+            .unwrap_or(self.defaults.tool_diameter);
+        // Aim for ~200 cells across the larger side, bounded so a big part stays
+        // cheap and a small one stays crisp.
+        let span = (max[0] - min[0]).max(max[1] - min[1]);
+        let resolution = (span / 200.0).clamp(0.25, 2.0);
+        let sim = simulate(
+            program,
+            min,
+            max,
+            &SimOptions {
+                resolution,
+                tool_radius: tool_diameter / 2.0,
+            },
+        );
+        let surface = sim.field.to_mesh();
+        let vertices = mesh_vertices(&surface.positions, &surface.normals);
+        (vertices, surface.indices)
+    }
+
+    /// Build a document from the current geometry and seed defaults: an outside
+    /// profile for each region's boundary and an inside profile for each hole.
+    fn generate_document(&self) -> Document {
+        let p = self.defaults;
         let tool = Tool {
             number: 1,
             diameter: p.tool_diameter,
@@ -310,13 +408,6 @@ impl AppController {
 
     /// A bounding-box stock around the imported geometry.
     fn stock(&self, top: f64, depth: f64) -> Stock {
-        let (min, max) = self.stock_bounds(top, depth);
-        Stock::Box { min, max }
-    }
-
-    /// The `[min, max]` XYZ corners of the bounding-box stock around the imported
-    /// geometry. An empty drawing collapses to a zero box.
-    fn stock_bounds(&self, top: f64, depth: f64) -> ([f64; 3], [f64; 3]) {
         let mut min = [f64::MAX, f64::MAX];
         let mut max = [f64::MIN, f64::MIN];
         for region in &self.regions {
@@ -331,7 +422,10 @@ impl AppController {
             min = [0.0, 0.0];
             max = [0.0, 0.0];
         }
-        ([min[0], min[1], depth], [max[0], max[1], top])
+        Stock::Box {
+            min: [min[0], min[1], depth],
+            max: [max[0], max[1], top],
+        }
     }
 
     fn program_name(&self) -> String {
@@ -342,11 +436,37 @@ impl AppController {
         }
     }
 
+    /// After an undo/redo, drop a selection that no longer points at anything.
+    fn reconcile_selection(&mut self) {
+        let sel = self.selection;
+        self.select(sel);
+    }
+
     /// Drop any run/export that no longer reflects the inputs.
     fn invalidate(&mut self) {
         self.outcome = None;
         self.nc = None;
     }
+}
+
+/// An empty starting document: a zero-size box stock, one default end mill, no
+/// operations.
+fn empty_document(p: &JobParams) -> Document {
+    Document::new(Setup {
+        name: "Untitled".to_string(),
+        heights: Heights::new(p.clearance, p.retract, p.top_of_stock),
+        stock: Stock::Box {
+            min: [0.0, 0.0, p.depth],
+            max: [0.0, 0.0, p.top_of_stock],
+        },
+        tools: vec![Tool {
+            number: 1,
+            diameter: p.tool_diameter,
+            flutes: 2,
+            kind: ToolKind::EndMill,
+        }],
+        operations: Vec::new(),
+    })
 }
 
 #[cfg(test)]
@@ -378,11 +498,29 @@ mod tests {
         }
     }
 
+    fn depth_of(op: &Operation) -> f64 {
+        match op {
+            Operation::Profile(o) => o.depth,
+            Operation::Pocket(o) => o.depth,
+            Operation::Face(o) => o.depth,
+            Operation::Drill(o) => o.depth,
+        }
+    }
+
+    #[test]
+    fn open_generates_ops_and_selects_the_first() {
+        let mut app = AppController::new(machine());
+        assert_eq!(app.open_dxf(PART_DXF, "part.dxf").unwrap(), 1);
+        // Rectangle boundary (outside) + circular hole (inside) = 2 profiles.
+        assert_eq!(app.document().setup.operations.len(), 2);
+        assert_eq!(app.selection(), Selection::Operation(0));
+        assert!(app.selected_operation().is_some());
+    }
+
     #[test]
     fn open_run_export_round_trip() {
         let mut app = AppController::new(machine());
         assert_eq!(app.open_dxf(PART_DXF, "part.dxf").unwrap(), 1);
-        assert_eq!(app.regions().len(), 1);
 
         let outcome = app.run(&CancelToken::new());
         assert!(
@@ -423,19 +561,46 @@ mod tests {
     }
 
     #[test]
-    fn param_edits_undo_and_invalidate_the_run() {
+    fn editing_the_selected_operation_is_undoable_and_invalidates() {
         let mut app = AppController::new(machine());
         app.open_dxf(PART_DXF, "part.dxf").unwrap();
         app.run(&CancelToken::new());
         assert!(app.outcome().is_some());
 
-        app.edit_params(|p| p.depth = -8.0);
-        assert_eq!(app.params().depth, -8.0);
+        // Op 0 is selected after import.
+        app.edit_selected_operation(|op| {
+            if let Operation::Profile(o) = op {
+                o.depth = -8.0;
+            }
+        });
+        assert_eq!(depth_of(app.operation(0).unwrap()), -8.0);
         assert!(app.outcome().is_none(), "editing invalidates the stale run");
         assert!(app.can_undo());
 
         assert!(app.undo());
-        assert_eq!(app.params().depth, -4.0, "undo restores the depth");
+        assert_eq!(depth_of(app.operation(0).unwrap()), -4.0, "undo restores");
+    }
+
+    #[test]
+    fn editing_heights_is_undoable() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        app.edit_heights(|h| h.clearance = 12.0);
+        assert_eq!(app.document().setup.heights.clearance, 12.0);
+        assert!(app.undo());
+        assert_eq!(app.document().setup.heights.clearance, 5.0);
+    }
+
+    #[test]
+    fn selecting_a_missing_node_falls_back_to_setup() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        app.select(Selection::Operation(99));
+        assert_eq!(app.selection(), Selection::Setup);
+        app.select(Selection::Tool(7));
+        assert_eq!(app.selection(), Selection::Setup);
+        app.select(Selection::Tool(0));
+        assert_eq!(app.selection(), Selection::Tool(0));
     }
 
     #[test]
@@ -450,7 +615,7 @@ mod tests {
         let mut app = AppController::new(machine());
         app.open_dxf(PART_DXF, "part.dxf").unwrap();
         // A ⌀12 tool cannot open the 10 mm hole.
-        app.edit_params(|p| p.tool_diameter = 12.0);
+        app.edit_tool(0, |t| t.diameter = 12.0);
         let outcome = app.run(&CancelToken::new());
         assert!(outcome.has_errors());
         assert_eq!(app.export_nc(), Err(ExportError::HasErrors));
