@@ -64,6 +64,19 @@ fn grow_arc(points: &[Point], i: usize, tol: f64) -> Option<(Point, bool, usize)
     if radius > MAX_ARC_RADIUS {
         return None;
     }
+    // The vertices lying on a common circle is not enough: the *straight*
+    // segments between them are what the machine actually cuts, and they must
+    // hug the circle too. If consecutive points are so sparse that the chord
+    // between them departs from the circle by more than `tol` (the sagitta), the
+    // run is a polygon whose corners merely happen to be concyclic — e.g. the
+    // four corners of a square — not a sampled arc. Reject it, or we would turn
+    // straight edges into a bulging arc. (A finely flattened arc has a sagitta of
+    // microns and sails through.)
+    if chord_sagitta(radius, points[i].distance(points[i + 1])) > tol
+        || chord_sagitta(radius, points[i + 1].distance(points[i + 2])) > tol
+    {
+        return None;
+    }
     let ccw = orient(points[i], points[i + 1], points[i + 2]) > 0.0;
 
     let mut end = i + 2;
@@ -74,6 +87,10 @@ fn grow_arc(points: &[Point], i: usize, tol: f64) -> Option<(Point, bool, usize)
         }
         // The turn must keep the same sense, so the arc stays monotonic.
         if (orient(points[end - 1], points[end], p) > 0.0) != ccw {
+            break;
+        }
+        // The chord to the next point must hug the circle (see above).
+        if chord_sagitta(radius, points[end].distance(p)) > tol {
             break;
         }
         end += 1;
@@ -94,6 +111,17 @@ fn grow_arc(points: &[Point], i: usize, tol: f64) -> Option<(Point, bool, usize)
         return None;
     }
     Some((center, ccw, end))
+}
+
+/// The sagitta of a chord of length `chord` on a circle of `radius`: how far the
+/// straight chord bows away from the arc. Grows with the chord, so it measures
+/// how sparsely an arc has been sampled.
+fn chord_sagitta(radius: f64, chord: f64) -> f64 {
+    let half = chord / 2.0;
+    if half >= radius {
+        return radius; // a half-turn or more between samples — hopelessly coarse
+    }
+    radius - (radius * radius - half * half).sqrt()
 }
 
 /// Perpendicular distance from `p` to the line through `a` and `b`.
@@ -166,6 +194,26 @@ mod tests {
             }
             _ => panic!("expected an arc"),
         }
+    }
+
+    #[test]
+    fn a_square_stays_lines_not_a_circle() {
+        // The four corners of a square are concyclic, but the edges between them
+        // are straight. Refitting must keep them as lines — never collapse the
+        // square into the circumscribed circle (a real bug an inward pocket
+        // offset produced).
+        let pts = [
+            Point::new(8.0, 32.0),
+            Point::new(8.0, 8.0),
+            Point::new(32.0, 8.0),
+            Point::new(32.0, 32.0),
+            Point::new(8.0, 32.0), // closed
+        ];
+        let segs = fit_arcs(&pts, 0.01);
+        assert!(
+            segs.iter().all(|s| matches!(s, PathSeg::Line { .. })),
+            "square must stay straight edges, got {segs:?}"
+        );
     }
 
     #[test]

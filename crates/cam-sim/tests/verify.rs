@@ -7,7 +7,7 @@ use cam_geo::{Contour, Point};
 use cam_model::{
     Comp, Document, Heights, Operation, PocketOp, ProfileOp, Setup, Side, Stock, Tool, ToolKind,
 };
-use cam_sim::{simulate, SimOptions};
+use cam_sim::{check_gouge, simulate, Heightfield, SimOptions};
 use cam_toolpath::{build_job, CancelToken};
 
 const TOOL_DIA: f64 = 6.0;
@@ -102,6 +102,61 @@ fn a_pocket_clears_its_floor_without_collisions() {
         sim.removed_volume > 2400.0,
         "removed {}",
         sim.removed_volume
+    );
+}
+
+/// The intended finished part for the 30×30, 4 mm-deep pocket: a flat -4 floor
+/// inside the boundary, the original top (0) everywhere else. `intended_depth`
+/// lets a test lie about the wanted depth to provoke a gouge.
+fn pocket_target(intended_depth: f64) -> Heightfield {
+    let mut t = Heightfield::new(
+        [STOCK_MIN[0], STOCK_MIN[1]],
+        [STOCK_MAX[0], STOCK_MAX[1]],
+        0.5,
+        STOCK_MAX[2],
+    );
+    t.lower_rect([5.0, 5.0], [35.0, 35.0], intended_depth);
+    t
+}
+
+fn pocket_op() -> PocketOp {
+    PocketOp {
+        id: 0,
+        tool: 1,
+        boundary: square(5.0, 5.0, 35.0, 35.0),
+        islands: vec![],
+        depth: -4.0,
+        stepdown: 2.0,
+        stepover: 3.0,
+        feed: 300.0,
+        plunge_feed: 100.0,
+    }
+}
+
+#[test]
+fn a_pocket_cut_to_depth_does_not_gouge_its_target() {
+    // The real pocket program cuts to -4; the target's floor is -4. The tool
+    // leaves wall material (never crosses the boundary), so nothing goes below
+    // target: no gouge.
+    let sim = run(&setup(vec![Operation::Pocket(pocket_op())]));
+    assert!(
+        check_gouge(&sim.field, &pocket_target(-4.0), 0.05).is_none(),
+        "an on-depth pocket must not gouge its target"
+    );
+}
+
+#[test]
+fn a_pocket_deeper_than_intended_is_caught_as_a_gouge() {
+    // Same real program (cuts to -4), but the part only wanted a 2 mm-deep
+    // pocket. The extra 2 mm is a gouge the backplot would never reveal.
+    let sim = run(&setup(vec![Operation::Pocket(pocket_op())]));
+    let gouge =
+        check_gouge(&sim.field, &pocket_target(-2.0), 0.05).expect("the over-cut must be flagged");
+    assert_eq!(gouge.kind, cam_sim::CollisionKind::Gouge);
+    assert!(
+        (gouge.at[2] + 4.0).abs() < 0.3,
+        "gouge floor near -4: {:?}",
+        gouge.at
     );
 }
 

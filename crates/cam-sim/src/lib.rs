@@ -11,7 +11,7 @@
 
 mod heightfield;
 
-pub use heightfield::Heightfield;
+pub use heightfield::{Heightfield, SurfaceDiff, SurfaceMesh};
 
 use cam_cldata::{ArcDir, Point3, Program, Step};
 use cam_geo::{Arc, Point};
@@ -39,6 +39,9 @@ impl Default for SimOptions {
 pub enum CollisionKind {
     /// A rapid (`G0`) traverse passes through remaining stock.
     RapidThroughStock,
+    /// The tool cut below the desired target surface — an over-cut (gouge) that
+    /// destroys part material.
+    Gouge,
 }
 
 /// A detected problem, with where it happened.
@@ -141,6 +144,29 @@ pub fn simulate(
     }
 }
 
+/// Verify a simulated `field` against a desired `target` surface: if the tool cut
+/// more than `tol` mm below the target anywhere, return a [`CollisionKind::Gouge`]
+/// summarising the worst point and total over-cut. Returns `None` when the run is
+/// within tolerance of (or leaves stock above) the target.
+///
+/// This is the verification a backplot cannot give: a program can be perfectly
+/// collision-free against the stock yet still cut into the finished part.
+pub fn check_gouge(field: &Heightfield, target: &Heightfield, tol: f64) -> Option<Collision> {
+    let diff = field.compare(target, tol);
+    if (diff.max_gouge as f64) <= tol {
+        return None;
+    }
+    let at = diff.gouge_at.unwrap_or([0.0, 0.0]);
+    Some(Collision {
+        kind: CollisionKind::Gouge,
+        at: [at[0], at[1], diff.gouge_z],
+        message: format!(
+            "gouge: cut {:.3} mm below target at ({:.2}, {:.2}) — {} cells, {:.1} mm³ over-cut",
+            diff.max_gouge, at[0], at[1], diff.cells_gouged, diff.gouge_volume
+        ),
+    })
+}
+
 /// Flatten an arc move into points (XY on the circle, Z interpolated end to end).
 fn arc_points(a: Point3, end: Point3, center: Point3, dir: ArcDir) -> Vec<[f64; 3]> {
     let r = ((a.x - center.x).powi(2) + (a.y - center.y).powi(2)).sqrt();
@@ -200,6 +226,46 @@ mod tests {
         let sim = simulate(&prog, STOCK_MIN, STOCK_MAX, &opts());
         assert!(!sim.is_clean(), "should flag the rapid");
         assert_eq!(sim.collisions[0].kind, CollisionKind::RapidThroughStock);
+    }
+
+    #[test]
+    fn a_cut_within_tolerance_of_target_is_not_a_gouge() {
+        // Simulate a flat -3 floor; target the same floor. No gouge.
+        let prog = ProgramBuilder::new()
+            .op(0)
+            .feed(300.0)
+            .rapid(Point3::new(2.0, 20.0, 5.0), MoveKind::Link)
+            .linear(Point3::new(2.0, 20.0, -3.0), MoveKind::Plunge)
+            .linear(Point3::new(38.0, 20.0, -3.0), MoveKind::Cutting)
+            .rapid(Point3::new(38.0, 20.0, 5.0), MoveKind::Retract)
+            .build();
+        let sim = simulate(&prog, STOCK_MIN, STOCK_MAX, &opts());
+        let mut target = Heightfield::new([0.0, 0.0], [40.0, 40.0], 0.5, 0.0);
+        target.lower_rect([0.0, 16.0], [40.0, 24.0], -3.0);
+        assert!(check_gouge(&sim.field, &target, 0.05).is_none());
+    }
+
+    #[test]
+    fn cutting_below_the_target_is_flagged_as_a_gouge() {
+        // Cut to -5 where the target only wanted -2: a 3 mm gouge.
+        let prog = ProgramBuilder::new()
+            .op(0)
+            .feed(300.0)
+            .rapid(Point3::new(2.0, 20.0, 5.0), MoveKind::Link)
+            .linear(Point3::new(2.0, 20.0, -5.0), MoveKind::Plunge)
+            .linear(Point3::new(38.0, 20.0, -5.0), MoveKind::Cutting)
+            .rapid(Point3::new(38.0, 20.0, 5.0), MoveKind::Retract)
+            .build();
+        let sim = simulate(&prog, STOCK_MIN, STOCK_MAX, &opts());
+        let mut target = Heightfield::new([0.0, 0.0], [40.0, 40.0], 0.5, 0.0);
+        target.lower_rect([0.0, 16.0], [40.0, 24.0], -2.0);
+        let gouge = check_gouge(&sim.field, &target, 0.05).expect("gouge must be caught");
+        assert_eq!(gouge.kind, CollisionKind::Gouge);
+        assert!(
+            (gouge.at[2] + 5.0).abs() < 0.2,
+            "gouge Z near -5: {:?}",
+            gouge.at
+        );
     }
 
     #[test]

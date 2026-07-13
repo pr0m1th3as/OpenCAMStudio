@@ -6,6 +6,41 @@
 //! the simplest model that captures 2.5-D removal faithfully — enough to verify
 //! that a program clears what it should and never plows a rapid through stock.
 
+/// How the simulated stock compares to a desired target surface — the raw
+/// material of gouge / residual verification.
+///
+/// Signs follow milling intuition: a **gouge** is stock cut *below* the target
+/// (material destroyed that should have remained — the dangerous error); a
+/// **residual** is stock left *above* the target (uncut material that should have
+/// been removed — a quality miss, not a hazard).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SurfaceDiff {
+    /// Deepest over-cut below the target, mm (0 if none exceeds tolerance).
+    pub max_gouge: f32,
+    /// XY of the deepest gouge, if any.
+    pub gouge_at: Option<[f64; 2]>,
+    /// Simulated Z at the deepest gouge.
+    pub gouge_z: f64,
+    /// Total volume cut below the target, mm³.
+    pub gouge_volume: f64,
+    /// Total volume of stock left above the target, mm³.
+    pub residual_volume: f64,
+    /// Cells whose over-cut exceeds tolerance.
+    pub cells_gouged: usize,
+    /// Cells whose leftover stock exceeds tolerance.
+    pub cells_residual: usize,
+}
+
+/// A triangle mesh of the stock surface, for rendering. One vertex per grid cell
+/// (at its centre), two triangles per interior quad, wound CCW as seen from `+Z`.
+/// Positions are millimetres `(x, y, z)`; normals are unit, `+Z`-ish.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SurfaceMesh {
+    pub positions: Vec<[f32; 3]>,
+    pub normals: Vec<[f32; 3]>,
+    pub indices: Vec<u32>,
+}
+
 /// A grid of remaining-stock heights.
 #[derive(Clone, Debug)]
 pub struct Heightfield {
@@ -99,6 +134,104 @@ impl Heightfield {
             .sum()
     }
 
+    /// Lower every cell whose centre lies in the XY rectangle `[min, max]` to
+    /// `z`, never raising — a primitive for building a target surface (e.g. a
+    /// pocket floor) or pre-shaping stock.
+    pub fn lower_rect(&mut self, min: [f64; 2], max: [f64; 2], z: f64) {
+        let (ix0, ix1) = self.index_range(min[0], max[0], 0);
+        let (iy0, iy1) = self.index_range(min[1], max[1], 1);
+        let z = z as f32;
+        for iy in iy0..=iy1 {
+            for ix in ix0..=ix1 {
+                let (cx, cy) = self.center(ix, iy);
+                if cx >= min[0] && cx <= max[0] && cy >= min[1] && cy <= max[1] {
+                    let cell = &mut self.z[iy * self.nx + ix];
+                    *cell = cell.min(z);
+                }
+            }
+        }
+    }
+
+    /// Compare this (simulated) field against a `target` surface, cell by cell.
+    /// `target` is sampled at each of this field's cell centres, so the two grids
+    /// need not align. `tol` (mm) is the deviation ignored as grazing.
+    pub fn compare(&self, target: &Heightfield, tol: f64) -> SurfaceDiff {
+        let tol = tol as f32;
+        let cell_area = self.res * self.res;
+        let mut diff = SurfaceDiff::default();
+        let mut worst = 0.0f32;
+        for iy in 0..self.ny {
+            for ix in 0..self.nx {
+                let actual = self.z[iy * self.nx + ix];
+                let (cx, cy) = self.center(ix, iy);
+                let over = target.sample(cx, cy) - actual; // >0 ⇒ cut below target
+                if over > tol {
+                    diff.gouge_volume += over as f64 * cell_area;
+                    diff.cells_gouged += 1;
+                    if over > worst {
+                        worst = over;
+                        diff.gouge_at = Some([cx, cy]);
+                        diff.gouge_z = actual as f64;
+                    }
+                } else if -over > tol {
+                    diff.residual_volume += (-over) as f64 * cell_area;
+                    diff.cells_residual += 1;
+                }
+            }
+        }
+        diff.max_gouge = worst;
+        diff
+    }
+
+    /// Triangulate the current surface into a [`SurfaceMesh`] for rendering.
+    /// Per-vertex normals come from central differences of the height grid.
+    pub fn to_mesh(&self) -> SurfaceMesh {
+        let mut positions = Vec::with_capacity(self.nx * self.ny);
+        for iy in 0..self.ny {
+            for ix in 0..self.nx {
+                let (cx, cy) = self.center(ix, iy);
+                positions.push([cx as f32, cy as f32, self.z[iy * self.nx + ix]]);
+            }
+        }
+
+        let res = self.res as f32;
+        let mut normals = Vec::with_capacity(self.nx * self.ny);
+        for iy in 0..self.ny {
+            for ix in 0..self.nx {
+                let xm = ix.saturating_sub(1);
+                let xp = (ix + 1).min(self.nx - 1);
+                let ym = iy.saturating_sub(1);
+                let yp = (iy + 1).min(self.ny - 1);
+                let dzdx = (self.z[iy * self.nx + xp] - self.z[iy * self.nx + xm])
+                    / ((xp - xm).max(1) as f32 * res);
+                let dzdy = (self.z[yp * self.nx + ix] - self.z[ym * self.nx + ix])
+                    / ((yp - ym).max(1) as f32 * res);
+                let n = [-dzdx, -dzdy, 1.0];
+                let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+                normals.push([n[0] / len, n[1] / len, n[2] / len]);
+            }
+        }
+
+        let mut indices = Vec::new();
+        for iy in 0..self.ny.saturating_sub(1) {
+            for ix in 0..self.nx.saturating_sub(1) {
+                let i = (iy * self.nx + ix) as u32;
+                let right = i + 1;
+                let down = i + self.nx as u32;
+                let down_right = down + 1;
+                // Two CCW triangles as seen from +Z (front-facing looking down).
+                indices.extend_from_slice(&[i, right, down_right]);
+                indices.extend_from_slice(&[i, down_right, down]);
+            }
+        }
+
+        SurfaceMesh {
+            positions,
+            normals,
+            indices,
+        }
+    }
+
     /// Centre of cell `(ix, iy)`.
     fn center(&self, ix: usize, iy: usize) -> (f64, f64) {
         (
@@ -174,5 +307,65 @@ mod tests {
         // A path over the cut band is clear; a path over uncut stock is not.
         assert!(hf.max_height_along([0.0, 5.0], [20.0, 5.0], 1.0) < -1.9);
         assert!(hf.max_height_along([0.0, 15.0], [20.0, 15.0], 1.0) > -0.001);
+    }
+
+    #[test]
+    fn lower_rect_carves_only_inside_the_rectangle() {
+        let mut hf = Heightfield::new([0.0, 0.0], [20.0, 20.0], 0.5, 0.0);
+        hf.lower_rect([5.0, 5.0], [15.0, 15.0], -3.0);
+        assert!((hf.sample(10.0, 10.0) + 3.0).abs() < 1e-6, "inside ⇒ -3");
+        assert!(
+            (hf.sample(2.0, 2.0) - 0.0).abs() < 1e-6,
+            "outside ⇒ untouched"
+        );
+        // Never raises: a deeper existing cut survives a shallower lower_rect.
+        hf.cut_segment([10.0, 10.0, -6.0], [10.0, 10.0, -6.0], 1.0);
+        hf.lower_rect([5.0, 5.0], [15.0, 15.0], -3.0);
+        assert!(hf.sample(10.0, 10.0) < -5.9, "deeper cut preserved");
+    }
+
+    #[test]
+    fn compare_reports_gouge_and_residual() {
+        // Simulated: a flat -4 floor. Target: floor at -2 inside a rectangle, top
+        // (0) outside. Inside ⇒ gouge (cut 2 mm too deep); outside ⇒ residual
+        // (2 mm of stock left standing above the target's -2... no — outside the
+        // rect the target is the original top 0, and actual is -4, so it's still
+        // a gouge). Use a target lowered everywhere except a raised pad.
+        let mut actual = Heightfield::new([0.0, 0.0], [20.0, 20.0], 0.5, 0.0);
+        actual.lower_rect([0.0, 0.0], [20.0, 20.0], -4.0); // cut flat to -4
+
+        let mut target = Heightfield::new([0.0, 0.0], [20.0, 20.0], 0.5, 0.0);
+        target.lower_rect([0.0, 0.0], [20.0, 20.0], -2.0); // wanted a -2 floor…
+        target.lower_rect([5.0, 5.0], [15.0, 15.0], -6.0); // …with a deep pocket
+
+        let diff = actual.compare(&target, 0.05);
+        // Outside the pocket: actual -4 vs target -2 ⇒ 2 mm gouge.
+        assert!(
+            (diff.max_gouge - 2.0).abs() < 1e-3,
+            "max gouge {}",
+            diff.max_gouge
+        );
+        assert!(diff.gouge_volume > 0.0 && diff.cells_gouged > 0);
+        // Inside the pocket: actual -4 vs target -6 ⇒ 2 mm of stock left = residual.
+        assert!(diff.residual_volume > 0.0 && diff.cells_residual > 0);
+    }
+
+    #[test]
+    fn to_mesh_has_a_vertex_per_cell_and_two_triangles_per_quad() {
+        let hf = Heightfield::new([0.0, 0.0], [10.0, 10.0], 1.0, -1.0);
+        let (nx, ny) = hf.dims();
+        let mesh = hf.to_mesh();
+        assert_eq!(mesh.positions.len(), nx * ny);
+        assert_eq!(mesh.normals.len(), nx * ny);
+        assert_eq!(mesh.indices.len(), (nx - 1) * (ny - 1) * 6);
+        // A flat field ⇒ every normal points straight up.
+        for n in &mesh.normals {
+            assert!((n[2] - 1.0).abs() < 1e-6, "flat ⇒ +Z normal, got {n:?}");
+        }
+        // Indices stay in bounds.
+        assert!(mesh
+            .indices
+            .iter()
+            .all(|&i| (i as usize) < mesh.positions.len()));
     }
 }
