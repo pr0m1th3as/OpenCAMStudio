@@ -13,7 +13,7 @@ use iced::widget::{button, column, container, row, scrollable, shader, text, tex
 use iced::{Alignment, Element, Length};
 
 use cam_model::{Envelope, Machine, Point3};
-use cam_render::{Scene, Vertex, PART};
+use cam_render::{MeshVertex, Scene, Vertex, PART};
 use cam_toolpath::{CancelToken, Severity};
 
 use crate::AppController;
@@ -52,6 +52,8 @@ struct App {
     depth: String,
     stepdown: String,
     status: String,
+    /// Whether the viewport overlays the simulated stock surface.
+    show_stock: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +67,8 @@ enum Message {
     Export,
     Undo,
     Redo,
+    /// Show or hide the simulated stock in the viewport.
+    ToggleStock,
 }
 
 fn default_machine() -> Machine {
@@ -92,6 +96,7 @@ impl App {
                 depth: p.depth.to_string(),
                 stepdown: p.stepdown.to_string(),
                 status: "Open the sample part to begin.".to_string(),
+                show_stock: false,
                 controller,
             },
             iced::Task::none(),
@@ -141,6 +146,14 @@ impl App {
                 } else {
                     self.status = "Nothing to redo.".to_string();
                 }
+            }
+            Message::ToggleStock => {
+                self.show_stock = !self.show_stock;
+                self.status = if self.show_stock {
+                    "Showing simulated stock.".to_string()
+                } else {
+                    "Hiding simulated stock.".to_string()
+                };
             }
         }
         iced::Task::none()
@@ -218,6 +231,12 @@ impl App {
                 button("Export .nc").on_press(Message::Export),
             ]
             .spacing(8),
+            button(if self.show_stock {
+                "Hide stock"
+            } else {
+                "Show stock"
+            })
+            .on_press(Message::ToggleStock),
             gap(12.0),
             text(self.status.clone()),
             diagnostics_view(&self.controller),
@@ -227,7 +246,7 @@ impl App {
         .width(Length::Fixed(320.0));
 
         let viewport = container(
-            shader(Viewport::new(&self.controller))
+            shader(Viewport::new(&self.controller, self.show_stock))
                 .width(Length::Fill)
                 .height(Length::Fill),
         )
@@ -258,11 +277,13 @@ fn diagnostics_view(controller: &AppController) -> Element<'_, Message> {
 
 struct Viewport {
     vertices: Arc<Vec<Vertex>>,
+    mesh_vertices: Arc<Vec<MeshVertex>>,
+    mesh_indices: Arc<Vec<u32>>,
     bounds: Option<([f32; 3], [f32; 3])>,
 }
 
 impl Viewport {
-    fn new(controller: &AppController) -> Self {
+    fn new(controller: &AppController, show_stock: bool) -> Self {
         // After a run, show the full backplot; before it, at least show the
         // imported part outlines so opening a file is visibly reflected.
         let scene = match controller.outcome() {
@@ -275,8 +296,19 @@ impl Viewport {
                 scene
             }
         };
+        // The simulated stock is drawn under the backplot, only when toggled on
+        // and available (a run has produced it).
+        let (mesh_vertices, mesh_indices) = match controller.outcome() {
+            Some(outcome) if show_stock => (
+                outcome.stock_vertices.clone(),
+                outcome.stock_indices.clone(),
+            ),
+            _ => (Vec::new(), Vec::new()),
+        };
         Self {
             vertices: Arc::new(scene.line_vertices()),
+            mesh_vertices: Arc::new(mesh_vertices),
+            mesh_indices: Arc::new(mesh_indices),
             bounds: scene.bounds(),
         }
     }
@@ -294,24 +326,35 @@ impl<Message> shader::Program<Message> for Viewport {
     ) -> Self::Primitive {
         ScenePrimitive {
             vertices: self.vertices.clone(),
+            mesh_vertices: self.mesh_vertices.clone(),
+            mesh_indices: self.mesh_indices.clone(),
             bounds: self.bounds,
         }
     }
 }
 
 /// The shared GPU state for the viewport — iced constructs it once and hands it
-/// back to us each frame.
-struct ViewportPipeline(cam_render::LineRenderer);
+/// back to us each frame. It owns both renderers: the solid stock (drawn first,
+/// underneath) and the line backplot (drawn on top).
+struct ViewportPipeline {
+    lines: cam_render::LineRenderer,
+    mesh: cam_render::MeshRenderer,
+}
 
 impl shader::Pipeline for ViewportPipeline {
     fn new(device: &wgpu::Device, _queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
-        ViewportPipeline(cam_render::LineRenderer::new(device, format))
+        ViewportPipeline {
+            lines: cam_render::LineRenderer::new(device, format),
+            mesh: cam_render::MeshRenderer::new(device, format),
+        }
     }
 }
 
 #[derive(Debug)]
 struct ScenePrimitive {
     vertices: Arc<Vec<Vertex>>,
+    mesh_vertices: Arc<Vec<MeshVertex>>,
+    mesh_indices: Arc<Vec<u32>>,
     bounds: Option<([f32; 3], [f32; 3])>,
 }
 
@@ -326,20 +369,26 @@ impl shader::Primitive for ScenePrimitive {
         bounds: &iced::Rectangle,
         _viewport: &shader::Viewport,
     ) {
-        pipeline.0.upload(device, &self.vertices);
+        pipeline.lines.upload(device, &self.vertices);
+        pipeline
+            .mesh
+            .upload(device, &self.mesh_vertices, &self.mesh_indices);
         let aspect = if bounds.height > 0.0 {
             bounds.width / bounds.height
         } else {
             1.0
         };
         let (min, max) = self.bounds.unwrap_or(([0.0, 0.0, 0.0], [1.0, 1.0, 0.0]));
-        pipeline
-            .0
-            .set_camera(queue, cam_render::top_view(min, max, aspect, 0.1));
+        let view_proj = cam_render::top_view(min, max, aspect, 0.1);
+        pipeline.lines.set_camera(queue, view_proj);
+        pipeline.mesh.set_camera(queue, view_proj);
     }
 
     fn draw(&self, pipeline: &Self::Pipeline, render_pass: &mut wgpu::RenderPass<'_>) -> bool {
-        pipeline.0.draw(render_pass);
+        // Solid stock first, then the backplot lines over it (no depth buffer —
+        // correct for the orthographic top view; see MeshRenderer).
+        pipeline.mesh.draw(render_pass);
+        pipeline.lines.draw(render_pass);
         true
     }
 }

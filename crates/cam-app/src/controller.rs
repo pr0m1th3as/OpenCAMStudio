@@ -12,7 +12,8 @@ use cam_model::{
     ToolKind,
 };
 use cam_post::{GrblPost, Post, PostError, PostOptions};
-use cam_render::{Scene, PART};
+use cam_render::{mesh_vertices, MeshVertex, Scene, PART};
+use cam_sim::{simulate, SimOptions};
 
 use cam_cldata::{Program, SpindleDir};
 use cam_toolpath::{build_job, CancelToken, Diagnostic, Severity};
@@ -48,13 +49,18 @@ impl Default for JobParams {
     }
 }
 
-/// The result of a run: the CL-data program, its diagnostics, and the viewport
-/// scene (part outlines + backplot).
+/// The result of a run: the CL-data program, its diagnostics, the viewport
+/// scene (part outlines + backplot), and a simulated stock surface (the material
+/// left after the toolpath cuts), ready for [`cam_render::MeshRenderer`].
 #[derive(Clone, Debug, Default)]
 pub struct RunOutcome {
     pub program: Program,
     pub diagnostics: Vec<Diagnostic>,
     pub scene: Scene,
+    /// Interleaved position+normal vertices of the cut stock surface.
+    pub stock_vertices: Vec<MeshVertex>,
+    /// Triangle indices into `stock_vertices`.
+    pub stock_indices: Vec<u32>,
 }
 
 impl RunOutcome {
@@ -196,13 +202,51 @@ impl AppController {
             scene.add_region(region, PART);
         }
 
+        let p = *self.params.current();
+        let (stock_vertices, stock_indices) =
+            self.simulate_stock(&program, p.top_of_stock, p.depth, p.tool_diameter);
+
         self.nc = None;
         self.outcome = Some(RunOutcome {
             program,
             diagnostics,
             scene,
+            stock_vertices,
+            stock_indices,
         });
         self.outcome.as_ref().unwrap()
+    }
+
+    /// Simulate material removal for `program` and triangulate the remaining
+    /// stock into render-ready vertices + indices. Returns empty buffers when
+    /// there is no stock (no geometry loaded).
+    fn simulate_stock(
+        &self,
+        program: &Program,
+        top: f64,
+        depth: f64,
+        tool_diameter: f64,
+    ) -> (Vec<MeshVertex>, Vec<u32>) {
+        let (min, max) = self.stock_bounds(top, depth);
+        if min[0] >= max[0] || min[1] >= max[1] {
+            return (Vec::new(), Vec::new());
+        }
+        // Aim for ~200 cells across the larger side, bounded so a big part stays
+        // cheap and a small one stays crisp.
+        let span = (max[0] - min[0]).max(max[1] - min[1]);
+        let resolution = (span / 200.0).clamp(0.25, 2.0);
+        let sim = simulate(
+            program,
+            min,
+            max,
+            &SimOptions {
+                resolution,
+                tool_radius: tool_diameter / 2.0,
+            },
+        );
+        let surface = sim.field.to_mesh();
+        let vertices = mesh_vertices(&surface.positions, &surface.normals);
+        (vertices, surface.indices)
     }
 
     /// Post the most recent run to grbl G-code, caching and returning it. Fails
@@ -266,6 +310,13 @@ impl AppController {
 
     /// A bounding-box stock around the imported geometry.
     fn stock(&self, top: f64, depth: f64) -> Stock {
+        let (min, max) = self.stock_bounds(top, depth);
+        Stock::Box { min, max }
+    }
+
+    /// The `[min, max]` XYZ corners of the bounding-box stock around the imported
+    /// geometry. An empty drawing collapses to a zero box.
+    fn stock_bounds(&self, top: f64, depth: f64) -> ([f64; 3], [f64; 3]) {
         let mut min = [f64::MAX, f64::MAX];
         let mut max = [f64::MIN, f64::MIN];
         for region in &self.regions {
@@ -280,10 +331,7 @@ impl AppController {
             min = [0.0, 0.0];
             max = [0.0, 0.0];
         }
-        Stock::Box {
-            min: [min[0], min[1], depth],
-            max: [max[0], max[1], top],
-        }
+        ([min[0], min[1], depth], [max[0], max[1], top])
     }
 
     fn program_name(&self) -> String {
@@ -350,6 +398,28 @@ mod tests {
 
         let nc = app.export_nc().unwrap();
         assert!(nc.contains("M30") && nc.contains("G54"));
+    }
+
+    #[test]
+    fn run_produces_a_simulated_stock_mesh() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        let outcome = app.run(&CancelToken::new());
+        assert!(
+            !outcome.stock_vertices.is_empty(),
+            "a run should simulate a stock surface"
+        );
+        assert!(
+            !outcome.stock_indices.is_empty() && outcome.stock_indices.len().is_multiple_of(3),
+            "indices form whole triangles"
+        );
+        assert!(
+            outcome
+                .stock_indices
+                .iter()
+                .all(|&i| (i as usize) < outcome.stock_vertices.len()),
+            "every index is in range"
+        );
     }
 
     #[test]

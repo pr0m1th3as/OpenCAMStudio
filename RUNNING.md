@@ -61,7 +61,10 @@ The window has a control panel on the left and a `wgpu` viewport on the right.
    outline is drawn in light grey. Any problems appear under **Diagnostics**
    (e.g. a tool too large to open the hole).
 4. **Undo / Redo** — step through parameter changes.
-5. **Export .nc** — posts the toolpath to grbl G-code (blocked if the run had
+5. **Show stock / Hide stock** — overlays the *simulated* stock surface (the
+   material left after the toolpath cuts) under the backplot, shaded so the
+   pocket walls and stepdowns read. Available after a **Run**.
+6. **Export .nc** — posts the toolpath to grbl G-code (blocked if the run had
    errors). The status line reports the line count.
 
 ### What to check when testing the GUI
@@ -76,6 +79,8 @@ things worth eyeballing:
   diagnostic and blocks export (the 6 mm-radius tool can't open the 10 mm hole).
 - **Undo** restores the previous parameter and the backplot updates on the next
   **Run**.
+- **Show stock** overlays a shaded grey surface with the pockets/holes carved
+  out; the colored backplot stays visible on top. **Hide stock** removes it.
 
 ## Notes
 

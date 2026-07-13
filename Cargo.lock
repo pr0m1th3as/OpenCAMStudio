@@ -401,6 +401,7 @@ dependencies = [
  "cam-model",
  "cam-post",
  "cam-render",
+ "cam-sim",
  "cam-toolpath",
  "iced",
  "wgpu",
