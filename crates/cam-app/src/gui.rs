@@ -214,10 +214,15 @@ impl App {
                 self.fields.insert(field, value);
             }
             Message::Apply => self.apply_inspector(),
-            Message::Export => match self.controller.export_nc() {
-                Ok(nc) => self.status = format!("Exported {} lines of G-code.", nc.lines().count()),
-                Err(e) => self.status = format!("Export blocked: {e:?}"),
-            },
+            Message::Export => {
+                self.status = match self.controller.export_nc() {
+                    Ok(nc) => format!("Exported {} lines of G-code.", nc.lines().count()),
+                    Err(crate::ExportError::RapidThroughStock(n)) => {
+                        format!("Export blocked: {n} rapid(s) through stock — see Output.")
+                    }
+                    Err(e) => format!("Export blocked: {e:?}"),
+                };
+            }
             Message::Undo => {
                 if self.controller.undo() {
                     self.refresh_fields();
@@ -582,6 +587,16 @@ impl App {
                 list = list.push(text("Diagnostics:").size(13));
                 for d in &outcome.diagnostics {
                     list = list.push(text(format!("• {:?}: {}", d.severity, d.message)).size(12));
+                }
+            }
+            // Material-removal simulation results: collisions a backplot can't show.
+            if outcome.collisions.is_empty() {
+                list = list.push(text("Simulation: no collisions.").size(12));
+            } else {
+                list =
+                    list.push(text(format!("Collisions ({}):", outcome.collisions.len())).size(13));
+                for c in &outcome.collisions {
+                    list = list.push(text(format!("⚠ {:?}: {}", c.kind, c.message)).size(12));
                 }
             }
         }

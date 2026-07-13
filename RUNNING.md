@@ -82,13 +82,16 @@ Workflow:
    recomputes the toolpath.
 3. **Run** — recomputes for the current document. The backplot is colored by
    move kind: green = cutting, yellow = rapid/link, red = plunge; the part
-   outline is light grey. Problems appear in **Output** (e.g. a tool too large).
+   outline is light grey. **Output** shows toolpath diagnostics (e.g. a tool too
+   large) *and* material-removal **collisions** from the simulation — e.g. a
+   rapid plowing through remaining stock, which a green backplot would hide.
 4. **Undo / Redo** — step through document edits.
 5. **Show stock / Hide stock** — overlays the *simulated* stock surface (the
    material left after the toolpath cuts) under the backplot, shaded so the
    pocket walls and stepdowns read. Available after a **Run**.
-6. **Export .nc** — posts the toolpath to grbl G-code (blocked if the run had
-   errors). The status line reports the line count.
+6. **Export .nc** — posts the toolpath to grbl G-code. Blocked if the run had
+   errors **or** the simulation found a rapid through stock (a crash hazard); the
+   status line says why. Otherwise it reports the line count.
 
 ### What to check when testing the GUI
 

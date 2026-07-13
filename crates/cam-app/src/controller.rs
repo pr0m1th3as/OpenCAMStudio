@@ -14,7 +14,7 @@ use cam_model::{
 };
 use cam_post::{GrblPost, Post, PostError, PostOptions};
 use cam_render::{mesh_vertices, MeshVertex, Scene, PART};
-use cam_sim::{simulate, SimOptions};
+use cam_sim::{simulate, Collision, CollisionKind, SimOptions};
 
 use cam_cldata::{Program, SpindleDir};
 use cam_toolpath::{build_job, CancelToken, Diagnostic, Severity};
@@ -78,6 +78,9 @@ pub struct RunOutcome {
     pub stock_vertices: Vec<MeshVertex>,
     /// Triangle indices into `stock_vertices`.
     pub stock_indices: Vec<u32>,
+    /// Collisions the material-removal simulation found (e.g. a rapid plowing
+    /// through remaining stock) — the verification a green backplot can't give.
+    pub collisions: Vec<Collision>,
 }
 
 impl RunOutcome {
@@ -96,6 +99,10 @@ pub enum ExportError {
     NothingToExport,
     /// The last run produced errors, so its G-code is unsafe to emit.
     HasErrors,
+    /// The simulation found `n` rapid(s) plowing through remaining stock — a
+    /// machine-crash hazard, blocked by default. (A future preference could let
+    /// the user downgrade this to a warning.)
+    RapidThroughStock(usize),
     /// The post rejected the program.
     Post(PostError),
 }
@@ -300,7 +307,7 @@ impl AppController {
             scene.add_region(region, PART);
         }
 
-        let (stock_vertices, stock_indices) = self.simulate_stock(&program);
+        let (stock_vertices, stock_indices, collisions) = self.simulate_stock(&program);
 
         self.nc = None;
         self.outcome = Some(RunOutcome {
@@ -309,6 +316,7 @@ impl AppController {
             scene,
             stock_vertices,
             stock_indices,
+            collisions,
         });
         self.outcome.as_ref().unwrap()
     }
@@ -320,6 +328,15 @@ impl AppController {
         if outcome.has_errors() {
             return Err(ExportError::HasErrors);
         }
+        // A rapid plowing through stock would crash the machine — block by default.
+        let rapids = outcome
+            .collisions
+            .iter()
+            .filter(|c| c.kind == CollisionKind::RapidThroughStock)
+            .count();
+        if rapids > 0 {
+            return Err(ExportError::RapidThroughStock(rapids));
+        }
         let options = PostOptions {
             program_name: Some(self.program_name()),
             ..Default::default()
@@ -329,13 +346,13 @@ impl AppController {
         Ok(self.nc.as_deref().unwrap())
     }
 
-    /// Simulate material removal for `program` and triangulate the remaining
-    /// stock into render-ready vertices + indices. Returns empty buffers when
-    /// there is no stock (no geometry loaded).
-    fn simulate_stock(&self, program: &Program) -> (Vec<MeshVertex>, Vec<u32>) {
+    /// Simulate material removal for `program`: triangulate the remaining stock
+    /// into render-ready vertices + indices, and return any collisions found.
+    /// Empty when there is no stock (no geometry loaded).
+    fn simulate_stock(&self, program: &Program) -> (Vec<MeshVertex>, Vec<u32>, Vec<Collision>) {
         let Stock::Box { min, max } = self.document.current().setup.stock;
         if min[0] >= max[0] || min[1] >= max[1] {
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Vec::new());
         }
         let tool_diameter = self
             .document
@@ -360,7 +377,7 @@ impl AppController {
         );
         let surface = sim.field.to_mesh();
         let vertices = mesh_vertices(&surface.positions, &surface.normals);
-        (vertices, surface.indices)
+        (vertices, surface.indices, sim.collisions)
     }
 
     /// Build a document from the current geometry and seed defaults: an outside
@@ -608,6 +625,30 @@ mod tests {
         let mut app = AppController::new(machine());
         app.open_dxf(PART_DXF, "part.dxf").unwrap();
         assert_eq!(app.export_nc(), Err(ExportError::NothingToExport));
+    }
+
+    #[test]
+    fn unsafe_heights_surface_a_rapid_collision() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        // A clean run has no collisions.
+        assert!(app.run(&CancelToken::new()).collisions.is_empty());
+        // Clearance/retract below the stock top force lateral rapids through the
+        // stock — the simulator must catch what a green backplot would hide.
+        app.edit_heights(|h| {
+            h.clearance = -1.0;
+            h.retract = -1.0;
+        });
+        let outcome = app.run(&CancelToken::new());
+        assert!(
+            !outcome.collisions.is_empty(),
+            "a rapid through stock must be flagged"
+        );
+        // ...and it blocks export (a machine-crash hazard).
+        assert!(
+            matches!(app.export_nc(), Err(ExportError::RapidThroughStock(_))),
+            "a rapid through stock must block export"
+        );
     }
 
     #[test]
