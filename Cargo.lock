@@ -449,6 +449,7 @@ dependencies = [
 name = "cam-render"
 version = "0.0.1"
 dependencies = [
+ "ab_glyph",
  "bytemuck",
  "cam-cldata",
  "cam-geo",

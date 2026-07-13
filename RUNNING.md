@@ -56,7 +56,16 @@ panes** below (drag a pane's title bar to rearrange; drag a border to resize):
 
 - **Project** (left) — the document tree: Setup, Stock, Tools, and Operations.
   Click a node to select it; the selected node is marked with `▸`.
-- **Viewport** (centre) — the `wgpu` backplot and the simulated stock.
+- **Viewport** (centre) — a native 3D `wgpu` view of the backplot and simulated
+  stock. **Left-drag** orbits (a turntable: horizontal spins about the vertical
+  axis, vertical tilts) with **no clamp**, so you can tilt all the way over to
+  the underside while the horizon stays level; **right-drag** pans, the **scroll
+  wheel** zooms; it opens top-down. A rotating **orientation cube** sits in the
+  top-right corner — chamfered edges, colour-coded faces each labelled with the
+  full word (**TOP / BOTTOM / FRONT / BACK / LEFT / RIGHT**) — turning with the
+  view so you always know which side you are looking at. **Click a cube face** to
+  snap the view square onto that side. The toolbar's **Reset view** returns to
+  the top view; **Cube: on/off** toggles the cube.
 - **Inspector** (right) — editable fields for the *selected* node.
 - **Output** (bottom) — the status line and run diagnostics.
 
@@ -96,6 +105,20 @@ things worth eyeballing:
 - **Undo** restores the previous value and the backplot updates.
 - **Show stock** overlays a shaded grey surface with the pockets/holes carved
   out; the colored backplot stays visible on top. **Hide stock** removes it.
+- **Left-drag** orbits as a turntable — horizontal spins about the vertical axis,
+  vertical tilts; keep dragging up and the part tilts all the way over so you can
+  inspect its **underside** (no clamp), yet the horizon stays level so the control
+  feels predictable. With **Show stock** on, the solid should occlude itself
+  correctly (near faces hide far ones) while the toolpath lines stay on top.
+  **Right-drag** pans; the **wheel** zooms.
+- The **orientation cube** (top-right) rotates together with the part as you
+  orbit — the word on the face toward you (TOP/BOTTOM/FRONT/BACK/LEFT/RIGHT)
+  names the current side; the words are rendered from a real TrueType font
+  (Quicksand) so they should be crisp, and the cube edges softened (chamfered).
+- **Clicking a cube face** should snap the view square onto that side, the right
+  way up (Top/Bottom/Front/Back/Left/Right all upright). **Reset view** returns
+  to the top view; **Cube: off** hides the cube (and clicks no longer pick),
+  **Cube: on** restores it.
 - Dragging a pane's title bar re-docks it; dragging a border resizes.
 
 ## Notes

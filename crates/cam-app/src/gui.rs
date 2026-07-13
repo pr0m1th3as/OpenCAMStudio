@@ -15,7 +15,7 @@ use iced::widget::{button, column, container, row, scrollable, shader, text, tex
 use iced::{Alignment, Element, Length};
 
 use cam_model::{Envelope, Machine, Operation, Point3};
-use cam_render::{MeshVertex, Scene, Vertex, PART};
+use cam_render::{MeshVertex, OrbitCamera, Scene, Vertex, PART};
 use cam_toolpath::{CancelToken, Severity};
 
 use crate::{AppController, Selection};
@@ -89,7 +89,33 @@ struct App {
     fields: BTreeMap<Field, String>,
     /// Whether the viewport overlays the simulated stock surface.
     show_stock: bool,
+    /// Whether the orientation-cube gizmo is shown (toggleable).
+    show_gizmo: bool,
+    /// The orbit-camera orientation, owned here; clicking a cube face or dragging
+    /// the viewport reports changes back as messages.
+    view: ViewControls,
     status: String,
+}
+
+/// The `(yaw, pitch)` that views a cube face (given by its outward normal)
+/// straight on, **the right way up** — the orientation a click on that gizmo face
+/// snaps to. Side and front/back views use `pitch = −90°` so world +Z is screen
+/// up (not −Z, which reads upside down).
+fn face_view(normal: [f32; 3]) -> (f32, f32) {
+    use std::f32::consts::{FRAC_PI_2, PI};
+    if normal[2] > 0.5 {
+        (0.0, 0.0) // +Z top → +Y up
+    } else if normal[2] < -0.5 {
+        (0.0, PI) // −Z bottom
+    } else if normal[1] > 0.5 {
+        (PI, -FRAC_PI_2) // +Y back → +Z up
+    } else if normal[1] < -0.5 {
+        (0.0, -FRAC_PI_2) // −Y front → +Z up
+    } else if normal[0] > 0.5 {
+        (-FRAC_PI_2, -FRAC_PI_2) // +X right → +Z up
+    } else {
+        (FRAC_PI_2, -FRAC_PI_2) // −X left → +Z up
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +129,16 @@ enum Message {
     Undo,
     Redo,
     ToggleStock,
+    /// Relative camera changes reported by dragging in the viewport.
+    OrbitBy(f32, f32),
+    PanBy([f32; 3]),
+    ZoomBy(f32),
+    /// Snap to a `(yaw, pitch)` orientation (a clicked cube face), re-framing.
+    SetView(f32, f32),
+    /// Reset to the framed top view.
+    ResetView,
+    /// Show or hide the orientation cube.
+    ToggleGizmo,
     PaneResized(pane_grid::ResizeEvent),
     PaneDragged(pane_grid::DragEvent),
 }
@@ -150,6 +186,8 @@ impl App {
             panes: initial_panes(),
             fields: BTreeMap::new(),
             show_stock: false,
+            show_gizmo: true,
+            view: ViewControls::default(),
             status: "Open the sample part to begin.".to_string(),
         };
         app.refresh_fields();
@@ -206,6 +244,30 @@ impl App {
                     "Hiding simulated stock.".to_string()
                 };
             }
+            Message::OrbitBy(dyaw, dpitch) => {
+                // Turntable: horizontal drag spins about world up, vertical tilts.
+                // Unclamped, so pitch can go all the way round to the underside.
+                self.view.yaw += dyaw;
+                self.view.pitch += dpitch;
+            }
+            Message::PanBy(delta) => {
+                for (p, d) in self.view.pan.iter_mut().zip(delta) {
+                    *p += d;
+                }
+            }
+            Message::ZoomBy(dz) => {
+                self.view.zoom = (self.view.zoom + dz).clamp(-4.0, 6.0);
+            }
+            Message::SetView(yaw, pitch) => {
+                self.view = ViewControls {
+                    yaw,
+                    pitch,
+                    zoom: 0.0,
+                    pan: [0.0; 3],
+                };
+            }
+            Message::ResetView => self.view = ViewControls::default(),
+            Message::ToggleGizmo => self.show_gizmo = !self.show_gizmo,
             Message::PaneResized(pane_grid::ResizeEvent { split, ratio }) => {
                 self.panes.resize(split, ratio);
             }
@@ -350,6 +412,13 @@ impl App {
                 "Show stock"
             })
             .on_press(Message::ToggleStock),
+            button("Reset view").on_press(Message::ResetView),
+            button(if self.show_gizmo {
+                "Cube: on"
+            } else {
+                "Cube: off"
+            })
+            .on_press(Message::ToggleGizmo),
         ]
         .spacing(8)
         .padding(8)
@@ -378,9 +447,14 @@ impl App {
         match pane {
             Pane::Project => self.project_tree(),
             Pane::Viewport => container(
-                shader(Viewport::new(&self.controller, self.show_stock))
-                    .width(Length::Fill)
-                    .height(Length::Fill),
+                shader(Viewport::new(
+                    &self.controller,
+                    self.show_stock,
+                    self.view,
+                    self.show_gizmo,
+                ))
+                .width(Length::Fill)
+                .height(Length::Fill),
             )
             .width(Length::Fill)
             .height(Length::Fill)
@@ -612,18 +686,68 @@ fn fmt_num(v: f64) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// The wgpu viewport, hosted in iced's shader widget.
+// The wgpu viewport, hosted in iced's shader widget — a 3D orbit camera.
 // ---------------------------------------------------------------------------
+
+/// Persistent orbit state — an *unclamped turntable*: `yaw` spins about the
+/// world up axis, `pitch` tilts. Both are top view at `0`, and neither is
+/// clamped, so pitch can carry all the way round to the underside. A turntable
+/// (rather than a free trackball) keeps the horizon level and every drag
+/// predictable.
+#[derive(Clone, Copy, Debug, Default)]
+struct ViewControls {
+    yaw: f32,
+    pitch: f32,
+    zoom: f32,
+    pan: [f32; 3],
+}
+
+/// Which button is dragging the view.
+#[derive(Clone, Copy, Debug)]
+enum DragMode {
+    Orbit,
+    Pan,
+}
+
+/// The shader widget's transient state: only the active drag. The camera lives
+/// in [`App`] so the view-cube buttons can drive it; drags report *relative*
+/// deltas back as messages (loss-free even across a burst of events).
+#[derive(Default)]
+struct ViewportState {
+    drag: Option<DragMode>,
+    last: Option<iced::Point>,
+}
+
+/// Orbit sensitivity (radians per pixel).
+const ORBIT_SENS: f32 = 0.008;
+/// Zoom sensitivity (exponent per wheel line).
+const ZOOM_SENS: f32 = 0.15;
+
+/// The orientation cube's square rectangle in the top-right of a `w × h`
+/// viewport (widget-local coordinates). Fractional, so it is the same in logical
+/// and physical pixels — the click hit-test and the drawn cube stay aligned.
+fn gizmo_rect(w: f32, h: f32) -> (f32, f32, f32) {
+    let size = (w.min(h) * 0.26).max(1.0);
+    let margin = 8.0;
+    (w - size - margin, margin, size)
+}
 
 struct Viewport {
     vertices: Arc<Vec<Vertex>>,
     mesh_vertices: Arc<Vec<MeshVertex>>,
     mesh_indices: Arc<Vec<u32>>,
     bounds: Option<([f32; 3], [f32; 3])>,
+    controls: ViewControls,
+    show_gizmo: bool,
 }
 
 impl Viewport {
-    fn new(controller: &AppController, show_stock: bool) -> Self {
+    fn new(
+        controller: &AppController,
+        show_stock: bool,
+        controls: ViewControls,
+        show_gizmo: bool,
+    ) -> Self {
         // After a run, show the full backplot; before it, at least show the
         // imported part outlines so opening a file is visibly reflected.
         let scene = match controller.outcome() {
@@ -650,43 +774,216 @@ impl Viewport {
             mesh_vertices: Arc::new(mesh_vertices),
             mesh_indices: Arc::new(mesh_indices),
             bounds: scene.bounds(),
+            controls,
+            show_gizmo,
         }
+    }
+
+    /// The orbit camera framed on the current scene, with the current controls.
+    fn camera(&self) -> OrbitCamera {
+        let (min, max) = self.bounds.unwrap_or(([0.0, 0.0, 0.0], [1.0, 1.0, 0.0]));
+        let mut cam = OrbitCamera::framed(min, max);
+        cam.orient = cam_render::orientation(self.controls.yaw, self.controls.pitch);
+        cam.zoom = self.controls.zoom;
+        cam.pan = self.controls.pan;
+        cam
+    }
+
+    /// The orientation cube's camera: the same rotation as the part, framed on
+    /// the unit cube (no zoom / pan).
+    fn gizmo_camera(&self) -> OrbitCamera {
+        let mut cam = OrbitCamera::framed([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]);
+        cam.orient = cam_render::orientation(self.controls.yaw, self.controls.pitch);
+        cam
+    }
+
+    /// If `pos` (absolute) lands on a gizmo face, the `(yaw, pitch)` to snap to.
+    fn gizmo_pick(&self, pos: iced::Point, bounds: iced::Rectangle) -> Option<(f32, f32)> {
+        if !self.show_gizmo {
+            return None;
+        }
+        let (gx, gy, size) = gizmo_rect(bounds.width, bounds.height);
+        let (gxa, gya) = (bounds.x + gx, bounds.y + gy);
+        if pos.x < gxa || pos.x > gxa + size || pos.y < gya || pos.y > gya + size {
+            return None;
+        }
+        let u = 2.0 * (pos.x - gxa) / size - 1.0;
+        let v = 1.0 - 2.0 * (pos.y - gya) / size; // screen-y down → NDC-y up
+        let cam = self.gizmo_camera();
+        let normal = cam_render::pick_face(cam.orient, cam.half_height(), u, v)?;
+        Some(face_view(normal))
     }
 }
 
-impl<Message> shader::Program<Message> for Viewport {
-    type State = ();
+impl shader::Program<Message> for Viewport {
+    type State = ViewportState;
     type Primitive = ScenePrimitive;
+
+    fn update(
+        &self,
+        state: &mut Self::State,
+        event: &iced::Event,
+        bounds: iced::Rectangle,
+        cursor: iced::mouse::Cursor,
+    ) -> Option<shader::Action<Message>> {
+        let iced::Event::Mouse(mouse_event) = event else {
+            return None;
+        };
+        use iced::mouse::{Button, Event as Mouse, ScrollDelta};
+        match mouse_event {
+            Mouse::ButtonPressed(button) => {
+                let pos = cursor.position_over(bounds)?;
+                // A left-click on a gizmo face snaps the view to that side.
+                if matches!(button, Button::Left) {
+                    if let Some((yaw, pitch)) = self.gizmo_pick(pos, bounds) {
+                        return Some(
+                            shader::Action::publish(Message::SetView(yaw, pitch)).and_capture(),
+                        );
+                    }
+                }
+                let mode = match button {
+                    Button::Left => DragMode::Orbit,
+                    Button::Right => DragMode::Pan,
+                    _ => return None,
+                };
+                state.drag = Some(mode);
+                state.last = Some(pos);
+                return Some(shader::Action::capture());
+            }
+            Mouse::CursorMoved { position } => {
+                if let (Some(mode), Some(last)) = (state.drag, state.last) {
+                    let (dx, dy) = (position.x - last.x, position.y - last.y);
+                    state.last = Some(*position);
+                    // Report a relative change; App owns and accumulates it.
+                    let message = match mode {
+                        DragMode::Orbit => Message::OrbitBy(dx * ORBIT_SENS, dy * ORBIT_SENS),
+                        DragMode::Pan => {
+                            let cam = self.camera();
+                            let wpp = cam.world_per_pixel(bounds.height);
+                            let (r, u) = (cam.right(), cam.up());
+                            // Drag moves the scene with the cursor.
+                            Message::PanBy([
+                                (-r[0] * dx + u[0] * dy) * wpp,
+                                (-r[1] * dx + u[1] * dy) * wpp,
+                                (-r[2] * dx + u[2] * dy) * wpp,
+                            ])
+                        }
+                    };
+                    return Some(shader::Action::publish(message).and_capture());
+                }
+            }
+            Mouse::ButtonReleased(_) => {
+                if state.drag.take().is_some() {
+                    state.last = None;
+                    return Some(shader::Action::capture());
+                }
+            }
+            Mouse::WheelScrolled { delta } if cursor.position_over(bounds).is_some() => {
+                let lines = match delta {
+                    ScrollDelta::Lines { y, .. } => *y,
+                    ScrollDelta::Pixels { y, .. } => *y / 20.0,
+                };
+                return Some(
+                    shader::Action::publish(Message::ZoomBy(lines * ZOOM_SENS)).and_capture(),
+                );
+            }
+            _ => {}
+        }
+        None
+    }
 
     fn draw(
         &self,
         _state: &Self::State,
         _cursor: iced::mouse::Cursor,
-        _bounds: iced::Rectangle,
+        bounds: iced::Rectangle,
     ) -> Self::Primitive {
+        let aspect = if bounds.height > 0.0 {
+            bounds.width / bounds.height
+        } else {
+            1.0
+        };
         ScenePrimitive {
             vertices: self.vertices.clone(),
             mesh_vertices: self.mesh_vertices.clone(),
             mesh_indices: self.mesh_indices.clone(),
-            bounds: self.bounds,
+            view_proj: self.camera().view_proj(aspect),
+            gizmo_view_proj: self.gizmo_camera().view_proj(1.0),
+            show_gizmo: self.show_gizmo,
+        }
+    }
+
+    fn mouse_interaction(
+        &self,
+        state: &Self::State,
+        bounds: iced::Rectangle,
+        cursor: iced::mouse::Cursor,
+    ) -> iced::mouse::Interaction {
+        if state.drag.is_some() {
+            iced::mouse::Interaction::Grabbing
+        } else if cursor.position_over(bounds).is_some() {
+            iced::mouse::Interaction::Grab
+        } else {
+            iced::mouse::Interaction::default()
         }
     }
 }
 
+/// A depth texture sized to the render target.
+struct DepthTarget {
+    view: wgpu::TextureView,
+    size: (u32, u32),
+    _texture: wgpu::Texture,
+}
+
 /// The shared GPU state for the viewport — iced constructs it once and hands it
-/// back to us each frame. It owns both renderers: the solid stock (drawn first,
-/// underneath) and the line backplot (drawn on top).
+/// back to us each frame. It owns both renderers (solid stock drawn first, the
+/// backplot lines over it) and a depth buffer so the rotated solid occludes
+/// itself correctly.
 struct ViewportPipeline {
     lines: cam_render::LineRenderer,
     mesh: cam_render::MeshRenderer,
+    gizmo: cam_render::GizmoRenderer,
+    depth: Option<DepthTarget>,
 }
 
 impl shader::Pipeline for ViewportPipeline {
-    fn new(device: &wgpu::Device, _queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
         ViewportPipeline {
             lines: cam_render::LineRenderer::new(device, format),
             mesh: cam_render::MeshRenderer::new(device, format),
+            gizmo: cam_render::GizmoRenderer::new(device, queue, format),
+            depth: None,
         }
+    }
+}
+
+impl ViewportPipeline {
+    /// Ensure a depth texture matching the full render target (`size` pixels).
+    fn ensure_depth(&mut self, device: &wgpu::Device, size: (u32, u32)) {
+        if self.depth.as_ref().map(|d| d.size) == Some(size) {
+            return;
+        }
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("cam-render viewport depth"),
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: cam_render::DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.depth = Some(DepthTarget {
+            view,
+            size,
+            _texture: texture,
+        });
     }
 }
 
@@ -695,7 +992,11 @@ struct ScenePrimitive {
     vertices: Arc<Vec<Vertex>>,
     mesh_vertices: Arc<Vec<MeshVertex>>,
     mesh_indices: Arc<Vec<u32>>,
-    bounds: Option<([f32; 3], [f32; 3])>,
+    view_proj: [[f32; 4]; 4],
+    /// The orientation cube's view-projection (same rotation, its own framing).
+    gizmo_view_proj: [[f32; 4]; 4],
+    /// Whether to draw the orientation cube.
+    show_gizmo: bool,
 }
 
 impl shader::Primitive for ScenePrimitive {
@@ -706,29 +1007,113 @@ impl shader::Primitive for ScenePrimitive {
         pipeline: &mut Self::Pipeline,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        bounds: &iced::Rectangle,
-        _viewport: &shader::Viewport,
+        _bounds: &iced::Rectangle,
+        viewport: &shader::Viewport,
     ) {
         pipeline.lines.upload(device, &self.vertices);
         pipeline
             .mesh
             .upload(device, &self.mesh_vertices, &self.mesh_indices);
-        let aspect = if bounds.height > 0.0 {
-            bounds.width / bounds.height
-        } else {
-            1.0
-        };
-        let (min, max) = self.bounds.unwrap_or(([0.0, 0.0, 0.0], [1.0, 1.0, 0.0]));
-        let view_proj = cam_render::top_view(min, max, aspect, 0.1);
-        pipeline.lines.set_camera(queue, view_proj);
-        pipeline.mesh.set_camera(queue, view_proj);
+        pipeline.lines.set_camera(queue, self.view_proj);
+        pipeline.mesh.set_camera(queue, self.view_proj);
+        pipeline.gizmo.set_camera(queue, self.gizmo_view_proj);
+        let size = viewport.physical_size();
+        pipeline.ensure_depth(device, (size.width.max(1), size.height.max(1)));
     }
 
-    fn draw(&self, pipeline: &Self::Pipeline, render_pass: &mut wgpu::RenderPass<'_>) -> bool {
-        // Solid stock first, then the backplot lines over it (no depth buffer —
-        // correct for the orthographic top view; see MeshRenderer).
-        pipeline.mesh.draw(render_pass);
-        pipeline.lines.draw(render_pass);
-        true
+    fn render(
+        &self,
+        pipeline: &Self::Pipeline,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        clip_bounds: &iced::Rectangle<u32>,
+    ) {
+        let Some(depth) = &pipeline.depth else {
+            return;
+        };
+        if clip_bounds.width == 0 || clip_bounds.height == 0 {
+            return;
+        }
+        // Our own pass: preserve iced's UI (Load), clear only our depth. We draw
+        // the solid (depth-writing) then the backplot lines (always on top),
+        // scissored to this widget's rectangle.
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("cam-render viewport pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth.view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_viewport(
+            clip_bounds.x as f32,
+            clip_bounds.y as f32,
+            clip_bounds.width as f32,
+            clip_bounds.height as f32,
+            0.0,
+            1.0,
+        );
+        pass.set_scissor_rect(
+            clip_bounds.x,
+            clip_bounds.y,
+            clip_bounds.width,
+            clip_bounds.height,
+        );
+        pipeline.mesh.draw(&mut pass);
+        pipeline.lines.draw(&mut pass);
+        drop(pass);
+
+        // Second pass: the orientation cube in the top-right corner, with its own
+        // depth cleared so the part never occludes it. Same rect as the click
+        // hit-test (gizmo_rect), offset into the widget's clip region.
+        if !self.show_gizmo {
+            return;
+        }
+        let (lx, ly, size) = gizmo_rect(clip_bounds.width as f32, clip_bounds.height as f32);
+        let size = size as u32;
+        if size == 0 {
+            return;
+        }
+        let gx = clip_bounds.x + lx as u32;
+        let gy = clip_bounds.y + ly as u32;
+        let mut gizmo_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("cam-render gizmo pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth.view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        gizmo_pass.set_viewport(gx as f32, gy as f32, size as f32, size as f32, 0.0, 1.0);
+        gizmo_pass.set_scissor_rect(gx, gy, size, size);
+        pipeline.gizmo.draw(&mut gizmo_pass);
     }
 }

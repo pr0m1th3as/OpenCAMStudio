@@ -12,14 +12,18 @@
 //!   headless unit tests.
 
 mod camera;
+mod gizmo;
 mod mesh;
 mod scene;
 
-pub use camera::top_view;
+pub use camera::{orientation, top_view, OrbitCamera, IDENTITY};
+#[cfg(feature = "gpu")]
+pub use gizmo::label_atlas;
+pub use gizmo::{pick_face, unit_cube, GizmoVertex};
 pub use mesh::{mesh_vertices, MeshVertex};
 pub use scene::{Color, LineStrip, Scene, Vertex, CUT, PART, PLUNGE, RAPID};
 
 #[cfg(feature = "gpu")]
 mod gpu;
 #[cfg(feature = "gpu")]
-pub use gpu::{LineRenderer, MeshRenderer};
+pub use gpu::{GizmoRenderer, LineRenderer, MeshRenderer, DEPTH_FORMAT};

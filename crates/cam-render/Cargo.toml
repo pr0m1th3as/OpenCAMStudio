@@ -13,7 +13,7 @@ repository.workspace = true
 # features and are fully unit-testable without a GPU. The `gpu` feature adds the
 # wgpu renderer, which needs a graphics stack to run.
 default = []
-gpu = ["dep:wgpu", "dep:bytemuck"]
+gpu = ["dep:wgpu", "dep:bytemuck", "dep:ab_glyph"]
 
 [dependencies]
 cam-geo = { path = "../cam-geo" }
@@ -22,3 +22,7 @@ cam-cldata = { path = "../cam-cldata" }
 # iced shader-widget viewport (one wgpu in the tree).
 wgpu = { version = "27", optional = true }
 bytemuck = { version = "1", features = ["derive"], optional = true }
+# Rasterises the orientation-cube labels from a real TrueType font (Quicksand,
+# OFL) into a texture atlas. Only needed by the `gpu` renderer; already in the
+# tree via iced. Pure Rust, MIT/Apache — GPLv3-compatible.
+ab_glyph = { version = "0.2", optional = true }
