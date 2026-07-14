@@ -185,6 +185,7 @@ mod tests {
         vec![Tool {
             number: 1,
             diameter,
+            length: 30.0,
             flutes: 2,
             kind: ToolKind::EndMill,
         }]

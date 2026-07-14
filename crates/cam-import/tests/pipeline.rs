@@ -64,6 +64,7 @@ fn import_and_plan() -> (String, Vec<cam_toolpath::Diagnostic>, usize, usize) {
         tools: vec![Tool {
             number: 1,
             diameter: 6.0,
+            length: 30.0,
             flutes: 2,
             kind: ToolKind::EndMill,
         }],

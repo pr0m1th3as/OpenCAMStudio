@@ -34,6 +34,7 @@ fn setup(operations: Vec<Operation>) -> Document {
         tools: vec![Tool {
             number: 1,
             diameter: TOOL_DIA,
+            length: 30.0,
             flutes: 2,
             kind: ToolKind::EndMill,
         }],
@@ -174,6 +175,7 @@ fn a_bad_setup_that_rapids_low_is_caught() {
         tools: vec![Tool {
             number: 1,
             diameter: TOOL_DIA,
+            length: 30.0,
             flutes: 2,
             kind: ToolKind::EndMill,
         }],

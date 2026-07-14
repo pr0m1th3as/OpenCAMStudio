@@ -204,6 +204,7 @@ mod tests {
         let tools = [Tool {
             number: 1,
             diameter: 10.0,
+            length: 30.0,
             flutes: 2,
             kind: ToolKind::EndMill,
         }];

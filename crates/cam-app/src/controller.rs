@@ -9,11 +9,11 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 
-use cam_geo::Polygon;
+use cam_geo::{Contour, Point, Polygon};
 use cam_import::{read_dxf_str, ImportError, ImportOptions};
 use cam_model::{
-    Comp, Document, Heights, History, Machine, Operation, ProfileOp, Setup, Side, Stock, Tool,
-    ToolKind,
+    Comp, Document, DrillOp, FaceOp, Heights, History, Machine, Operation, PocketOp, ProfileOp,
+    Setup, Side, Stock, Tool, ToolKind,
 };
 use cam_post::{GrblPost, Post, PostError, PostOptions};
 use cam_render::{mesh_vertices, MeshVertex, Scene, PART};
@@ -30,6 +30,8 @@ pub struct JobParams {
     pub tool_diameter: f64,
     pub depth: f64,
     pub stepdown: f64,
+    /// Radial/lateral stepover for area-clearing ops (pocket/face), mm.
+    pub stepover: f64,
     pub feed: f64,
     pub plunge_feed: f64,
     pub spindle_rpm: f64,
@@ -44,6 +46,7 @@ impl Default for JobParams {
             tool_diameter: 6.0,
             depth: -4.0,
             stepdown: 2.0,
+            stepover: 3.0,
             feed: 300.0,
             plunge_feed: 100.0,
             spindle_rpm: 1000.0,
@@ -52,6 +55,16 @@ impl Default for JobParams {
             top_of_stock: 0.0,
         }
     }
+}
+
+/// Which kind of operation [`AppController::new_operation`] should create from the
+/// loaded geometry. The strategies already exist; this picks the default variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpKind {
+    Profile,
+    Pocket,
+    Drill,
+    Face,
 }
 
 /// Which node of the document is currently selected — what the tree highlights
@@ -255,6 +268,51 @@ impl AppController {
         self.invalidate();
     }
 
+    /// Append a fresh default tool (numbered one past the highest existing tool)
+    /// and select it, as one undoable change.
+    pub fn add_tool(&mut self) {
+        let number = self
+            .document
+            .current()
+            .setup
+            .tools
+            .iter()
+            .map(|t| t.number)
+            .max()
+            .map_or(1, |m| m + 1);
+        let p = self.defaults;
+        let tool = Tool {
+            number,
+            diameter: p.tool_diameter,
+            length: 30.0,
+            flutes: 2,
+            kind: ToolKind::EndMill,
+        };
+        self.document.edit(move |doc| doc.setup.tools.push(tool));
+        let index = self.document.current().setup.tools.len() - 1;
+        self.selection = Selection::Tool(index);
+        self.invalidate();
+    }
+
+    /// Delete the tool at `index`, selecting a neighbour (or the setup if none is
+    /// left). A no-op if the index is out of range. Operations that referenced the
+    /// tool's number are left as-is — they surface a "references tool N which is
+    /// not in the setup" diagnostic on the next run rather than being rewritten.
+    pub fn delete_tool(&mut self, index: usize) {
+        let count = self.document.current().setup.tools.len();
+        if index >= count {
+            return;
+        }
+        self.document.edit(move |doc| {
+            doc.setup.tools.remove(index);
+        });
+        self.selection = match count - 1 {
+            0 => Selection::Setup,
+            remaining => Selection::Tool(index.min(remaining - 1)),
+        };
+        self.invalidate();
+    }
+
     /// Edit the selected operation as one undoable change. A no-op unless an
     /// operation is selected.
     pub fn edit_selected_operation(&mut self, f: impl FnOnce(&mut Operation)) {
@@ -319,26 +377,74 @@ impl AppController {
         self.invalidate();
     }
 
-    /// Create a new default operation (an outside profile on the first imported
-    /// region) and select it. A no-op if no geometry is loaded. Operation-kind
-    /// choice (pocket/drill/face) is a later increment.
-    pub fn new_operation(&mut self) {
-        let chain = match self.regions.first() {
-            Some(region) => region.outer().clone(),
-            None => return,
+    /// Create a new default operation of `kind` from the first imported region and
+    /// select it. A no-op if no geometry is loaded. The generated op is a sane
+    /// starting point the user then edits in the inspector:
+    /// - **Profile** — an outside profile of the region's outer boundary.
+    /// - **Pocket** — clear the region's outer boundary, leaving its holes as islands.
+    /// - **Drill** — one hole at each of the region's hole centroids (its outer
+    ///   centroid if it has none).
+    /// - **Face** — face the region's XY bounding rectangle.
+    pub fn new_operation(&mut self, kind: OpKind) {
+        let Some(region) = self.regions.first() else {
+            return;
         };
         let p = self.defaults;
-        self.add_operation(Operation::Profile(ProfileOp {
-            id: 0, // renumbered by add_operation
-            tool: 1,
-            chain,
-            side: Side::Outside,
-            comp: Comp::Computed,
-            depth: p.depth,
-            stepdown: p.stepdown,
-            feed: p.feed,
-            plunge_feed: p.plunge_feed,
-        }));
+        // id 0 here is a placeholder — add_operation renumbers with a fresh id.
+        let op = match kind {
+            OpKind::Profile => Operation::Profile(ProfileOp {
+                id: 0,
+                tool: 1,
+                chain: region.outer().clone(),
+                side: Side::Outside,
+                comp: Comp::Computed,
+                depth: p.depth,
+                stepdown: p.stepdown,
+                feed: p.feed,
+                plunge_feed: p.plunge_feed,
+            }),
+            OpKind::Pocket => Operation::Pocket(PocketOp {
+                id: 0,
+                tool: 1,
+                boundary: region.outer().clone(),
+                islands: region.holes().to_vec(),
+                depth: p.depth,
+                stepdown: p.stepdown,
+                stepover: p.stepover,
+                feed: p.feed,
+                plunge_feed: p.plunge_feed,
+            }),
+            OpKind::Drill => {
+                let points = if region.holes().is_empty() {
+                    vec![centroid(region.outer())]
+                } else {
+                    region.holes().iter().map(centroid).collect()
+                };
+                Operation::Drill(DrillOp {
+                    id: 0,
+                    tool: 1,
+                    points,
+                    depth: p.depth,
+                    peck: None,
+                    dwell: None,
+                    feed: p.plunge_feed,
+                })
+            }
+            OpKind::Face => {
+                let (min, max) = self.bounds_xy();
+                Operation::Face(FaceOp {
+                    id: 0,
+                    tool: 1,
+                    boundary: rect_contour(min, max),
+                    depth: p.depth,
+                    stepdown: p.stepdown,
+                    stepover: p.stepover,
+                    feed: p.feed,
+                    plunge_feed: p.plunge_feed,
+                })
+            }
+        };
+        self.add_operation(op);
     }
 
     /// Delete the selected operation, selecting a neighbour (or the setup). A
@@ -538,6 +644,7 @@ impl AppController {
         let tool = Tool {
             number: 1,
             diameter: p.tool_diameter,
+            length: 30.0,
             flutes: 2,
             kind: ToolKind::EndMill,
         };
@@ -574,8 +681,9 @@ impl AppController {
         })
     }
 
-    /// A bounding-box stock around the imported geometry.
-    fn stock(&self, top: f64, depth: f64) -> Stock {
+    /// The XY bounding box of all imported geometry, `([min_x, min_y], [max_x,
+    /// max_y])`. Collapses to the origin when nothing is loaded.
+    fn bounds_xy(&self) -> ([f64; 2], [f64; 2]) {
         let mut min = [f64::MAX, f64::MAX];
         let mut max = [f64::MIN, f64::MIN];
         for region in &self.regions {
@@ -587,9 +695,15 @@ impl AppController {
             }
         }
         if min[0] > max[0] {
-            min = [0.0, 0.0];
-            max = [0.0, 0.0];
+            ([0.0, 0.0], [0.0, 0.0])
+        } else {
+            (min, max)
         }
+    }
+
+    /// A bounding-box stock around the imported geometry.
+    fn stock(&self, top: f64, depth: f64) -> Stock {
+        let (min, max) = self.bounds_xy();
         Stock::Box {
             min: [min[0], min[1], depth],
             max: [max[0], max[1], top],
@@ -617,6 +731,27 @@ impl AppController {
     }
 }
 
+/// The average of a contour's vertices — a good-enough default drill point for a
+/// closed loop (exact for a circle, sensible for the polygonal holes we import).
+fn centroid(c: &Contour) -> [f64; 2] {
+    let pts = c.points();
+    let n = pts.len().max(1) as f64;
+    let (sx, sy) = pts
+        .iter()
+        .fold((0.0, 0.0), |(sx, sy), p| (sx + p.x, sy + p.y));
+    [sx / n, sy / n]
+}
+
+/// A CCW rectangle contour spanning `[min, max]` in XY.
+fn rect_contour(min: [f64; 2], max: [f64; 2]) -> Contour {
+    Contour::new(vec![
+        Point::new(min[0], min[1]),
+        Point::new(max[0], min[1]),
+        Point::new(max[0], max[1]),
+        Point::new(min[0], max[1]),
+    ])
+}
+
 /// Set an operation's id, whatever its kind.
 fn set_op_id(op: &mut Operation, id: u32) {
     match op {
@@ -640,6 +775,7 @@ fn empty_document(p: &JobParams) -> Document {
         tools: vec![Tool {
             number: 1,
             diameter: p.tool_diameter,
+            length: 30.0,
             flutes: 2,
             kind: ToolKind::EndMill,
         }],
@@ -807,10 +943,52 @@ mod tests {
         let mut app = AppController::new(machine());
         app.open_dxf(PART_DXF, "part.dxf").unwrap();
         assert_eq!(op_ids(&app), vec![0, 1]);
-        app.new_operation();
+        app.new_operation(OpKind::Profile);
         assert_eq!(op_ids(&app), vec![0, 1, 2]);
         assert_eq!(app.selection(), Selection::Operation(2));
         assert!(matches!(app.operation(2), Some(Operation::Profile(_))));
+    }
+
+    #[test]
+    fn new_operation_builds_each_kind_from_geometry() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        let region = &app.regions()[0];
+        let n_holes = region.holes().len();
+        let (bmin, bmax) = app.bounds_xy();
+
+        app.new_operation(OpKind::Pocket);
+        match app.selected_operation() {
+            Some(Operation::Pocket(o)) => {
+                // Boundary is the outer loop; holes become islands.
+                assert_eq!(o.islands.len(), n_holes);
+                assert!(o.stepover > 0.0);
+            }
+            other => panic!("expected pocket, got {other:?}"),
+        }
+
+        app.new_operation(OpKind::Drill);
+        match app.selected_operation() {
+            // The sample part has one circular hole → one drill point.
+            Some(Operation::Drill(o)) => assert_eq!(o.points.len(), n_holes.max(1)),
+            other => panic!("expected drill, got {other:?}"),
+        }
+
+        app.new_operation(OpKind::Face);
+        match app.selected_operation() {
+            Some(Operation::Face(o)) => {
+                // Boundary is the XY bounding rectangle of the geometry.
+                let xs: Vec<f64> = o.boundary.points().iter().map(|p| p.x).collect();
+                let ys: Vec<f64> = o.boundary.points().iter().map(|p| p.y).collect();
+                let fmin = |v: &[f64]| v.iter().cloned().fold(f64::MAX, f64::min);
+                let fmax = |v: &[f64]| v.iter().cloned().fold(f64::MIN, f64::max);
+                assert!((fmin(&xs) - bmin[0]).abs() < 1e-9);
+                assert!((fmax(&xs) - bmax[0]).abs() < 1e-9);
+                assert!((fmin(&ys) - bmin[1]).abs() < 1e-9);
+                assert!((fmax(&ys) - bmax[1]).abs() < 1e-9);
+            }
+            other => panic!("expected face, got {other:?}"),
+        }
     }
 
     #[test]
@@ -904,5 +1082,45 @@ mod tests {
         let outcome = app.run(&CancelToken::new());
         assert!(outcome.has_errors());
         assert_eq!(app.export_nc(), Err(ExportError::HasErrors));
+    }
+
+    #[test]
+    fn add_and_delete_tool_are_undoable() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        assert_eq!(app.document().setup.tools.len(), 1);
+
+        app.add_tool();
+        let tools = &app.document().setup.tools;
+        assert_eq!(tools.len(), 2);
+        // Numbered one past the highest existing tool, and selected.
+        assert_eq!(tools[1].number, 2);
+        assert_eq!(app.selection(), Selection::Tool(1));
+
+        app.delete_tool(1);
+        assert_eq!(app.document().setup.tools.len(), 1);
+
+        // Both mutations are single undo steps.
+        assert!(app.undo()); // undo delete
+        assert_eq!(app.document().setup.tools.len(), 2);
+        assert!(app.undo()); // undo add
+        assert_eq!(app.document().setup.tools.len(), 1);
+    }
+
+    #[test]
+    fn tool_length_round_trips_through_edit() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        app.edit_tool(0, |t| t.length = 42.0);
+        assert_eq!(app.document().setup.tools[0].length, 42.0);
+    }
+
+    #[test]
+    fn deleting_the_last_tool_selects_the_setup() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        app.delete_tool(0);
+        assert!(app.document().setup.tools.is_empty());
+        assert_eq!(app.selection(), Selection::Setup);
     }
 }

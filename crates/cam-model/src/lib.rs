@@ -87,7 +87,7 @@ impl Machine {
 }
 
 /// The cutting-tool geometry a cycle/strategy reasons about.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolKind {
     /// Flat-bottomed square end mill.
     EndMill,
@@ -101,6 +101,30 @@ pub enum ToolKind {
     FaceMill,
 }
 
+impl ToolKind {
+    /// Every kind, in a stable order — for pickers and iteration.
+    pub const ALL: [ToolKind; 5] = [
+        ToolKind::EndMill,
+        ToolKind::BallMill,
+        ToolKind::Drill,
+        ToolKind::ChamferMill,
+        ToolKind::FaceMill,
+    ];
+}
+
+impl std::fmt::Display for ToolKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            ToolKind::EndMill => "End mill",
+            ToolKind::BallMill => "Ball mill",
+            ToolKind::Drill => "Drill",
+            ToolKind::ChamferMill => "Chamfer mill",
+            ToolKind::FaceMill => "Face mill",
+        };
+        f.write_str(s)
+    }
+}
+
 /// A cutting tool. The P2 slice is the minimum a post/cycle needs; feeds, speeds
 /// and a richer library land with the document model at P3.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -109,6 +133,9 @@ pub struct Tool {
     pub number: u32,
     /// Cutting diameter, mm.
     pub diameter: f64,
+    /// Overall tool length, mm (informational for now; the tool library and
+    /// gouge-against-holder checks are the eventual consumers).
+    pub length: f64,
     /// Number of flutes.
     pub flutes: u32,
     /// Tool geometry class.
@@ -161,6 +188,7 @@ mod tests {
         let t = Tool {
             number: 1,
             diameter: 6.0,
+            length: 30.0,
             flutes: 2,
             kind: ToolKind::EndMill,
         };

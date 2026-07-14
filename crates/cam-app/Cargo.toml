@@ -28,5 +28,5 @@ cam-post = { path = "../cam-post" }
 cam-import = { path = "../cam-import" }
 cam-render = { path = "../cam-render" }
 cam-sim = { path = "../cam-sim" }
-iced = { version = "0.14", features = ["wgpu"], optional = true }
+iced = { version = "0.14", features = ["wgpu", "svg"], optional = true }
 wgpu = { version = "27", optional = true }

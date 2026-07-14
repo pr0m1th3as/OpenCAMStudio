@@ -43,6 +43,7 @@ fn document() -> Document {
     let tool = Tool {
         number: 1,
         diameter: 6.0,
+        length: 30.0,
         flutes: 2,
         kind: ToolKind::EndMill,
     };
@@ -148,6 +149,7 @@ fn tool_too_large_for_hole_reports_error() {
     let tool = Tool {
         number: 1,
         diameter: 12.0,
+        length: 30.0,
         flutes: 2,
         kind: ToolKind::EndMill,
     };
@@ -177,6 +179,7 @@ fn cancellation_stops_before_emitting() {
     let tool = Tool {
         number: 1,
         diameter: 6.0,
+        length: 30.0,
         flutes: 2,
         kind: ToolKind::EndMill,
     };

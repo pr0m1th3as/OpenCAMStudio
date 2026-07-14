@@ -1,29 +1,118 @@
 //! The iced desktop shell — a thin view over [`crate::AppController`].
 //!
-//! A professional-CAM layout built on iced's [`pane_grid`]: a **menu bar**
-//! (File / Edit / View · Run · Windows) across the top, then four docked,
-//! resizable panes — a **Project** tree (select a node), the **Viewport**
-//! (backplot + simulated stock), an **Inspector** (edit the selected node), and
-//! an **Output** console (diagnostics + status). Any pane can be shown/hidden
-//! from the **Windows** menu (hiding one keeps the others' sizes). All behaviour
-//! is delegated to the controller; this module only translates messages and
-//! draws. Only compiled with the `gui` feature.
+//! A professional-CAM layout built on iced's [`pane_grid`]: a tabbed **ribbon**
+//! (Home / Operations / Tooling / View / Windows) across the top, then four
+//! docked, resizable panes — a **Project** tree
+//! (select a node), the **Viewport** (backplot + simulated stock), an
+//! **Inspector** (edit the selected node), and an **Output** console
+//! (diagnostics + status). Any pane can be shown/hidden from the **Windows**
+//! ribbon tab (hiding one keeps the others' sizes). All behaviour is delegated to
+//! the controller; this module only translates messages and draws. Only compiled
+//! with the `gui` feature.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use iced::widget::pane_grid::{self, PaneGrid};
 use iced::widget::{
-    button, checkbox, column, container, mouse_area, row, scrollable, shader, text, text_input,
-    Space,
+    button, checkbox, column, container, mouse_area, pick_list, row, scrollable, shader, text,
+    text_input, Space,
 };
-use iced::{Alignment, Element, Length, Padding};
+use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
-use cam_model::{Envelope, Machine, Operation, Point3};
+use cam_model::{Envelope, Machine, Operation, Point3, ToolKind};
+
+/// Ribbon palette and metrics, adopted from **OpenCADStudio**'s ribbon
+/// (`HakanSeven12/OpenCADStudio`, GPL-3.0) so users moving CAD → CAM meet a
+/// familiar surface. Values are its own `TOPBAR_BG`/`RIBBON_BG`/… constants; the
+/// widget structure here is ours (a simpler five-tab band, no density modes).
+mod palette {
+    use iced::Color;
+
+    const fn rgb(r: f32, g: f32, b: f32) -> Color {
+        Color { r, g, b, a: 1.0 }
+    }
+
+    /// Tab-strip background.
+    pub const TOPBAR_BG: Color = rgb(0.17, 0.17, 0.17);
+    /// Ribbon-band background.
+    pub const RIBBON_BG: Color = rgb(0.22, 0.22, 0.22);
+    /// The band's dark framing border.
+    pub const BORDER_DARK: Color = rgb(0.12, 0.12, 0.12);
+    /// Active-tab accent.
+    pub const ACCENT_BLUE: Color = rgb(0.20, 0.55, 0.90);
+    /// Normal control text.
+    pub const LABEL_COLOR: Color = rgb(0.82, 0.82, 0.82);
+    /// Group caption text (and disabled controls).
+    pub const GROUP_LABEL: Color = rgb(0.50, 0.50, 0.50);
+    /// Hover fill for tabs.
+    pub const TOOL_HOVER: Color = rgb(0.32, 0.32, 0.32);
+    /// Hover fill for command rows.
+    pub const ROW_HOVER: Color = rgb(0.24, 0.24, 0.24);
+}
+
+/// Ribbon command icons. Each variant is a small embedded SVG (see
+/// `assets/icons/CREDITS.md` — most reused from OpenCADStudio, GPL-3.0; the
+/// CAM-specific ones drawn to match). The SVGs carry their own colours, so we
+/// render them untinted.
+#[derive(Clone, Copy, Debug)]
+enum Icon {
+    OpenSample,
+    Export,
+    Undo,
+    Redo,
+    Run,
+    Profile,
+    Pocket,
+    Drill,
+    Face,
+    NewTool,
+    Duplicate,
+    Delete,
+    ShowStock,
+    ResetView,
+    ShowCube,
+}
+
+impl Icon {
+    fn bytes(self) -> &'static [u8] {
+        match self {
+            Icon::OpenSample => include_bytes!("../assets/icons/cui_import.svg"),
+            Icon::Export => include_bytes!("../assets/icons/cui_export.svg"),
+            Icon::Undo => include_bytes!("../assets/icons/undo.svg"),
+            Icon::Redo => include_bytes!("../assets/icons/redo.svg"),
+            Icon::Run => include_bytes!("../assets/icons/run.svg"),
+            Icon::Profile => include_bytes!("../assets/icons/offset.svg"),
+            Icon::Pocket => include_bytes!("../assets/icons/pocket.svg"),
+            Icon::Drill => include_bytes!("../assets/icons/drill.svg"),
+            Icon::Face => include_bytes!("../assets/icons/face.svg"),
+            Icon::NewTool => include_bytes!("../assets/icons/endmill.svg"),
+            Icon::Duplicate => include_bytes!("../assets/icons/copy.svg"),
+            Icon::Delete => include_bytes!("../assets/icons/erase.svg"),
+            Icon::ShowStock => include_bytes!("../assets/icons/box3d.svg"),
+            Icon::ResetView => include_bytes!("../assets/icons/zoom_ext.svg"),
+            Icon::ShowCube => include_bytes!("../assets/icons/viewcube.svg"),
+        }
+    }
+
+    /// An iced SVG handle for this icon. The handle id is derived from the bytes,
+    /// so iced caches the rasterisation across frames.
+    fn handle(self) -> iced::widget::svg::Handle {
+        iced::widget::svg::Handle::from_memory(self.bytes())
+    }
+}
+
+/// An SVG icon widget sized to a square `size` px.
+fn icon_svg(icon: Icon, size: f32) -> Element<'static, Message> {
+    iced::widget::svg(icon.handle())
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
+        .into()
+}
 use cam_render::{MeshVertex, OrbitCamera, Scene, Vertex, PART};
 use cam_toolpath::{CancelToken, Severity};
 
-use crate::{AppController, Selection};
+use crate::{AppController, OpKind, Selection};
 
 /// A small sample part (rectangle + circular hole) so the app is useful without
 /// a file dialog on first run.
@@ -49,8 +138,8 @@ fn theme(_state: &App) -> iced::Theme {
     iced::Theme::Dark
 }
 
-/// The docked panes. Any of them can be shown or hidden from the Windows menu
-/// (except the Viewport, which is always present as the main view).
+/// The docked panes. Any of them can be shown or hidden from the Windows ribbon
+/// tab (except the Viewport, which is always present as the main view).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pane {
     Project,
@@ -73,7 +162,7 @@ impl Pane {
     /// individually while resizing (see `App::clamp_resize`).
     fn min_size(self) -> f32 {
         match self {
-            Pane::Project => 200.0,   // fits the New/Duplicate/Delete row
+            Pane::Project => 200.0,   // fits the Duplicate/Delete row
             Pane::Viewport => 200.0,  // the main view stays usable
             Pane::Inspector => 240.0, // fits the field rows
             Pane::Output => 60.0,     // a short console is fine
@@ -95,13 +184,36 @@ impl Pane {
 /// Every pane, in Windows-menu order.
 const ALL_PANES: [Pane; 4] = [Pane::Project, Pane::Viewport, Pane::Inspector, Pane::Output];
 
-/// A top-bar dropdown menu.
+/// A tab in the top-bar ribbon. Each tab shows a band of grouped commands.
+/// Operations and Tooling are added as those capabilities land.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Menu {
-    File,
-    Edit,
+enum RibbonTab {
+    Home,
+    Operations,
+    Tooling,
     View,
     Windows,
+}
+
+impl RibbonTab {
+    /// The tabs shown in the strip, left to right.
+    const ALL: [RibbonTab; 5] = [
+        RibbonTab::Home,
+        RibbonTab::Operations,
+        RibbonTab::Tooling,
+        RibbonTab::View,
+        RibbonTab::Windows,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            RibbonTab::Home => "Home",
+            RibbonTab::Operations => "Operations",
+            RibbonTab::Tooling => "Tooling",
+            RibbonTab::View => "View",
+            RibbonTab::Windows => "Windows",
+        }
+    }
 }
 
 /// An editable inspector field, keyed independently of which node owns it.
@@ -111,6 +223,8 @@ enum Field {
     Retract,
     TopOfStock,
     ToolDiameter,
+    ToolLength,
+    Flutes,
     Depth,
     Stepdown,
     Stepover,
@@ -125,6 +239,8 @@ impl Field {
             Field::Retract => "Retract (mm)",
             Field::TopOfStock => "Top of stock (mm)",
             Field::ToolDiameter => "Tool ⌀ (mm)",
+            Field::ToolLength => "Length (mm)",
+            Field::Flutes => "Flutes",
             Field::Depth => "Depth (mm)",
             Field::Stepdown => "Stepdown (mm)",
             Field::Stepover => "Stepover (mm)",
@@ -143,8 +259,10 @@ struct App {
     /// Whether the one-shot startup layout (Output shrunk to its minimum) has been
     /// re-applied against the real window size yet.
     did_initial_layout: bool,
-    /// The open top-bar dropdown, if any.
-    open_menu: Option<Menu>,
+    /// The active ribbon tab.
+    active_tab: RibbonTab,
+    /// The index (within the active tab's groups) of the open collapse-popup, if any.
+    open_group: Option<usize>,
     /// Edit buffers for the inspector fields of the current selection.
     fields: BTreeMap<Field, String>,
     /// Whether the viewport overlays the simulated stock surface.
@@ -188,8 +306,8 @@ enum Message {
     Export,
     Undo,
     Redo,
-    /// Create a new operation from the loaded geometry.
-    NewOp,
+    /// Create a new operation of the given kind from the loaded geometry.
+    NewOp(OpKind),
     /// Structural edits to the selected operation.
     DuplicateOp,
     DeleteOp,
@@ -212,10 +330,18 @@ enum Message {
     PaneDragged(pane_grid::DragEvent),
     /// The window was resized (tracked for pixel-accurate pane minimums).
     WindowResized(iced::Size),
-    /// Open (toggle) a top-bar dropdown.
-    OpenMenu(Menu),
-    /// Close any open dropdown.
-    CloseMenu,
+    /// Change the selected tool's geometry kind (committed immediately).
+    ToolKindChanged(ToolKind),
+    /// Create a new default tool and select it.
+    NewTool,
+    /// Delete the selected tool.
+    DeleteTool,
+    /// Switch the active ribbon tab.
+    SelectRibbonTab(RibbonTab),
+    /// Open/close the collapse-popup for a collapsed group (index in the active tab).
+    ToggleRibbonGroup(usize),
+    /// Close any open collapse-popup.
+    CloseRibbonPopup,
     /// Show (`true`) or hide (`false`) a pane.
     SetPaneVisible(Pane, bool),
 }
@@ -275,7 +401,8 @@ impl App {
             panes: initial_panes(),
             window: iced::Size::new(1280.0, 800.0),
             did_initial_layout: false,
-            open_menu: None,
+            active_tab: RibbonTab::Home,
+            open_group: None,
             fields: BTreeMap::new(),
             show_stock: false,
             show_gizmo: true,
@@ -290,17 +417,10 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> iced::Task<Message> {
-        // Any action other than opening a menu or flicking a menu toggle closes
-        // the open dropdown (so it behaves like a real menu).
-        if !matches!(
-            message,
-            Message::OpenMenu(_)
-                | Message::CloseMenu
-                | Message::SetPaneVisible(..)
-                | Message::ToggleStock
-                | Message::ToggleGizmo
-        ) {
-            self.open_menu = None;
+        // Any action other than opening a group-popup closes the open one (so a
+        // command picked from a popup, or a click elsewhere, dismisses it).
+        if !matches!(message, Message::ToggleRibbonGroup(_)) {
+            self.open_group = None;
         }
         match message {
             Message::OpenSample => match self.controller.open_dxf(SAMPLE_DXF, "sample.dxf") {
@@ -348,8 +468,8 @@ impl App {
                     self.status = "Nothing to redo.".to_string();
                 }
             }
-            Message::NewOp => {
-                self.controller.new_operation();
+            Message::NewOp(kind) => {
+                self.controller.new_operation(kind);
                 self.refresh_fields();
                 self.rerun();
             }
@@ -420,14 +540,33 @@ impl App {
                     self.minimize_pane(Pane::Output);
                 }
             }
-            Message::OpenMenu(menu) => {
-                self.open_menu = if self.open_menu == Some(menu) {
+            Message::ToolKindChanged(kind) => {
+                if let Selection::Tool(i) = self.controller.selection() {
+                    self.controller.edit_tool(i, |t| t.kind = kind);
+                    self.rerun();
+                }
+            }
+            Message::NewTool => {
+                self.controller.add_tool();
+                self.refresh_fields();
+            }
+            Message::DeleteTool => {
+                if let Selection::Tool(i) = self.controller.selection() {
+                    self.controller.delete_tool(i);
+                    self.refresh_fields();
+                    self.rerun();
+                }
+            }
+            Message::SelectRibbonTab(tab) => self.active_tab = tab,
+            Message::ToggleRibbonGroup(i) => {
+                self.open_group = if self.open_group == Some(i) {
                     None
                 } else {
-                    Some(menu)
+                    Some(i)
                 };
             }
-            Message::CloseMenu => self.open_menu = None,
+            // The preamble already cleared it; the arm keeps the match exhaustive.
+            Message::CloseRibbonPopup => {}
             Message::SetPaneVisible(pane, show) => self.set_pane_visible(pane, show),
         }
         iced::Task::none()
@@ -601,7 +740,7 @@ impl App {
     fn inspector_fields(&self) -> Vec<Field> {
         match self.controller.selection() {
             Selection::Setup => vec![Field::Clearance, Field::Retract, Field::TopOfStock],
-            Selection::Tool(_) => vec![Field::ToolDiameter],
+            Selection::Tool(_) => vec![Field::ToolDiameter, Field::ToolLength, Field::Flutes],
             Selection::Stock => Vec::new(),
             Selection::Operation(id) => match self.controller.operation(id) {
                 Some(Operation::Profile(_)) => {
@@ -635,6 +774,14 @@ impl App {
             Field::TopOfStock => Some(setup.heights.top_of_stock),
             Field::ToolDiameter => match self.controller.selection() {
                 Selection::Tool(i) => setup.tools.get(i).map(|t| t.diameter),
+                _ => None,
+            },
+            Field::ToolLength => match self.controller.selection() {
+                Selection::Tool(i) => setup.tools.get(i).map(|t| t.length),
+                _ => None,
+            },
+            Field::Flutes => match self.controller.selection() {
+                Selection::Tool(i) => setup.tools.get(i).map(|t| t.flutes as f64),
                 _ => None,
             },
             _ => self
@@ -676,6 +823,13 @@ impl App {
                 if let Some(&v) = parsed.get(&Field::ToolDiameter) {
                     t.diameter = v;
                 }
+                if let Some(&v) = parsed.get(&Field::ToolLength) {
+                    t.length = v;
+                }
+                if let Some(&v) = parsed.get(&Field::Flutes) {
+                    // Flutes is an integer count; round the typed value.
+                    t.flutes = v.round().max(1.0) as u32;
+                }
             }),
             Selection::Operation(_) => self
                 .controller
@@ -706,21 +860,6 @@ impl App {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        // A menu bar: File / Edit / View on the left, Run in the middle, Windows
-        // pushed to the far right.
-        let menu_btn = |label: &str, menu: Menu| {
-            button(text(label.to_string()).size(13)).on_press(Message::OpenMenu(menu))
-        };
-        let menu_bar = row![
-            menu_btn("File", Menu::File),
-            menu_btn("Edit", Menu::Edit),
-            menu_btn("View", Menu::View),
-            menu_btn("Windows", Menu::Windows),
-        ]
-        .spacing(6)
-        .padding(6)
-        .align_y(Alignment::Center);
-
         let grid = PaneGrid::new(&self.panes, |_id, pane, _is_max| {
             pane_grid::Content::new(self.pane_content(*pane))
                 .title_bar(pane_grid::TitleBar::new(text(pane.name()).size(13)).padding(4))
@@ -732,97 +871,210 @@ impl App {
         .width(Length::Fill)
         .height(Length::Fill);
 
-        let base = column![menu_bar, grid];
-        match self.open_menu {
+        let base = column![self.ribbon(), grid];
+        match self.ribbon_popup() {
             None => base.into(),
-            Some(menu) => {
-                // A full-window catcher (clicking off the menu closes it) under
-                // the positioned dropdown.
+            Some(popup) => {
+                // A full-window catcher under the popup so a click off it dismisses.
                 let catcher = mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
-                    .on_press(Message::CloseMenu);
-                iced::widget::stack![base, catcher, self.menu_overlay(menu)].into()
+                    .on_press(Message::CloseRibbonPopup);
+                iced::widget::stack![base, catcher, popup].into()
             }
         }
     }
 
-    /// The open dropdown, floated roughly under its menu-bar button.
-    fn menu_overlay(&self, menu: Menu) -> Element<'_, Message> {
-        let dropdown = container(self.menu_items(menu))
+    /// The top-bar ribbon: a tab strip (darker bar, active tab in accent) over a
+    /// framed band showing the active tab's grouped commands. Styled after
+    /// OpenCADStudio's ribbon (see the [`palette`] module).
+    fn ribbon(&self) -> Element<'_, Message> {
+        let tab_btn = |tab: RibbonTab| {
+            let active = tab == self.active_tab;
+            button(text(tab.label()).size(12))
+                .padding(Padding::from([5.0, 14.0]))
+                .on_press(Message::SelectRibbonTab(tab))
+                .style(move |_theme, status| tab_button_style(active, status))
+        };
+        let mut tabs = row![].spacing(6);
+        for tab in RibbonTab::ALL {
+            tabs = tabs.push(tab_btn(tab));
+        }
+        let strip = container(tabs.padding(2).align_y(Alignment::Center))
+            .width(Length::Fill)
+            .style(|_theme| container::Style {
+                background: Some(Background::Color(palette::TOPBAR_BG)),
+                ..container::Style::default()
+            });
+
+        let band = container(self.ribbon_body())
             .padding(6)
-            .width(Length::Fixed(170.0))
-            .style(iced::widget::container::rounded_box);
-        // Rough left offsets under each button (tune if the bar's metrics change).
-        let left = |x: f32| Padding {
-            top: 40.0,
-            right: 0.0,
-            bottom: 0.0,
-            left: x,
+            .width(Length::Fill)
+            .style(|_theme| container::Style {
+                background: Some(Background::Color(palette::RIBBON_BG)),
+                border: Border {
+                    color: palette::BORDER_DARK,
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                ..container::Style::default()
+            });
+
+        column![strip, band].into()
+    }
+
+    /// The command groups for the active tab, or `None` for the Windows tab (which
+    /// is a pane-toggle list, not icon commands).
+    fn ribbon_specs(&self) -> Option<Vec<GroupSpec>> {
+        let has_geo = !self.controller.regions().is_empty();
+        let has_tool = matches!(self.controller.selection(), Selection::Tool(_));
+        let new_op = |kind: OpKind| has_geo.then_some(Message::NewOp(kind));
+        let specs = match self.active_tab {
+            RibbonTab::Home => vec![
+                GroupSpec {
+                    title: "File",
+                    commands: vec![
+                        cmd(Icon::OpenSample, "Open", Some(Message::OpenSample)),
+                        cmd(Icon::Export, "Export", Some(Message::Export)),
+                    ],
+                },
+                GroupSpec {
+                    title: "Edit",
+                    commands: vec![
+                        cmd(Icon::Undo, "Undo", Some(Message::Undo)),
+                        cmd(Icon::Redo, "Redo", Some(Message::Redo)),
+                        cmd(Icon::Run, "Run", Some(Message::Apply)),
+                    ],
+                },
+            ],
+            RibbonTab::Operations => vec![GroupSpec {
+                title: "Create",
+                commands: vec![
+                    cmd(Icon::Profile, "Profile", new_op(OpKind::Profile)),
+                    cmd(Icon::Pocket, "Pocket", new_op(OpKind::Pocket)),
+                    cmd(Icon::Drill, "Drill", new_op(OpKind::Drill)),
+                    cmd(Icon::Face, "Face", new_op(OpKind::Face)),
+                ],
+            }],
+            RibbonTab::Tooling => vec![GroupSpec {
+                title: "Tools",
+                commands: vec![
+                    cmd(Icon::NewTool, "New", Some(Message::NewTool)),
+                    cmd(
+                        Icon::Delete,
+                        "Delete",
+                        has_tool.then_some(Message::DeleteTool),
+                    ),
+                ],
+            }],
+            RibbonTab::View => vec![GroupSpec {
+                title: "View",
+                commands: vec![
+                    toggle_cmd(
+                        Icon::ShowStock,
+                        "Stock",
+                        self.show_stock,
+                        Message::ToggleStock,
+                    ),
+                    cmd(Icon::ResetView, "Reset", Some(Message::ResetView)),
+                    toggle_cmd(
+                        Icon::ShowCube,
+                        "Cube",
+                        self.show_gizmo,
+                        Message::ToggleGizmo,
+                    ),
+                ],
+            }],
+            RibbonTab::Windows => return None,
         };
-        let pad = match menu {
-            Menu::File => left(6.0),
-            Menu::Edit => left(56.0),
-            Menu::View => left(106.0),
-            Menu::Windows => left(160.0),
+        Some(specs)
+    }
+
+    /// The densities the active tab's groups should render at, given the window
+    /// width. Empty for the Windows tab.
+    fn ribbon_densities(&self, specs: &[GroupSpec]) -> Vec<Density> {
+        let counts: Vec<usize> = specs.iter().map(|g| g.commands.len()).collect();
+        let available = (self.window.width - RIBBON_CHROME).max(0.0);
+        solve_densities(&counts, available)
+    }
+
+    /// The groups shown for the active ribbon tab, each at its solved density.
+    fn ribbon_body(&self) -> Element<'_, Message> {
+        let Some(specs) = self.ribbon_specs() else {
+            return self.windows_body();
         };
-        container(dropdown)
+        let densities = self.ribbon_densities(&specs);
+        let mut band = row![].spacing(GROUP_GAP).align_y(Alignment::Start);
+        for (i, (spec, &density)) in specs.iter().zip(&densities).enumerate() {
+            band = band.push(render_group(spec, density, i));
+        }
+        band.into()
+    }
+
+    /// The Windows tab: a checkbox per pane (naturally narrow, no collapse).
+    fn windows_body(&self) -> Element<'_, Message> {
+        let mut panes = column![].spacing(4);
+        for pane in ALL_PANES {
+            let shown = self.pane_handle(pane).is_some();
+            panes = panes.push(
+                row![
+                    checkbox(shown)
+                        .size(15)
+                        .on_toggle(move |v| Message::SetPaneVisible(pane, v)),
+                    text(pane.name()).size(13),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            );
+        }
+        row![ribbon_group("Panes", panes)].into()
+    }
+
+    /// The floating panel for an open collapsed-group popup, positioned under its
+    /// button. `None` unless a group is open *and* actually collapsed at the
+    /// current width. Its x-offset is the exact sum of the preceding groups' drawn
+    /// widths — the analytic layout doubles as popup positioning.
+    fn ribbon_popup(&self) -> Option<Element<'_, Message>> {
+        let index = self.open_group?;
+        let specs = self.ribbon_specs()?;
+        let spec = specs.get(index)?;
+        let densities = self.ribbon_densities(&specs);
+        if !densities.get(index)?.is_popup() {
+            return None;
+        }
+        let x = 6.0
+            + densities[..index]
+                .iter()
+                .zip(&specs[..index])
+                .map(|(&d, s)| group_width(s.commands.len(), d) + GROUP_GAP)
+                .sum::<f32>();
+
+        let mut commands = row![].spacing(CMD_GAP);
+        for command in &spec.commands {
+            commands = commands.push(render_command(command, false));
+        }
+        let panel = container(commands)
+            .padding(6)
+            .style(|_theme| container::Style {
+                background: Some(Background::Color(palette::RIBBON_BG)),
+                border: Border {
+                    color: palette::BORDER_DARK,
+                    width: 1.0,
+                    radius: 3.0.into(),
+                },
+                ..container::Style::default()
+            });
+        // Drop the panel just below the ribbon, offset to the group's column.
+        let positioned = container(panel)
             .width(Length::Fill)
             .height(Length::Fill)
             .align_x(iced::alignment::Horizontal::Left)
             .align_y(iced::alignment::Vertical::Top)
-            .padding(pad)
-            .into()
-    }
-
-    /// The items of a dropdown menu.
-    fn menu_items(&self, menu: Menu) -> Element<'_, Message> {
-        let item = |label: &str, msg: Message| {
-            button(text(label.to_string()).size(13))
-                .on_press(msg)
-                .width(Length::Fill)
-        };
-        let toggle = |label: &str, on: bool, msg: Message| {
-            row![
-                checkbox(on).size(15).on_toggle(move |_| msg.clone()),
-                text(label.to_string()).size(13),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center)
-        };
-        match menu {
-            Menu::File => column![
-                item("Open Sample", Message::OpenSample),
-                item("Export .nc", Message::Export),
-            ],
-            Menu::Edit => column![
-                item("Undo", Message::Undo),
-                item("Redo", Message::Redo),
-                item("Run", Message::Apply),
-            ],
-            Menu::View => column![
-                toggle("Show stock", self.show_stock, Message::ToggleStock),
-                item("Reset View", Message::ResetView),
-                toggle("Show Cube", self.show_gizmo, Message::ToggleGizmo),
-            ],
-            Menu::Windows => {
-                let mut items = column![].spacing(4);
-                for pane in ALL_PANES {
-                    let shown = self.pane_handle(pane).is_some();
-                    items = items.push(
-                        row![
-                            checkbox(shown)
-                                .size(15)
-                                .on_toggle(move |v| Message::SetPaneVisible(pane, v)),
-                            text(pane.name()).size(13),
-                        ]
-                        .spacing(6)
-                        .align_y(Alignment::Center),
-                    );
-                }
-                items
-            }
-        }
-        .spacing(4)
-        .into()
+            .padding(Padding {
+                top: RIBBON_H,
+                left: x,
+                right: 0.0,
+                bottom: 0.0,
+            });
+        Some(positioned.into())
     }
 
     fn pane_content(&self, pane: Pane) -> Element<'_, Message> {
@@ -880,7 +1132,7 @@ impl App {
         }
         list = list.push(text("  Operations").size(12));
         if setup.operations.is_empty() {
-            list = list.push(text("    (none — New adds one)").size(11));
+            list = list.push(text("    (none — add one from the Operations tab)").size(11));
         }
         let op_count = setup.operations.len();
         for (i, op) in setup.operations.iter().enumerate() {
@@ -912,22 +1164,24 @@ impl App {
             );
         }
 
-        // Structural editing: New (needs geometry), plus Duplicate/Delete of the
-        // selected operation. (Reorder is inline per row, above.)
+        // Structural editing of the selected operation: Duplicate/Delete. New ops
+        // are created (per kind) from the Operations ribbon tab; reorder is inline
+        // per row, above.
         let has_op = matches!(sel, Selection::Operation(_));
-        let has_geo = !self.controller.regions().is_empty();
-        // Intrinsic-width buttons (each sized to its own label, so a longer label
-        // like "Duplicate" never spills outside its box). The pane can't be
-        // dragged narrow enough to matter thanks to PANE_MIN_RATIO.
-        let op_btn = |label: &str, msg: Message, enabled: bool| {
-            button(text(label.to_string()).size(12)).on_press_maybe(enabled.then_some(msg))
+        // Intrinsic-width buttons (small icon + label), each sized to its own
+        // content. The pane can't be dragged narrow enough to spill thanks to
+        // PANE_MIN_RATIO.
+        let op_btn = |icon: Icon, label: &str, msg: Message, enabled: bool| {
+            let content = row![icon_svg(icon, 14.0), text(label.to_string()).size(12)]
+                .spacing(4)
+                .align_y(Alignment::Center);
+            button(content).on_press_maybe(enabled.then_some(msg))
         };
         list = list.push(text(" ").size(6));
         list = list.push(
             row![
-                op_btn("New", Message::NewOp, has_geo),
-                op_btn("Duplicate", Message::DuplicateOp, has_op),
-                op_btn("Delete", Message::DeleteOp, has_op),
+                op_btn(Icon::Duplicate, "Duplicate", Message::DuplicateOp, has_op),
+                op_btn(Icon::Delete, "Delete", Message::DeleteOp, has_op),
             ]
             .spacing(4),
         );
@@ -985,6 +1239,27 @@ impl App {
                 .align_y(Alignment::Center),
             );
         }
+        // The tool geometry class is an enum, so it gets a picker (committed
+        // immediately) rather than a text field.
+        if let Selection::Tool(i) = self.controller.selection() {
+            if let Some(tool) = self.controller.document().setup.tools.get(i) {
+                list = list.push(
+                    row![
+                        text("Type").width(Length::Fixed(150.0)).size(13),
+                        pick_list(
+                            &ToolKind::ALL[..],
+                            Some(tool.kind),
+                            Message::ToolKindChanged
+                        )
+                        .text_size(13)
+                        .width(Length::Fixed(140.0)),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                );
+            }
+        }
+
         list = list.push(button("Apply").on_press(Message::Apply));
 
         scrollable(list)
@@ -1097,6 +1372,290 @@ fn subtree_min(
             }
         }
     }
+}
+
+/// A labelled ribbon group: its command widgets stacked over a small caption in
+/// muted grey (OpenCADStudio places the group label at the bottom).
+fn ribbon_group<'a>(
+    title: &'a str,
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let caption = text(title).size(10).color(palette::GROUP_LABEL);
+    container(column![content.into(), caption].spacing(4))
+        .padding(Padding::from([3.0, 4.0]))
+        .into()
+}
+
+/// Fixed width of a large (Full-density) ribbon command button, px.
+const COMMAND_W: f32 = 64.0;
+
+/// Tab-strip button: transparent normally, accent-filled when active, a subtle
+/// fill on hover.
+fn tab_button_style(active: bool, status: button::Status) -> button::Style {
+    let background = if active {
+        Some(Background::Color(palette::ACCENT_BLUE))
+    } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+        Some(Background::Color(palette::TOOL_HOVER))
+    } else {
+        None
+    };
+    button::Style {
+        background,
+        text_color: if active {
+            Color::WHITE
+        } else {
+            palette::LABEL_COLOR
+        },
+        border: Border {
+            radius: 3.0.into(),
+            ..Border::default()
+        },
+        ..button::Style::default()
+    }
+}
+
+/// Ribbon command button: flat, muted-grey when disabled, a row-hover fill
+/// otherwise.
+fn command_button_style(status: button::Status) -> button::Style {
+    let background = match status {
+        button::Status::Hovered | button::Status::Pressed => {
+            Some(Background::Color(palette::ROW_HOVER))
+        }
+        _ => None,
+    };
+    let text_color = if matches!(status, button::Status::Disabled) {
+        palette::GROUP_LABEL
+    } else {
+        palette::LABEL_COLOR
+    };
+    button::Style {
+        background,
+        text_color,
+        border: Border {
+            radius: 3.0.into(),
+            ..Border::default()
+        },
+        ..button::Style::default()
+    }
+}
+
+/// Ribbon toggle button: accent-tinted while `on`, otherwise a normal command
+/// button.
+fn command_toggle_style(on: bool, status: button::Status) -> button::Style {
+    if !on {
+        return command_button_style(status);
+    }
+    let mut accent = palette::ACCENT_BLUE;
+    // A muted accent fill so the icon/label stay readable; brighter on hover.
+    accent.a = if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+        0.55
+    } else {
+        0.38
+    };
+    button::Style {
+        background: Some(Background::Color(accent)),
+        text_color: palette::LABEL_COLOR,
+        border: Border {
+            radius: 3.0.into(),
+            ..Border::default()
+        },
+        ..button::Style::default()
+    }
+}
+
+// --- Responsive ribbon collapse ------------------------------------------------
+//
+// As the window narrows, each group degrades through four densities so the ribbon
+// never overflows — modelled on OpenCADStudio's ribbon. The layout maths is a pure
+// function of the per-group command counts and the available width, so the
+// degradation order is unit-tested without any GUI.
+
+/// How densely a ribbon group is drawn. Ordered loosest → tightest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Density {
+    /// Large icon-over-label buttons in a row.
+    Full,
+    /// Icon-only buttons in a row (labels dropped).
+    Compact,
+    /// One representative button (icon + caption) that opens a popup of the group.
+    Collapsed,
+    /// One representative button (icon only) that opens a popup.
+    Tight,
+}
+
+impl Density {
+    /// A collapsed/tight group is a single popup-opening button, not its commands.
+    fn is_popup(self) -> bool {
+        matches!(self, Density::Collapsed | Density::Tight)
+    }
+}
+
+const CMD_GAP: f32 = 2.0; // between command buttons within a group
+const GROUP_GAP: f32 = 8.0; // between groups
+const GROUP_PAD: f32 = 4.0; // per side, inside a group container
+const COMPACT_W: f32 = 34.0; // icon-only command button
+const COLLAPSED_W: f32 = 64.0; // single group button, with caption
+const TIGHT_W: f32 = 34.0; // single group button, icon only
+/// Ribbon chrome outside the group row (band padding + a little slack).
+const RIBBON_CHROME: f32 = 28.0;
+/// Approximate full ribbon height (tab strip + band), for dropping popups just
+/// below it. Eyeballed; a few px off only shifts the popup slightly.
+const RIBBON_H: f32 = 96.0;
+
+/// The drawn width of a group of `n` commands at a given density.
+fn group_width(n: usize, density: Density) -> f32 {
+    let (btn_w, buttons) = match density {
+        Density::Full => (COMMAND_W, n),
+        Density::Compact => (COMPACT_W, n),
+        Density::Collapsed => (COLLAPSED_W, 1),
+        Density::Tight => (TIGHT_W, 1),
+    };
+    let inner = buttons as f32 * btn_w + buttons.saturating_sub(1) as f32 * CMD_GAP;
+    inner + GROUP_PAD * 2.0
+}
+
+/// The total drawn width of the group row at the given densities (with gaps).
+fn row_width(counts: &[usize], densities: &[Density]) -> f32 {
+    let groups: f32 = counts
+        .iter()
+        .zip(densities)
+        .map(|(&n, &d)| group_width(n, d))
+        .sum();
+    let gaps = counts.len().saturating_sub(1) as f32 * GROUP_GAP;
+    groups + gaps
+}
+
+/// Assign each group a density so the row fits `available` px. Groups degrade
+/// **right-to-left**, one density level at a time (all groups drop to Compact from
+/// the right before any drop to Collapsed, etc.) — OpenCADStudio's behaviour. If
+/// everything is Tight and it still overflows, the row is left tight (iced clips).
+fn solve_densities(counts: &[usize], available: f32) -> Vec<Density> {
+    let mut densities = vec![Density::Full; counts.len()];
+    for level in [Density::Compact, Density::Collapsed, Density::Tight] {
+        if row_width(counts, &densities) <= available {
+            break;
+        }
+        for i in (0..densities.len()).rev() {
+            if densities[i] < level {
+                densities[i] = level;
+            }
+            if row_width(counts, &densities) <= available {
+                break;
+            }
+        }
+    }
+    densities
+}
+
+/// One ribbon command in a group's data model — enough to render it at any
+/// density (icon+label, icon-only, or inside a popup).
+struct Command {
+    icon: Icon,
+    label: &'static str,
+    /// `None` disables the button (greyed, unclickable).
+    action: Option<Message>,
+    /// `Some(on)` renders a toggle (accent-tinted while on); `None` is a plain action.
+    toggle: Option<bool>,
+}
+
+/// A ribbon group's data model.
+struct GroupSpec {
+    title: &'static str,
+    commands: Vec<Command>,
+}
+
+impl GroupSpec {
+    /// The icon shown when the group collapses to a single button.
+    fn rep_icon(&self) -> Icon {
+        self.commands.first().map_or(Icon::Run, |c| c.icon)
+    }
+}
+
+fn cmd(icon: Icon, label: &'static str, action: Option<Message>) -> Command {
+    Command {
+        icon,
+        label,
+        action,
+        toggle: None,
+    }
+}
+
+fn toggle_cmd(icon: Icon, label: &'static str, on: bool, msg: Message) -> Command {
+    Command {
+        icon,
+        label,
+        action: Some(msg),
+        toggle: Some(on),
+    }
+}
+
+/// Render a single command at Full (`compact = false`, icon over label) or Compact
+/// (`compact = true`, icon only) density.
+fn render_command(command: &Command, compact: bool) -> Element<'static, Message> {
+    let (icon_px, width) = if compact {
+        (22.0, COMPACT_W)
+    } else {
+        (26.0, COMMAND_W)
+    };
+    let content: Element<'static, Message> = if compact {
+        icon_svg(command.icon, icon_px)
+    } else {
+        column![
+            icon_svg(command.icon, icon_px),
+            text(command.label).size(10)
+        ]
+        .spacing(3)
+        .align_x(Alignment::Center)
+        .into()
+    };
+    let base = button(content)
+        .width(Length::Fixed(width))
+        .padding(Padding::from([4.0, 2.0]));
+    match command.toggle {
+        Some(on) => base
+            .on_press_maybe(command.action.clone())
+            .style(move |_theme, status| command_toggle_style(on, status))
+            .into(),
+        None => base
+            .on_press_maybe(command.action.clone())
+            .style(|_theme, status| command_button_style(status))
+            .into(),
+    }
+}
+
+/// Render a whole group at its assigned density. Collapsed/Tight groups become a
+/// single button that toggles the group's popup (`index` in the active tab).
+fn render_group(spec: &GroupSpec, density: Density, index: usize) -> Element<'static, Message> {
+    if density.is_popup() {
+        let (icon_px, width) = if density == Density::Tight {
+            (22.0, TIGHT_W)
+        } else {
+            (26.0, COLLAPSED_W)
+        };
+        let content: Element<'static, Message> = if density == Density::Collapsed {
+            column![
+                icon_svg(spec.rep_icon(), icon_px),
+                text(spec.title).size(10)
+            ]
+            .spacing(3)
+            .align_x(Alignment::Center)
+            .into()
+        } else {
+            icon_svg(spec.rep_icon(), icon_px)
+        };
+        return button(content)
+            .width(Length::Fixed(width))
+            .padding(Padding::from([4.0, 2.0]))
+            .on_press(Message::ToggleRibbonGroup(index))
+            .style(|_theme, status| command_button_style(status))
+            .into();
+    }
+    let compact = density == Density::Compact;
+    let mut commands = row![].spacing(CMD_GAP);
+    for command in &spec.commands {
+        commands = commands.push(render_command(command, compact));
+    }
+    ribbon_group(spec.title, commands)
 }
 
 /// A short label for an operation's kind.
@@ -1643,5 +2202,51 @@ impl shader::Primitive for ScenePrimitive {
         gizmo_pass.set_viewport(gx as f32, gy as f32, size as f32, size as f32, 0.0, 1.0);
         gizmo_pass.set_scissor_rect(gx, gy, size, size);
         pipeline.gizmo.draw(&mut gizmo_pass);
+    }
+}
+
+#[cfg(test)]
+mod ribbon_tests {
+    use super::*;
+
+    // Home tab shape: File(2) + Edit(3).
+    const HOME: [usize; 2] = [2, 3];
+
+    #[test]
+    fn wide_window_keeps_all_groups_full() {
+        let d = solve_densities(&HOME, 2000.0);
+        assert_eq!(d, vec![Density::Full, Density::Full]);
+    }
+
+    #[test]
+    fn narrowing_degrades_right_group_first() {
+        // A width that fits Full+Compact but not Full+Full: the rightmost (Edit)
+        // group must be the one that drops.
+        let full_full = row_width(&HOME, &[Density::Full, Density::Full]);
+        let full_compact = row_width(&HOME, &[Density::Full, Density::Compact]);
+        let w = 0.5 * (full_full + full_compact); // between the two
+        let d = solve_densities(&HOME, w);
+        assert_eq!(d, vec![Density::Full, Density::Compact]);
+    }
+
+    #[test]
+    fn very_narrow_collapses_everything_to_tight() {
+        let d = solve_densities(&HOME, 1.0);
+        assert_eq!(d, vec![Density::Tight, Density::Tight]);
+    }
+
+    #[test]
+    fn degradation_is_monotonic_in_width() {
+        // As available width shrinks, total tightness never decreases.
+        let tightness = |d: &[Density]| d.iter().map(|&x| x as u8 as u32).sum::<u32>();
+        let mut prev = 0;
+        for w in (0..1200).step_by(20).map(|x| x as f32) {
+            let t = tightness(&solve_densities(&HOME, w));
+            // Wider (later, larger w) must be <= tighter earlier — iterate ascending
+            // width and assert non-increasing tightness relative to the previous
+            // (narrower) width.
+            assert!(t <= prev || prev == 0, "tightness rose as width grew");
+            prev = t;
+        }
     }
 }
