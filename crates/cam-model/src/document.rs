@@ -95,6 +95,10 @@ pub struct ProfileOp {
     pub feed: f64,
     /// Plunge feed, mm/min.
     pub plunge_feed: f64,
+    /// The chosen start point (part XY), if any: the loop is rotated to begin at
+    /// the offset vertex nearest this point. `None` starts at the chain's first
+    /// vertex (the default).
+    pub start: Option<[f64; 2]>,
 }
 
 /// A drilling operation: a set of holes taken to a depth, optionally pecked and

@@ -39,6 +39,7 @@ fn profile_op(id: u32, chain: cam_geo::Contour, side: Side) -> Operation {
         stepdown: 2.0,
         feed: 300.0,
         plunge_feed: 100.0,
+        start: None,
     })
 }
 

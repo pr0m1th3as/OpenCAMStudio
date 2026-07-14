@@ -170,6 +170,8 @@ fn emit_loop(
     if pts.len() < 3 {
         return;
     }
+    let rotated = rotate_to_start(pts, op.start);
+    let pts = rotated.as_slice();
     let start = pts[0];
     let link = Tag::new(op.id, MoveKind::Link);
     let plunge = Tag::new(op.id, MoveKind::Plunge);
@@ -209,6 +211,29 @@ fn emit_loop(
     });
 }
 
+/// Rotate a closed loop so it begins at the vertex nearest `start` (part XY).
+/// `None` leaves the loop unchanged. The winding order is preserved — only the
+/// starting index changes.
+pub(crate) fn rotate_to_start(
+    pts: &[cam_geo::Point],
+    start: Option<[f64; 2]>,
+) -> Vec<cam_geo::Point> {
+    let Some(s) = start else {
+        return pts.to_vec();
+    };
+    let Some((k, _)) = pts.iter().enumerate().min_by(|(_, a), (_, b)| {
+        let da = (a.x - s[0]).powi(2) + (a.y - s[1]).powi(2);
+        let db = (b.x - s[0]).powi(2) + (b.y - s[1]).powi(2);
+        da.total_cmp(&db)
+    }) else {
+        return pts.to_vec();
+    };
+    let mut out = Vec::with_capacity(pts.len());
+    out.extend_from_slice(&pts[k..]);
+    out.extend_from_slice(&pts[..k]);
+    out
+}
+
 /// The absolute Z of each stepdown pass, from just below `top` down to `depth`
 /// (inclusive), never stepping more than `stepdown` at a time.
 pub(crate) fn depth_levels(top: f64, depth: f64, stepdown: f64) -> Vec<f64> {
@@ -237,5 +262,29 @@ mod tests {
         assert_eq!(depth_levels(0.0, -1.0, 1.5), vec![-1.0]);
         assert_eq!(depth_levels(0.0, -5.0, 2.0), vec![-2.0, -4.0, -5.0]);
         assert!(depth_levels(0.0, 1.0, 1.0).is_empty());
+    }
+
+    #[test]
+    fn rotate_to_start_leads_with_nearest_vertex() {
+        use cam_geo::Point;
+        let sq = [
+            Point::new(0.0, 0.0),
+            Point::new(10.0, 0.0),
+            Point::new(10.0, 10.0),
+            Point::new(0.0, 10.0),
+        ];
+        // None leaves it unchanged.
+        assert_eq!(rotate_to_start(&sq, None), sq.to_vec());
+        // Near the third vertex (10,10) → the loop begins there, winding intact.
+        let r = rotate_to_start(&sq, Some([9.5, 9.0]));
+        assert_eq!(
+            r,
+            vec![
+                Point::new(10.0, 10.0),
+                Point::new(0.0, 10.0),
+                Point::new(0.0, 0.0),
+                Point::new(10.0, 0.0),
+            ]
+        );
     }
 }

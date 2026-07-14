@@ -57,6 +57,7 @@ fn document() -> Document {
         stepdown: 2.0,
         feed: 300.0,
         plunge_feed: 100.0,
+        start: None,
     };
     let hole = ProfileOp {
         id: 1,
@@ -68,6 +69,7 @@ fn document() -> Document {
         stepdown: 2.0,
         feed: 300.0,
         plunge_feed: 100.0,
+        start: None,
     };
     Document::new(Setup {
         name: "first light".into(),
@@ -163,6 +165,7 @@ fn tool_too_large_for_hole_reports_error() {
         stepdown: 2.0,
         feed: 300.0,
         plunge_feed: 100.0,
+        start: None,
     };
     let tools = [tool];
     let env = JobEnv {
@@ -193,6 +196,7 @@ fn cancellation_stops_before_emitting() {
         stepdown: 2.0,
         feed: 300.0,
         plunge_feed: 100.0,
+        start: None,
     };
     let tools = [tool];
     let env = JobEnv {

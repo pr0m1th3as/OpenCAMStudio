@@ -315,8 +315,14 @@ struct App {
     /// The orbit-camera orientation, owned here; clicking a cube face or dragging
     /// the viewport reports changes back as messages.
     view: ViewControls,
+    /// Last known cursor position over the viewport (window coords), for drawing
+    /// the pickbox while a geometry pick is pending.
+    cursor: Option<iced::Point>,
     status: String,
 }
+
+/// The pickbox aperture, px — its half-size is the vertex-snap tolerance.
+const PICKBOX_PX: f32 = 12.0;
 
 /// The `(yaw, pitch)` that views a cube face (given by its outward normal)
 /// straight on, **the right way up** — the orientation a click on that gizmo face
@@ -376,8 +382,11 @@ enum Message {
     SetPendingTool(u32),
     /// Cancel the pending operation.
     CancelOp,
-    /// A world `(x, y)` picked in the viewport (completes a pending operation).
-    PickWorld([f32; 2]),
+    /// A world `(x, y)` picked in the viewport plus the pickbox aperture in world
+    /// mm (completes a pending operation).
+    PickWorld([f32; 2], f32),
+    /// The cursor moved over the viewport (window coords) while a pick is pending.
+    ViewportCursor(iced::Point),
     /// Structural edits to the selected operation.
     DuplicateOp,
     DeleteOp,
@@ -477,6 +486,7 @@ impl App {
             show_stock: false,
             show_gizmo: true,
             view: ViewControls::default(),
+            cursor: None,
             status: "Open the sample part to begin.".to_string(),
         };
         app.refresh_fields();
@@ -613,18 +623,20 @@ impl App {
                 self.controller.cancel_operation();
                 self.status = "Cancelled operation creation.".to_string();
             }
-            Message::PickWorld(w) => {
+            Message::PickWorld(w, aperture) => {
                 if self
                     .controller
-                    .pick_operation_geometry([w[0] as f64, w[1] as f64])
+                    .pick_operation_geometry([w[0] as f64, w[1] as f64], aperture as f64)
                 {
+                    self.cursor = None;
                     self.refresh_fields();
                     self.rerun();
                     self.status = "Operation created.".to_string();
                 } else {
-                    self.status = "No geometry there — click on a region.".to_string();
+                    self.status = "No geometry there — click a vertex or region.".to_string();
                 }
             }
+            Message::ViewportCursor(p) => self.cursor = Some(p),
             Message::DuplicateOp => {
                 self.controller.duplicate_selected_operation();
                 self.refresh_fields();
@@ -1031,16 +1043,47 @@ impl App {
         .width(Length::Fill)
         .height(Length::Fill);
 
-        let base = column![self.ribbon(), grid];
-        match self.ribbon_popup() {
-            None => base.into(),
-            Some(popup) => {
-                // A full-window catcher under the popup so a click off it dismisses.
-                let catcher = mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
-                    .on_press(Message::CloseRibbonPopup);
-                iced::widget::stack![base, catcher, popup].into()
-            }
+        let mut layers = iced::widget::stack![column![self.ribbon(), grid]];
+        if let Some(popup) = self.ribbon_popup() {
+            // A full-window catcher under the popup so a click off it dismisses.
+            let catcher = mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
+                .on_press(Message::CloseRibbonPopup);
+            layers = layers.push(catcher).push(popup);
         }
+        if let Some(pickbox) = self.pickbox_overlay() {
+            layers = layers.push(pickbox);
+        }
+        layers.into()
+    }
+
+    /// The pickbox: a small accent square drawn over the cursor while a geometry
+    /// pick is pending, its half-size the vertex-snap aperture. Purely visual — it
+    /// does not intercept clicks (they fall through to the viewport).
+    fn pickbox_overlay(&self) -> Option<Element<'_, Message>> {
+        self.controller.pending_op()?;
+        let c = self.cursor?;
+        let half = PICKBOX_PX / 2.0;
+        let square = container(Space::new())
+            .width(Length::Fixed(PICKBOX_PX))
+            .height(Length::Fixed(PICKBOX_PX))
+            .style(|_theme| container::Style {
+                border: Border {
+                    color: palette::ACCENT_BLUE,
+                    width: 1.5,
+                    radius: 0.0.into(),
+                },
+                ..container::Style::default()
+            });
+        let positioned = container(square)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(Padding {
+                top: (c.y - half).max(0.0),
+                left: (c.x - half).max(0.0),
+                right: 0.0,
+                bottom: 0.0,
+            });
+        Some(positioned.into())
     }
 
     /// The top-bar ribbon: a tab strip (darker bar, active tab in accent) over a
@@ -2142,8 +2185,9 @@ impl shader::Program<Message> for Viewport {
                         );
                     }
                 }
-                // In geometry-pick mode a left-click selects a region (projected
-                // onto the stock-top plane) instead of orbiting.
+                // In geometry-pick mode a left-click selects geometry (projected
+                // onto the stock-top plane) instead of orbiting; the pickbox
+                // half-size becomes the world-space snap aperture.
                 if self.picking && matches!(button, Button::Left) {
                     let aspect = if bounds.height > 0.0 {
                         bounds.width / bounds.height
@@ -2152,8 +2196,12 @@ impl shader::Program<Message> for Viewport {
                     };
                     let u = 2.0 * (pos.x - bounds.x) / bounds.width - 1.0;
                     let v = 1.0 - 2.0 * (pos.y - bounds.y) / bounds.height;
-                    if let Some(w) = self.camera().pick_plane(u, v, aspect, self.pick_z) {
-                        return Some(shader::Action::publish(Message::PickWorld(w)).and_capture());
+                    let cam = self.camera();
+                    if let Some(w) = cam.pick_plane(u, v, aspect, self.pick_z) {
+                        let aperture = 0.5 * PICKBOX_PX * cam.world_per_pixel(bounds.height);
+                        return Some(
+                            shader::Action::publish(Message::PickWorld(w, aperture)).and_capture(),
+                        );
                     }
                     return Some(shader::Action::capture());
                 }
@@ -2192,6 +2240,11 @@ impl shader::Program<Message> for Viewport {
                         }
                     };
                     return Some(shader::Action::publish(message).and_capture());
+                }
+                // While a pick is pending, track the cursor so the App can draw the
+                // pickbox over it. Don't capture — this is passive tracking.
+                if self.picking && cursor.position_over(bounds).is_some() {
+                    return Some(shader::Action::publish(Message::ViewportCursor(*position)));
                 }
             }
             Mouse::ButtonReleased(_) => {
@@ -2241,9 +2294,13 @@ impl shader::Program<Message> for Viewport {
         bounds: iced::Rectangle,
         cursor: iced::mouse::Cursor,
     ) -> iced::mouse::Interaction {
-        if state.drag.is_some() {
+        let over = cursor.position_over(bounds).is_some();
+        if self.picking && over {
+            // A crosshair under the drawn pickbox — AutoCAD-style precise aiming.
+            iced::mouse::Interaction::Crosshair
+        } else if state.drag.is_some() {
             iced::mouse::Interaction::Grabbing
-        } else if cursor.position_over(bounds).is_some() {
+        } else if over {
             iced::mouse::Interaction::Grab
         } else {
             iced::mouse::Interaction::default()

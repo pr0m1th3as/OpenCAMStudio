@@ -189,6 +189,7 @@ fn a_bad_setup_that_rapids_low_is_caught() {
             stepdown: 1.5,
             feed: 300.0,
             plunge_feed: 100.0,
+            start: None,
         })],
     });
     let (program, _) = build_job(&doc, 1000.0, SpindleDir::Cw, &CancelToken::new());

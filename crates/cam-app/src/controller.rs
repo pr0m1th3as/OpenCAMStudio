@@ -527,7 +527,7 @@ impl AppController {
             return;
         }
         let tool = self.first_tool_number();
-        let op = self.build_op(kind, 0, tool);
+        let op = self.build_op(kind, 0, tool, None);
         if let Some(op) = op {
             self.add_operation(op);
         }
@@ -541,7 +541,13 @@ impl AppController {
     /// - **Drill** — one hole at each of the region's hole centroids (its outer
     ///   centroid if it has none).
     /// - **Face** — face the region's XY bounding rectangle.
-    fn build_op(&self, kind: OpKind, index: usize, tool: u32) -> Option<Operation> {
+    fn build_op(
+        &self,
+        kind: OpKind,
+        index: usize,
+        tool: u32,
+        start: Option<[f64; 2]>,
+    ) -> Option<Operation> {
         let region = self.regions.get(index)?;
         let p = self.defaults;
         // id 0 is a placeholder — add_operation renumbers with a fresh id.
@@ -556,6 +562,7 @@ impl AppController {
                 stepdown: p.stepdown,
                 feed: p.feed,
                 plunge_feed: p.plunge_feed,
+                start,
             }),
             OpKind::Pocket => Operation::Pocket(PocketOp {
                 id: 0,
@@ -664,18 +671,43 @@ impl AppController {
             .map(|(i, _)| i)
     }
 
-    /// Complete the pending operation on the region containing `world`: build it
-    /// with the pending kind + tool, add and select it, and leave pick mode.
-    /// Returns `true` if a region was hit and an operation created. A miss leaves
+    /// The nearest vertex (of any region's outer boundary or holes) within
+    /// `aperture` world-mm of `world`, as `(region index, vertex XY)`. This is the
+    /// pickbox hit-test: `aperture` is the box half-size mapped to world units.
+    pub fn nearest_vertex(&self, world: [f64; 2], aperture: f64) -> Option<(usize, [f64; 2])> {
+        let mut best: Option<(usize, [f64; 2], f64)> = None;
+        for (i, region) in self.regions.iter().enumerate() {
+            let rings = std::iter::once(region.outer()).chain(region.holes());
+            for ring in rings {
+                for pt in ring.points() {
+                    let d2 = (pt.x - world[0]).powi(2) + (pt.y - world[1]).powi(2);
+                    if best.is_none_or(|(_, _, bd2)| d2 < bd2) {
+                        best = Some((i, [pt.x, pt.y], d2));
+                    }
+                }
+            }
+        }
+        best.filter(|(_, _, d2)| *d2 <= aperture * aperture)
+            .map(|(i, pt, _)| (i, pt))
+    }
+
+    /// Complete the pending operation from a viewport pick at `world`, with a
+    /// pickbox of `aperture` world-mm. A vertex inside the box sets the region **and**
+    /// the start point; otherwise the region whose area contains the point is used
+    /// (for pocket/face). Returns `true` if an operation was created. A miss leaves
     /// the wizard active so the user can click again.
-    pub fn pick_operation_geometry(&mut self, world: [f64; 2]) -> bool {
+    pub fn pick_operation_geometry(&mut self, world: [f64; 2], aperture: f64) -> bool {
         let Some(pending) = self.pending_op else {
             return false;
         };
-        let Some(index) = self.region_at(world) else {
-            return false;
+        let (index, start) = match self.nearest_vertex(world, aperture) {
+            Some((i, pt)) => (i, Some(pt)),
+            None => match self.region_at(world) {
+                Some(i) => (i, None),
+                None => return false,
+            },
         };
-        if let Some(op) = self.build_op(pending.kind, index, pending.tool) {
+        if let Some(op) = self.build_op(pending.kind, index, pending.tool, start) {
             self.add_operation(op);
             self.pending_op = None;
             return true;
@@ -898,6 +930,7 @@ impl AppController {
                 stepdown: p.stepdown,
                 feed: p.feed,
                 plunge_feed: p.plunge_feed,
+                start: None,
             }));
             id += 1;
         };
@@ -1447,17 +1480,44 @@ mod tests {
         app.set_pending_tool(2);
 
         // A miss leaves the wizard active and creates nothing.
-        assert!(!app.pick_operation_geometry([100.0, 100.0]));
+        assert!(!app.pick_operation_geometry([100.0, 100.0], 2.0));
         assert!(app.pending_op().is_some());
         assert_eq!(op_ids(&app).len(), before);
 
-        // A hit on the plate creates the pocket on that region with tool 2.
-        assert!(app.pick_operation_geometry([20.0, 20.0]));
+        // A click in the plate interior (no vertex within the aperture) falls back
+        // to region fill and creates the pocket on that region with tool 2.
+        assert!(app.pick_operation_geometry([20.0, 20.0], 2.0));
         assert!(app.pending_op().is_none());
         assert_eq!(op_ids(&app).len(), before + 1);
         match app.selected_operation() {
             Some(Operation::Pocket(o)) => assert_eq!(o.tool, 2),
             other => panic!("expected pocket on tool 2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nearest_vertex_snaps_within_aperture_only() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        // The plate's corner is at (10, 10). A click just off it, within aperture, snaps.
+        assert_eq!(
+            app.nearest_vertex([10.6, 10.4], 2.0),
+            Some((0, [10.0, 10.0]))
+        );
+        // Same click with a tiny aperture finds nothing.
+        assert_eq!(app.nearest_vertex([10.6, 10.4], 0.1), None);
+    }
+
+    #[test]
+    fn picking_a_vertex_sets_the_profile_start() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        app.begin_operation(OpKind::Profile);
+        // Click near the (70, 50) corner with a generous aperture.
+        assert!(app.pick_operation_geometry([69.5, 49.6], 2.0));
+        match app.selected_operation() {
+            Some(Operation::Profile(o)) => assert_eq!(o.start, Some([70.0, 50.0])),
+            other => panic!("expected a profile with a start, got {other:?}"),
         }
     }
 
