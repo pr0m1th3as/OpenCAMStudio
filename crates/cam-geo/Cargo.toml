@@ -10,3 +10,4 @@ repository.workspace = true
 
 [dependencies]
 i_overlay = "7"
+serde = { workspace = true }

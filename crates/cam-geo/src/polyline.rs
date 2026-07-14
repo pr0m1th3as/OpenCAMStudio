@@ -8,7 +8,7 @@
 use crate::Point;
 
 /// An open chain of points.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Polyline {
     points: Vec<Point>,
 }

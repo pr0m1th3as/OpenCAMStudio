@@ -11,3 +11,4 @@ repository.workspace = true
 [dependencies]
 cam-cldata = { path = "../cam-cldata" }
 cam-geo = { path = "../cam-geo" }
+serde = { workspace = true }

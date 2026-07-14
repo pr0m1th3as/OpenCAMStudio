@@ -7,7 +7,7 @@ use i_overlay::i_float::float::compatible::FloatPointCompatible;
 /// This is *our* type — downstream crates use it without pulling in `i_overlay`.
 /// It also implements `i_overlay`'s [`FloatPointCompatible`], so slices of
 /// `Point` pass straight into the geometry engine with no conversion or copy.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Point {
     pub x: f64,
     pub y: f64,

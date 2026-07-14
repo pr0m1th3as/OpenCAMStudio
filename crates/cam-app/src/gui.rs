@@ -11,6 +11,7 @@
 //! with the `gui` feature.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use iced::widget::pane_grid::{self, PaneGrid};
@@ -57,7 +58,10 @@ mod palette {
 /// render them untinted.
 #[derive(Clone, Copy, Debug)]
 enum Icon {
-    OpenSample,
+    New,
+    Open,
+    Save,
+    Import,
     Export,
     Undo,
     Redo,
@@ -77,7 +81,10 @@ enum Icon {
 impl Icon {
     fn bytes(self) -> &'static [u8] {
         match self {
-            Icon::OpenSample => include_bytes!("../assets/icons/cui_import.svg"),
+            Icon::New => include_bytes!("../assets/icons/new.svg"),
+            Icon::Open => include_bytes!("../assets/icons/open.svg"),
+            Icon::Save => include_bytes!("../assets/icons/save.svg"),
+            Icon::Import => include_bytes!("../assets/icons/cui_import.svg"),
             Icon::Export => include_bytes!("../assets/icons/cui_export.svg"),
             Icon::Undo => include_bytes!("../assets/icons/undo.svg"),
             Icon::Redo => include_bytes!("../assets/icons/redo.svg"),
@@ -112,7 +119,7 @@ fn icon_svg(icon: Icon, size: f32) -> Element<'static, Message> {
 use cam_render::{MeshVertex, OrbitCamera, Scene, Vertex, PART};
 use cam_toolpath::{CancelToken, Severity};
 
-use crate::{AppController, OpKind, Selection};
+use crate::{AppController, OpKind, PendingOp, Selection};
 
 /// A small sample part (rectangle + circular hole) so the app is useful without
 /// a file dialog on first run.
@@ -136,6 +143,29 @@ pub fn run() -> iced::Result {
 
 fn theme(_state: &App) -> iced::Theme {
     iced::Theme::Dark
+}
+
+/// Prompt (native dialog) for an existing file matching `exts`, returning its path.
+async fn pick_open(name: &'static str, exts: &'static [&'static str]) -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .add_filter(name, exts)
+        .pick_file()
+        .await
+        .map(|h| h.path().to_path_buf())
+}
+
+/// Prompt (native dialog) for a save location, seeded with `default_name`.
+async fn pick_save(
+    name: &'static str,
+    default_name: &'static str,
+    exts: &'static [&'static str],
+) -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .add_filter(name, exts)
+        .set_file_name(default_name)
+        .save_file()
+        .await
+        .map(|h| h.path().to_path_buf())
 }
 
 /// The docked panes. Any of them can be shown or hidden from the Windows ribbon
@@ -250,6 +280,19 @@ impl Field {
     }
 }
 
+/// A tool as offered in the wizard's tool picker.
+#[derive(Clone, Copy, PartialEq)]
+struct ToolChoice {
+    number: u32,
+    diameter: f64,
+}
+
+impl std::fmt::Display for ToolChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "T{} ⌀{}", self.number, fmt_num(self.diameter))
+    }
+}
+
 struct App {
     controller: AppController,
     panes: pane_grid::State<Pane>,
@@ -303,11 +346,38 @@ enum Message {
     FieldChanged(Field, String),
     /// Commit the inspector fields (one undo step) and recompute the toolpath.
     Apply,
-    Export,
     Undo,
     Redo,
-    /// Create a new operation of the given kind from the loaded geometry.
-    NewOp(OpKind),
+    // --- File I/O (native dialogs via rfd) ---
+    /// Start a fresh, empty project.
+    NewProject,
+    /// Prompt for and open a `.ocam` project.
+    OpenProject,
+    /// The chosen project to open (`None` = cancelled).
+    ProjectToOpen(Option<PathBuf>),
+    /// Save to the current path, or prompt if there is none.
+    SaveProject,
+    /// Always prompt for a save location.
+    SaveProjectAs,
+    /// The chosen path to save to (`None` = cancelled).
+    ProjectToSave(Option<PathBuf>),
+    /// Prompt for and import a `.dxf`/`.dwg` file.
+    ImportCad,
+    /// The chosen CAD file to import (`None` = cancelled).
+    CadToImport(Option<PathBuf>),
+    /// Prompt for a `.nc` export location.
+    ExportNc,
+    /// The chosen `.nc` path (`None` = cancelled).
+    NcToExport(Option<PathBuf>),
+    // --- Operation-creation wizard ---
+    /// Begin creating an operation of `kind` (enter geometry-pick mode).
+    BeginOp(OpKind),
+    /// Change the pending operation's tool.
+    SetPendingTool(u32),
+    /// Cancel the pending operation.
+    CancelOp,
+    /// A world `(x, y)` picked in the viewport (completes a pending operation).
+    PickWorld([f32; 2]),
     /// Structural edits to the selected operation.
     DuplicateOp,
     DeleteOp,
@@ -441,15 +511,76 @@ impl App {
                 self.fields.insert(field, value);
             }
             Message::Apply => self.apply_inspector(),
-            Message::Export => {
-                self.status = match self.controller.export_nc() {
-                    Ok(nc) => format!("Exported {} lines of G-code.", nc.lines().count()),
-                    Err(crate::ExportError::RapidThroughStock(n)) => {
-                        format!("Export blocked: {n} rapid(s) through stock — see Output.")
+            Message::NewProject => {
+                self.controller.new_project();
+                self.refresh_fields();
+                self.status = "New project.".to_string();
+            }
+            Message::OpenProject => {
+                return iced::Task::perform(
+                    pick_open("OpenCAMStudio project", &["ocam"]),
+                    Message::ProjectToOpen,
+                );
+            }
+            Message::ProjectToOpen(Some(path)) => {
+                self.status = match self.controller.open_project(&path) {
+                    Ok(()) => {
+                        self.refresh_fields();
+                        self.rerun();
+                        format!("Opened {}.", path.display())
                     }
-                    Err(e) => format!("Export blocked: {e:?}"),
+                    Err(e) => format!("Open failed: {e}"),
                 };
             }
+            Message::SaveProject => match self.controller.current_path().map(PathBuf::from) {
+                Some(path) => self.save_to(&path),
+                None => {
+                    return iced::Task::perform(
+                        pick_save("OpenCAMStudio project", "project.ocam", &["ocam"]),
+                        Message::ProjectToSave,
+                    )
+                }
+            },
+            Message::SaveProjectAs => {
+                return iced::Task::perform(
+                    pick_save("OpenCAMStudio project", "project.ocam", &["ocam"]),
+                    Message::ProjectToSave,
+                );
+            }
+            Message::ProjectToSave(Some(path)) => self.save_to(&path),
+            Message::ImportCad => {
+                return iced::Task::perform(
+                    pick_open("CAD drawing", &["dxf", "dwg"]),
+                    Message::CadToImport,
+                );
+            }
+            Message::CadToImport(Some(path)) => {
+                self.status = match self.controller.import_cad(&path) {
+                    Ok(n) => {
+                        self.refresh_fields();
+                        self.rerun();
+                        format!("Imported {n} region(s) from {}.", path.display())
+                    }
+                    Err(e) => format!("Import failed: {e}"),
+                };
+            }
+            Message::ExportNc => {
+                return iced::Task::perform(
+                    pick_save("G-code", "program.nc", &["nc"]),
+                    Message::NcToExport,
+                );
+            }
+            Message::NcToExport(Some(path)) => {
+                self.status = match self.controller.export_nc_to(&path) {
+                    Ok(()) => format!("Exported G-code to {}.", path.display()),
+                    Err(e) => format!("Export blocked: {e}"),
+                };
+            }
+            // Cancelled dialogs — nothing to do.
+            Message::ProjectToOpen(None)
+            | Message::ProjectToSave(None)
+            | Message::CadToImport(None)
+            | Message::NcToExport(None) => {}
             Message::Undo => {
                 if self.controller.undo() {
                     self.refresh_fields();
@@ -468,10 +599,31 @@ impl App {
                     self.status = "Nothing to redo.".to_string();
                 }
             }
-            Message::NewOp(kind) => {
-                self.controller.new_operation(kind);
+            Message::BeginOp(kind) => {
+                self.controller.begin_operation(kind);
                 self.refresh_fields();
-                self.rerun();
+                self.status = if self.controller.pending_op().is_some() {
+                    "Pick a region in the viewport (or Cancel in the Inspector).".to_string()
+                } else {
+                    "Open a part and add a tool first.".to_string()
+                };
+            }
+            Message::SetPendingTool(number) => self.controller.set_pending_tool(number),
+            Message::CancelOp => {
+                self.controller.cancel_operation();
+                self.status = "Cancelled operation creation.".to_string();
+            }
+            Message::PickWorld(w) => {
+                if self
+                    .controller
+                    .pick_operation_geometry([w[0] as f64, w[1] as f64])
+                {
+                    self.refresh_fields();
+                    self.rerun();
+                    self.status = "Operation created.".to_string();
+                } else {
+                    self.status = "No geometry there — click on a region.".to_string();
+                }
             }
             Message::DuplicateOp => {
                 self.controller.duplicate_selected_operation();
@@ -859,6 +1011,14 @@ impl App {
         };
     }
 
+    /// Save the project to `path` and report the result.
+    fn save_to(&mut self, path: &Path) {
+        self.status = match self.controller.save_project(path) {
+            Ok(()) => format!("Saved {}.", path.display()),
+            Err(e) => format!("Save failed: {e}"),
+        };
+    }
+
     fn view(&self) -> Element<'_, Message> {
         let grid = PaneGrid::new(&self.panes, |_id, pane, _is_max| {
             pane_grid::Content::new(self.pane_content(*pane))
@@ -926,14 +1086,26 @@ impl App {
     fn ribbon_specs(&self) -> Option<Vec<GroupSpec>> {
         let has_geo = !self.controller.regions().is_empty();
         let has_tool = matches!(self.controller.selection(), Selection::Tool(_));
-        let new_op = |kind: OpKind| has_geo.then_some(Message::NewOp(kind));
+        // A new op needs geometry to pick and at least one tool.
+        let can_create = has_geo && !self.controller.document().setup.tools.is_empty();
+        let begin = |kind: OpKind| can_create.then_some(Message::BeginOp(kind));
         let specs = match self.active_tab {
             RibbonTab::Home => vec![
                 GroupSpec {
-                    title: "File",
+                    title: "Project",
                     commands: vec![
-                        cmd(Icon::OpenSample, "Open", Some(Message::OpenSample)),
-                        cmd(Icon::Export, "Export", Some(Message::Export)),
+                        cmd(Icon::New, "New", Some(Message::NewProject)),
+                        cmd(Icon::Open, "Open", Some(Message::OpenProject)),
+                        cmd(Icon::Save, "Save", Some(Message::SaveProject)),
+                        cmd(Icon::Save, "Save As", Some(Message::SaveProjectAs)),
+                    ],
+                },
+                GroupSpec {
+                    title: "Data",
+                    commands: vec![
+                        cmd(Icon::Import, "Import", Some(Message::ImportCad)),
+                        cmd(Icon::Export, "Export", Some(Message::ExportNc)),
+                        cmd(Icon::Open, "Sample", Some(Message::OpenSample)),
                     ],
                 },
                 GroupSpec {
@@ -948,10 +1120,10 @@ impl App {
             RibbonTab::Operations => vec![GroupSpec {
                 title: "Create",
                 commands: vec![
-                    cmd(Icon::Profile, "Profile", new_op(OpKind::Profile)),
-                    cmd(Icon::Pocket, "Pocket", new_op(OpKind::Pocket)),
-                    cmd(Icon::Drill, "Drill", new_op(OpKind::Drill)),
-                    cmd(Icon::Face, "Face", new_op(OpKind::Face)),
+                    cmd(Icon::Profile, "Profile", begin(OpKind::Profile)),
+                    cmd(Icon::Pocket, "Pocket", begin(OpKind::Pocket)),
+                    cmd(Icon::Drill, "Drill", begin(OpKind::Drill)),
+                    cmd(Icon::Face, "Face", begin(OpKind::Face)),
                 ],
             }],
             RibbonTab::Tooling => vec![GroupSpec {
@@ -1193,7 +1365,47 @@ impl App {
     }
 
     /// The inspector: editable fields for the selected node.
+    /// The new-operation wizard shown in the Inspector while a geometry pick is
+    /// pending: the kind, a tool picker, a prompt, and Cancel.
+    fn op_wizard(&self, pending: PendingOp) -> Element<'_, Message> {
+        let kind = match pending.kind {
+            OpKind::Profile => "Profile",
+            OpKind::Pocket => "Pocket",
+            OpKind::Drill => "Drill",
+            OpKind::Face => "Face",
+        };
+        let tools: Vec<ToolChoice> = self
+            .controller
+            .document()
+            .setup
+            .tools
+            .iter()
+            .map(|t| ToolChoice {
+                number: t.number,
+                diameter: t.diameter,
+            })
+            .collect();
+        let selected = tools.iter().copied().find(|c| c.number == pending.tool);
+        let picker = pick_list(tools, selected, |c| Message::SetPendingTool(c.number))
+            .text_size(13)
+            .width(Length::Fill);
+        column![
+            text(format!("New {kind} operation")).size(15),
+            text("Tool").size(12),
+            picker,
+            text("Click a region in the viewport to place it.").size(12),
+            button(text("Cancel").size(13)).on_press(Message::CancelOp),
+        ]
+        .spacing(10)
+        .padding(8)
+        .into()
+    }
+
     fn inspector(&self) -> Element<'_, Message> {
+        // While a new-operation wizard is active, the inspector is the wizard.
+        if let Some(pending) = self.controller.pending_op() {
+            return self.op_wizard(pending);
+        }
         let heading = match self.controller.selection() {
             Selection::Setup => "Setup".to_string(),
             Selection::Stock => "Stock".to_string(),
@@ -1819,6 +2031,10 @@ struct Viewport {
     bounds: Option<([f32; 3], [f32; 3])>,
     controls: ViewControls,
     show_gizmo: bool,
+    /// Geometry-pick mode (a new-operation wizard is awaiting a region click).
+    picking: bool,
+    /// The world Z of the plane clicks are projected onto (top of stock).
+    pick_z: f32,
 }
 
 impl Viewport {
@@ -1828,6 +2044,8 @@ impl Viewport {
         controls: ViewControls,
         show_gizmo: bool,
     ) -> Self {
+        let picking = controller.pending_op().is_some();
+        let pick_z = controller.document().setup.heights.top_of_stock as f32;
         // After a run, show the full backplot; before it, at least show the
         // imported part outlines so opening a file is visibly reflected.
         let scene = match controller.outcome() {
@@ -1856,6 +2074,8 @@ impl Viewport {
             bounds: scene.bounds(),
             controls,
             show_gizmo,
+            picking,
+            pick_z,
         }
     }
 
@@ -1921,6 +2141,21 @@ impl shader::Program<Message> for Viewport {
                             shader::Action::publish(Message::SetView(yaw, pitch)).and_capture(),
                         );
                     }
+                }
+                // In geometry-pick mode a left-click selects a region (projected
+                // onto the stock-top plane) instead of orbiting.
+                if self.picking && matches!(button, Button::Left) {
+                    let aspect = if bounds.height > 0.0 {
+                        bounds.width / bounds.height
+                    } else {
+                        1.0
+                    };
+                    let u = 2.0 * (pos.x - bounds.x) / bounds.width - 1.0;
+                    let v = 1.0 - 2.0 * (pos.y - bounds.y) / bounds.height;
+                    if let Some(w) = self.camera().pick_plane(u, v, aspect, self.pick_z) {
+                        return Some(shader::Action::publish(Message::PickWorld(w)).and_capture());
+                    }
+                    return Some(shader::Action::capture());
                 }
                 // Leave presses in the pane-resize band along the edges to the
                 // pane_grid divider — its grab zone bleeds a few px into the pane,

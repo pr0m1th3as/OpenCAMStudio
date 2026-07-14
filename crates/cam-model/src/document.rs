@@ -19,7 +19,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 ///
 /// Heights are first-class (a core design rule): unsafe Z is a primary hazard
 /// and must never be implicit.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Heights {
     /// Z for rapid traverses between features — the highest, safest plane.
     pub clearance: f64,
@@ -42,14 +42,14 @@ impl Heights {
 
 /// A description of the raw material. The first-light slice models only a
 /// rectangular block; `from-model + offsets` stock arrives with the kernel.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Stock {
     /// An axis-aligned block spanning `[min, max]` in each axis (mm).
     Box { min: [f64; 3], max: [f64; 3] },
 }
 
 /// Which side of a profiled chain the tool runs on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Side {
     /// Tool outside the closed chain (leaves the enclosed region intact) — the
     /// usual choice for cutting a part free of stock.
@@ -62,7 +62,7 @@ pub enum Side {
 }
 
 /// How cutter-radius compensation is applied.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Comp {
     /// We compute the offset geometry ourselves (kernel-independent). The only
     /// mode for first light.
@@ -75,7 +75,7 @@ pub enum Comp {
 
 /// A 2.5-D profiling operation: follow a closed chain at an offset, in stepdown
 /// passes, down to a depth.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ProfileOp {
     /// Operation id (0-based within the setup); stamped onto every emitted tag.
     pub id: u32,
@@ -100,7 +100,7 @@ pub struct ProfileOp {
 /// A drilling operation: a set of holes taken to a depth, optionally pecked and
 /// dwelled. It is emitted as a Tier-2 cycle intent, so each post lowers it per
 /// its capabilities (canned `G83` on Fanuc, explicit pecks on grbl).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DrillOp {
     /// Operation id.
     pub id: u32,
@@ -121,7 +121,7 @@ pub struct DrillOp {
 /// A 2.5-D pocket-clearing operation: remove all material inside a closed
 /// boundary (leaving any islands standing), in concentric offset rings, in
 /// stepdown passes, down to a depth.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PocketOp {
     /// Operation id.
     pub id: u32,
@@ -145,7 +145,7 @@ pub struct PocketOp {
 
 /// A facing operation: clear the top of the stock over a boundary with parallel
 /// passes, in stepdown passes, down to a depth.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FaceOp {
     /// Operation id.
     pub id: u32,
@@ -167,7 +167,7 @@ pub struct FaceOp {
 
 /// An operation in a setup. An enum so a setup holds a heterogeneous, ordered
 /// list.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Operation {
     /// A profiling operation.
     Profile(ProfileOp),
@@ -193,7 +193,7 @@ impl Operation {
 
 /// A machining setup: one fixturing of the stock, its safety planes, and the
 /// ordered operations performed in it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Setup {
     /// Human-readable name.
     pub name: String,
@@ -208,7 +208,7 @@ pub struct Setup {
 }
 
 /// The top-level document: a schema version and a setup.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Document {
     /// Schema version this document conforms to.
     pub schema_version: u32,

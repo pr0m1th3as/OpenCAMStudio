@@ -10,8 +10,13 @@
 //!   not in headless tests.
 
 mod controller;
+mod project;
 
-pub use controller::{AppController, ExportError, JobParams, OpKind, RunOutcome, Selection};
+pub use controller::{
+    AppController, ExportError, ExportToError, JobParams, OpKind, PendingOp, ProjectError,
+    RunOutcome, Selection,
+};
+pub use project::Project;
 
 #[cfg(feature = "gui")]
 pub mod gui;

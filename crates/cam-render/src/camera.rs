@@ -168,6 +168,46 @@ impl OrbitCamera {
         let proj = orthographic_rh(-half_w, half_w, -half_h, half_h, near, far);
         mul(&proj, &view)
     }
+
+    /// Unproject viewport NDC `(u, v)` — each in `[-1, 1]`, `+v` up — to the world
+    /// `(x, y)` where the orthographic pick ray meets the plane `z = plane_z`.
+    /// `aspect` is width / height. Returns `None` only when the view is edge-on to
+    /// the plane (the ray runs parallel to it). Used to turn a viewport click into
+    /// a world point for geometry picking.
+    pub fn pick_plane(&self, u: f32, v: f32, aspect: f32, plane_z: f32) -> Option<[f32; 2]> {
+        let aspect = if aspect.is_finite() && aspect > 0.0 {
+            aspect
+        } else {
+            1.0
+        };
+        let half = self.half_height();
+        let (half_w, half_h) = if aspect >= 1.0 {
+            (half * aspect, half)
+        } else {
+            (half, half / aspect)
+        };
+        let right = self.right();
+        let up = self.up();
+        // View +Z in world is the third row of the world→view rotation; the camera
+        // looks along −Z, so the into-scene ray direction is its negation.
+        let forward = [-self.orient[0][2], -self.orient[1][2], -self.orient[2][2]];
+        let eff = [
+            self.target[0] + self.pan[0],
+            self.target[1] + self.pan[1],
+            self.target[2] + self.pan[2],
+        ];
+        // A point on the view plane through the (panned) target for this NDC.
+        let origin = [
+            eff[0] + u * half_w * right[0] + v * half_h * up[0],
+            eff[1] + u * half_w * right[1] + v * half_h * up[1],
+            eff[2] + u * half_w * right[2] + v * half_h * up[2],
+        ];
+        if forward[2].abs() < 1e-6 {
+            return None;
+        }
+        let t = (plane_z - origin[2]) / forward[2];
+        Some([origin[0] + t * forward[0], origin[1] + t * forward[1]])
+    }
 }
 
 /// The identity rotation — the top-down view.
@@ -415,5 +455,44 @@ mod tests {
             c[0] < -1e-3,
             "target panned right ⇒ centre left of origin: {c:?}"
         );
+    }
+
+    #[test]
+    fn pick_centre_is_the_target_in_top_view() {
+        let cam = OrbitCamera::framed([0.0, 0.0, 0.0], [100.0, 50.0, 0.0]);
+        let p = cam.pick_plane(0.0, 0.0, 2.0, 0.0).unwrap();
+        assert!(
+            (p[0] - 50.0).abs() < 1e-4 && (p[1] - 25.0).abs() < 1e-4,
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn pick_offset_moves_proportionally_and_symmetrically() {
+        let cam = OrbitCamera::framed([0.0, 0.0, 0.0], [100.0, 50.0, 0.0]);
+        let c = cam.pick_plane(0.0, 0.0, 2.0, 0.0).unwrap();
+        let right = cam.pick_plane(1.0, 0.0, 2.0, 0.0).unwrap();
+        let left = cam.pick_plane(-1.0, 0.0, 2.0, 0.0).unwrap();
+        let up = cam.pick_plane(0.0, 1.0, 2.0, 0.0).unwrap();
+        // +u → +world-x, symmetric about the centre; +v → +world-y.
+        assert!(right[0] > c[0] && left[0] < c[0]);
+        assert!(
+            (right[0] - c[0] - (c[0] - left[0])).abs() < 1e-4,
+            "symmetric in x"
+        );
+        assert!(up[1] > c[1]);
+        // Top view: the pick is independent of the plane height.
+        let deep = cam.pick_plane(0.7, -0.3, 2.0, -25.0).unwrap();
+        let shallow = cam.pick_plane(0.7, -0.3, 2.0, 5.0).unwrap();
+        assert!((deep[0] - shallow[0]).abs() < 1e-4 && (deep[1] - shallow[1]).abs() < 1e-4);
+    }
+
+    #[test]
+    fn pick_is_none_when_view_is_edge_on() {
+        use std::f32::consts::FRAC_PI_2;
+        let mut cam = OrbitCamera::framed([0.0, 0.0, 0.0], [100.0, 50.0, 0.0]);
+        // Pitch 90°: looking horizontally, so a horizontal plane can't be hit.
+        cam.orient = orientation(0.0, FRAC_PI_2);
+        assert!(cam.pick_plane(0.0, 0.0, 2.0, 0.0).is_none());
     }
 }

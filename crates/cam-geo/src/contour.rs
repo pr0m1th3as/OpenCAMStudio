@@ -8,7 +8,7 @@ use crate::Point;
 /// A contour's [signed area](Contour::signed_area) encodes its orientation:
 /// counter-clockwise is positive (a solid boundary), clockwise is negative (a
 /// hole), matching the convention used throughout `cam-geo`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Contour {
     points: Vec<Point>,
 }

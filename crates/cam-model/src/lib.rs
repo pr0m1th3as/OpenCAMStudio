@@ -87,7 +87,7 @@ impl Machine {
 }
 
 /// The cutting-tool geometry a cycle/strategy reasons about.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ToolKind {
     /// Flat-bottomed square end mill.
     EndMill,
@@ -127,7 +127,7 @@ impl std::fmt::Display for ToolKind {
 
 /// A cutting tool. The P2 slice is the minimum a post/cycle needs; feeds, speeds
 /// and a richer library land with the document model at P3.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Tool {
     /// Tool number (emitted as `Tn`).
     pub number: u32,

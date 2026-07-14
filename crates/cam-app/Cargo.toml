@@ -17,7 +17,7 @@ path = "src/main.rs"
 # `gui` feature adds the iced desktop shell (and the wgpu renderer), which needs
 # a graphics/windowing stack to run.
 default = []
-gui = ["dep:iced", "dep:wgpu", "cam-render/gpu"]
+gui = ["dep:iced", "dep:wgpu", "dep:rfd", "cam-render/gpu"]
 
 [dependencies]
 cam-geo = { path = "../cam-geo" }
@@ -28,5 +28,8 @@ cam-post = { path = "../cam-post" }
 cam-import = { path = "../cam-import" }
 cam-render = { path = "../cam-render" }
 cam-sim = { path = "../cam-sim" }
+serde = { workspace = true }
+serde_json = { workspace = true }
 iced = { version = "0.14", features = ["wgpu", "svg"], optional = true }
 wgpu = { version = "27", optional = true }
+rfd = { version = "0.17", optional = true }

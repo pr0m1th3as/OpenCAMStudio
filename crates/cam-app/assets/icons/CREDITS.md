@@ -29,3 +29,4 @@ Drawn for this project in the same flat 24×24 style (grey `#e0e0e0` with cyan
 - `face.svg` — Face operation
 - `endmill.svg` — New tool
 - `undo.svg`, `redo.svg`, `run.svg` — edit / run actions
+- `new.svg`, `open.svg`, `save.svg` — project file actions

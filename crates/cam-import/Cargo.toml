@@ -10,6 +10,10 @@ repository.workspace = true
 
 [dependencies]
 cam-geo = { path = "../cam-geo" }
+# Reads DXF (ASCII + binary) and DWG; MPL-2.0 (GPLv3-compatible). The bundled
+# sample still uses the in-crate ASCII reader (`dxf.rs`); real file imports go
+# through acadrust via `read_cad_file`.
+acadrust = "0.4"
 
 [dev-dependencies]
 cam-cldata = { path = "../cam-cldata" }

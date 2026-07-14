@@ -8,9 +8,12 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 use cam_geo::{Contour, Point, Polygon};
-use cam_import::{read_dxf_str, ImportError, ImportOptions};
+use cam_import::{read_cad_file, read_dxf_str, ImportError, ImportOptions};
+
+use crate::project::Project;
 use cam_model::{
     Comp, Document, DrillOp, FaceOp, Heights, History, Machine, Operation, PocketOp, ProfileOp,
     Setup, Side, Stock, Tool, ToolKind,
@@ -25,7 +28,7 @@ use cam_toolpath::{build_job, CancelToken, Diagnostic, Severity};
 /// Seed defaults for a freshly-imported document: the values every generated
 /// operation and the setup's heights start from. Once a document exists, editing
 /// happens on the document, not here.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct JobParams {
     pub tool_diameter: f64,
     pub depth: f64,
@@ -139,9 +142,61 @@ pub struct AppController {
     /// Operation ids excluded from toolpath generation (kept in the tree).
     excluded: BTreeSet<u32>,
     source_name: String,
+    /// The `.ocam` path this project was last saved to / opened from.
+    current_path: Option<PathBuf>,
+    /// An operation being created, awaiting a geometry pick in the viewport.
+    pending_op: Option<PendingOp>,
     outcome: Option<RunOutcome>,
     nc: Option<String>,
 }
+
+/// An operation being created via the pick-geometry wizard: the kind and the tool
+/// it will use, pending a geometry pick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingOp {
+    pub kind: OpKind,
+    pub tool: u32,
+}
+
+/// Why a project save/open failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProjectError {
+    /// The file could not be read or written.
+    Io(String),
+    /// The project JSON could not be produced or parsed.
+    Json(String),
+}
+
+impl std::fmt::Display for ProjectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProjectError::Io(e) => write!(f, "file error: {e}"),
+            ProjectError::Json(e) => write!(f, "project format error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ProjectError {}
+
+/// Why exporting G-code to a file failed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExportToError {
+    /// The toolpath could not be posted (see [`ExportError`]).
+    Export(ExportError),
+    /// The `.nc` file could not be written.
+    Io(String),
+}
+
+impl std::fmt::Display for ExportToError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExportToError::Export(e) => write!(f, "{e:?}"),
+            ExportToError::Io(e) => write!(f, "file error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ExportToError {}
 
 impl AppController {
     /// A fresh controller for `machine`, with an empty "Untitled" document and no
@@ -156,6 +211,8 @@ impl AppController {
             selection: Selection::default(),
             excluded: BTreeSet::new(),
             source_name: String::new(),
+            current_path: None,
+            pending_op: None,
             outcome: None,
             nc: None,
         }
@@ -230,16 +287,40 @@ impl AppController {
         }
     }
 
-    /// Load geometry from DXF text, replacing any current drawing. Generates a
-    /// fresh editable document (an outside profile per boundary, an inside
-    /// profile per hole) from the seed defaults. Returns the number of regions.
+    /// Load geometry from DXF text, replacing any current drawing (used for the
+    /// bundled sample and tests). Returns the number of regions.
     pub fn open_dxf(&mut self, text: &str, name: impl Into<String>) -> Result<usize, ImportError> {
         let import = read_dxf_str(text, &ImportOptions::default())?;
-        self.regions = import.regions;
-        self.source_name = name.into();
+        self.install_import(import.regions, name.into());
+        Ok(self.regions.len())
+    }
+
+    /// Import a CAD file (`.dxf` ASCII/binary or `.dwg`) via acadrust, replacing
+    /// any current drawing and generating a fresh document. Returns the region
+    /// count. This does not set the project path — an imported drawing is saved as
+    /// a new `.ocam` project.
+    pub fn import_cad(&mut self, path: impl AsRef<Path>) -> Result<usize, ImportError> {
+        let path = path.as_ref();
+        let import = read_cad_file(path, &ImportOptions::default())?;
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("imported")
+            .to_string();
+        self.install_import(import.regions, name);
+        Ok(self.regions.len())
+    }
+
+    /// Install freshly imported regions: generate a document, select the first
+    /// operation, and reset derived state. Shared by every import path.
+    fn install_import(&mut self, regions: Vec<Polygon>, name: String) {
+        self.regions = regions;
+        self.source_name = name;
         let document = self.generate_document();
         self.document = History::new(document);
         self.excluded.clear();
+        self.pending_op = None;
+        self.current_path = None;
         self.selection = self
             .document
             .current()
@@ -249,7 +330,68 @@ impl AppController {
             .map(|op| Selection::Operation(op.id()))
             .unwrap_or(Selection::Setup);
         self.invalidate();
-        Ok(self.regions.len())
+    }
+
+    /// Reset to a fresh, empty "Untitled" project.
+    pub fn new_project(&mut self) {
+        self.regions.clear();
+        self.document = History::new(empty_document(&self.defaults));
+        self.excluded.clear();
+        self.source_name.clear();
+        self.current_path = None;
+        self.pending_op = None;
+        self.selection = Selection::Setup;
+        self.invalidate();
+    }
+
+    /// The `.ocam` file this project was last saved to / opened from, if any.
+    pub fn current_path(&self) -> Option<&Path> {
+        self.current_path.as_deref()
+    }
+
+    /// Save the current project (document + geometry + defaults) to `path` as JSON,
+    /// and remember it as the current path.
+    pub fn save_project(&mut self, path: impl AsRef<Path>) -> Result<(), ProjectError> {
+        let project = Project {
+            schema_version: cam_model::SCHEMA_VERSION,
+            document: self.document.current().clone(),
+            regions: self.regions.clone(),
+            defaults: self.defaults,
+            source_name: self.source_name.clone(),
+        };
+        let json = project
+            .to_json()
+            .map_err(|e| ProjectError::Json(e.to_string()))?;
+        let path = path.as_ref();
+        std::fs::write(path, json).map_err(|e| ProjectError::Io(e.to_string()))?;
+        self.current_path = Some(path.to_path_buf());
+        Ok(())
+    }
+
+    /// Open a `.ocam` project from `path`, replacing the current session.
+    pub fn open_project(&mut self, path: impl AsRef<Path>) -> Result<(), ProjectError> {
+        let path = path.as_ref();
+        let text = std::fs::read_to_string(path).map_err(|e| ProjectError::Io(e.to_string()))?;
+        let project = Project::from_json(&text).map_err(|e| ProjectError::Json(e.to_string()))?;
+        self.regions = project.regions;
+        self.defaults = project.defaults;
+        self.source_name = project.source_name;
+        self.document = History::new(project.document);
+        self.excluded.clear();
+        self.pending_op = None;
+        self.current_path = Some(path.to_path_buf());
+        self.selection = Selection::Setup;
+        self.reconcile_selection();
+        self.invalidate();
+        Ok(())
+    }
+
+    /// Export the current toolpath as G-code to `path`. Runs the same gating as
+    /// [`AppController::export_nc`] (a rapid through stock blocks the write).
+    pub fn export_nc_to(&mut self, path: impl AsRef<Path>) -> Result<(), ExportToError> {
+        let nc = self.export_nc().map_err(ExportToError::Export)?.to_string();
+        std::fs::write(path.as_ref(), nc).map_err(|e| ExportToError::Io(e.to_string()))?;
+        Ok(())
     }
 
     /// Edit the setup's heights as one undoable change.
@@ -377,24 +519,36 @@ impl AppController {
         self.invalidate();
     }
 
-    /// Create a new default operation of `kind` from the first imported region and
-    /// select it. A no-op if no geometry is loaded. The generated op is a sane
-    /// starting point the user then edits in the inspector:
+    /// Create a new default operation of `kind` from the **first** imported region
+    /// with the first tool, and select it. A convenience over the pick wizard,
+    /// kept for headless use/tests. A no-op if no geometry is loaded.
+    pub fn new_operation(&mut self, kind: OpKind) {
+        if self.regions.is_empty() {
+            return;
+        }
+        let tool = self.first_tool_number();
+        let op = self.build_op(kind, 0, tool);
+        if let Some(op) = op {
+            self.add_operation(op);
+        }
+    }
+
+    /// Build a default operation of `kind` on region `index` using tool number
+    /// `tool`. Returns `None` if the region index is out of range. The result is a
+    /// sane starting point the user edits in the inspector:
     /// - **Profile** — an outside profile of the region's outer boundary.
     /// - **Pocket** — clear the region's outer boundary, leaving its holes as islands.
     /// - **Drill** — one hole at each of the region's hole centroids (its outer
     ///   centroid if it has none).
     /// - **Face** — face the region's XY bounding rectangle.
-    pub fn new_operation(&mut self, kind: OpKind) {
-        let Some(region) = self.regions.first() else {
-            return;
-        };
+    fn build_op(&self, kind: OpKind, index: usize, tool: u32) -> Option<Operation> {
+        let region = self.regions.get(index)?;
         let p = self.defaults;
-        // id 0 here is a placeholder — add_operation renumbers with a fresh id.
+        // id 0 is a placeholder — add_operation renumbers with a fresh id.
         let op = match kind {
             OpKind::Profile => Operation::Profile(ProfileOp {
                 id: 0,
-                tool: 1,
+                tool,
                 chain: region.outer().clone(),
                 side: Side::Outside,
                 comp: Comp::Computed,
@@ -405,7 +559,7 @@ impl AppController {
             }),
             OpKind::Pocket => Operation::Pocket(PocketOp {
                 id: 0,
-                tool: 1,
+                tool,
                 boundary: region.outer().clone(),
                 islands: region.holes().to_vec(),
                 depth: p.depth,
@@ -422,7 +576,7 @@ impl AppController {
                 };
                 Operation::Drill(DrillOp {
                     id: 0,
-                    tool: 1,
+                    tool,
                     points,
                     depth: p.depth,
                     peck: None,
@@ -434,7 +588,7 @@ impl AppController {
                 let (min, max) = self.bounds_xy();
                 Operation::Face(FaceOp {
                     id: 0,
-                    tool: 1,
+                    tool,
                     boundary: rect_contour(min, max),
                     depth: p.depth,
                     stepdown: p.stepdown,
@@ -444,7 +598,89 @@ impl AppController {
                 })
             }
         };
-        self.add_operation(op);
+        Some(op)
+    }
+
+    /// The lowest tool number in the setup (the default for a new operation), or 1.
+    fn first_tool_number(&self) -> u32 {
+        self.document
+            .current()
+            .setup
+            .tools
+            .iter()
+            .map(|t| t.number)
+            .min()
+            .unwrap_or(1)
+    }
+
+    // --- Operation-creation wizard (pick a tool, then geometry) ----------------
+
+    /// The operation currently being created (kind + tool), if the wizard is active.
+    pub fn pending_op(&self) -> Option<PendingOp> {
+        self.pending_op
+    }
+
+    /// Begin creating an operation of `kind`: enter geometry-pick mode with the
+    /// currently-selected tool (or the first tool). A no-op with no effect if the
+    /// setup has no tools or no geometry is loaded — the caller should have gated it.
+    pub fn begin_operation(&mut self, kind: OpKind) {
+        if self.regions.is_empty() || self.document.current().setup.tools.is_empty() {
+            return;
+        }
+        let tool = match self.selection {
+            Selection::Tool(i) => self
+                .document
+                .current()
+                .setup
+                .tools
+                .get(i)
+                .map_or_else(|| self.first_tool_number(), |t| t.number),
+            _ => self.first_tool_number(),
+        };
+        self.pending_op = Some(PendingOp { kind, tool });
+    }
+
+    /// Change the tool of the pending operation. A no-op unless the wizard is active.
+    pub fn set_pending_tool(&mut self, number: u32) {
+        if let Some(pending) = self.pending_op.as_mut() {
+            pending.tool = number;
+        }
+    }
+
+    /// Cancel the pending operation without creating anything.
+    pub fn cancel_operation(&mut self) {
+        self.pending_op = None;
+    }
+
+    /// The index of the topmost region whose filled area contains `world` (last
+    /// drawn wins on overlap), or `None`.
+    pub fn region_at(&self, world: [f64; 2]) -> Option<usize> {
+        let p = cam_geo::Point::new(world[0], world[1]);
+        self.regions
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, region)| region.contains(p))
+            .map(|(i, _)| i)
+    }
+
+    /// Complete the pending operation on the region containing `world`: build it
+    /// with the pending kind + tool, add and select it, and leave pick mode.
+    /// Returns `true` if a region was hit and an operation created. A miss leaves
+    /// the wizard active so the user can click again.
+    pub fn pick_operation_geometry(&mut self, world: [f64; 2]) -> bool {
+        let Some(pending) = self.pending_op else {
+            return false;
+        };
+        let Some(index) = self.region_at(world) else {
+            return false;
+        };
+        if let Some(op) = self.build_op(pending.kind, index, pending.tool) {
+            self.add_operation(op);
+            self.pending_op = None;
+            return true;
+        }
+        false
     }
 
     /// Delete the selected operation, selecting a neighbour (or the setup). A
@@ -1122,5 +1358,115 @@ mod tests {
         app.delete_tool(0);
         assert!(app.document().setup.tools.is_empty());
         assert_eq!(app.selection(), Selection::Setup);
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "ocam-test-{}-{}-{name}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        p
+    }
+
+    #[test]
+    fn project_round_trips_through_disk() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        app.edit_tool(0, |t| t.length = 55.0);
+        let doc_before = app.document().clone();
+        let regions_before = app.regions().to_vec();
+
+        let path = temp_path("proj.ocam");
+        app.save_project(&path).unwrap();
+        assert_eq!(app.current_path(), Some(path.as_path()));
+
+        // Wipe, then reopen the saved file.
+        app.new_project();
+        assert!(app.regions().is_empty());
+        app.open_project(&path).unwrap();
+
+        assert_eq!(app.document(), &doc_before);
+        assert_eq!(app.regions(), regions_before.as_slice());
+        assert_eq!(app.current_path(), Some(path.as_path()));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn project_json_is_stable() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        let project = Project {
+            schema_version: cam_model::SCHEMA_VERSION,
+            document: app.document().clone(),
+            regions: app.regions().to_vec(),
+            defaults: *app.defaults(),
+            source_name: app.source_name().to_string(),
+        };
+        let json = project.to_json().unwrap();
+        assert_eq!(Project::from_json(&json).unwrap(), project);
+    }
+
+    #[test]
+    fn import_cad_reads_a_dxf_file_via_acadrust() {
+        let path = temp_path("part.dxf");
+        std::fs::write(&path, PART_DXF).unwrap();
+        let mut app = AppController::new(machine());
+        let n = app.import_cad(&path).unwrap();
+        assert!(n >= 1, "acadrust should read the rectangle+hole part");
+        assert_eq!(
+            app.source_name(),
+            path.file_name().unwrap().to_str().unwrap()
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn region_at_hits_inside_misses_hole_and_outside() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        // The part is a 10..70 × 10..50 rectangle with a ⌀10 hole at (40, 30).
+        assert_eq!(app.region_at([20.0, 20.0]), Some(0)); // inside the plate
+        assert_eq!(app.region_at([40.0, 30.0]), None); // in the hole
+        assert_eq!(app.region_at([100.0, 100.0]), None); // off the part
+    }
+
+    #[test]
+    fn wizard_creates_op_on_the_picked_region_with_the_chosen_tool() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        app.add_tool(); // a second tool, number 2
+        let before = op_ids(&app).len();
+
+        app.begin_operation(OpKind::Pocket);
+        assert!(app.pending_op().is_some());
+        app.set_pending_tool(2);
+
+        // A miss leaves the wizard active and creates nothing.
+        assert!(!app.pick_operation_geometry([100.0, 100.0]));
+        assert!(app.pending_op().is_some());
+        assert_eq!(op_ids(&app).len(), before);
+
+        // A hit on the plate creates the pocket on that region with tool 2.
+        assert!(app.pick_operation_geometry([20.0, 20.0]));
+        assert!(app.pending_op().is_none());
+        assert_eq!(op_ids(&app).len(), before + 1);
+        match app.selected_operation() {
+            Some(Operation::Pocket(o)) => assert_eq!(o.tool, 2),
+            other => panic!("expected pocket on tool 2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn begin_operation_is_a_no_op_without_tools() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        app.delete_tool(0); // no tools left
+        app.begin_operation(OpKind::Profile);
+        assert!(app.pending_op().is_none(), "no tool ⇒ no wizard");
     }
 }

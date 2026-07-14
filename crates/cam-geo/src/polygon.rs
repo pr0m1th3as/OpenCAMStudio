@@ -19,7 +19,7 @@ pub enum Containment {
 /// clockwise; [`Polygon::new`] / [`Polygon::with_holes`] normalise orientation
 /// so callers need not. Operations that produce polygons ([`crate::offset`],
 /// [`crate::union`], …) return them already normalised.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Polygon {
     outer: Contour,
     holes: Vec<Contour>,
