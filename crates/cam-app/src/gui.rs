@@ -21,7 +21,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
-use cam_model::{Envelope, Machine, Operation, Point3, ToolKind};
+use cam_model::{Envelope, Lead, Machine, Operation, Plunge, Point3, ToolKind};
 
 /// Ribbon palette and metrics, adopted from **OpenCADStudio**'s ribbon
 /// (`HakanSeven12/OpenCADStudio`, GPL-3.0) so users moving CAD → CAM meet a
@@ -246,6 +246,104 @@ impl RibbonTab {
     }
 }
 
+/// The kind of a [`Lead`], for the inspector picker (params come from fields).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeadKind {
+    None,
+    Linear,
+    Arc,
+}
+
+impl LeadKind {
+    const ALL: [LeadKind; 3] = [LeadKind::None, LeadKind::Linear, LeadKind::Arc];
+
+    fn of(lead: Lead) -> Self {
+        match lead {
+            Lead::None => LeadKind::None,
+            Lead::Linear { .. } => LeadKind::Linear,
+            Lead::Arc { .. } => LeadKind::Arc,
+        }
+    }
+
+    /// A `Lead` of this kind, carrying over the previous size where sensible.
+    fn to_lead(self, prev: Lead) -> Lead {
+        let size = match prev {
+            Lead::None => 3.0,
+            Lead::Linear { length } => length,
+            Lead::Arc { radius } => radius,
+        };
+        match self {
+            LeadKind::None => Lead::None,
+            LeadKind::Linear => Lead::Linear { length: size },
+            LeadKind::Arc => Lead::Arc { radius: size },
+        }
+    }
+}
+
+impl std::fmt::Display for LeadKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            LeadKind::None => "None",
+            LeadKind::Linear => "Linear",
+            LeadKind::Arc => "Arc",
+        })
+    }
+}
+
+/// The kind of a [`Plunge`], for the inspector picker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlungeKind {
+    Straight,
+    Ramp,
+    Helix,
+    ZigZag,
+}
+
+impl PlungeKind {
+    const ALL: [PlungeKind; 4] = [
+        PlungeKind::Straight,
+        PlungeKind::Ramp,
+        PlungeKind::Helix,
+        PlungeKind::ZigZag,
+    ];
+
+    fn of(plunge: Plunge) -> Self {
+        match plunge {
+            Plunge::Straight => PlungeKind::Straight,
+            Plunge::Ramp { .. } => PlungeKind::Ramp,
+            Plunge::Helix { .. } => PlungeKind::Helix,
+            Plunge::ZigZag { .. } => PlungeKind::ZigZag,
+        }
+    }
+
+    /// A `Plunge` of this kind with sensible default parameters.
+    fn to_plunge(self) -> Plunge {
+        match self {
+            PlungeKind::Straight => Plunge::Straight,
+            PlungeKind::Ramp => Plunge::Ramp { angle_deg: 5.0 },
+            PlungeKind::Helix => Plunge::Helix {
+                radius: 2.0,
+                pitch: 1.0,
+            },
+            PlungeKind::ZigZag => Plunge::ZigZag {
+                length: 5.0,
+                angle_deg: 5.0,
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for PlungeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            PlungeKind::Straight => "Straight",
+            PlungeKind::Ramp => "Ramp",
+            PlungeKind::Helix => "Helix",
+            PlungeKind::ZigZag => "Zig-zag",
+        })
+    }
+}
+
 /// An editable inspector field, keyed independently of which node owns it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Field {
@@ -260,6 +358,14 @@ enum Field {
     Stepover,
     Feed,
     PlungeFeed,
+    /// Lead-in size (length for Linear, radius for Arc).
+    LeadInSize,
+    /// Lead-out size.
+    LeadOutSize,
+    /// Plunge parameter A: ramp/zig-zag angle, or helix radius.
+    PlungeA,
+    /// Plunge parameter B: zig-zag length, or helix pitch.
+    PlungeB,
 }
 
 impl Field {
@@ -276,7 +382,56 @@ impl Field {
             Field::Stepover => "Stepover (mm)",
             Field::Feed => "Feed (mm/min)",
             Field::PlungeFeed => "Plunge feed (mm/min)",
+            Field::LeadInSize => "Lead-in size (mm)",
+            Field::LeadOutSize => "Lead-out size (mm)",
+            Field::PlungeA => "Plunge angle/radius",
+            Field::PlungeB => "Plunge length/pitch",
         }
+    }
+}
+
+/// The size (length/radius) carried by a lead, or 0 for `None`.
+fn lead_size(lead: Lead) -> f64 {
+    match lead {
+        Lead::None => 0.0,
+        Lead::Linear { length } => length,
+        Lead::Arc { radius } => radius,
+    }
+}
+
+/// Plunge parameters as `(a, b)` for the inspector: `(angle, —)` for ramp,
+/// `(radius, pitch)` for helix, `(angle, length)` for zig-zag, `(0, 0)` straight.
+fn plunge_params(plunge: Plunge) -> (f64, f64) {
+    match plunge {
+        Plunge::Straight => (0.0, 0.0),
+        Plunge::Ramp { angle_deg } => (angle_deg, 0.0),
+        Plunge::Helix { radius, pitch } => (radius, pitch),
+        Plunge::ZigZag { length, angle_deg } => (angle_deg, length),
+    }
+}
+
+/// Set a lead's size (length/radius), keeping its kind.
+fn set_lead_size(lead: Lead, size: f64) -> Lead {
+    match lead {
+        Lead::None => Lead::None,
+        Lead::Linear { .. } => Lead::Linear { length: size },
+        Lead::Arc { .. } => Lead::Arc { radius: size },
+    }
+}
+
+/// Set a plunge's parameters from the inspector `(a, b)`, keeping its kind.
+fn set_plunge_params(plunge: Plunge, a: f64, b: f64) -> Plunge {
+    match plunge {
+        Plunge::Straight => Plunge::Straight,
+        Plunge::Ramp { .. } => Plunge::Ramp { angle_deg: a },
+        Plunge::Helix { .. } => Plunge::Helix {
+            radius: a,
+            pitch: b,
+        },
+        Plunge::ZigZag { .. } => Plunge::ZigZag {
+            angle_deg: a,
+            length: b,
+        },
     }
 }
 
@@ -411,6 +566,11 @@ enum Message {
     WindowResized(iced::Size),
     /// Change the selected tool's geometry kind (committed immediately).
     ToolKindChanged(ToolKind),
+    /// Change the selected profile's lead-in / lead-out / plunge kind (committed
+    /// immediately with default parameters; sizes are then edited as fields).
+    LeadInKindChanged(LeadKind),
+    LeadOutKindChanged(LeadKind),
+    PlungeKindChanged(PlungeKind),
     /// Create a new default tool and select it.
     NewTool,
     /// Delete the selected tool.
@@ -710,6 +870,33 @@ impl App {
                     self.rerun();
                 }
             }
+            Message::LeadInKindChanged(kind) => {
+                self.controller.edit_selected_operation(|op| {
+                    if let Operation::Profile(p) = op {
+                        p.lead_in = kind.to_lead(p.lead_in);
+                    }
+                });
+                self.refresh_fields();
+                self.rerun();
+            }
+            Message::LeadOutKindChanged(kind) => {
+                self.controller.edit_selected_operation(|op| {
+                    if let Operation::Profile(p) = op {
+                        p.lead_out = kind.to_lead(p.lead_out);
+                    }
+                });
+                self.refresh_fields();
+                self.rerun();
+            }
+            Message::PlungeKindChanged(kind) => {
+                self.controller.edit_selected_operation(|op| {
+                    if let Operation::Profile(p) = op {
+                        p.plunge = kind.to_plunge();
+                    }
+                });
+                self.refresh_fields();
+                self.rerun();
+            }
             Message::NewTool => {
                 self.controller.add_tool();
                 self.refresh_fields();
@@ -907,13 +1094,29 @@ impl App {
             Selection::Tool(_) => vec![Field::ToolDiameter, Field::ToolLength, Field::Flutes],
             Selection::Stock => Vec::new(),
             Selection::Operation(id) => match self.controller.operation(id) {
-                Some(Operation::Profile(_)) => {
-                    vec![
+                Some(Operation::Profile(p)) => {
+                    let mut fields = vec![
                         Field::Depth,
                         Field::Stepdown,
                         Field::Feed,
                         Field::PlungeFeed,
-                    ]
+                    ];
+                    // Lead/plunge sizes appear only when the kind uses them.
+                    if p.lead_in != Lead::None {
+                        fields.push(Field::LeadInSize);
+                    }
+                    if p.lead_out != Lead::None {
+                        fields.push(Field::LeadOutSize);
+                    }
+                    match p.plunge {
+                        Plunge::Straight => {}
+                        Plunge::Ramp { .. } => fields.push(Field::PlungeA),
+                        Plunge::Helix { .. } | Plunge::ZigZag { .. } => {
+                            fields.push(Field::PlungeA);
+                            fields.push(Field::PlungeB);
+                        }
+                    }
+                    fields
                 }
                 Some(Operation::Pocket(_)) => vec![
                     Field::Depth,
@@ -1514,6 +1717,30 @@ impl App {
                 );
             }
         }
+        // Profile lead-in / lead-out / plunge strategy pickers (their numeric
+        // parameters appear as fields above when the kind uses them).
+        if let Selection::Operation(id) = self.controller.selection() {
+            if let Some(Operation::Profile(p)) = self.controller.operation(id) {
+                list = list.push(profile_picker(
+                    "Lead-in",
+                    LeadKind::of(p.lead_in),
+                    &LeadKind::ALL[..],
+                    Message::LeadInKindChanged,
+                ));
+                list = list.push(profile_picker(
+                    "Lead-out",
+                    LeadKind::of(p.lead_out),
+                    &LeadKind::ALL[..],
+                    Message::LeadOutKindChanged,
+                ));
+                list = list.push(profile_picker(
+                    "Plunge",
+                    PlungeKind::of(p.plunge),
+                    &PlungeKind::ALL[..],
+                    Message::PlungeKindChanged,
+                ));
+            }
+        }
 
         list = list.push(button("Apply").on_press(Message::Apply));
 
@@ -1930,6 +2157,10 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Profile(o), Field::Stepdown) => Some(o.stepdown),
         (Operation::Profile(o), Field::Feed) => Some(o.feed),
         (Operation::Profile(o), Field::PlungeFeed) => Some(o.plunge_feed),
+        (Operation::Profile(o), Field::LeadInSize) => Some(lead_size(o.lead_in)),
+        (Operation::Profile(o), Field::LeadOutSize) => Some(lead_size(o.lead_out)),
+        (Operation::Profile(o), Field::PlungeA) => Some(plunge_params(o.plunge).0),
+        (Operation::Profile(o), Field::PlungeB) => Some(plunge_params(o.plunge).1),
         (Operation::Pocket(o), Field::Depth) => Some(o.depth),
         (Operation::Pocket(o), Field::Stepdown) => Some(o.stepdown),
         (Operation::Pocket(o), Field::Stepover) => Some(o.stepover),
@@ -1961,6 +2192,16 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
             if let Some(v) = get(Field::PlungeFeed) {
                 o.plunge_feed = v;
             }
+            if let Some(v) = get(Field::LeadInSize) {
+                o.lead_in = set_lead_size(o.lead_in, v);
+            }
+            if let Some(v) = get(Field::LeadOutSize) {
+                o.lead_out = set_lead_size(o.lead_out, v);
+            }
+            let (a, b) = plunge_params(o.plunge);
+            let a = get(Field::PlungeA).unwrap_or(a);
+            let b = get(Field::PlungeB).unwrap_or(b);
+            o.plunge = set_plunge_params(o.plunge, a, b);
         }
         Operation::Pocket(o) => {
             if let Some(v) = get(Field::Depth) {
@@ -2004,6 +2245,27 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
 /// Format a number for display (Rust's shortest round-trippable form).
 fn fmt_num(v: f64) -> String {
     format!("{v}")
+}
+
+/// A labelled strategy picker row (lead / plunge kind) for the profile inspector.
+fn profile_picker<T>(
+    label: &str,
+    selected: T,
+    options: &'static [T],
+    on_select: impl Fn(T) -> Message + 'static,
+) -> Element<'static, Message>
+where
+    T: ToString + PartialEq + Clone + 'static,
+{
+    row![
+        text(label.to_string()).width(Length::Fixed(150.0)).size(13),
+        pick_list(options, Some(selected), on_select)
+            .text_size(13)
+            .width(Length::Fixed(140.0)),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
+    .into()
 }
 
 // ---------------------------------------------------------------------------

@@ -5,7 +5,8 @@
 use cam_cldata::SpindleDir;
 use cam_geo::{Contour, Point};
 use cam_model::{
-    Comp, Document, Heights, Operation, PocketOp, ProfileOp, Setup, Side, Stock, Tool, ToolKind,
+    Comp, Document, Heights, Lead, Operation, Plunge, PocketOp, ProfileOp, Setup, Side, Stock,
+    Tool, ToolKind,
 };
 use cam_sim::{check_gouge, simulate, Heightfield, SimOptions};
 use cam_toolpath::{build_job, CancelToken};
@@ -73,6 +74,7 @@ fn a_pocket_clears_its_floor_without_collisions() {
         stepover: 3.0,
         feed: 300.0,
         plunge_feed: 100.0,
+        plunge: Plunge::Straight,
     };
     let sim = run(&setup(vec![Operation::Pocket(op)]));
 
@@ -131,6 +133,7 @@ fn pocket_op() -> PocketOp {
         stepover: 3.0,
         feed: 300.0,
         plunge_feed: 100.0,
+        plunge: Plunge::Straight,
     }
 }
 
@@ -190,6 +193,9 @@ fn a_bad_setup_that_rapids_low_is_caught() {
             feed: 300.0,
             plunge_feed: 100.0,
             start: None,
+            lead_in: Lead::None,
+            lead_out: Lead::None,
+            plunge: Plunge::Straight,
         })],
     });
     let (program, _) = build_job(&doc, 1000.0, SpindleDir::Cw, &CancelToken::new());

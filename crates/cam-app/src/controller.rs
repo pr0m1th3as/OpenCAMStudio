@@ -15,8 +15,8 @@ use cam_import::{read_cad_file, read_dxf_str, ImportError, ImportOptions};
 
 use crate::project::Project;
 use cam_model::{
-    Comp, Document, DrillOp, FaceOp, Heights, History, Machine, Operation, PocketOp, ProfileOp,
-    Setup, Side, Stock, Tool, ToolKind,
+    Comp, Document, DrillOp, FaceOp, Heights, History, Lead, Machine, Operation, Plunge, PocketOp,
+    ProfileOp, Setup, Side, Stock, Tool, ToolKind,
 };
 use cam_post::{GrblPost, Post, PostError, PostOptions};
 use cam_render::{mesh_vertices, MeshVertex, Scene, PART};
@@ -563,6 +563,9 @@ impl AppController {
                 feed: p.feed,
                 plunge_feed: p.plunge_feed,
                 start,
+                lead_in: Lead::None,
+                lead_out: Lead::None,
+                plunge: Plunge::Straight,
             }),
             OpKind::Pocket => Operation::Pocket(PocketOp {
                 id: 0,
@@ -574,6 +577,7 @@ impl AppController {
                 stepover: p.stepover,
                 feed: p.feed,
                 plunge_feed: p.plunge_feed,
+                plunge: Plunge::Straight,
             }),
             OpKind::Drill => {
                 let points = if region.holes().is_empty() {
@@ -931,6 +935,9 @@ impl AppController {
                 feed: p.feed,
                 plunge_feed: p.plunge_feed,
                 start: None,
+                lead_in: Lead::None,
+                lead_out: Lead::None,
+                plunge: Plunge::Straight,
             }));
             id += 1;
         };

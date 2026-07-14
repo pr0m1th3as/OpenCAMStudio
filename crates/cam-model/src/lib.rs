@@ -18,8 +18,8 @@ mod history;
 
 pub use cam_cldata::Point3;
 pub use document::{
-    Comp, Document, DrillOp, FaceOp, Heights, Operation, PocketOp, ProfileOp, Setup, Side, Stock,
-    SCHEMA_VERSION,
+    Comp, Document, DrillOp, FaceOp, Heights, Lead, Operation, Plunge, PocketOp, ProfileOp, Setup,
+    Side, Stock, SCHEMA_VERSION,
 };
 pub use history::History;
 

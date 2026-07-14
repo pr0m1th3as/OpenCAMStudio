@@ -73,6 +73,31 @@ pub enum Comp {
     ControlRight,
 }
 
+/// How the tool eases onto (lead-in) or off (lead-out) a profiled contour at the
+/// start point, to avoid a witness mark from a direct plunge.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum Lead {
+    /// No lead — plunge directly onto the contour (the default).
+    None,
+    /// A straight lead of `length` mm, tangent (collinear) to the contour.
+    Linear { length: f64 },
+    /// A tangent arc of `radius` mm onto/off the contour.
+    Arc { radius: f64 },
+}
+
+/// How the tool enters the material in Z at the start of each pass.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum Plunge {
+    /// A straight vertical plunge (the default; fine for drills/centre-cutting mills).
+    Straight,
+    /// Descend at `angle_deg` from horizontal along the toolpath (linear ramp).
+    Ramp { angle_deg: f64 },
+    /// Spiral down on a helix of `radius` mm, `pitch` mm of descent per turn.
+    Helix { radius: f64, pitch: f64 },
+    /// Back-and-forth ramp of `length` mm at `angle_deg`, for narrow slots.
+    ZigZag { length: f64, angle_deg: f64 },
+}
+
 /// A 2.5-D profiling operation: follow a closed chain at an offset, in stepdown
 /// passes, down to a depth.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -99,6 +124,12 @@ pub struct ProfileOp {
     /// the offset vertex nearest this point. `None` starts at the chain's first
     /// vertex (the default).
     pub start: Option<[f64; 2]>,
+    /// Lead-in onto the contour at the start point.
+    pub lead_in: Lead,
+    /// Lead-out off the contour after the cut.
+    pub lead_out: Lead,
+    /// How the tool enters the material in Z at each pass.
+    pub plunge: Plunge,
 }
 
 /// A drilling operation: a set of holes taken to a depth, optionally pecked and
@@ -145,6 +176,8 @@ pub struct PocketOp {
     pub feed: f64,
     /// Plunge feed, mm/min.
     pub plunge_feed: f64,
+    /// How the tool enters the material in Z at each pass.
+    pub plunge: Plunge,
 }
 
 /// A facing operation: clear the top of the stock over a boundary with parallel

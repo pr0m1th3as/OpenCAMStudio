@@ -170,7 +170,7 @@ mod tests {
     use super::*;
     use cam_cldata::MoveKind;
     use cam_geo::Contour;
-    use cam_model::{Tool, ToolKind};
+    use cam_model::{Plunge, Tool, ToolKind};
 
     fn square(side: f64) -> Contour {
         Contour::new(vec![
@@ -215,6 +215,7 @@ mod tests {
             stepover: 4.0,
             feed: 300.0,
             plunge_feed: 100.0,
+            plunge: Plunge::Straight,
         };
         let ts = tools(8.0);
         let env = JobEnv {
@@ -238,6 +239,7 @@ mod tests {
             stepover: 4.0,
             feed: 300.0,
             plunge_feed: 100.0,
+            plunge: Plunge::Straight,
         };
         let ts = tools(12.0); // radius 6 > half of 10 ⇒ cannot enter
         let env = JobEnv {

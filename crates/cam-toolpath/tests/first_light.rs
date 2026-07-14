@@ -8,7 +8,8 @@
 use cam_cldata::{MoveKind, Program, SpindleDir, Step};
 use cam_geo::{Contour, Point};
 use cam_model::{
-    Comp, Document, Heights, Machine, Operation, ProfileOp, Setup, Side, Stock, Tool, ToolKind,
+    Comp, Document, Heights, Lead, Machine, Operation, Plunge, ProfileOp, Setup, Side, Stock, Tool,
+    ToolKind,
 };
 use cam_post::{GrblPost, Post, PostOptions};
 use cam_toolpath::{build_job, CancelToken, JobEnv, ProfileStrategy, Strategy};
@@ -58,6 +59,9 @@ fn document() -> Document {
         feed: 300.0,
         plunge_feed: 100.0,
         start: None,
+        lead_in: Lead::None,
+        lead_out: Lead::None,
+        plunge: Plunge::Straight,
     };
     let hole = ProfileOp {
         id: 1,
@@ -70,6 +74,9 @@ fn document() -> Document {
         feed: 300.0,
         plunge_feed: 100.0,
         start: None,
+        lead_in: Lead::None,
+        lead_out: Lead::None,
+        plunge: Plunge::Straight,
     };
     Document::new(Setup {
         name: "first light".into(),
@@ -166,6 +173,9 @@ fn tool_too_large_for_hole_reports_error() {
         feed: 300.0,
         plunge_feed: 100.0,
         start: None,
+        lead_in: Lead::None,
+        lead_out: Lead::None,
+        plunge: Plunge::Straight,
     };
     let tools = [tool];
     let env = JobEnv {
@@ -197,6 +207,9 @@ fn cancellation_stops_before_emitting() {
         feed: 300.0,
         plunge_feed: 100.0,
         start: None,
+        lead_in: Lead::None,
+        lead_out: Lead::None,
+        plunge: Plunge::Straight,
     };
     let tools = [tool];
     let env = JobEnv {
@@ -347,4 +360,68 @@ fn ascii_backplot(prog: &Program, w: usize, h: usize) -> String {
         .map(|row| String::from_utf8(row).unwrap())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// A profile with an arc lead-in/out and a helix plunge posts to valid grbl G-code
+/// with helical `G2/G3` moves (a Z word on an arc) — proven against the post.
+#[test]
+fn arc_lead_and_helix_plunge_post_to_helical_gcode() {
+    let op = ProfileOp {
+        id: 0,
+        tool: 1,
+        // Sited well inside the envelope so the outward leads keep clear of x=0/y=0.
+        chain: rect(40.0, 40.0, 100.0, 80.0),
+        side: Side::Outside,
+        comp: Comp::Computed,
+        depth: -4.0,
+        stepdown: 2.0,
+        feed: 300.0,
+        plunge_feed: 100.0,
+        start: None,
+        lead_in: Lead::Arc { radius: 3.0 },
+        lead_out: Lead::Arc { radius: 3.0 },
+        plunge: Plunge::Helix {
+            radius: 2.0,
+            pitch: 1.0,
+        },
+    };
+    let tool = Tool {
+        number: 1,
+        diameter: 6.0,
+        length: 30.0,
+        flutes: 2,
+        kind: ToolKind::EndMill,
+    };
+    let doc = Document::new(Setup {
+        name: "lead_helix".into(),
+        heights: Heights::new(5.0, 2.0, 0.0),
+        stock: Stock::Box {
+            min: [0.0, 0.0, -10.0],
+            max: [80.0, 60.0, 0.0],
+        },
+        tools: vec![tool],
+        operations: vec![Operation::Profile(op)],
+    });
+
+    let (program, diags) = build_job(&doc, 1000.0, SpindleDir::Cw, &CancelToken::new());
+    assert!(
+        !diags
+            .iter()
+            .any(|d| d.severity == cam_toolpath::Severity::Error),
+        "no error diagnostics: {diags:?}"
+    );
+    // The program carries lead-in and helical arc moves.
+    assert!(
+        program.steps.iter().any(|s| matches!(s, Step::Arc { .. })),
+        "expected arc moves (leads + helix)"
+    );
+
+    let nc = GrblPost
+        .post(&program, &machine(), &PostOptions::default())
+        .expect("post ok");
+    // A helical move is a G2/G3 line that also carries a Z word.
+    let helical = nc
+        .lines()
+        .any(|l| (l.contains("G2") || l.contains("G3")) && l.contains('Z'));
+    assert!(helical, "expected a helical G2/G3 with a Z word:\n{nc}");
 }

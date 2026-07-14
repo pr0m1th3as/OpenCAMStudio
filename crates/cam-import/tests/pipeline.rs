@@ -4,7 +4,8 @@
 use cam_cldata::SpindleDir;
 use cam_import::{read_dxf_file, ImportOptions};
 use cam_model::{
-    Comp, Document, Heights, Machine, Operation, ProfileOp, Setup, Side, Stock, Tool, ToolKind,
+    Comp, Document, Heights, Lead, Machine, Operation, Plunge, ProfileOp, Setup, Side, Stock, Tool,
+    ToolKind,
 };
 use cam_post::{GrblPost, Post, PostOptions};
 use cam_toolpath::{build_job, CancelToken};
@@ -40,6 +41,9 @@ fn profile_op(id: u32, chain: cam_geo::Contour, side: Side) -> Operation {
         feed: 300.0,
         plunge_feed: 100.0,
         start: None,
+        lead_in: Lead::None,
+        lead_out: Lead::None,
+        plunge: Plunge::Straight,
     })
 }
 
