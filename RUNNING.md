@@ -51,8 +51,17 @@ LIBGL_ALWAYS_SOFTWARE=1 WGPU_BACKEND=gl cargo run -p cam-app --features gui
 
 ### Using the app
 
-The window has a **toolbar** across the top and four **resizable, dockable
-panes** below (drag a pane's title bar to rearrange; drag a border to resize):
+The window has a **menu bar** across the top and four docked, resizable panes:
+**Project**, **Viewport**, **Inspector**, and an **Output** console. Drag a
+border to resize, or a pane's title bar to rearrange.
+
+The menu bar holds **File** (Open Sample · Export .nc), **Edit** (Undo · Redo ·
+Run), **View** (Show stock · Reset View · Show Cube), and **Windows** (a checkbox
+per pane to show/hide it; hiding one keeps the others' sizes, re-showing docks it
+back on its edge). Click a menu to open it; click anywhere off it to close. Each
+pane also has an individual minimum size, so dragging a border will not crush a
+pane narrower than its contents need. Re-showing the **Viewport** reclaims the
+room, squeezing the other open panes to their minimums so the view gets the rest.
 
 - **Project** (left) — the document tree: Setup, Stock, Tools, and Operations.
   Click a node to select it; the selected node is marked with `▸`.
@@ -71,15 +80,19 @@ panes** below (drag a pane's title bar to rearrange; drag a border to resize):
 
 Workflow:
 
-1. **Open sample** — loads a built-in rectangle-with-a-hole (no file dialog yet;
-   file loading is the next increment). The tree fills with two profile
-   operations and the viewport frames the geometry.
+1. **File → Open Sample** — loads a built-in rectangle-with-a-hole (no file
+   dialog yet; file loading is the next increment). The tree fills with two
+   profile operations and the viewport frames the geometry.
 2. Select a node in **Project**, then edit its fields in **Inspector**:
    - a **Setup** exposes Clearance / Retract / Top of stock;
    - a **Tool** exposes its diameter;
    - an **Operation** exposes Depth / Stepdown / (Stepover) / Feed / Plunge feed.
    Press **Enter** or **Apply** to commit — each Apply is one undo step and
-   recomputes the toolpath.
+   recomputes the toolpath. Each operation row carries its own controls: a
+   **checkbox** (untick to exclude that op from the toolpath and simulation — it
+   stays in the tree, marked *(excluded)*) and inline **↑ / ↓** reorder arrows.
+   The buttons under the tree **New** an operation from the loaded geometry, or
+   (with one selected) **Duplicate** / **Delete** it.
 3. **Run** — recomputes for the current document. The backplot is colored by
    move kind: green = cutting, yellow = rapid/link, red = plunge; the part
    outline is light grey. **Output** shows toolpath diagnostics (e.g. a tool too
@@ -123,6 +136,9 @@ things worth eyeballing:
   to the top view; **Cube: off** hides the cube (and clicks no longer pick),
   **Cube: on** restores it.
 - Dragging a pane's title bar re-docks it; dragging a border resizes.
+- The **Windows ▾** menu toggles each pane's visibility. Hide the Inspector or
+  Output to give the viewport more room; re-show it and it docks back on its
+  edge, leaving the other panes' sizes intact.
 
 ## Notes
 

@@ -6,6 +6,9 @@
 //! and export G-code. The iced shell is a thin view over this — so the app's
 //! logic is unit-tested exactly like the rest of the pipeline.
 
+use std::borrow::Cow;
+use std::collections::BTreeSet;
+
 use cam_geo::Polygon;
 use cam_import::{read_dxf_str, ImportError, ImportOptions};
 use cam_model::{
@@ -120,6 +123,8 @@ pub struct AppController {
     document: History<Document>,
     defaults: JobParams,
     selection: Selection,
+    /// Operation ids excluded from toolpath generation (kept in the tree).
+    excluded: BTreeSet<u32>,
     source_name: String,
     outcome: Option<RunOutcome>,
     nc: Option<String>,
@@ -136,6 +141,7 @@ impl AppController {
             document: History::new(empty_document(&defaults)),
             defaults,
             selection: Selection::default(),
+            excluded: BTreeSet::new(),
             source_name: String::new(),
             outcome: None,
             nc: None,
@@ -220,6 +226,7 @@ impl AppController {
         self.source_name = name.into();
         let document = self.generate_document();
         self.document = History::new(document);
+        self.excluded.clear();
         self.selection = self
             .document
             .current()
@@ -266,6 +273,139 @@ impl AppController {
         }
     }
 
+    /// The next free operation id (max existing + 1).
+    fn next_op_id(&self) -> u32 {
+        self.document
+            .current()
+            .setup
+            .operations
+            .iter()
+            .map(|o| o.id())
+            .max()
+            .map_or(0, |m| m + 1)
+    }
+
+    /// Append `op` (renumbered with a fresh id) to the setup and select it, as one
+    /// undoable change.
+    pub fn add_operation(&mut self, mut op: Operation) {
+        let id = self.next_op_id();
+        set_op_id(&mut op, id);
+        self.document.edit(move |doc| doc.setup.operations.push(op));
+        self.selection = Selection::Operation(id);
+        self.invalidate();
+    }
+
+    /// Duplicate the selected operation, inserting the copy right after it and
+    /// selecting it. A no-op unless an operation is selected.
+    pub fn duplicate_selected_operation(&mut self) {
+        let Selection::Operation(sel) = self.selection else {
+            return;
+        };
+        let Some(mut copy) = self.operation(sel).cloned() else {
+            return;
+        };
+        let new_id = self.next_op_id();
+        set_op_id(&mut copy, new_id);
+        self.document.edit(move |doc| {
+            let at = doc
+                .setup
+                .operations
+                .iter()
+                .position(|o| o.id() == sel)
+                .map_or(doc.setup.operations.len(), |p| p + 1);
+            doc.setup.operations.insert(at, copy);
+        });
+        self.selection = Selection::Operation(new_id);
+        self.invalidate();
+    }
+
+    /// Create a new default operation (an outside profile on the first imported
+    /// region) and select it. A no-op if no geometry is loaded. Operation-kind
+    /// choice (pocket/drill/face) is a later increment.
+    pub fn new_operation(&mut self) {
+        let chain = match self.regions.first() {
+            Some(region) => region.outer().clone(),
+            None => return,
+        };
+        let p = self.defaults;
+        self.add_operation(Operation::Profile(ProfileOp {
+            id: 0, // renumbered by add_operation
+            tool: 1,
+            chain,
+            side: Side::Outside,
+            comp: Comp::Computed,
+            depth: p.depth,
+            stepdown: p.stepdown,
+            feed: p.feed,
+            plunge_feed: p.plunge_feed,
+        }));
+    }
+
+    /// Delete the selected operation, selecting a neighbour (or the setup). A
+    /// no-op unless an operation is selected.
+    pub fn delete_selected_operation(&mut self) {
+        let Selection::Operation(id) = self.selection else {
+            return;
+        };
+        self.document
+            .edit(|doc| doc.setup.operations.retain(|o| o.id() != id));
+        self.excluded.remove(&id);
+        self.selection = self
+            .document
+            .current()
+            .setup
+            .operations
+            .first()
+            .map_or(Selection::Setup, |o| Selection::Operation(o.id()));
+        self.invalidate();
+    }
+
+    /// Whether operation `id` is excluded from toolpath generation.
+    pub fn is_operation_excluded(&self, id: u32) -> bool {
+        self.excluded.contains(&id)
+    }
+
+    /// Include or exclude operation `id` from toolpath generation (it stays in
+    /// the tree either way).
+    pub fn set_operation_excluded(&mut self, id: u32, excluded: bool) {
+        let changed = if excluded {
+            self.excluded.insert(id)
+        } else {
+            self.excluded.remove(&id)
+        };
+        if changed {
+            self.invalidate();
+        }
+    }
+
+    /// Move operation `id` one step earlier (`up`) or later in execution order.
+    /// A no-op if it can't move that way.
+    pub fn move_operation(&mut self, id: u32, up: bool) {
+        self.document.edit(|doc| {
+            let ops = &mut doc.setup.operations;
+            if let Some(i) = ops.iter().position(|o| o.id() == id) {
+                let j = if up {
+                    i.checked_sub(1)
+                } else if i + 1 < ops.len() {
+                    Some(i + 1)
+                } else {
+                    None
+                };
+                if let Some(j) = j {
+                    ops.swap(i, j);
+                }
+            }
+        });
+        self.invalidate();
+    }
+
+    /// Move the selected operation one step in execution order.
+    pub fn move_selected_operation(&mut self, up: bool) {
+        if let Selection::Operation(id) = self.selection {
+            self.move_operation(id, up);
+        }
+    }
+
     /// Undo the last document edit.
     pub fn undo(&mut self) -> bool {
         let changed = self.document.undo();
@@ -298,9 +438,20 @@ impl AppController {
     /// diagnostics, viewport scene, and simulated stock. Returns a reference to
     /// the outcome. `cancel` allows a long run to be aborted.
     pub fn run(&mut self, cancel: &CancelToken) -> &RunOutcome {
-        let document = self.document.current();
+        // Excluded operations are dropped from the job (kept in the tree, just
+        // not machined) by running a filtered copy of the document.
+        let base = self.document.current();
+        let document = if self.excluded.is_empty() {
+            Cow::Borrowed(base)
+        } else {
+            let mut d = base.clone();
+            d.setup
+                .operations
+                .retain(|o| !self.excluded.contains(&o.id()));
+            Cow::Owned(d)
+        };
         let (program, diagnostics) =
-            build_job(document, self.defaults.spindle_rpm, SpindleDir::Cw, cancel);
+            build_job(&document, self.defaults.spindle_rpm, SpindleDir::Cw, cancel);
 
         let mut scene = Scene::from_program(&program);
         for region in &self.regions {
@@ -466,6 +617,16 @@ impl AppController {
     }
 }
 
+/// Set an operation's id, whatever its kind.
+fn set_op_id(op: &mut Operation, id: u32) {
+    match op {
+        Operation::Profile(o) => o.id = id,
+        Operation::Drill(o) => o.id = id,
+        Operation::Pocket(o) => o.id = id,
+        Operation::Face(o) => o.id = id,
+    }
+}
+
 /// An empty starting document: a zero-size box stock, one default end mill, no
 /// operations.
 fn empty_document(p: &JobParams) -> Document {
@@ -596,6 +757,89 @@ mod tests {
 
         assert!(app.undo());
         assert_eq!(depth_of(app.operation(0).unwrap()), -4.0, "undo restores");
+    }
+
+    fn op_ids(app: &AppController) -> Vec<u32> {
+        app.document()
+            .setup
+            .operations
+            .iter()
+            .map(|o| o.id())
+            .collect()
+    }
+
+    #[test]
+    fn duplicate_delete_and_reorder_operations() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        assert_eq!(op_ids(&app), vec![0, 1]);
+
+        // Duplicate op 0: the copy gets a fresh id, is inserted right after it,
+        // and becomes the selection.
+        app.select(Selection::Operation(0));
+        app.duplicate_selected_operation();
+        assert_eq!(op_ids(&app), vec![0, 2, 1]);
+        assert_eq!(app.selection(), Selection::Operation(2));
+
+        // Move the copy down past op 1, then back up.
+        app.move_selected_operation(false);
+        assert_eq!(op_ids(&app), vec![0, 1, 2]);
+        app.move_selected_operation(true);
+        assert_eq!(op_ids(&app), vec![0, 2, 1]);
+        assert_eq!(
+            app.selection(),
+            Selection::Operation(2),
+            "selection follows"
+        );
+
+        // Delete the copy; selection falls back to the first op.
+        app.delete_selected_operation();
+        assert_eq!(op_ids(&app), vec![0, 1]);
+        assert_eq!(app.selection(), Selection::Operation(0));
+
+        // All of it is undoable, one step at a time.
+        assert!(app.undo()); // undo delete
+        assert_eq!(op_ids(&app), vec![0, 2, 1]);
+    }
+
+    #[test]
+    fn new_operation_adds_a_selected_profile() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        assert_eq!(op_ids(&app), vec![0, 1]);
+        app.new_operation();
+        assert_eq!(op_ids(&app), vec![0, 1, 2]);
+        assert_eq!(app.selection(), Selection::Operation(2));
+        assert!(matches!(app.operation(2), Some(Operation::Profile(_))));
+    }
+
+    #[test]
+    fn excluding_an_operation_drops_it_from_the_run() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        let full = app.run(&CancelToken::new()).program.steps().len();
+
+        app.set_operation_excluded(0, true);
+        assert!(app.is_operation_excluded(0));
+        let reduced = app.run(&CancelToken::new()).program.steps().len();
+        assert!(reduced < full, "excluded op should shorten the program");
+
+        // The op is still in the tree, just not machined.
+        assert_eq!(op_ids(&app), vec![0, 1]);
+        // Re-including restores the full program.
+        app.set_operation_excluded(0, false);
+        assert_eq!(app.run(&CancelToken::new()).program.steps().len(), full);
+    }
+
+    #[test]
+    fn structural_edits_no_op_without_an_operation_selected() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        app.select(Selection::Setup);
+        app.duplicate_selected_operation();
+        app.delete_selected_operation();
+        app.move_selected_operation(true);
+        assert_eq!(op_ids(&app), vec![0, 1], "no structural change");
     }
 
     #[test]
