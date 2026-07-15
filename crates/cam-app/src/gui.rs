@@ -134,7 +134,10 @@ fn icon_svg(icon: Icon, size: f32) -> Element<'static, Message> {
 use cam_render::{MeshVertex, OrbitCamera, Scene, Vertex, PART};
 use cam_toolpath::{CancelToken, Severity};
 
-use crate::{AppController, LoopRef, OpKind, PendingOp, PickResult, Selection, SnapHit, SnapKind};
+use crate::{
+    op_selects_circles, AppController, LoopRef, OpKind, PendingOp, PickResult, Selection, SnapHit,
+    SnapKind,
+};
 
 /// A small sample part (rectangle + circular hole) so the app is useful without
 /// a file dialog on first run.
@@ -801,7 +804,7 @@ const PICKBOX_PX: f32 = 12.0;
 /// The object-snap catch aperture, px — larger than the pickbox so snaps engage
 /// from a comfortable distance (and the marker, sized from it, reads clearly).
 /// TODO(prefs): expose this (snap distance) in user preferences — see WORKSTATE.
-const SNAP_PICK_PX: f32 = 2.0 * PICKBOX_PX;
+const SNAP_PICK_PX: f32 = 1.5 * PICKBOX_PX;
 /// Snap marker size as a multiple of the snap aperture.
 /// TODO(prefs): expose this (snap-shape size) in user preferences.
 const SNAP_MARK_SCALE: f32 = 1.2;
@@ -1366,9 +1369,14 @@ impl App {
                 };
                 // Highlight the loop a click would select (snap's loop, else the
                 // nearest one under the box) — disambiguates concentric circles.
+                // Drill/thread only engage circular loops (holes).
+                let circles = self
+                    .controller
+                    .pending_op()
+                    .is_some_and(|p| op_selects_circles(p.kind));
                 self.hover_loop = self.snap_hover.map(|h| h.loop_ref).or_else(|| {
                     self.controller
-                        .nearest_loop_point([w[0] as f64, w[1] as f64], aperture as f64)
+                        .nearest_loop_point([w[0] as f64, w[1] as f64], aperture as f64, circles)
                         .map(|(l, _)| l)
                 });
             }
@@ -3657,6 +3665,10 @@ impl Viewport {
                 scene
             }
         };
+        // Frame the camera on the *stable* part/backplot only — capture bounds
+        // before the transient pick overlays (hover highlight, snap marker), or
+        // the whole view would re-fit and drift as the cursor moves.
+        let bounds = scene.bounds();
         // While the pick wizard is active, highlight the chosen boundary (accent)
         // and any excluded islands (gold) so the user sees what they picked.
         if let Some(pending) = controller.pending_op() {
@@ -3698,7 +3710,7 @@ impl Viewport {
             vertices: Arc::new(scene.line_vertices()),
             mesh_vertices: Arc::new(mesh_vertices),
             mesh_indices: Arc::new(mesh_indices),
-            bounds: scene.bounds(),
+            bounds,
             controls,
             show_gizmo,
             gizmo_size,
@@ -3926,10 +3938,14 @@ impl shader::Program<Message> for Viewport {
         cursor: iced::mouse::Cursor,
     ) -> iced::mouse::Interaction {
         let over = cursor.position_over(bounds).is_some();
-        if self.picking && over && !self.snap_engaged {
-            // A crosshair under the drawn pickbox — AutoCAD-style precise aiming.
-            // Suppressed once a snap engages, so its marker takes over cleanly.
-            iced::mouse::Interaction::Crosshair
+        if self.picking && over {
+            // Aiming a pick: a crosshair, but a plain arrow once a snap engages so
+            // its marker reads on its own. Never the orbit "hand" while picking.
+            if self.snap_engaged {
+                iced::mouse::Interaction::default()
+            } else {
+                iced::mouse::Interaction::Crosshair
+            }
         } else if state.drag.is_some() {
             iced::mouse::Interaction::Grabbing
         } else if over {

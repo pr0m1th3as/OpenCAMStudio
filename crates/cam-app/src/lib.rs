@@ -15,8 +15,8 @@ mod project;
 mod tool_library;
 
 pub use controller::{
-    AppController, ExportError, ExportToError, JobParams, LoopPart, LoopRef, OpKind, PendingOp,
-    PickResult, ProjectError, RunOutcome, Selection, SnapHit, SnapKind,
+    op_selects_circles, AppController, ExportError, ExportToError, JobParams, LoopPart, LoopRef,
+    OpKind, PendingOp, PickResult, ProjectError, RunOutcome, Selection, SnapHit, SnapKind,
 };
 pub use project::Project;
 

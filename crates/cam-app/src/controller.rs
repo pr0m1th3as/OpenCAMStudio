@@ -72,6 +72,13 @@ pub enum OpKind {
     Thread,
 }
 
+/// Whether an operation kind restricts geometry selection to **circular** loops.
+/// Drilling and thread-milling target holes (the pick gives the centre, and for
+/// threads the diameter), so a rectangle or open edge is not a valid pick.
+pub fn op_selects_circles(kind: OpKind) -> bool {
+    matches!(kind, OpKind::Drill | OpKind::Thread)
+}
+
 /// Which node of the document is currently selected — what the tree highlights
 /// and the inspector edits.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -894,11 +901,21 @@ impl AppController {
 
     /// The loop whose edge is closest to `world` within `aperture`, together with
     /// the exact **nearest point on that edge** (not a vertex). The always-works
-    /// fallback for boundary selection when no object-snap catches.
-    pub fn nearest_loop_point(&self, world: [f64; 2], aperture: f64) -> Option<(LoopRef, [f64; 2])> {
+    /// fallback for boundary selection when no object-snap catches. With
+    /// `circles_only`, only circular loops are selectable (drill/thread target
+    /// holes) — a rectangle or open edge is ignored.
+    pub fn nearest_loop_point(
+        &self,
+        world: [f64; 2],
+        aperture: f64,
+        circles_only: bool,
+    ) -> Option<(LoopRef, [f64; 2])> {
         let w = Point::new(world[0], world[1]);
         let mut best: Option<(LoopRef, [f64; 2], f64)> = None;
         for (loop_ref, contour) in self.iter_loops() {
+            if circles_only && fit_circle(contour.points()).is_none() {
+                continue;
+            }
             let (pt, d2) = nearest_point_on_contour(contour.points(), w);
             if best.is_none_or(|(_, _, bd2)| d2 < bd2) {
                 best = Some((loop_ref, pt, d2));
@@ -1004,10 +1021,12 @@ impl AppController {
             return PickResult::Missed;
         };
         // Resolve the loop and start point: prefer an object-snap (corner / mid /
-        // …), else the nearest point on the loop under the box.
+        // …), else the nearest point on the loop under the box. Drill/thread are
+        // restricted to circular loops (holes).
+        let circles = op_selects_circles(pending.kind);
         let (picked, start) = match self.snap_at(world, aperture, snaps) {
             Some(hit) => (hit.loop_ref, hit.point),
-            None => match self.nearest_loop_point(world, aperture) {
+            None => match self.nearest_loop_point(world, aperture, circles) {
                 Some(lp) => lp,
                 None => return PickResult::Missed,
             },
@@ -2367,6 +2386,32 @@ mod tests {
         );
         // The rectangle has corners ⇒ it is not treated as a circle: no quadrant.
         assert!(app.snap_at([69.5, 30.0], 1.5, &[SnapKind::Quadrant]).is_none());
+    }
+
+    #[test]
+    fn drill_only_selects_circular_holes() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        app.begin_operation(OpKind::Drill);
+        // The rectangle edge is not a hole ⇒ a drill pick there misses.
+        assert_eq!(
+            app.pick_operation_geometry([10.4, 25.0], 2.0, &[]),
+            PickResult::Missed
+        );
+        assert!(app.pending_op().is_some(), "still awaiting a hole");
+        // The circle hole is selectable ⇒ a drill at its centre.
+        assert_eq!(
+            app.pick_operation_geometry([45.4, 30.0], 2.0, &[]),
+            PickResult::Created
+        );
+        match app.selected_operation() {
+            Some(Operation::Drill(o)) => {
+                assert_eq!(o.points.len(), 1);
+                let c = o.points[0];
+                assert!((c[0] - 40.0).abs() < 0.1 && (c[1] - 30.0).abs() < 0.1, "centre {c:?}");
+            }
+            other => panic!("expected a drill, got {other:?}"),
+        }
     }
 
     #[test]
