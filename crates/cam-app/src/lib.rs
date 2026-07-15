@@ -11,6 +11,8 @@
 
 mod controller;
 mod project;
+#[cfg(feature = "gui")]
+mod tool_library;
 
 pub use controller::{
     AppController, ExportError, ExportToError, JobParams, LoopPart, LoopRef, OpKind, PendingOp,

@@ -490,6 +490,77 @@ impl AppController {
         self.invalidate();
     }
 
+    /// Embed a tool (chosen from the cross-project library) into this project's
+    /// setup and return the project-local number to store on an operation. If an
+    /// identical tool (same geometry, ignoring number) is already embedded, its
+    /// number is reused; otherwise a copy is added with a fresh project-unique
+    /// number. One undoable change when it adds.
+    pub fn use_tool(&mut self, tool: Tool) -> u32 {
+        if let Some(existing) = self
+            .document
+            .current()
+            .setup
+            .tools
+            .iter()
+            .find(|t| same_tool_geometry(t, &tool))
+        {
+            return existing.number;
+        }
+        let number = self
+            .document
+            .current()
+            .setup
+            .tools
+            .iter()
+            .map(|t| t.number)
+            .max()
+            .map_or(1, |m| m + 1);
+        let embedded = Tool { number, ..tool };
+        self.document
+            .edit(move |doc| doc.setup.tools.push(embedded));
+        self.invalidate();
+        number
+    }
+
+    /// The tools actually referenced by at least one operation, in setup order.
+    /// This is what the read-only Project→Tools view shows.
+    pub fn used_tools(&self) -> Vec<&Tool> {
+        let setup = &self.document.current().setup;
+        let used: BTreeSet<u32> = setup.operations.iter().map(|o| o.tool()).collect();
+        setup
+            .tools
+            .iter()
+            .filter(|t| used.contains(&t.number))
+            .collect()
+    }
+
+    /// Drop embedded tools no longer referenced by any operation (keeps the setup —
+    /// and the saved `.ocam` — to just the tools in use). One undoable change if it
+    /// removes anything.
+    pub fn prune_unused_tools(&mut self) {
+        let used: BTreeSet<u32> = self
+            .document
+            .current()
+            .setup
+            .operations
+            .iter()
+            .map(|o| o.tool())
+            .collect();
+        let has_unused = self
+            .document
+            .current()
+            .setup
+            .tools
+            .iter()
+            .any(|t| !used.contains(&t.number));
+        if !has_unused {
+            return;
+        }
+        self.document
+            .edit(move |doc| doc.setup.tools.retain(|t| used.contains(&t.number)));
+        self.invalidate();
+    }
+
     /// Edit the selected operation as one undoable change. A no-op unless an
     /// operation is selected.
     pub fn edit_selected_operation(&mut self, f: impl FnOnce(&mut Operation)) {
@@ -676,26 +747,17 @@ impl AppController {
         }
     }
 
-    /// Begin creating an operation of `kind`: enter geometry-pick mode with the
-    /// currently-selected tool (or the first tool). A no-op with no effect if the
-    /// setup has no tools or no geometry is loaded — the caller should have gated it.
+    /// Begin creating an operation of `kind`: enter geometry-pick mode. A no-op if no
+    /// geometry is loaded. The tool need not be embedded yet — it is picked from the
+    /// library during setup (the GUI seeds a default and calls [`Self::use_tool`]);
+    /// `tool` starts at the first embedded tool's number, or 1 as a placeholder.
     pub fn begin_operation(&mut self, kind: OpKind) {
-        if self.regions.is_empty() || self.document.current().setup.tools.is_empty() {
+        if self.regions.is_empty() {
             return;
         }
-        let tool = match self.selection {
-            Selection::Tool(i) => self
-                .document
-                .current()
-                .setup
-                .tools
-                .get(i)
-                .map_or_else(|| self.first_tool_number(), |t| t.number),
-            _ => self.first_tool_number(),
-        };
         self.pending_op = Some(PendingOp {
             kind,
-            tool,
+            tool: self.first_tool_number(),
             boundary: None,
             islands: Vec::new(),
         });
@@ -1011,12 +1073,19 @@ impl AppController {
     /// (a real import — the user creates ops by picking).
     fn generate_document(&self, seed_ops: bool) -> Document {
         let p = self.defaults;
-        let tool = Tool {
-            number: 1,
-            diameter: p.tool_diameter,
-            length: 30.0,
-            flutes: 2,
-            kind: ToolKind::EndMill,
+        // Real imports start with no tools — the user picks them from the library
+        // during op setup (`use_tool` embeds them). The Sample seeds one tool so its
+        // pre-made profiles still cut.
+        let tools = if seed_ops {
+            vec![Tool {
+                number: 1,
+                diameter: p.tool_diameter,
+                length: 30.0,
+                flutes: 2,
+                kind: ToolKind::EndMill,
+            }]
+        } else {
+            Vec::new()
         };
 
         let mut operations = Vec::new();
@@ -1052,7 +1121,7 @@ impl AppController {
             name: self.program_name(),
             heights: Heights::new(p.clearance, p.retract, p.top_of_stock),
             stock: self.stock(p.top_of_stock, p.depth),
-            tools: vec![tool],
+            tools,
             operations,
         })
     }
@@ -1129,6 +1198,12 @@ fn dist_point_seg2(p: Point, a: Point, b: Point) -> f64 {
     };
     let (cx, cy) = (a.x + t * abx, a.y + t * aby);
     (p.x - cx).powi(2) + (p.y - cy).powi(2)
+}
+
+/// Whether two tools have the same cutting geometry, ignoring their numbers — used
+/// to dedupe when embedding a library tool into a project's setup.
+fn same_tool_geometry(a: &Tool, b: &Tool) -> bool {
+    a.diameter == b.diameter && a.length == b.length && a.flutes == b.flutes && a.kind == b.kind
 }
 
 /// Set an operation's id, whatever its kind.
@@ -1570,7 +1645,51 @@ mod tests {
             "import must not auto-create operations"
         );
         assert_eq!(app.selection(), Selection::Setup);
+        // Real imports also start with no embedded tools — tools arrive when ops
+        // are set up (picked from the library).
+        assert!(
+            app.document().setup.tools.is_empty(),
+            "import must not seed tools"
+        );
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn use_tool_embeds_dedupes_and_reports_used() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap(); // sample: seeds tool T1 + 2 ops
+        let base = app.document().setup.tools.len();
+
+        // Embedding a brand-new tool adds it with a fresh number.
+        let bit = Tool {
+            number: 99, // library numbering is ignored on embed
+            diameter: 4.0,
+            length: 30.0,
+            flutes: 2,
+            kind: ToolKind::EndMill,
+        };
+        let n1 = app.use_tool(bit);
+        assert_eq!(app.document().setup.tools.len(), base + 1);
+        assert_ne!(
+            n1, 99,
+            "embedded number is project-local, not the library's"
+        );
+
+        // Embedding the same geometry again reuses the number (no duplicate).
+        let n2 = app.use_tool(bit);
+        assert_eq!(n1, n2);
+        assert_eq!(app.document().setup.tools.len(), base + 1);
+
+        // used_tools reflects only tools referenced by operations. The freshly
+        // embedded tool isn't used by any op yet, so it must not appear.
+        assert!(app.used_tools().iter().all(|t| t.number != n1));
+        // The sample's ops reference T1, which must appear.
+        assert!(app.used_tools().iter().any(|t| t.number == 1));
+
+        // Pruning drops the unreferenced embedded tool.
+        app.prune_unused_tools();
+        assert_eq!(app.document().setup.tools.len(), base);
+        assert!(app.document().setup.tools.iter().all(|t| t.number != n1));
     }
 
     #[test]
@@ -1678,11 +1797,18 @@ mod tests {
     }
 
     #[test]
-    fn begin_operation_is_a_no_op_without_tools() {
+    fn begin_operation_needs_geometry_not_tools() {
+        // With no geometry loaded, beginning an op is a no-op.
         let mut app = AppController::new(machine());
-        app.open_dxf(PART_DXF, "part.dxf").unwrap();
-        app.delete_tool(0); // no tools left
         app.begin_operation(OpKind::Profile);
-        assert!(app.pending_op().is_none(), "no tool ⇒ no wizard");
+        assert!(app.pending_op().is_none(), "no geometry ⇒ no wizard");
+
+        // With geometry but no embedded tools, the wizard still starts — the tool is
+        // picked from the library during setup.
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        app.delete_tool(0); // strip the sample's seeded tool
+        assert!(app.document().setup.tools.is_empty());
+        app.begin_operation(OpKind::Profile);
+        assert!(app.pending_op().is_some(), "no tool is fine now");
     }
 }

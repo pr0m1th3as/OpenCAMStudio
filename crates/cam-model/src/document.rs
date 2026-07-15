@@ -241,6 +241,16 @@ impl Operation {
             Operation::Face(op) => op.id,
         }
     }
+
+    /// The number of the tool this operation cuts with.
+    pub fn tool(&self) -> u32 {
+        match self {
+            Operation::Profile(op) => op.tool,
+            Operation::Drill(op) => op.tool,
+            Operation::Pocket(op) => op.tool,
+            Operation::Face(op) => op.tool,
+        }
+    }
 }
 
 /// A machining setup: one fixturing of the stock, its safety planes, and the

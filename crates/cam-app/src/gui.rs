@@ -23,6 +23,8 @@ use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
 use cam_model::{Envelope, Lead, Machine, Operation, Plunge, Point3, Side, ToolKind};
 
+use crate::tool_library::ToolLibrary;
+
 /// Ribbon palette and metrics, adopted from **OpenCADStudio**'s ribbon
 /// (`HakanSeven12/OpenCADStudio`, GPL-3.0) so users moving CAD → CAM meet a
 /// familiar surface. Values are its own `TOPBAR_BG`/`RIBBON_BG`/… constants; the
@@ -50,6 +52,12 @@ mod palette {
     pub const TOOL_HOVER: Color = rgb(0.32, 0.32, 0.32);
     /// Hover fill for command rows.
     pub const ROW_HOVER: Color = rgb(0.24, 0.24, 0.24);
+    /// Pane content background.
+    pub const PANE_BG: Color = rgb(0.15, 0.15, 0.15);
+    /// Visible divider line framing each pane.
+    pub const SEPARATOR: Color = rgb(0.34, 0.34, 0.34);
+    /// Selected project-tree row highlight (a muted fill, not the loud button blue).
+    pub const SELECT_BG: Color = rgb(0.20, 0.28, 0.38);
 }
 
 /// Ribbon command icons. Each variant is a small embedded SVG (see
@@ -437,16 +445,25 @@ fn set_plunge_params(plunge: Plunge, a: f64, b: f64) -> Plunge {
     }
 }
 
-/// A tool as offered in the wizard's tool picker.
+/// A library tool as offered in the wizard's tool picker (carries its library index
+/// so a pick embeds the right entry).
 #[derive(Clone, Copy, PartialEq)]
 struct ToolChoice {
+    index: usize,
     number: u32,
     diameter: f64,
+    kind: ToolKind,
 }
 
 impl std::fmt::Display for ToolChoice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "T{} ⌀{}", self.number, fmt_num(self.diameter))
+        write!(
+            f,
+            "T{} ⌀{} {}",
+            self.number,
+            fmt_num(self.diameter),
+            self.kind
+        )
     }
 }
 
@@ -456,9 +473,12 @@ struct App {
     /// Current window size, tracked so pane resizes can be clamped to per-pane
     /// pixel minimums (pane_grid works in ratios, not pixels).
     window: iced::Size,
-    /// Whether the one-shot startup layout (Output shrunk to its minimum) has been
-    /// re-applied against the real window size yet.
-    did_initial_layout: bool,
+    /// Fixed pixel sizes for the non-Viewport panes. Held constant across window
+    /// resizes (only the Viewport absorbs the change); updated when the user drags a
+    /// divider. Project / Inspector are widths, Output is a height.
+    project_px: f32,
+    inspector_px: f32,
+    output_px: f32,
     /// The active ribbon tab.
     active_tab: RibbonTab,
     /// The index (within the active tab's groups) of the open collapse-popup, if any.
@@ -475,6 +495,18 @@ struct App {
     /// Last known cursor position over the viewport (window coords), for drawing
     /// the pickbox while a geometry pick is pending.
     cursor: Option<iced::Point>,
+    /// Cross-project tool library (loaded from the config dir), picked from during
+    /// op setup and managed from the Tooling tab.
+    library: ToolLibrary,
+    /// The library tool selected for editing in the Tooling-tab library editor.
+    lib_sel: usize,
+    /// The operation whose right-click context menu is open, and where to anchor it
+    /// (window coords, from the tree cursor tracker).
+    open_op_menu: Option<u32>,
+    op_menu_pos: iced::Point,
+    /// Last cursor position over the Project pane (window coords), for anchoring the
+    /// op context menu.
+    tree_cursor: iced::Point,
     status: String,
 }
 
@@ -556,8 +588,6 @@ enum Message {
     // --- Operation-creation wizard ---
     /// Begin creating an operation of `kind` (enter geometry-pick mode).
     BeginOp(OpKind),
-    /// Change the pending operation's tool.
-    SetPendingTool(u32),
     /// Cancel the pending operation.
     CancelOp,
     /// Confirm a pending operation (finalise a pocket boundary + islands).
@@ -610,6 +640,17 @@ enum Message {
     CloseRibbonPopup,
     /// Show (`true`) or hide (`false`) a pane.
     SetPaneVisible(Pane, bool),
+    /// Pick a library tool (by index) for the pending op — embeds it into the setup.
+    SetPendingLibraryTool(usize),
+    /// Select a library tool for editing in the Tooling-tab library editor.
+    SelectLibraryTool(usize),
+    /// Open the right-click context menu for operation `id` (anchored at the tree
+    /// cursor), and select that operation.
+    OpMenu(u32),
+    /// Dismiss the operation context menu.
+    CloseOpMenu,
+    /// Track the cursor over the Project pane (window coords) for menu anchoring.
+    TreeCursor(iced::Point),
 }
 
 fn default_machine() -> Machine {
@@ -666,7 +707,9 @@ impl App {
             controller: AppController::new(default_machine()),
             panes: initial_panes(),
             window: iced::Size::new(1280.0, 800.0),
-            did_initial_layout: false,
+            project_px: 220.0,
+            inspector_px: 250.0,
+            output_px: 140.0,
             active_tab: RibbonTab::Home,
             open_group: None,
             fields: BTreeMap::new(),
@@ -674,12 +717,17 @@ impl App {
             show_gizmo: true,
             view: ViewControls::default(),
             cursor: None,
+            library: ToolLibrary::load(),
+            lib_sel: 0,
+            open_op_menu: None,
+            op_menu_pos: iced::Point::ORIGIN,
+            tree_cursor: iced::Point::ORIGIN,
             status: "Open the sample part to begin.".to_string(),
         };
         app.refresh_fields();
-        // Start with the Output console at its minimum height (using the assumed
-        // window size; the first real resize event refines it).
-        app.minimize_pane(Pane::Output);
+        // Seed the fixed layout against the assumed window size; the first real
+        // resize event re-applies it against the true size.
+        app.apply_fixed_layout();
         (app, iced::Task::none())
     }
 
@@ -801,17 +849,31 @@ impl App {
             }
             Message::BeginOp(kind) => {
                 self.controller.begin_operation(kind);
+                // Seed the op with the first library tool so it always has a valid
+                // tool; the user can change it in the wizard picker.
+                if self.controller.pending_op().is_some() {
+                    if let Some(&tool) = self.library.tools.first() {
+                        let number = self.controller.use_tool(tool);
+                        self.controller.set_pending_tool(number);
+                    }
+                }
                 self.refresh_fields();
                 self.status = if self.controller.pending_op().is_some() {
                     "Click a boundary line in the viewport (or Cancel in the Inspector)."
                         .to_string()
                 } else {
-                    "Open a part and add a tool first.".to_string()
+                    "Open a part first.".to_string()
                 };
             }
-            Message::SetPendingTool(number) => self.controller.set_pending_tool(number),
+            Message::SetPendingLibraryTool(i) => {
+                if let Some(&tool) = self.library.tools.get(i) {
+                    let number = self.controller.use_tool(tool);
+                    self.controller.set_pending_tool(number);
+                }
+            }
             Message::CancelOp => {
                 self.controller.cancel_operation();
+                self.controller.prune_unused_tools();
                 self.status = "Cancelled operation creation.".to_string();
             }
             Message::ConfirmOp => {
@@ -845,6 +907,7 @@ impl App {
             }
             Message::ViewportCursor(p) => self.cursor = Some(p),
             Message::DuplicateOp => {
+                self.open_op_menu = None;
                 self.controller.duplicate_selected_operation();
                 self.refresh_fields();
                 self.rerun();
@@ -854,7 +917,10 @@ impl App {
                 self.rerun();
             }
             Message::DeleteOp => {
+                self.open_op_menu = None;
                 self.controller.delete_selected_operation();
+                // A tool no longer used by any op drops out of the setup.
+                self.controller.prune_unused_tools();
                 self.refresh_fields();
                 self.rerun();
             }
@@ -897,6 +963,8 @@ impl App {
             Message::PaneResized(pane_grid::ResizeEvent { split, ratio }) => {
                 let ratio = self.clamp_resize(split, ratio);
                 self.panes.resize(split, ratio);
+                // Persist the dragged size so a later window resize keeps it.
+                self.capture_side_px(split, ratio);
             }
             Message::PaneDragged(pane_grid::DragEvent::Dropped { pane, target }) => {
                 self.panes.drop(pane, target);
@@ -904,17 +972,15 @@ impl App {
             Message::PaneDragged(_) => {}
             Message::WindowResized(size) => {
                 self.window = size;
-                // Re-apply the startup layout once now that the true window size
-                // is known — then leave the user's manual sizing alone.
-                if !self.did_initial_layout {
-                    self.did_initial_layout = true;
-                    self.minimize_pane(Pane::Output);
-                }
+                // Hold the side panes + Output at their fixed pixel sizes; the
+                // Viewport absorbs the change.
+                self.apply_fixed_layout();
             }
             Message::ToolKindChanged(kind) => {
-                if let Selection::Tool(i) = self.controller.selection() {
-                    self.controller.edit_tool(i, |t| t.kind = kind);
-                    self.rerun();
+                // Library-tool editing (Tooling tab): edit the library entry.
+                if let Some(t) = self.library.tools.get_mut(self.lib_sel) {
+                    t.kind = kind;
+                    self.library.save();
                 }
             }
             Message::LeadInKindChanged(kind) => {
@@ -953,17 +1019,44 @@ impl App {
                 self.rerun();
             }
             Message::NewTool => {
-                self.controller.add_tool();
+                // Add a tool to the library and select it for editing. If an op
+                // wizard is active, also embed it and pick it for the pending op.
+                self.lib_sel = self.library.add_default();
+                self.library.save();
+                if self.controller.pending_op().is_some() {
+                    if let Some(&tool) = self.library.tools.get(self.lib_sel) {
+                        let number = self.controller.use_tool(tool);
+                        self.controller.set_pending_tool(number);
+                    }
+                }
                 self.refresh_fields();
             }
             Message::DeleteTool => {
-                if let Selection::Tool(i) = self.controller.selection() {
-                    self.controller.delete_tool(i);
+                if self.lib_sel < self.library.tools.len() && self.library.tools.len() > 1 {
+                    self.library.tools.remove(self.lib_sel);
+                    self.lib_sel = self.lib_sel.min(self.library.tools.len() - 1);
+                    self.library.save();
                     self.refresh_fields();
-                    self.rerun();
                 }
             }
-            Message::SelectRibbonTab(tab) => self.active_tab = tab,
+            Message::SelectLibraryTool(i) => {
+                self.lib_sel = i;
+                self.refresh_fields();
+            }
+            Message::OpMenu(id) => {
+                self.controller.select(Selection::Operation(id));
+                self.refresh_fields();
+                self.open_op_menu = Some(id);
+                self.op_menu_pos = self.tree_cursor;
+            }
+            Message::CloseOpMenu => self.open_op_menu = None,
+            Message::TreeCursor(p) => self.tree_cursor = p,
+            Message::SelectRibbonTab(tab) => {
+                self.active_tab = tab;
+                // The Tooling tab turns the Inspector into the library editor, so the
+                // field buffers must reload for the new context.
+                self.refresh_fields();
+            }
             Message::ToggleRibbonGroup(i) => {
                 self.open_group = if self.open_group == Some(i) {
                     None
@@ -1019,10 +1112,14 @@ impl App {
             .map(|(h, _)| *h)
     }
 
-    /// Show or hide a pane. Hiding closes it (the others keep their sizes; the
-    /// last remaining pane can't be closed). Showing splits it back off an
-    /// existing pane and, if it has a fixed edge, docks it there.
+    /// Show or hide a pane. The Viewport is always visible (no-op). Hiding closes a
+    /// pane; showing splits it back off an existing pane and docks it to its fixed
+    /// edge. Either way the fixed layout is re-derived so the remaining side panes
+    /// keep their sizes and the Viewport takes the rest.
     fn set_pane_visible(&mut self, pane: Pane, show: bool) {
+        if pane == Pane::Viewport {
+            return;
+        }
         match (show, self.pane_handle(pane)) {
             (false, Some(handle)) => {
                 self.panes.close(handle);
@@ -1038,65 +1135,16 @@ impl App {
                         }
                     }
                 }
-                // Re-showing the Viewport reclaims the room: shrink every pane it
-                // is split against to that pane's minimum so the view gets the rest.
-                if pane == Pane::Viewport {
-                    self.maximize_pane(Pane::Viewport);
-                }
             }
             _ => {}
         }
+        self.apply_fixed_layout();
     }
 
-    /// Resize the splits along the path from the root to `pane` so that, at each
-    /// one, the subtree *not* containing `pane` is squeezed to its minimum size —
-    /// giving `pane` as much of the window as the other panes' minimums allow.
-    /// Splits are walked outermost-first so a parent's dimension is settled before
-    /// its children read it.
-    fn maximize_pane(&mut self, pane: Pane) {
-        let Some(handle) = self.pane_handle(pane) else {
-            return;
-        };
-        let Some(path) = splits_to_pane(self.panes.layout(), handle) else {
-            return;
-        };
-        for (split, in_a) in path {
-            let bounds = iced::Size::new(
-                self.window.width,
-                (self.window.height - MENU_BAR_H).max(1.0),
-            );
-            let regions = self
-                .panes
-                .layout()
-                .split_regions(PANE_SPACING, PANE_MIN_PX, bounds);
-            let Some(&(axis, rect, _)) = regions.get(&split) else {
-                continue;
-            };
-            let Some((a, b)) = find_split(self.panes.layout(), split) else {
-                continue;
-            };
-            let dim = match axis {
-                pane_grid::Axis::Vertical => rect.width,
-                pane_grid::Axis::Horizontal => rect.height,
-            };
-            if dim <= 1.0 {
-                continue;
-            }
-            // Shrink the sibling subtree (the one without `pane`) to its minimum.
-            let ratio = if in_a {
-                1.0 - subtree_min(b, &self.panes, axis) / dim
-            } else {
-                subtree_min(a, &self.panes, axis) / dim
-            };
-            let ratio = self.clamp_resize(split, ratio.clamp(0.0, 1.0));
-            self.panes.resize(split, ratio);
-        }
-    }
-
-    /// Resize the pane's immediate parent split so `pane` gets just its minimum
-    /// size, handing the rest to its sibling. Used to seed the startup layout with
-    /// a short Output console.
-    fn minimize_pane(&mut self, pane: Pane) {
+    /// Resize the split that bounds `pane` so `pane` occupies `px` pixels along its
+    /// split axis, handing the remainder to its sibling (the Viewport side). The
+    /// pixel math mirrors `maximize_pane`; `px` is floored at the pane's minimum.
+    fn set_pane_px(&mut self, pane: Pane, px: f32) {
         let Some(handle) = self.pane_handle(pane) else {
             return;
         };
@@ -1125,10 +1173,69 @@ impl App {
         if dim <= 1.0 {
             return;
         }
-        let frac = pane.min_size() / dim;
+        let frac = (px.max(pane.min_size()) / dim).clamp(0.0, 1.0);
         let ratio = if in_a { frac } else { 1.0 - frac };
-        let ratio = self.clamp_resize(split, ratio.clamp(0.0, 1.0));
+        let ratio = self.clamp_resize(split, ratio);
         self.panes.resize(split, ratio);
+    }
+
+    /// Hold the non-Viewport panes at their fixed pixel sizes, letting the Viewport
+    /// absorb the rest. Outermost split first so a parent's dimension is settled
+    /// before its children read it: Output (a height) and Project (a width) are
+    /// independent, while Inspector's region width depends on Project — so it is set
+    /// last. Hidden panes are simply skipped (`set_pane_px` early-returns).
+    fn apply_fixed_layout(&mut self) {
+        self.set_pane_px(Pane::Output, self.output_px);
+        self.set_pane_px(Pane::Project, self.project_px);
+        self.set_pane_px(Pane::Inspector, self.inspector_px);
+    }
+
+    /// After a manual divider drag, store the affected pane's new pixel size so a
+    /// later window resize preserves it. `split`/`ratio` are the just-applied resize.
+    fn capture_side_px(&mut self, split: pane_grid::Split, ratio: f32) {
+        let bounds = iced::Size::new(
+            self.window.width,
+            (self.window.height - MENU_BAR_H).max(1.0),
+        );
+        let regions = self
+            .panes
+            .layout()
+            .split_regions(PANE_SPACING, PANE_MIN_PX, bounds);
+        let Some(&(axis, rect, _)) = regions.get(&split) else {
+            return;
+        };
+        let dim = match axis {
+            pane_grid::Axis::Vertical => rect.width,
+            pane_grid::Axis::Horizontal => rect.height,
+        };
+        if dim <= 1.0 {
+            return;
+        }
+        for pane in [Pane::Project, Pane::Inspector, Pane::Output] {
+            let Some(handle) = self.pane_handle(pane) else {
+                continue;
+            };
+            let Some(path) = splits_to_pane(self.panes.layout(), handle) else {
+                continue;
+            };
+            let Some(&(pane_split, in_a)) = path.last() else {
+                continue;
+            };
+            if pane_split != split {
+                continue;
+            }
+            let px = if in_a {
+                ratio * dim
+            } else {
+                (1.0 - ratio) * dim
+            };
+            match pane {
+                Pane::Project => self.project_px = px,
+                Pane::Inspector => self.inspector_px = px,
+                Pane::Output => self.output_px = px,
+                Pane::Viewport => {}
+            }
+        }
     }
 
     /// Reload the inspector edit buffers from the model for the current
@@ -1142,8 +1249,17 @@ impl App {
         }
     }
 
+    /// Whether the Inspector is in tool-library editing mode (driven by the Tooling
+    /// ribbon tab, independent of the project selection).
+    fn library_mode(&self) -> bool {
+        self.active_tab == RibbonTab::Tooling
+    }
+
     /// Which fields the inspector shows for the current selection.
     fn inspector_fields(&self) -> Vec<Field> {
+        if self.library_mode() {
+            return vec![Field::ToolDiameter, Field::ToolLength, Field::Flutes];
+        }
         match self.controller.selection() {
             Selection::Setup => vec![Field::Clearance, Field::Retract, Field::TopOfStock],
             Selection::Tool(_) => vec![Field::ToolDiameter, Field::ToolLength, Field::Flutes],
@@ -1200,6 +1316,15 @@ impl App {
 
     /// The model value backing a field for the current selection, if any.
     fn field_value(&self, field: Field) -> Option<f64> {
+        if self.library_mode() {
+            let t = self.library.tools.get(self.lib_sel)?;
+            return match field {
+                Field::ToolDiameter => Some(t.diameter),
+                Field::ToolLength => Some(t.length),
+                Field::Flutes => Some(t.flutes as f64),
+                _ => None,
+            };
+        }
         let setup = &self.controller.document().setup;
         match field {
             Field::Clearance => Some(setup.heights.clearance),
@@ -1238,6 +1363,25 @@ impl App {
                     return;
                 }
             }
+        }
+
+        // Library-tool editing writes to the library file, not the project — an
+        // embedded copy in a project is a snapshot and is left untouched.
+        if self.library_mode() {
+            if let Some(t) = self.library.tools.get_mut(self.lib_sel) {
+                if let Some(&v) = parsed.get(&Field::ToolDiameter) {
+                    t.diameter = v;
+                }
+                if let Some(&v) = parsed.get(&Field::ToolLength) {
+                    t.length = v;
+                }
+                if let Some(&v) = parsed.get(&Field::Flutes) {
+                    t.flutes = v.round().max(1.0) as u32;
+                }
+            }
+            self.library.save();
+            self.refresh_fields();
+            return;
         }
 
         match self.controller.selection() {
@@ -1319,10 +1463,63 @@ impl App {
                 .on_press(Message::CloseRibbonPopup);
             layers = layers.push(catcher).push(popup);
         }
+        if let Some(menu) = self.op_menu_overlay() {
+            // A full-window catcher under the menu so a click off it dismisses.
+            let catcher = mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
+                .on_press(Message::CloseOpMenu);
+            layers = layers.push(catcher).push(menu);
+        }
         if let Some(pickbox) = self.pickbox_overlay() {
             layers = layers.push(pickbox);
         }
         layers.into()
+    }
+
+    /// The operation right-click context menu (Duplicate / Delete), anchored at the
+    /// tree cursor. `None` unless a menu is open. Reuses the ribbon-popup overlay
+    /// pattern: positioned in the top-level view stack over a click-off catcher.
+    fn op_menu_overlay(&self) -> Option<Element<'_, Message>> {
+        self.open_op_menu?;
+        let item = |icon: Icon, label: &str, msg: Message| {
+            button(
+                row![icon_svg(icon, 14.0), text(label.to_string()).size(13)]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+            )
+            .width(Length::Fixed(130.0))
+            .padding(Padding::from([4.0, 8.0]))
+            .on_press(msg)
+            .style(|_theme, status| command_button_style(status))
+        };
+        let menu = container(
+            column![
+                item(Icon::Duplicate, "Duplicate", Message::DuplicateOp),
+                item(Icon::Delete, "Delete", Message::DeleteOp),
+            ]
+            .spacing(2),
+        )
+        .padding(4)
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(palette::RIBBON_BG)),
+            border: Border {
+                color: palette::BORDER_DARK,
+                width: 1.0,
+                radius: 3.0.into(),
+            },
+            ..container::Style::default()
+        });
+        let positioned = container(menu)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Left)
+            .align_y(iced::alignment::Vertical::Top)
+            .padding(Padding {
+                top: self.op_menu_pos.y,
+                left: self.op_menu_pos.x,
+                right: 0.0,
+                bottom: 0.0,
+            });
+        Some(positioned.into())
     }
 
     /// The pickbox: a small accent square drawn over the cursor while a geometry
@@ -1397,9 +1594,9 @@ impl App {
     /// is a pane-toggle list, not icon commands).
     fn ribbon_specs(&self) -> Option<Vec<GroupSpec>> {
         let has_geo = !self.controller.regions().is_empty();
-        let has_tool = matches!(self.controller.selection(), Selection::Tool(_));
-        // A new op needs geometry to pick and at least one tool.
-        let can_create = has_geo && !self.controller.document().setup.tools.is_empty();
+        // A new op needs geometry to pick; its tool is drawn from the library, so the
+        // library must have at least one tool (it seeds defaults, so it always does).
+        let can_create = has_geo && !self.library.tools.is_empty();
         let begin = |kind: OpKind| can_create.then_some(Message::BeginOp(kind));
         let specs = match self.active_tab {
             RibbonTab::Home => vec![
@@ -1444,13 +1641,14 @@ impl App {
                 ],
             }],
             RibbonTab::Tooling => vec![GroupSpec {
-                title: "Tools",
+                title: "Library",
                 commands: vec![
                     cmd(Icon::NewTool, "New", Some(Message::NewTool)),
                     cmd(
                         Icon::Delete,
                         "Delete",
-                        has_tool.then_some(Message::DeleteTool),
+                        // Keep at least one tool in the library.
+                        (self.library.tools.len() > 1).then_some(Message::DeleteTool),
                     ),
                 ],
             }],
@@ -1501,7 +1699,8 @@ impl App {
     /// The Windows tab: a checkbox per pane (naturally narrow, no collapse).
     fn windows_body(&self) -> Element<'_, Message> {
         let mut panes = column![].spacing(4);
-        for pane in ALL_PANES {
+        // The Viewport is always visible and has no toggle.
+        for pane in ALL_PANES.into_iter().filter(|p| *p != Pane::Viewport) {
             let shown = self.pane_handle(pane).is_some();
             panes = panes.push(
                 row![
@@ -1567,7 +1766,7 @@ impl App {
     }
 
     fn pane_content(&self, pane: Pane) -> Element<'_, Message> {
-        match pane {
+        let inner: Element<'_, Message> = match pane {
             Pane::Project => self.project_tree(),
             Pane::Viewport => container(
                 shader(Viewport::new(
@@ -1584,101 +1783,119 @@ impl App {
             .into(),
             Pane::Inspector => self.inspector(),
             Pane::Output => self.output(),
-        }
+        };
+        // A bordered panel so the gaps between panes read as visible separators.
+        container(inner)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_theme| container::Style {
+                background: Some(Background::Color(palette::PANE_BG)),
+                border: Border {
+                    color: palette::SEPARATOR,
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                ..container::Style::default()
+            })
+            .into()
     }
 
-    /// The project tree: setup, stock, tools, and operations as selectable rows.
+    /// The project tree: a structure view of the setup, stock, the tools in use
+    /// (read-only), and the operations. Rows are plain selectable text (the selected
+    /// row is highlighted, not a button). Each operation row carries inline controls
+    /// (include checkbox + reorder arrows) and a right-click menu (Duplicate/Delete).
     fn project_tree(&self) -> Element<'_, Message> {
         let setup = &self.controller.document().setup;
         let sel = self.controller.selection();
-        let node = |label: String, target: Selection, active: bool| {
-            let mark = if active { "▸ " } else { "  " };
-            button(text(format!("{mark}{label}")).size(13))
-                .on_press(Message::Select(target))
-                .width(Length::Fill)
-        };
 
         let mut list = column![
-            node(
+            select_row(
                 format!("Setup — {}", setup.name),
-                Selection::Setup,
-                sel == Selection::Setup
+                sel == Selection::Setup,
+                Message::Select(Selection::Setup),
             ),
-            node(
+            select_row(
                 "Stock".to_string(),
-                Selection::Stock,
-                sel == Selection::Stock
+                sel == Selection::Stock,
+                Message::Select(Selection::Stock),
             ),
-            text("  Tools").size(12),
         ]
         .spacing(2);
-        for (i, tool) in setup.tools.iter().enumerate() {
-            list = list.push(node(
-                format!("  T{} ⌀{}", tool.number, fmt_num(tool.diameter)),
-                Selection::Tool(i),
-                sel == Selection::Tool(i),
-            ));
+
+        // Tools in use — read-only; tools are chosen from the library during op setup.
+        list = list.push(tree_header("Tools (in use)"));
+        let used = self.controller.used_tools();
+        if used.is_empty() {
+            list = list.push(tree_note("none yet — set up an operation"));
         }
-        list = list.push(text("  Operations").size(12));
+        for t in used {
+            list = list.push(
+                container(
+                    text(format!("T{} ⌀{} {}", t.number, fmt_num(t.diameter), t.kind))
+                        .size(13)
+                        .color(palette::LABEL_COLOR),
+                )
+                .padding(Padding::from([3.0, 6.0])),
+            );
+        }
+
+        list = list.push(tree_header("Operations"));
         if setup.operations.is_empty() {
-            list = list.push(text("    (none — add one from the Operations tab)").size(11));
+            list = list.push(tree_note("none — add one from the Operations tab"));
         }
         let op_count = setup.operations.len();
         for (i, op) in setup.operations.iter().enumerate() {
             let id = op.id();
             let active = sel == Selection::Operation(id);
             let excluded = self.controller.is_operation_excluded(id);
-            // Each op row carries its own controls: an include checkbox (checked =
-            // machined), the selectable name, and inline reorder arrows. An
-            // excluded op stays in the tree, marked, but is not cut.
-            let mark = if active { "▸ " } else { "  " };
-            let mut label = format!("{mark}{id}: {}", op_kind(op));
+            // Inline controls: an include checkbox (checked = machined) and reorder
+            // arrows. Left-click the row selects it; right-click opens Duplicate/Delete.
+            let mut label = format!("{id}: {}", op_kind(op));
             if excluded {
                 label.push_str("  (excluded)");
             }
             let include = checkbox(!excluded)
                 .size(15)
                 .on_toggle(move |checked| Message::SetOpExcluded(id, !checked));
-            let name = button(text(label).size(13))
-                .on_press(Message::Select(Selection::Operation(id)))
-                .width(Length::Fill);
+            let name = text(label).size(13).width(Length::Fill).color(if excluded {
+                palette::GROUP_LABEL
+            } else {
+                palette::LABEL_COLOR
+            });
             let up = button(text("↑").size(12))
                 .on_press_maybe((i > 0).then_some(Message::MoveOp(id, true)));
             let down = button(text("↓").size(12))
                 .on_press_maybe((i + 1 < op_count).then_some(Message::MoveOp(id, false)));
-            list = list.push(
+            let inner = container(
                 row![include, name, up, down]
                     .spacing(4)
                     .align_y(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding(Padding::from([2.0, 6.0]))
+            .style(move |_theme| container::Style {
+                background: active.then_some(Background::Color(palette::SELECT_BG)),
+                border: Border {
+                    radius: 3.0.into(),
+                    ..Border::default()
+                },
+                ..container::Style::default()
+            });
+            list = list.push(
+                mouse_area(inner)
+                    .on_press(Message::Select(Selection::Operation(id)))
+                    .on_right_press(Message::OpMenu(id)),
             );
         }
 
-        // Structural editing of the selected operation: Duplicate/Delete. New ops
-        // are created (per kind) from the Operations ribbon tab; reorder is inline
-        // per row, above.
-        let has_op = matches!(sel, Selection::Operation(_));
-        // Intrinsic-width buttons (small icon + label), each sized to its own
-        // content. The pane can't be dragged narrow enough to spill thanks to
-        // PANE_MIN_RATIO.
-        let op_btn = |icon: Icon, label: &str, msg: Message, enabled: bool| {
-            let content = row![icon_svg(icon, 14.0), text(label.to_string()).size(12)]
-                .spacing(4)
-                .align_y(Alignment::Center);
-            button(content).on_press_maybe(enabled.then_some(msg))
-        };
-        list = list.push(text(" ").size(6));
-        list = list.push(
-            row![
-                op_btn(Icon::Duplicate, "Duplicate", Message::DuplicateOp, has_op),
-                op_btn(Icon::Delete, "Delete", Message::DeleteOp, has_op),
-            ]
-            .spacing(4),
-        );
-
-        scrollable(list.padding(6))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+        // Track the cursor over the pane so the right-click menu can anchor to it.
+        mouse_area(
+            scrollable(list.padding(6))
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_move(Message::TreeCursor)
+        .into()
     }
 
     /// The inspector: editable fields for the selected node.
@@ -1691,25 +1908,51 @@ impl App {
             OpKind::Drill => "Drill",
             OpKind::Face => "Face",
         };
+        // The tool is picked from the cross-project library; picking embeds a copy
+        // into the setup (see `use_tool`). The current selection is the library entry
+        // whose geometry matches the pending op's embedded tool.
         let tools: Vec<ToolChoice> = self
+            .library
+            .tools
+            .iter()
+            .enumerate()
+            .map(|(index, t)| ToolChoice {
+                index,
+                number: t.number,
+                diameter: t.diameter,
+                kind: t.kind,
+            })
+            .collect();
+        let embedded = self
             .controller
             .document()
             .setup
             .tools
             .iter()
-            .map(|t| ToolChoice {
-                number: t.number,
-                diameter: t.diameter,
+            .find(|t| t.number == pending.tool)
+            .copied();
+        let selected = embedded
+            .and_then(|e| {
+                self.library.tools.iter().position(|l| {
+                    l.diameter == e.diameter
+                        && l.length == e.length
+                        && l.flutes == e.flutes
+                        && l.kind == e.kind
+                })
             })
-            .collect();
-        let selected = tools.iter().copied().find(|c| c.number == pending.tool);
-        let picker = pick_list(tools, selected, |c| Message::SetPendingTool(c.number))
+            .and_then(|i| tools.get(i).copied());
+        let picker = pick_list(tools, selected, |c| Message::SetPendingLibraryTool(c.index))
             .text_size(13)
             .width(Length::Fill);
         let mut col = column![
             text(format!("New {kind} operation")).size(15),
             text("Tool").size(12),
-            picker,
+            row![
+                picker,
+                button(text("＋ New").size(13)).on_press(Message::NewTool),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
         ]
         .spacing(10)
         .padding(8);
@@ -1737,10 +1980,56 @@ impl App {
         col.into()
     }
 
+    /// The Tooling-tab tool-library editor: a selectable list of library tools plus
+    /// the selected tool's editable fields (reusing the inspector field pipeline).
+    /// New / Delete live on the Tooling ribbon tab.
+    fn library_editor(&self) -> Element<'_, Message> {
+        let mut list = column![
+            text("Tool Library").size(15),
+            text("Reusable across projects · New / Delete on the Tooling tab").size(11),
+        ]
+        .spacing(8)
+        .padding(8);
+
+        let mut rows = column![].spacing(2);
+        for (i, t) in self.library.tools.iter().enumerate() {
+            let label = format!("T{} ⌀{} {}", t.number, fmt_num(t.diameter), t.kind);
+            rows = rows.push(select_row(
+                label,
+                i == self.lib_sel,
+                Message::SelectLibraryTool(i),
+            ));
+        }
+        list = list.push(rows);
+
+        for field in self.inspector_fields() {
+            let value = self.fields.get(&field).cloned().unwrap_or_default();
+            list = list.push(field_row(field, &value));
+        }
+        if let Some(t) = self.library.tools.get(self.lib_sel) {
+            list = list.push(row![
+                text("Type").width(Length::Fixed(150.0)).size(13),
+                pick_list(&ToolKind::ALL[..], Some(t.kind), Message::ToolKindChanged)
+                    .text_size(13)
+                    .width(Length::Fixed(140.0)),
+            ]);
+            list = list.push(button("Apply").on_press(Message::Apply));
+        }
+
+        scrollable(list)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
     fn inspector(&self) -> Element<'_, Message> {
         // While a new-operation wizard is active, the inspector is the wizard.
         if let Some(pending) = self.controller.pending_op() {
             return self.op_wizard(pending);
+        }
+        // The Tooling tab turns the Inspector into the tool-library editor.
+        if self.library_mode() {
+            return self.library_editor();
         }
         let heading = match self.controller.selection() {
             Selection::Setup => "Setup".to_string(),
@@ -2368,6 +2657,55 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
 /// Format a number for display (Rust's shortest round-trippable form).
 fn fmt_num(v: f64) -> String {
     format!("{v}")
+}
+
+/// A selectable project-tree / list row: plain text that highlights when active
+/// (a muted fill, not a button). Left-click sends `on_press`.
+fn select_row<'a>(label: String, active: bool, on_press: Message) -> Element<'a, Message> {
+    let content = container(text(label).size(13).color(palette::LABEL_COLOR))
+        .width(Length::Fill)
+        .padding(Padding::from([3.0, 6.0]))
+        .style(move |_theme| container::Style {
+            background: active.then_some(Background::Color(palette::SELECT_BG)),
+            border: Border {
+                radius: 3.0.into(),
+                ..Border::default()
+            },
+            ..container::Style::default()
+        });
+    mouse_area(content).on_press(on_press).into()
+}
+
+/// A section header row in the project tree.
+fn tree_header<'a>(label: &str) -> Element<'a, Message> {
+    container(text(label.to_string()).size(11).color(palette::GROUP_LABEL))
+        .padding(Padding::from([6.0, 4.0]))
+        .into()
+}
+
+/// A muted placeholder note in the project tree (e.g. an empty section).
+fn tree_note<'a>(label: &str) -> Element<'a, Message> {
+    container(
+        text(format!("({label})"))
+            .size(11)
+            .color(palette::GROUP_LABEL),
+    )
+    .padding(Padding::from([1.0, 12.0]))
+    .into()
+}
+
+/// An inspector field row: a label and a numeric text input bound to `field`.
+fn field_row<'a>(field: Field, value: &str) -> Element<'a, Message> {
+    row![
+        text(field.label()).width(Length::Fixed(150.0)).size(13),
+        text_input("", value)
+            .on_input(move |v| Message::FieldChanged(field, v))
+            .on_submit(Message::Apply)
+            .width(Length::Fixed(90.0)),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
+    .into()
 }
 
 /// A labelled strategy picker row (lead / plunge kind) for the profile inspector.
