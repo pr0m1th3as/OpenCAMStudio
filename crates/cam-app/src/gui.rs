@@ -599,6 +599,14 @@ enum Field {
     OriginX,
     OriginY,
     OriginZ,
+    /// Program start-point offset X / Y / Z from its base (mm).
+    StartOffX,
+    StartOffY,
+    StartOffZ,
+    /// Program start-point reference X / Y / Z (when the base is a point, mm).
+    StartRefX,
+    StartRefY,
+    StartRefZ,
     ToolDiameter,
     ToolLength,
     Flutes,
@@ -650,6 +658,12 @@ impl Field {
             Field::OriginX => "Origin X (mm)",
             Field::OriginY => "Origin Y (mm)",
             Field::OriginZ => "Origin Z (mm)",
+            Field::StartOffX => "Offset X (mm)",
+            Field::StartOffY => "Offset Y (mm)",
+            Field::StartOffZ => "Offset Z (mm)",
+            Field::StartRefX => "Ref X (mm)",
+            Field::StartRefY => "Ref Y (mm)",
+            Field::StartRefZ => "Ref Z (mm)",
             Field::ToolDiameter => "Tool ⌀ (mm)",
             Field::ToolLength => "Length (mm)",
             Field::Flutes => "Flutes",
@@ -830,6 +844,29 @@ fn op_uses_snaps(kind: OpKind) -> bool {
     matches!(kind, OpKind::Profile | OpKind::Chamfer | OpKind::Pocket)
 }
 
+/// The axis index (0=X, 1=Y, 2=Z) a start-point offset/reference field addresses.
+fn start_axis(field: Field) -> usize {
+    match field {
+        Field::StartOffX | Field::StartRefX => 0,
+        Field::StartOffY | Field::StartRefY => 1,
+        _ => 2,
+    }
+}
+
+/// Whether a field belongs to the start-point section (rendered there, not in the
+/// generic Setup field loop).
+fn is_start_field(field: Field) -> bool {
+    matches!(
+        field,
+        Field::StartOffX
+            | Field::StartOffY
+            | Field::StartOffZ
+            | Field::StartRefX
+            | Field::StartRefY
+            | Field::StartRefZ
+    )
+}
+
 /// Orientation-cube on-screen size (logical px): default and the slider's range.
 const GIZMO_SIZE_DEFAULT: f32 = 110.0;
 const GIZMO_SIZE_MIN: f32 = 60.0;
@@ -991,6 +1028,11 @@ enum Message {
     ViewportCursor(iced::Point),
     /// Toggle a viewport object-snap on/off during operation picking.
     ToggleSnap(SnapKind),
+    /// Enable/disable the program start point (Setup inspector).
+    ToggleStartPoint(bool),
+    /// Switch the start-point base between a reference point (`true`) and the
+    /// workpiece origin (`false`).
+    SetStartFromReference(bool),
     /// Enter/leave "set workpiece origin" pick mode (ribbon Edit tab).
     ToggleSetOrigin,
     /// A viewport click while setting the origin: the world `(x,y)` + aperture;
@@ -1317,6 +1359,27 @@ impl App {
                 } else {
                     self.status = "Nothing to redo.".to_string();
                 }
+            }
+            Message::ToggleStartPoint(on) => {
+                self.controller.edit_start_point(|sp| {
+                    *sp = on.then_some(cam_model::StartPoint {
+                        base: cam_model::StartBase::Origin,
+                        offset: [0.0, 0.0, 0.0],
+                    });
+                });
+                self.refresh_fields();
+            }
+            Message::SetStartFromReference(on) => {
+                self.controller.edit_start_point(|sp| {
+                    if let Some(sp) = sp {
+                        sp.base = if on {
+                            cam_model::StartBase::Reference([0.0, 0.0, 0.0])
+                        } else {
+                            cam_model::StartBase::Origin
+                        };
+                    }
+                });
+                self.refresh_fields();
             }
             Message::ToggleSetOrigin => {
                 self.setting_origin = !self.setting_origin;
@@ -1906,14 +1969,26 @@ impl App {
             return tool_fields(self.library.tools.get(self.lib_sel).map(|t| t.kind));
         }
         match self.controller.selection() {
-            Selection::Setup => vec![
-                Field::Clearance,
-                Field::Retract,
-                Field::TopOfStock,
-                Field::OriginX,
-                Field::OriginY,
-                Field::OriginZ,
-            ],
+            Selection::Setup => {
+                let mut f = vec![
+                    Field::Clearance,
+                    Field::Retract,
+                    Field::TopOfStock,
+                    Field::OriginX,
+                    Field::OriginY,
+                    Field::OriginZ,
+                ];
+                // Start-point numeric fields, only when it is enabled (and the
+                // reference only when the base is a point). Rendered in the
+                // start-point section, not the generic field loop.
+                if let Some(sp) = self.controller.document().setup.start_point {
+                    f.extend([Field::StartOffX, Field::StartOffY, Field::StartOffZ]);
+                    if matches!(sp.base, cam_model::StartBase::Reference(_)) {
+                        f.extend([Field::StartRefX, Field::StartRefY, Field::StartRefZ]);
+                    }
+                }
+                f
+            }
             Selection::Tool(i) => {
                 tool_fields(self.controller.document().setup.tools.get(i).map(|t| t.kind))
             }
@@ -2003,6 +2078,15 @@ impl App {
             Field::OriginX => Some(setup.origin[0]),
             Field::OriginY => Some(setup.origin[1]),
             Field::OriginZ => Some(setup.origin[2]),
+            Field::StartOffX | Field::StartOffY | Field::StartOffZ => {
+                setup.start_point.map(|sp| sp.offset[start_axis(field)])
+            }
+            Field::StartRefX | Field::StartRefY | Field::StartRefZ => {
+                setup.start_point.and_then(|sp| match sp.base {
+                    cam_model::StartBase::Reference(p) => Some(p[start_axis(field)]),
+                    cam_model::StartBase::Origin => None,
+                })
+            }
             Field::StockXOffset | Field::StockYOffset | Field::StockTop | Field::StockThickness => {
                 let cam_model::Stock::BoundingBox {
                     x_offset,
@@ -2100,6 +2184,30 @@ impl App {
                     }
                     if let Some(&v) = parsed.get(&Field::OriginZ) {
                         o[2] = v;
+                    }
+                });
+                self.controller.edit_start_point(|start| {
+                    if let Some(sp) = start {
+                        for (f, i) in [
+                            (Field::StartOffX, 0),
+                            (Field::StartOffY, 1),
+                            (Field::StartOffZ, 2),
+                        ] {
+                            if let Some(&v) = parsed.get(&f) {
+                                sp.offset[i] = v;
+                            }
+                        }
+                        if let cam_model::StartBase::Reference(p) = &mut sp.base {
+                            for (f, i) in [
+                                (Field::StartRefX, 0),
+                                (Field::StartRefY, 1),
+                                (Field::StartRefZ, 2),
+                            ] {
+                                if let Some(&v) = parsed.get(&f) {
+                                    p[i] = v;
+                                }
+                            }
+                        }
                     }
                 });
             }
@@ -2829,6 +2937,53 @@ impl App {
         .into()
     }
 
+    /// The Setup node's program-start-point editor: an enable toggle, a base
+    /// choice (from the origin, or from a reference point), and the offset (plus
+    /// the reference when chosen). The numeric rows reuse the field pipeline
+    /// (parse + Apply); the toggles commit immediately.
+    fn start_point_editor(&self) -> Element<'_, Message> {
+        let sp = self.controller.document().setup.start_point;
+        let mut col = column![text("Program start point")
+            .size(12)
+            .color(palette::GROUP_LABEL)]
+        .spacing(6);
+        col = col.push(
+            row![
+                checkbox(sp.is_some())
+                    .size(15)
+                    .on_toggle(Message::ToggleStartPoint),
+                text("Rapid to a start point").size(13),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        );
+        if let Some(sp) = sp {
+            let from_ref = matches!(sp.base, cam_model::StartBase::Reference(_));
+            col = col.push(
+                row![
+                    checkbox(from_ref)
+                        .size(15)
+                        .on_toggle(Message::SetStartFromReference),
+                    text("From a reference point (else origin)").size(13),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            );
+            let field = |f: Field| {
+                field_row(f, &self.fields.get(&f).cloned().unwrap_or_default())
+            };
+            col = col.push(field(Field::StartOffX));
+            col = col.push(field(Field::StartOffY));
+            col = col.push(field(Field::StartOffZ));
+            if from_ref {
+                col = col.push(field(Field::StartRefX));
+                col = col.push(field(Field::StartRefY));
+                col = col.push(field(Field::StartRefZ));
+            }
+        }
+        col.into()
+    }
+
     /// The Tooling-tab tool-library editor: a selectable list of library tools plus
     /// the selected tool's editable fields (reusing the inspector field pipeline).
     /// New / Delete live on the Tooling ribbon tab.
@@ -2913,6 +3068,10 @@ impl App {
             list = list.push(text("Nothing to edit here yet.").size(12));
         }
         for field in ordered {
+            // Start-point fields render in their own section (below), not here.
+            if is_start_field(field) {
+                continue;
+            }
             let value = self.fields.get(&field).cloned().unwrap_or_default();
             list = list.push(
                 row![
@@ -2925,6 +3084,10 @@ impl App {
                 .spacing(8)
                 .align_y(Alignment::Center),
             );
+        }
+        // The workpiece start-point editor (Setup only): enable, base, offset, ref.
+        if let Selection::Setup = self.controller.selection() {
+            list = list.push(self.start_point_editor());
         }
         // The tool geometry class is an enum, so it gets a picker (committed
         // immediately) rather than a text field.
