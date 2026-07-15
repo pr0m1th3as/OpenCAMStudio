@@ -889,10 +889,10 @@ impl App {
                 self.rerun();
             }
             Message::PlungeKindChanged(kind) => {
-                self.controller.edit_selected_operation(|op| {
-                    if let Operation::Profile(p) = op {
-                        p.plunge = kind.to_plunge();
-                    }
+                self.controller.edit_selected_operation(|op| match op {
+                    Operation::Profile(p) => p.plunge = kind.to_plunge(),
+                    Operation::Pocket(p) => p.plunge = kind.to_plunge(),
+                    _ => {}
                 });
                 self.refresh_fields();
                 self.rerun();
@@ -1118,13 +1118,24 @@ impl App {
                     }
                     fields
                 }
-                Some(Operation::Pocket(_)) => vec![
-                    Field::Depth,
-                    Field::Stepdown,
-                    Field::Stepover,
-                    Field::Feed,
-                    Field::PlungeFeed,
-                ],
+                Some(Operation::Pocket(p)) => {
+                    let mut fields = vec![
+                        Field::Depth,
+                        Field::Stepdown,
+                        Field::Stepover,
+                        Field::Feed,
+                        Field::PlungeFeed,
+                    ];
+                    match p.plunge {
+                        Plunge::Straight => {}
+                        Plunge::Ramp { .. } => fields.push(Field::PlungeA),
+                        Plunge::Helix { .. } | Plunge::ZigZag { .. } => {
+                            fields.push(Field::PlungeA);
+                            fields.push(Field::PlungeB);
+                        }
+                    }
+                    fields
+                }
                 Some(Operation::Face(_)) => vec![Field::Depth, Field::Stepdown, Field::Feed],
                 Some(Operation::Drill(_)) => vec![Field::Depth, Field::Feed],
                 None => Vec::new(),
@@ -1717,28 +1728,40 @@ impl App {
                 );
             }
         }
-        // Profile lead-in / lead-out / plunge strategy pickers (their numeric
-        // parameters appear as fields above when the kind uses them).
+        // Lead / plunge strategy pickers (their numeric parameters appear as fields
+        // above when the kind uses them). Profiles get lead-in/out + plunge; pockets
+        // get plunge only.
         if let Selection::Operation(id) = self.controller.selection() {
-            if let Some(Operation::Profile(p)) = self.controller.operation(id) {
-                list = list.push(profile_picker(
-                    "Lead-in",
-                    LeadKind::of(p.lead_in),
-                    &LeadKind::ALL[..],
-                    Message::LeadInKindChanged,
-                ));
-                list = list.push(profile_picker(
-                    "Lead-out",
-                    LeadKind::of(p.lead_out),
-                    &LeadKind::ALL[..],
-                    Message::LeadOutKindChanged,
-                ));
-                list = list.push(profile_picker(
-                    "Plunge",
-                    PlungeKind::of(p.plunge),
-                    &PlungeKind::ALL[..],
-                    Message::PlungeKindChanged,
-                ));
+            match self.controller.operation(id) {
+                Some(Operation::Profile(p)) => {
+                    list = list.push(profile_picker(
+                        "Lead-in",
+                        LeadKind::of(p.lead_in),
+                        &LeadKind::ALL[..],
+                        Message::LeadInKindChanged,
+                    ));
+                    list = list.push(profile_picker(
+                        "Lead-out",
+                        LeadKind::of(p.lead_out),
+                        &LeadKind::ALL[..],
+                        Message::LeadOutKindChanged,
+                    ));
+                    list = list.push(profile_picker(
+                        "Plunge",
+                        PlungeKind::of(p.plunge),
+                        &PlungeKind::ALL[..],
+                        Message::PlungeKindChanged,
+                    ));
+                }
+                Some(Operation::Pocket(p)) => {
+                    list = list.push(profile_picker(
+                        "Plunge",
+                        PlungeKind::of(p.plunge),
+                        &PlungeKind::ALL[..],
+                        Message::PlungeKindChanged,
+                    ));
+                }
+                _ => {}
             }
         }
 
@@ -2166,6 +2189,8 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Pocket(o), Field::Stepover) => Some(o.stepover),
         (Operation::Pocket(o), Field::Feed) => Some(o.feed),
         (Operation::Pocket(o), Field::PlungeFeed) => Some(o.plunge_feed),
+        (Operation::Pocket(o), Field::PlungeA) => Some(plunge_params(o.plunge).0),
+        (Operation::Pocket(o), Field::PlungeB) => Some(plunge_params(o.plunge).1),
         (Operation::Face(o), Field::Depth) => Some(o.depth),
         (Operation::Face(o), Field::Stepdown) => Some(o.stepdown),
         (Operation::Face(o), Field::Feed) => Some(o.feed),
@@ -2219,6 +2244,10 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
             if let Some(v) = get(Field::PlungeFeed) {
                 o.plunge_feed = v;
             }
+            let (a, b) = plunge_params(o.plunge);
+            let a = get(Field::PlungeA).unwrap_or(a);
+            let b = get(Field::PlungeB).unwrap_or(b);
+            o.plunge = set_plunge_params(o.plunge, a, b);
         }
         Operation::Face(o) => {
             if let Some(v) = get(Field::Depth) {

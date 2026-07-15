@@ -301,7 +301,7 @@ fn unit(x: f64, y: f64) -> (f64, f64) {
 }
 
 /// Unit tangent leaving the start vertex (start → pts[1]).
-fn start_tangent(pts: &[Point]) -> (f64, f64) {
+pub(crate) fn start_tangent(pts: &[Point]) -> (f64, f64) {
     unit(pts[1].x - pts[0].x, pts[1].y - pts[0].y)
 }
 
@@ -325,7 +325,7 @@ fn signed_area2(pts: &[Point]) -> f64 {
 
 /// The outward normal at the start (away from the loop interior), for placing leads
 /// and helix centres on the non-material side.
-fn outward_normal(pts: &[Point]) -> (f64, f64) {
+pub(crate) fn outward_normal(pts: &[Point]) -> (f64, f64) {
     let t = start_tangent(pts);
     // Interior is left of travel for a CCW loop, so outward is the right normal;
     // the reverse for CW.
@@ -412,7 +412,7 @@ fn emit_lead(
 /// Emit the plunge from `p@from_z` down to `p@to_z` (ending at `p` in XY), per the
 /// strategy. Bad parameters fall back to a straight plunge (never panic).
 #[allow(clippy::too_many_arguments)]
-fn emit_plunge(
+pub(crate) fn emit_plunge(
     prog: &mut Program,
     p: Point,
     tan: (f64, f64),

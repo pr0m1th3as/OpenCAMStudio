@@ -135,6 +135,8 @@ impl Strategy for PocketStrategy {
 }
 
 /// Emit approach, plunge, one closed cutting loop, and retract for a ring at `z`.
+/// The entry uses the operation's plunge strategy (helix/ramp descend toward the
+/// pocket interior, staying clear of the wall).
 fn emit_ring(prog: &mut Program, pts: &[Point], op: &PocketOp, h: &Heights, z: f64) {
     if pts.len() < 3 {
         return;
@@ -153,11 +155,22 @@ fn emit_ring(prog: &mut Program, pts: &[Point], op: &PocketOp, h: &Heights, z: f
         to: Point3::new(start.x, start.y, h.top_of_stock),
         tag: link,
     });
-    prog.push(Step::Linear {
-        to: Point3::new(start.x, start.y, z),
-        feed: op.plunge_feed,
-        tag: plunge,
-    });
+    // Descend into the material per the plunge strategy. A helix/ramp is placed on
+    // the *inward* side of the ring so it stays within the pocket, not the wall.
+    let tan = crate::profile::start_tangent(pts);
+    let out = crate::profile::outward_normal(pts);
+    crate::profile::emit_plunge(
+        prog,
+        start,
+        tan,
+        (-out.0, -out.1),
+        h.top_of_stock,
+        z,
+        op.plunge,
+        op.plunge_feed,
+        op.feed,
+        plunge,
+    );
     crate::emit::cut_loop(prog, pts, op.feed, cut, z);
     prog.push(Step::Rapid {
         to: Point3::new(start.x, start.y, h.clearance),
@@ -225,6 +238,50 @@ mod tests {
         let result = PocketStrategy::new(op).compute(&env, &CancelToken::new());
         assert!(!result.has_errors(), "{:?}", result.diagnostics);
         assert_eq!(plunges(&result), 8, "4 rings × 2 depth levels");
+    }
+
+    #[test]
+    fn helix_plunge_pocket_enters_on_helical_arcs() {
+        let op = PocketOp {
+            id: 0,
+            tool: 1,
+            boundary: square(40.0),
+            islands: vec![],
+            depth: -3.0,
+            stepdown: 1.5,
+            stepover: 4.0,
+            feed: 300.0,
+            plunge_feed: 100.0,
+            plunge: Plunge::Helix {
+                radius: 1.0,
+                pitch: 0.5,
+            },
+        };
+        let ts = tools(8.0);
+        let env = JobEnv {
+            heights: Heights::new(5.0, 2.0, 0.0),
+            tools: &ts,
+        };
+        let result = PocketStrategy::new(op).compute(&env, &CancelToken::new());
+        assert!(!result.has_errors(), "{:?}", result.diagnostics);
+        // The straight-plunge linears are replaced by (Plunge-tagged) helix arcs.
+        assert_eq!(
+            plunges(&result),
+            0,
+            "no straight plunges with a helix entry"
+        );
+        let plunge_arcs: Vec<f64> = result
+            .program
+            .steps()
+            .iter()
+            .filter_map(|s| match s {
+                Step::Arc { tag, end, .. } if tag.kind == MoveKind::Plunge => Some(end.z),
+                _ => None,
+            })
+            .collect();
+        assert!(!plunge_arcs.is_empty(), "expected helix plunge arcs");
+        // The helix descends: at least one arc ends below the stock top.
+        assert!(plunge_arcs.iter().any(|&z| z < 0.0), "helix must descend");
     }
 
     #[test]
