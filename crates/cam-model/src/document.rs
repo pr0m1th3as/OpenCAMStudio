@@ -13,7 +13,8 @@ use crate::Tool;
 /// The document schema version. Bumped when the on-disk model format changes;
 /// present from the start so save-files are versioned before there is a loader.
 /// v2: `ToolKind` became a data-carrying enum (per-kind geometry).
-pub const SCHEMA_VERSION: u32 = 2;
+/// v3: `Stock` became a part-relative spec (offsets + top + thickness).
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// The safety planes for a setup, all **absolute Z in millimetres**. By
 /// convention WCS Z0 is the top of stock, so `top_of_stock` is usually `0.0`.
@@ -42,11 +43,45 @@ impl Heights {
 }
 
 /// A description of the raw material. The first-light slice models only a
-/// rectangular block; `from-model + offsets` stock arrives with the kernel.
+/// rectangular block, defined **relative to the part** so it auto-fits: the
+/// part's XY bounding box grown by per-axis offsets, hanging `thickness` below
+/// an explicit top Z. The app resolves it to a concrete box with the loaded
+/// geometry's bounds ([`Stock::resolve`]). `from-model` stock arrives with the
+/// kernel as a further variant.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Stock {
-    /// An axis-aligned block spanning `[min, max]` in each axis (mm).
-    Box { min: [f64; 3], max: [f64; 3] },
+    /// A block sized from the part's XY bounding box: grown by `x_offset` on both
+    /// X sides and `y_offset` on both Y sides, spanning from `top` down by
+    /// `thickness` (so the bottom sits at `top − thickness`). All in mm.
+    BoundingBox {
+        x_offset: f64,
+        y_offset: f64,
+        top: f64,
+        thickness: f64,
+    },
+}
+
+impl Stock {
+    /// Resolve to an axis-aligned box `(min, max)` (mm) given the part's XY
+    /// bounds. Pure — the caller supplies the bounds (which live outside the
+    /// document), keeping the stock definition part-relative and auto-fitting.
+    pub fn resolve(&self, min_xy: [f64; 2], max_xy: [f64; 2]) -> ([f64; 3], [f64; 3]) {
+        match *self {
+            Stock::BoundingBox {
+                x_offset,
+                y_offset,
+                top,
+                thickness,
+            } => (
+                [
+                    min_xy[0] - x_offset,
+                    min_xy[1] - y_offset,
+                    top - thickness,
+                ],
+                [max_xy[0] + x_offset, max_xy[1] + y_offset, top],
+            ),
+        }
+    }
 }
 
 /// Which side of a profiled chain the tool runs on.
@@ -450,6 +485,19 @@ mod tests {
             op.feed = 301.0; // one field differs
         }
         assert!(!a.same_work(&b), "a differing feed is different work");
+    }
+
+    #[test]
+    fn stock_resolves_offsets_and_thickness() {
+        let stock = Stock::BoundingBox {
+            x_offset: 2.0,
+            y_offset: 5.0,
+            top: 0.0,
+            thickness: 20.0,
+        };
+        let (min, max) = stock.resolve([10.0, 10.0], [70.0, 50.0]);
+        assert_eq!(min, [8.0, 5.0, -20.0], "grown per-axis, bottom = top - thickness");
+        assert_eq!(max, [72.0, 55.0, 0.0]);
     }
 
     #[test]

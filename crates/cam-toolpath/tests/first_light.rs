@@ -81,9 +81,11 @@ fn document() -> Document {
     Document::new(Setup {
         name: "first light".into(),
         heights: Heights::new(5.0, 2.0, 0.0),
-        stock: Stock::Box {
-            min: [0.0, 0.0, -10.0],
-            max: [80.0, 60.0, 0.0],
+        stock: Stock::BoundingBox {
+            x_offset: 0.0,
+            y_offset: 0.0,
+            top: 0.0,
+            thickness: 10.0,
         },
         tools: vec![tool],
         operations: vec![Operation::Profile(outer), Operation::Profile(hole)],
@@ -395,9 +397,11 @@ fn arc_lead_and_helix_plunge_post_to_helical_gcode() {
     let doc = Document::new(Setup {
         name: "lead_helix".into(),
         heights: Heights::new(5.0, 2.0, 0.0),
-        stock: Stock::Box {
-            min: [0.0, 0.0, -10.0],
-            max: [80.0, 60.0, 0.0],
+        stock: Stock::BoundingBox {
+            x_offset: 0.0,
+            y_offset: 0.0,
+            top: 0.0,
+            thickness: 10.0,
         },
         tools: vec![tool],
         operations: vec![Operation::Profile(op)],

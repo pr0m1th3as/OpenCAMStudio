@@ -57,6 +57,7 @@ to public.
 
 | Deferred | Lands as |
 |----------|----------|
+| Smooth stock render for curved walls | with **3D milling** — gradient-shaded / dexel or `Kernel`-surface stock, replacing the axis-aligned heightfield walls (cosmetic in 2.5D, verification-critical in 3D) |
 | 3D surface machining | new `Strategy` + `Kernel` surface eval |
 | 4/5-axis | CL-data gains orientation; new strategies + post capability |
 | Turning / mill-turn | new strategy family; lathe post capabilities |

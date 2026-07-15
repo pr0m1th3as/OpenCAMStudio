@@ -247,6 +247,125 @@ impl Heightfield {
         }
     }
 
+    /// Triangulate the stock as a **watertight solid** down to `floor` (the stock
+    /// bottom, mm): sloped per-cell tops, a bottom face, and vertical walls **only
+    /// at steep steps** and the perimeter. Unlike [`to_mesh`](Self::to_mesh) — a
+    /// smooth sheet with no thickness — the block shows its full depth; and unlike
+    /// a pure voxel block it keeps gentle slopes smooth, so a chamfer bevel is a
+    /// clean ramp while a pocket wall stays crisply vertical. A cell cut to or
+    /// below `floor` is left open, so a through feature is see-through. Faces carry
+    /// geometric normals from their (CCW-outward) winding — flat per triangle, so a
+    /// planar bevel shades uniformly and no step smears.
+    pub fn to_solid_mesh(&self, floor: f64) -> SurfaceMesh {
+        let f = floor as f32;
+        let res = self.res as f32;
+        let (ox, oy) = (self.origin[0] as f32, self.origin[1] as f32);
+        // A neighbour drop steeper than this reads as a wall (rendered vertical);
+        // gentler steps are a slope the tops ramp across — so a ≤45° chamfer
+        // (≈`res` drop per cell) stays smooth while pocket walls stay vertical.
+        let wall_step = 2.5 * res;
+
+        let mut positions: Vec<[f32; 3]> = Vec::new();
+        let mut normals: Vec<[f32; 3]> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        // One triangle with a flat normal from its winding (CCW ⇒ outward).
+        let mut tri = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
+            let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let mut n = [
+                u[1] * v[2] - u[2] * v[1],
+                u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0],
+            ];
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-9);
+            n = [n[0] / len, n[1] / len, n[2] / len];
+            let base = positions.len() as u32;
+            positions.extend_from_slice(&[a, b, c]);
+            normals.extend_from_slice(&[n; 3]);
+            indices.extend_from_slice(&[base, base + 1, base + 2]);
+        };
+        let mut quad = |a, b, c, d| {
+            tri(a, b, c);
+            tri(a, c, d);
+        };
+        // Cell height, or `None` off-grid.
+        let h = |ix: i64, iy: i64| -> Option<f32> {
+            if ix < 0 || iy < 0 || ix as usize >= self.nx || iy as usize >= self.ny {
+                None
+            } else {
+                Some(self.z[iy as usize * self.nx + ix as usize])
+            }
+        };
+        // Height of a cell corner as seen by a cell at `z0`: average `z0` with the
+        // (up to 3) other cells meeting at that corner that are within `wall_step`
+        // (gradual). Gentle slopes thus share corner heights (continuous ramp);
+        // across a wall the steep neighbour is excluded, so the corner stays at
+        // this cell's level and a vertical wall is drawn there instead.
+        let corner = |z0: f32, around: [Option<f32>; 3]| -> f32 {
+            let (mut sum, mut n) = (z0, 1.0f32);
+            for c in around.into_iter().flatten() {
+                if (c - z0).abs() <= wall_step {
+                    sum += c;
+                    n += 1.0;
+                }
+            }
+            sum / n
+        };
+
+        for iy in 0..self.ny {
+            for ix in 0..self.nx {
+                let z = self.z[iy * self.nx + ix];
+                if z <= f + 1e-4 {
+                    continue; // cut through to the floor ⇒ open (see-through)
+                }
+                let (i, j) = (ix as i64, iy as i64);
+                let (e, w, n_, s) = (h(i + 1, j), h(i - 1, j), h(i, j + 1), h(i, j - 1));
+                let (ne, nw) = (h(i + 1, j + 1), h(i - 1, j + 1));
+                let (se, sw) = (h(i + 1, j - 1), h(i - 1, j - 1));
+                // Corner heights (SW, SE, NE, NW of the cell footprint).
+                let c_sw = corner(z, [w, s, sw]);
+                let c_se = corner(z, [e, s, se]);
+                let c_ne = corner(z, [e, n_, ne]);
+                let c_nw = corner(z, [w, n_, nw]);
+                let (x0, y0) = (ox + ix as f32 * res, oy + iy as f32 * res);
+                let (x1, y1) = (x0 + res, y0 + res);
+                // Sloped top and flat bottom.
+                quad(
+                    [x0, y0, c_sw],
+                    [x1, y0, c_se],
+                    [x1, y1, c_ne],
+                    [x0, y1, c_nw],
+                );
+                quad([x0, y0, f], [x0, y1, f], [x1, y1, f], [x1, y0, f]);
+                // A vertical wall on a side only where the drop to that neighbour is
+                // steep (or it is off-grid / cut through) — from this cell's two
+                // edge corners down to the neighbour level, clamped to the floor.
+                let level = |nb: Option<f32>| nb.map_or(f, |v| v.max(f));
+                let lw = level(w);
+                if z - lw > wall_step {
+                    quad([x0, y0, c_sw], [x0, y1, c_nw], [x0, y1, lw], [x0, y0, lw]);
+                }
+                let le = level(e);
+                if z - le > wall_step {
+                    quad([x1, y1, c_ne], [x1, y0, c_se], [x1, y0, le], [x1, y1, le]);
+                }
+                let ls = level(s);
+                if z - ls > wall_step {
+                    quad([x1, y0, c_se], [x0, y0, c_sw], [x0, y0, ls], [x1, y0, ls]);
+                }
+                let ln = level(n_);
+                if z - ln > wall_step {
+                    quad([x0, y1, c_nw], [x1, y1, c_ne], [x1, y1, ln], [x0, y1, ln]);
+                }
+            }
+        }
+        SurfaceMesh {
+            positions,
+            normals,
+            indices,
+        }
+    }
+
     /// Centre of cell `(ix, iy)`.
     fn center(&self, ix: usize, iy: usize) -> (f64, f64) {
         (
@@ -382,5 +501,65 @@ mod tests {
             .indices
             .iter()
             .all(|&i| (i as usize) < mesh.positions.len()));
+    }
+
+    #[test]
+    fn solid_mesh_is_a_closed_block_with_walls_and_a_floor() {
+        // Uncut 10×10 block, top 0, floor -5.
+        let hf = Heightfield::new([0.0, 0.0], [10.0, 10.0], 1.0, 0.0);
+        let mesh = hf.to_solid_mesh(-5.0);
+        assert!(mesh.indices.iter().all(|&i| (i as usize) < mesh.positions.len()));
+        // Must carry top (+Z), bottom (−Z) and side-wall (horizontal) faces — a
+        // sheet would have only +Z.
+        let has = |pred: fn(&[f32; 3]) -> bool| mesh.normals.iter().any(pred);
+        assert!(has(|n| n[2] > 0.9), "has a top");
+        assert!(has(|n| n[2] < -0.9), "has a bottom");
+        assert!(has(|n| n[0].abs() > 0.9 || n[1].abs() > 0.9), "has perimeter walls");
+        // No geometry ever dips below the floor.
+        assert!(mesh.positions.iter().all(|p| p[2] >= -5.0 - 1e-4));
+    }
+
+    #[test]
+    fn gentle_slopes_stay_smooth_while_deep_steps_get_walls() {
+        // The chamfer-staircase fix: a shallow step (gentle vs the cell size) ramps
+        // smoothly, adding no vertical wall; a deep step keeps a crisp wall.
+        let floor = -5.0;
+        let wall_faces = |hf: &Heightfield| {
+            hf.to_solid_mesh(floor)
+                .normals
+                .iter()
+                .filter(|n| n[2].abs() < 0.1) // near-horizontal normal ⇒ vertical face
+                .count()
+        };
+        let mut shallow = Heightfield::new([0.0, 0.0], [20.0, 20.0], 0.5, 0.0);
+        shallow.lower_rect([5.0, 5.0], [15.0, 15.0], -0.5);
+        let mut deep = Heightfield::new([0.0, 0.0], [20.0, 20.0], 0.5, 0.0);
+        deep.lower_rect([5.0, 5.0], [15.0, 15.0], -3.0);
+        assert!(
+            wall_faces(&deep) > wall_faces(&shallow),
+            "deep {} vs shallow {}: a deep pocket walls its edge; a shallow one ramps",
+            wall_faces(&deep),
+            wall_faces(&shallow)
+        );
+    }
+
+    #[test]
+    fn solid_mesh_leaves_through_cuts_open() {
+        // A cell cut clean through (below the floor) contributes no top face, so a
+        // through feature reads as see-through rather than a filled recess.
+        let floor = -5.0;
+        let tops = |hf: &Heightfield| {
+            hf.to_solid_mesh(floor)
+                .normals
+                .iter()
+                .filter(|n| n[2] > 0.9)
+                .count()
+        };
+        let mut hf = Heightfield::new([0.0, 0.0], [3.0, 3.0], 1.0, 0.0);
+        let before = tops(&hf);
+        // Cut the centre cell past the floor.
+        hf.cut_segment([1.3, 1.5, -6.0], [1.7, 1.5, -6.0], 0.3);
+        assert!(hf.sample(1.5, 1.5) <= -5.9, "centre cell cut through");
+        assert!(tops(&hf) < before, "the through-cut cell has no top ⇒ open hole");
     }
 }

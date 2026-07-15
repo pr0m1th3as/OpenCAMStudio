@@ -1123,7 +1123,7 @@ impl AppController {
     /// into render-ready vertices + indices, and return any collisions found.
     /// Empty when there is no stock (no geometry loaded).
     fn simulate_stock(&self, program: &Program) -> (Vec<MeshVertex>, Vec<u32>, Vec<Collision>) {
-        let Stock::Box { min, max } = self.document.current().setup.stock;
+        let (min, max) = self.stock_box();
         if min[0] >= max[0] || min[1] >= max[1] {
             return (Vec::new(), Vec::new(), Vec::new());
         }
@@ -1155,7 +1155,9 @@ impl AppController {
             },
             &sim_tools,
         );
-        let surface = sim.field.to_mesh();
+        // Render the stock as a watertight solid down to its floor, so the full
+        // thickness shows and cut walls shade crisply (not a smooth top sheet).
+        let surface = sim.field.to_solid_mesh(min[2]);
         let vertices = mesh_vertices(&surface.positions, &surface.normals);
         (vertices, surface.indices, sim.collisions)
     }
@@ -1240,13 +1242,28 @@ impl AppController {
         }
     }
 
-    /// A bounding-box stock around the imported geometry.
+    /// The initial part-relative stock: a snug fit to the geometry (no XY offset)
+    /// hanging from `top` down to the deepest cut `depth`.
     fn stock(&self, top: f64, depth: f64) -> Stock {
-        let (min, max) = self.bounds_xy();
-        Stock::Box {
-            min: [min[0], min[1], depth],
-            max: [max[0], max[1], top],
+        Stock::BoundingBox {
+            x_offset: 0.0,
+            y_offset: 0.0,
+            top,
+            thickness: top - depth,
         }
+    }
+
+    /// The current stock resolved to a concrete box `(min, max)` (mm), fitting the
+    /// stock spec to the loaded geometry's XY bounds.
+    pub fn stock_box(&self) -> ([f64; 3], [f64; 3]) {
+        let (min, max) = self.bounds_xy();
+        self.document.current().setup.stock.resolve(min, max)
+    }
+
+    /// Edit the setup's stock definition as one undoable change.
+    pub fn edit_stock(&mut self, f: impl FnOnce(&mut Stock)) {
+        self.document.edit(|doc| f(&mut doc.setup.stock));
+        self.invalidate();
     }
 
     fn program_name(&self) -> String {
@@ -1338,9 +1355,11 @@ fn empty_document(p: &JobParams) -> Document {
     Document::new(Setup {
         name: "Untitled".to_string(),
         heights: Heights::new(p.clearance, p.retract, p.top_of_stock),
-        stock: Stock::Box {
-            min: [0.0, 0.0, p.depth],
-            max: [0.0, 0.0, p.top_of_stock],
+        stock: Stock::BoundingBox {
+            x_offset: 0.0,
+            y_offset: 0.0,
+            top: p.top_of_stock,
+            thickness: p.top_of_stock - p.depth,
         },
         tools: vec![Tool {
             number: 1,
@@ -1474,6 +1493,38 @@ mod tests {
             .iter()
             .map(|o| o.id())
             .collect()
+    }
+
+    #[test]
+    fn stock_auto_fits_the_part_and_offsets_grow_it() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        let (bmin, bmax) = app.bounds_xy();
+
+        // Default stock snugly fits the part in XY (no offset) and hangs from the
+        // top down to the deepest cut.
+        let (min, max) = app.stock_box();
+        assert_eq!([min[0], min[1]], bmin, "no XY offset by default");
+        assert_eq!([max[0], max[1]], bmax);
+        assert!(max[2] > min[2], "non-degenerate Z");
+
+        // Grow it: 3 mm in X, 5 mm in Y, 25 mm thick from a top of 0.
+        app.edit_stock(|s| {
+            *s = Stock::BoundingBox {
+                x_offset: 3.0,
+                y_offset: 5.0,
+                top: 0.0,
+                thickness: 25.0,
+            };
+        });
+        let (min, max) = app.stock_box();
+        assert_eq!(min, [bmin[0] - 3.0, bmin[1] - 5.0, -25.0]);
+        assert_eq!(max, [bmax[0] + 3.0, bmax[1] + 5.0, 0.0]);
+
+        // Editing stock is one undoable step.
+        assert!(app.undo());
+        let (min, _) = app.stock_box();
+        assert_eq!([min[0], min[1]], bmin, "undo restores the snug fit");
     }
 
     #[test]

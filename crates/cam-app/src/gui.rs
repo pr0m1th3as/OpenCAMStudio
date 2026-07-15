@@ -579,6 +579,14 @@ enum Field {
     Clearance,
     Retract,
     TopOfStock,
+    /// Stock: material added on both X sides of the part's bounding box (mm).
+    StockXOffset,
+    /// Stock: material added on both Y sides of the part's bounding box (mm).
+    StockYOffset,
+    /// Stock: absolute Z of the top surface (mm).
+    StockTop,
+    /// Stock: block thickness below the top (mm); bottom = top − thickness.
+    StockThickness,
     ToolDiameter,
     ToolLength,
     Flutes,
@@ -623,6 +631,10 @@ impl Field {
             Field::Clearance => "Clearance (mm)",
             Field::Retract => "Retract (mm)",
             Field::TopOfStock => "Top of stock (mm)",
+            Field::StockXOffset => "X offset (mm)",
+            Field::StockYOffset => "Y offset (mm)",
+            Field::StockTop => "Stock top (mm)",
+            Field::StockThickness => "Thickness (mm)",
             Field::ToolDiameter => "Tool ⌀ (mm)",
             Field::ToolLength => "Length (mm)",
             Field::Flutes => "Flutes",
@@ -1681,7 +1693,12 @@ impl App {
             Selection::Tool(i) => {
                 tool_fields(self.controller.document().setup.tools.get(i).map(|t| t.kind))
             }
-            Selection::Stock => Vec::new(),
+            Selection::Stock => vec![
+                Field::StockXOffset,
+                Field::StockYOffset,
+                Field::StockTop,
+                Field::StockThickness,
+            ],
             Selection::Operation(id) => match self.controller.operation(id) {
                 Some(Operation::Profile(p)) => {
                     let mut fields = vec![
@@ -1759,6 +1776,20 @@ impl App {
             Field::Clearance => Some(setup.heights.clearance),
             Field::Retract => Some(setup.heights.retract),
             Field::TopOfStock => Some(setup.heights.top_of_stock),
+            Field::StockXOffset | Field::StockYOffset | Field::StockTop | Field::StockThickness => {
+                let cam_model::Stock::BoundingBox {
+                    x_offset,
+                    y_offset,
+                    top,
+                    thickness,
+                } = setup.stock;
+                Some(match field {
+                    Field::StockXOffset => x_offset,
+                    Field::StockYOffset => y_offset,
+                    Field::StockTop => top,
+                    _ => thickness,
+                })
+            }
             Field::ToolDiameter => match self.controller.selection() {
                 Selection::Tool(i) => setup.tools.get(i).map(|t| t.diameter),
                 _ => None,
@@ -1848,7 +1879,26 @@ impl App {
             Selection::Operation(_) => self
                 .controller
                 .edit_selected_operation(|op| apply_op_fields(op, &parsed)),
-            Selection::Stock => {}
+            Selection::Stock => self.controller.edit_stock(|stock| {
+                let cam_model::Stock::BoundingBox {
+                    x_offset,
+                    y_offset,
+                    top,
+                    thickness,
+                } = stock;
+                if let Some(&v) = parsed.get(&Field::StockXOffset) {
+                    *x_offset = v.max(0.0);
+                }
+                if let Some(&v) = parsed.get(&Field::StockYOffset) {
+                    *y_offset = v.max(0.0);
+                }
+                if let Some(&v) = parsed.get(&Field::StockTop) {
+                    *top = v;
+                }
+                if let Some(&v) = parsed.get(&Field::StockThickness) {
+                    *thickness = v.max(0.0);
+                }
+            }),
         }
         self.refresh_fields();
         self.rerun();
@@ -2556,18 +2606,17 @@ impl App {
         let mut list = column![text(heading).size(15)].spacing(8).padding(8);
 
         if let Selection::Stock = self.controller.selection() {
-            let cam_model::Stock::Box { min, max } = self.controller.document().setup.stock;
+            // The concrete block the offsets/heights resolve to, as read-only
+            // context above the editable fields.
+            let (min, max) = self.controller.stock_box();
             list = list.push(
                 text(format!(
-                    "Box  X {:.1}…{:.1}\n     Y {:.1}…{:.1}\n     Z {:.1}…{:.1}",
+                    "Resolved box\n  X {:.1}…{:.1}   Y {:.1}…{:.1}   Z {:.1}…{:.1}",
                     min[0], max[0], min[1], max[1], min[2], max[2]
                 ))
-                .size(12),
+                .size(11)
+                .color(palette::GROUP_LABEL),
             );
-            return scrollable(list)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into();
         }
 
         let ordered = self.inspector_fields();

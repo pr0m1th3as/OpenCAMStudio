@@ -28,9 +28,11 @@ fn setup(operations: Vec<Operation>) -> Document {
     Document::new(Setup {
         name: "verify".into(),
         heights: Heights::new(5.0, 2.0, 0.0),
-        stock: Stock::Box {
-            min: STOCK_MIN,
-            max: STOCK_MAX,
+        stock: Stock::BoundingBox {
+            x_offset: 0.0,
+            y_offset: 0.0,
+            top: STOCK_MAX[2],
+            thickness: STOCK_MAX[2] - STOCK_MIN[2],
         },
         tools: vec![Tool {
             number: 1,
@@ -172,9 +174,11 @@ fn a_bad_setup_that_rapids_low_is_caught() {
     let doc = Document::new(Setup {
         name: "unsafe".into(),
         heights: Heights::new(-1.0, -1.0, 0.0), // clearance below stock top!
-        stock: Stock::Box {
-            min: STOCK_MIN,
-            max: STOCK_MAX,
+        stock: Stock::BoundingBox {
+            x_offset: 0.0,
+            y_offset: 0.0,
+            top: STOCK_MAX[2],
+            thickness: STOCK_MAX[2] - STOCK_MIN[2],
         },
         tools: vec![Tool {
             number: 1,
