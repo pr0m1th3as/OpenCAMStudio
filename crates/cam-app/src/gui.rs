@@ -818,6 +818,10 @@ struct App {
     /// "Set origin" pick mode: a viewport click drops the workpiece datum (using
     /// object snaps for corners/centres, or a free point elsewhere).
     setting_origin: bool,
+    /// Two-point origin mode: X from the 1st pick, Y from the 2nd, Z the midpoint.
+    setting_origin_2pt: bool,
+    /// The first point captured in two-point origin mode (awaiting the second).
+    origin_first: Option<[f64; 3]>,
     /// Whether the workpiece-origin datum marker is drawn (View toggle).
     show_origin: bool,
     status: String,
@@ -1017,13 +1021,16 @@ enum Message {
     ToggleSnap(SnapKind),
     /// Enable/disable the program start point (Setup inspector).
     ToggleStartPoint(bool),
-    /// Enter/leave "set workpiece origin" pick mode (ribbon Edit tab).
+    /// Enter/leave single-point "set workpiece origin" pick mode (Edit tab).
     ToggleSetOrigin,
+    /// Enter/leave two-point origin pick mode: X from the 1st pick, Y from the
+    /// 2nd, Z the midpoint of both.
+    ToggleSetOrigin2pt,
     /// Show or hide the workpiece-origin datum marker (View tab).
     ToggleShowOrigin,
-    /// A viewport click while setting the origin: the world `(x,y)` + aperture;
-    /// resolved to a snapped or free point that becomes the datum.
-    SetOriginPick([f32; 2], f32),
+    /// A viewport click while setting the origin (either mode): world `(x,y)` +
+    /// aperture, resolved to a snapped or free point.
+    OriginPointPicked([f32; 2], f32),
     /// Structural edits to the selected operation.
     DuplicateOp,
     DeleteOp,
@@ -1165,6 +1172,8 @@ impl App {
             snap_aperture: 1.0,
             hover_loop: None,
             setting_origin: false,
+            setting_origin_2pt: false,
+            origin_first: None,
             show_origin: true,
             status: "Open the sample part to begin.".to_string(),
         };
@@ -1354,11 +1363,13 @@ impl App {
             }
             Message::ToggleShowOrigin => self.show_origin = !self.show_origin,
             Message::ToggleSetOrigin => {
-                self.setting_origin = !self.setting_origin;
+                let on = !self.setting_origin;
+                self.setting_origin = on;
+                self.setting_origin_2pt = false;
+                self.origin_first = None;
                 self.snap_hover = None;
                 self.hover_loop = None;
-                if self.setting_origin {
-                    // Mutually exclusive with the op wizard; show the origin fields.
+                if on {
                     self.controller.cancel_operation();
                     self.controller.select(Selection::Origin);
                     self.focus_ops.clear();
@@ -1367,26 +1378,63 @@ impl App {
                         "Set origin: click a corner/centre (snaps) or any point.".to_string();
                 }
             }
-            Message::SetOriginPick(w, aperture) => {
+            Message::ToggleSetOrigin2pt => {
+                let on = !self.setting_origin_2pt;
+                self.setting_origin_2pt = on;
+                self.setting_origin = false;
+                self.origin_first = None;
+                self.snap_hover = None;
+                self.hover_loop = None;
+                if on {
+                    self.controller.cancel_operation();
+                    self.controller.select(Selection::Origin);
+                    self.focus_ops.clear();
+                    self.refresh_fields();
+                    self.status = "2-point origin: click point 1 (sets X).".to_string();
+                }
+            }
+            Message::OriginPointPicked(w, aperture) => {
                 let world = [w[0] as f64, w[1] as f64];
-                // Snap to geometry if a snap catches, else take the free point.
-                let p = self
+                // Snap to geometry if a snap catches, else take the free point; Z is
+                // the pick plane (top of stock).
+                let p2 = self
                     .controller
                     .snap_at(world, aperture as f64, &self.snaps)
                     .map(|h| h.point)
                     .unwrap_or(world);
-                self.controller.edit_origin(|o| {
-                    o[0] = p[0];
-                    o[1] = p[1]; // Z stays; edit it in the Setup fields
-                });
-                self.setting_origin = false;
+                let z = self.controller.document().setup.heights.top_of_stock;
+                let p = [p2[0], p2[1], z];
                 self.snap_hover = None;
                 self.hover_loop = None;
-                self.refresh_fields();
-                self.status = format!("Origin set to X{:.3} Y{:.3}.", p[0], p[1]);
+                if self.setting_origin {
+                    // Single point: X and Y (Z stays; edit it in the fields).
+                    self.controller.edit_origin(|o| {
+                        o[0] = p[0];
+                        o[1] = p[1];
+                    });
+                    self.setting_origin = false;
+                    self.refresh_fields();
+                    self.status = format!("Origin set to X{:.3} Y{:.3}.", p[0], p[1]);
+                } else if let Some(first) = self.origin_first.take() {
+                    // Two-point: X from the 1st pick, Y from the 2nd, Z the midpoint.
+                    let origin = [first[0], p[1], (first[2] + p[2]) / 2.0];
+                    self.controller.edit_origin(|o| *o = origin);
+                    self.setting_origin_2pt = false;
+                    self.refresh_fields();
+                    self.status = format!(
+                        "Origin set to X{:.3} Y{:.3} Z{:.3}.",
+                        origin[0], origin[1], origin[2]
+                    );
+                } else {
+                    // Two-point: first pick — store it, await the second (Y).
+                    self.origin_first = Some(p);
+                    self.status = "2-point origin: click point 2 (sets Y).".to_string();
+                }
             }
             Message::BeginOp(kind) => {
                 self.setting_origin = false;
+                self.setting_origin_2pt = false;
+                self.origin_first = None;
                 self.controller.begin_operation(kind);
                 // Seed the op with the first library tool so it always has a valid
                 // tool; the user can change it in the wizard picker.
@@ -1479,7 +1527,7 @@ impl App {
                 // Preview the object-snap under the cursor (drawn as a marker).
                 // Active for set-origin, and for op kinds that use a start (inert
                 // for Face/Drill/Thread).
-                let use_snaps = self.setting_origin
+                let use_snaps = self.in_origin_pick()
                     || self
                         .controller
                         .pending_op()
@@ -1492,7 +1540,7 @@ impl App {
                 };
                 // Highlight the loop a click would select (op picks only —
                 // disambiguates concentric circles; drill/thread → circles only).
-                self.hover_loop = if self.setting_origin {
+                self.hover_loop = if self.in_origin_pick() {
                     None
                 } else {
                     let circles = self
@@ -1911,6 +1959,11 @@ impl App {
         }
     }
 
+    /// Whether either origin-pick mode (single or two-point) is active.
+    fn in_origin_pick(&self) -> bool {
+        self.setting_origin || self.setting_origin_2pt
+    }
+
     /// Reset the viewport highlight to the controller's current single selection
     /// (an operation, or nothing). Used after structural edits (duplicate/delete)
     /// that move the selection, so the highlight set never keeps stale ids.
@@ -2307,7 +2360,7 @@ impl App {
     /// pick is pending, its half-size the vertex-snap aperture. Purely visual — it
     /// does not intercept clicks (they fall through to the viewport).
     fn pickbox_overlay(&self) -> Option<Element<'_, Message>> {
-        if self.controller.pending_op().is_none() && !self.setting_origin {
+        if self.controller.pending_op().is_none() && !self.in_origin_pick() {
             return None;
         }
         // Once a snap engages, its (bolder) in-scene marker stands in for the
@@ -2427,12 +2480,20 @@ impl App {
             }],
             RibbonTab::Edit => vec![GroupSpec {
                 title: "Workpiece",
-                commands: vec![toggle_cmd(
-                    Icon::SetOrigin,
-                    "Set Origin",
-                    self.setting_origin,
-                    Message::ToggleSetOrigin,
-                )],
+                commands: vec![
+                    toggle_cmd(
+                        Icon::SetOrigin,
+                        "Set Origin",
+                        self.setting_origin,
+                        Message::ToggleSetOrigin,
+                    ),
+                    toggle_cmd(
+                        Icon::SetOrigin,
+                        "Origin 2-pt",
+                        self.setting_origin_2pt,
+                        Message::ToggleSetOrigin2pt,
+                    ),
+                ],
             }],
             RibbonTab::Tooling => vec![GroupSpec {
                 title: "Library",
@@ -2613,8 +2674,9 @@ impl App {
                     &self.focus_ops.iter().copied().collect::<Vec<_>>(),
                     self.snap_hover.map(|h| (h, self.snap_aperture)),
                     self.hover_loop,
-                    self.setting_origin,
+                    self.in_origin_pick(),
                     self.show_origin,
+                    self.origin_first,
                 ))
                 .width(Length::Fill)
                 .height(Length::Fill),
@@ -3883,6 +3945,7 @@ impl Viewport {
         hover_loop: Option<LoopRef>,
         set_origin: bool,
         show_origin: bool,
+        origin_first: Option<[f64; 3]>,
     ) -> Self {
         let picking = controller.pending_op().is_some();
         let pick_z = controller.document().setup.heights.top_of_stock as f32;
@@ -3930,6 +3993,13 @@ impl Viewport {
                 let r = ((mx[0] - mn[0]).max(mx[1] - mn[1]) * 0.06).max(1.0);
                 add_origin_marker(&mut scene, origin, pick_z, r);
             }
+        }
+        // The first point captured in two-point origin mode (awaiting the second).
+        if let Some(first) = origin_first {
+            let r = bounds
+                .map(|(mn, mx)| ((mx[0] - mn[0]).max(mx[1] - mn[1]) * 0.04).max(1.0))
+                .unwrap_or(3.0);
+            add_origin_marker(&mut scene, first, pick_z, r);
         }
         // The object-snap marker under the cursor (op pick *or* set-origin).
         if let Some((hit, aperture)) = snap {
@@ -4045,7 +4115,7 @@ impl shader::Program<Message> for Viewport {
                     if let Some(w) = cam.pick_plane(u, v, aspect, self.pick_z) {
                         let aperture = 0.5 * SNAP_PICK_PX * cam.world_per_pixel(bounds.height);
                         let msg = if self.set_origin {
-                            Message::SetOriginPick(w, aperture)
+                            Message::OriginPointPicked(w, aperture)
                         } else {
                             Message::PickWorld(w, aperture)
                         };
