@@ -44,6 +44,10 @@ to public.
 
 ## After the slice (unordered candidates)
 
+- **User preferences panel + persistence** (no settings file yet): object-snap
+  distance (`SNAP_PICK_PX`) & marker size (`SNAP_MARK_SCALE`), orientation-cube
+  size/visibility, default snap set, and other view/UX knobs — all currently
+  compile-time constants awaiting a prefs UI + on-disk store.
 - Feeds & speeds calculator; tool library persistence/import.
 - Rest-material awareness between operations.
 - 3-axis: Z-level roughing, waterline/scallop finishing (needs `cam-geo` 3D and

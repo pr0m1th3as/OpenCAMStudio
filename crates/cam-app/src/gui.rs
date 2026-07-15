@@ -134,7 +134,7 @@ fn icon_svg(icon: Icon, size: f32) -> Element<'static, Message> {
 use cam_render::{MeshVertex, OrbitCamera, Scene, Vertex, PART};
 use cam_toolpath::{CancelToken, Severity};
 
-use crate::{AppController, OpKind, PendingOp, PickResult, Selection, SnapHit, SnapKind};
+use crate::{AppController, LoopRef, OpKind, PendingOp, PickResult, Selection, SnapHit, SnapKind};
 
 /// A small sample part (rectangle + circular hole) so the app is useful without
 /// a file dialog on first run.
@@ -790,11 +790,27 @@ struct App {
     /// The world-mm pickbox aperture from the last hover, sizing the snap marker
     /// (roughly constant on screen).
     snap_aperture: f64,
+    /// The loop under the cursor while a pick is pending — highlighted so it is
+    /// obvious which loop a click will select (vital for concentric circles).
+    hover_loop: Option<LoopRef>,
     status: String,
 }
 
 /// The pickbox aperture, px — its half-size is the vertex-snap tolerance.
 const PICKBOX_PX: f32 = 12.0;
+/// The object-snap catch aperture, px — larger than the pickbox so snaps engage
+/// from a comfortable distance (and the marker, sized from it, reads clearly).
+/// TODO(prefs): expose this (snap distance) in user preferences — see WORKSTATE.
+const SNAP_PICK_PX: f32 = 2.0 * PICKBOX_PX;
+/// Snap marker size as a multiple of the snap aperture.
+/// TODO(prefs): expose this (snap-shape size) in user preferences.
+const SNAP_MARK_SCALE: f32 = 1.2;
+
+/// Whether an operation kind uses a start/lead-in point, and so honours object
+/// snaps. Face/Drill/Thread have no start, so snaps are inert (and hidden) there.
+fn op_uses_snaps(kind: OpKind) -> bool {
+    matches!(kind, OpKind::Profile | OpKind::Chamfer | OpKind::Pocket)
+}
 
 /// Orientation-cube on-screen size (logical px): default and the slider's range.
 const GIZMO_SIZE_DEFAULT: f32 = 110.0;
@@ -807,6 +823,9 @@ const GIZMO_MARGIN: f32 = 8.0;
 const PICK_BOUNDARY: [f32; 4] = [0.20, 0.55, 0.90, 1.0];
 /// Highlight colour for an excluded island loop (gold).
 const PICK_ISLAND: [f32; 4] = [0.90, 0.65, 0.10, 1.0];
+/// Highlight colour for the loop under the cursor during a pick (bright yellow) —
+/// shows which loop a click will select, e.g. among concentric circles.
+const PICK_HOVER: [f32; 4] = [0.95, 0.92, 0.25, 1.0];
 /// Object-snap marker colour (bright cyan — reads over part and stock alike).
 const SNAP_MARK: [f32; 4] = [0.20, 0.95, 0.95, 1.0];
 
@@ -815,7 +834,9 @@ const SNAP_MARK: [f32; 4] = [0.20, 0.95, 0.95, 1.0];
 /// hourglass = Nearest), sized by the pickbox `aperture` so it reads at any zoom.
 fn add_snap_marker(scene: &mut Scene, hit: SnapHit, aperture: f64, z: f32) {
     let (cx, cy) = (hit.point[0] as f32, hit.point[1] as f32);
-    let h = (aperture as f32).max(0.01); // half-size ≈ pickbox
+    // A touch larger than the (already doubled) snap aperture, so the engaged
+    // marker reads clearly in place of the pickbox.
+    let h = (aperture as f32 * SNAP_MARK_SCALE).max(0.01);
     let p = |dx: f32, dy: f32| [cx + dx * h, cy + dy * h, z];
     let strip: Vec<[f32; 3]> = match hit.kind {
         // Square.
@@ -1069,6 +1090,7 @@ impl App {
             snaps: vec![SnapKind::End, SnapKind::Mid, SnapKind::Quadrant],
             snap_hover: None,
             snap_aperture: 1.0,
+            hover_loop: None,
             status: "Open the sample part to begin.".to_string(),
         };
         app.refresh_fields();
@@ -1288,14 +1310,26 @@ impl App {
                 }
             }
             Message::PickWorld(w, aperture) => {
+                // Snaps only apply to op kinds with a start; others select by the
+                // nearest point on the loop.
+                let snaps: &[SnapKind] = if self
+                    .controller
+                    .pending_op()
+                    .is_some_and(|p| op_uses_snaps(p.kind))
+                {
+                    &self.snaps
+                } else {
+                    &[]
+                };
                 match self.controller.pick_operation_geometry(
                     [w[0] as f64, w[1] as f64],
                     aperture as f64,
-                    &self.snaps,
+                    snaps,
                 ) {
                     PickResult::Created => {
                         self.cursor = None;
                         self.snap_hover = None;
+                        self.hover_loop = None;
                         self.refresh_fields();
                         self.rerun();
                         self.status = "Operation created.".to_string();
@@ -1313,14 +1347,30 @@ impl App {
             Message::ViewportCursor(p) => {
                 self.cursor = Some(p);
                 self.snap_hover = None;
+                self.hover_loop = None;
             }
             Message::HoverWorld(screen, w, aperture) => {
                 self.cursor = Some(screen);
                 self.snap_aperture = aperture as f64;
-                // Preview the object-snap under the cursor (drawn as a marker).
-                self.snap_hover =
+                // Preview the object-snap under the cursor (drawn as a marker), but
+                // only for op kinds that use a start — inert for Face/Drill/Thread.
+                let use_snaps = self
+                    .controller
+                    .pending_op()
+                    .is_some_and(|p| op_uses_snaps(p.kind));
+                self.snap_hover = if use_snaps {
                     self.controller
-                        .snap_at([w[0] as f64, w[1] as f64], aperture as f64, &self.snaps);
+                        .snap_at([w[0] as f64, w[1] as f64], aperture as f64, &self.snaps)
+                } else {
+                    None
+                };
+                // Highlight the loop a click would select (snap's loop, else the
+                // nearest one under the box) — disambiguates concentric circles.
+                self.hover_loop = self.snap_hover.map(|h| h.loop_ref).or_else(|| {
+                    self.controller
+                        .nearest_loop_point([w[0] as f64, w[1] as f64], aperture as f64)
+                        .map(|(l, _)| l)
+                });
             }
             Message::ToggleSnap(kind) => {
                 if let Some(pos) = self.snaps.iter().position(|k| *k == kind) {
@@ -2083,6 +2133,11 @@ impl App {
     /// does not intercept clicks (they fall through to the viewport).
     fn pickbox_overlay(&self) -> Option<Element<'_, Message>> {
         self.controller.pending_op()?;
+        // Once a snap engages, its (bolder) in-scene marker stands in for the
+        // pickbox — so the blue aperture square shows only while nothing snaps.
+        if self.snap_hover.is_some() {
+            return None;
+        }
         let c = self.cursor?;
         let half = PICKBOX_PX / 2.0;
         let square = container(Space::new())
@@ -2365,6 +2420,7 @@ impl App {
                     self.gizmo_size,
                     &self.focus_ops.iter().copied().collect::<Vec<_>>(),
                     self.snap_hover.map(|h| (h, self.snap_aperture)),
+                    self.hover_loop,
                 ))
                 .width(Length::Fill)
                 .height(Length::Fill),
@@ -2588,11 +2644,7 @@ impl App {
 
         // Object snaps govern where the start/lead-in lands; show them for the
         // kinds that carry a start, while still awaiting that (boundary) pick.
-        let snappy = matches!(
-            pending.kind,
-            OpKind::Profile | OpKind::Chamfer | OpKind::Pocket
-        );
-        if snappy && pending.boundary.is_none() {
+        if op_uses_snaps(pending.kind) && pending.boundary.is_none() {
             col = col.push(self.snap_toolbar());
         }
 
@@ -3572,11 +3624,15 @@ struct Viewport {
     gizmo_size: f32,
     /// Geometry-pick mode (a new-operation wizard is awaiting a region click).
     picking: bool,
+    /// An object-snap is engaged under the cursor — its marker replaces the
+    /// crosshair/pickbox.
+    snap_engaged: bool,
     /// The world Z of the plane clicks are projected onto (top of stock).
     pick_z: f32,
 }
 
 impl Viewport {
+    #[allow(clippy::too_many_arguments)] // cohesive per-frame view inputs
     fn new(
         controller: &AppController,
         show_stock: bool,
@@ -3585,6 +3641,7 @@ impl Viewport {
         gizmo_size: f32,
         focus_ops: &[u32],
         snap: Option<(SnapHit, f64)>,
+        hover_loop: Option<LoopRef>,
     ) -> Self {
         let picking = controller.pending_op().is_some();
         let pick_z = controller.document().setup.heights.top_of_stock as f32;
@@ -3603,6 +3660,14 @@ impl Viewport {
         // While the pick wizard is active, highlight the chosen boundary (accent)
         // and any excluded islands (gold) so the user sees what they picked.
         if let Some(pending) = controller.pending_op() {
+            // The loop under the cursor (what a click selects), drawn first so the
+            // boundary/island highlights paint over it once chosen.
+            if let Some(c) = hover_loop
+                .filter(|l| Some(*l) != pending.boundary)
+                .and_then(|l| controller.loop_contour(l))
+            {
+                add_loop_highlight(&mut scene, c, PICK_HOVER);
+            }
             if let Some(c) = pending.boundary.and_then(|b| controller.loop_contour(b)) {
                 add_loop_highlight(&mut scene, c, PICK_BOUNDARY);
             }
@@ -3638,6 +3703,7 @@ impl Viewport {
             show_gizmo,
             gizmo_size,
             picking,
+            snap_engaged: snap.is_some(),
             pick_z,
         }
     }
@@ -3722,7 +3788,7 @@ impl shader::Program<Message> for Viewport {
                     let v = 1.0 - 2.0 * (pos.y - bounds.y) / bounds.height;
                     let cam = self.camera();
                     if let Some(w) = cam.pick_plane(u, v, aspect, self.pick_z) {
-                        let aperture = 0.5 * PICKBOX_PX * cam.world_per_pixel(bounds.height);
+                        let aperture = 0.5 * SNAP_PICK_PX * cam.world_per_pixel(bounds.height);
                         return Some(
                             shader::Action::publish(Message::PickWorld(w, aperture)).and_capture(),
                         );
@@ -3792,7 +3858,7 @@ impl shader::Program<Message> for Viewport {
                     let cam = self.camera();
                     let msg = match cam.pick_plane(u, v, aspect, self.pick_z) {
                         Some(w) => {
-                            let aperture = 0.5 * PICKBOX_PX * cam.world_per_pixel(bounds.height);
+                            let aperture = 0.5 * SNAP_PICK_PX * cam.world_per_pixel(bounds.height);
                             Message::HoverWorld(*position, w, aperture)
                         }
                         None => Message::ViewportCursor(*position),
@@ -3860,8 +3926,9 @@ impl shader::Program<Message> for Viewport {
         cursor: iced::mouse::Cursor,
     ) -> iced::mouse::Interaction {
         let over = cursor.position_over(bounds).is_some();
-        if self.picking && over {
+        if self.picking && over && !self.snap_engaged {
             // A crosshair under the drawn pickbox — AutoCAD-style precise aiming.
+            // Suppressed once a snap engages, so its marker takes over cleanly.
             iced::mouse::Interaction::Crosshair
         } else if state.drag.is_some() {
             iced::mouse::Interaction::Grabbing
