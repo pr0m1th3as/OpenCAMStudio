@@ -1343,7 +1343,17 @@ impl App {
                             format!("Boundary set — click areas to exclude ({n}), then Confirm.");
                     }
                     PickResult::Missed => {
-                        self.status = "No line there — click a boundary edge.".to_string();
+                        // Word the miss to match what is actually pickable for this
+                        // op — a circular edge for drill/thread, else any boundary.
+                        let circles = self
+                            .controller
+                            .pending_op()
+                            .is_some_and(|p| op_selects_circles(p.kind));
+                        self.status = if circles {
+                            "No arc there — click on a circular edge.".to_string()
+                        } else {
+                            "No line there — click a boundary edge.".to_string()
+                        };
                     }
                 }
             }
