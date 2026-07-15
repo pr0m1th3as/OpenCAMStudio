@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="64" height="64" stroke-linejoin="round" stroke-linecap="round">
+  <!-- isometric stock block, shaded for depth -->
+  <path d="M4 7 L4 16 L12 20 L12 11 Z" fill="#e0e0e0" fill-opacity="0.06"/>
+  <path d="M20 7 L20 16 L12 20 L12 11 Z" fill="#e0e0e0" fill-opacity="0.13"/>
+  <path d="M12 3 L20 7 L12 11 L4 7 Z" fill="#e0e0e0" fill-opacity="0.20"/>
+  <path d="M12 3 L20 7 L20 16 L12 20 L4 16 L4 7 Z M12 11 L12 20 M4 7 L12 11 L20 7" fill="none" stroke="#e0e0e0" stroke-width="1.6"/>
+  <!-- profile toolpath: contour offset around the part -->
+  <path d="M12 1.6 L21.4 7 L12 12 L2.6 7 Z" fill="none" stroke="#4cc9f0" stroke-width="1.4" stroke-linecap="butt" stroke-dasharray="2.6 1.8"/>
+  <!-- cutter riding the contour -->
+  <circle cx="21.4" cy="7" r="1.5" fill="#4cc9f0" fill-opacity="0.55" stroke="#4cc9f0" stroke-width="1.1"/>
+</svg>

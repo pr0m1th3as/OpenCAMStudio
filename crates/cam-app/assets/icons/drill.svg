@@ -1,6 +1,11 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="64" height="64" fill="none" stroke-linecap="round" stroke-linejoin="round">
-  <line x1="12" y1="3" x2="12" y2="8.5" stroke="#e0e0e0" stroke-width="1.6"/>
-  <polyline points="9.5,6 12,8.7 14.5,6" stroke="#e0e0e0" stroke-width="1.6"/>
-  <circle cx="12" cy="14.5" r="4.5" stroke="#e0e0e0" stroke-width="1.6"/>
-  <circle cx="12" cy="14.5" r="1.1" fill="#4cc9f0" stroke="none"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="64" height="64" stroke-linejoin="round" stroke-linecap="round">
+  <!-- twist drill bit, tip down -->
+  <!-- shank -->
+  <rect x="9.4" y="2.5" width="5.2" height="6" rx="1" fill="#e0e0e0" fill-opacity="0.12" stroke="#e0e0e0" stroke-width="1.6"/>
+  <!-- fluted body tapering to the point -->
+  <path d="M9.4 8.5 L9.4 15.5 L12 20.5 L14.6 15.5 L14.6 8.5 Z" fill="#e0e0e0" fill-opacity="0.07" stroke="#e0e0e0" stroke-width="1.6"/>
+  <!-- helical flutes -->
+  <path d="M10 9.6 L14 12.2 M10 12.6 L14 15.2" stroke="#4cc9f0" stroke-width="1.4"/>
+  <!-- cutting point -->
+  <path d="M9.4 15.5 L12 20.5 L14.6 15.5" fill="none" stroke="#4cc9f0" stroke-width="1.5"/>
 </svg>

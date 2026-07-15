@@ -69,6 +69,7 @@ enum Icon {
     Profile,
     Pocket,
     Drill,
+    Thread,
     Face,
     NewTool,
     Duplicate,
@@ -89,9 +90,10 @@ impl Icon {
             Icon::Undo => include_bytes!("../assets/icons/undo.svg"),
             Icon::Redo => include_bytes!("../assets/icons/redo.svg"),
             Icon::Run => include_bytes!("../assets/icons/run.svg"),
-            Icon::Profile => include_bytes!("../assets/icons/offset.svg"),
+            Icon::Profile => include_bytes!("../assets/icons/profile.svg"),
             Icon::Pocket => include_bytes!("../assets/icons/pocket.svg"),
             Icon::Drill => include_bytes!("../assets/icons/drill.svg"),
+            Icon::Thread => include_bytes!("../assets/icons/thread.svg"),
             Icon::Face => include_bytes!("../assets/icons/face.svg"),
             Icon::NewTool => include_bytes!("../assets/icons/endmill.svg"),
             Icon::Duplicate => include_bytes!("../assets/icons/copy.svg"),
@@ -548,6 +550,9 @@ enum Message {
     ExportNc,
     /// The chosen `.nc` path (`None` = cancelled).
     NcToExport(Option<PathBuf>),
+    /// A ribbon command that is present but not yet wired to an operation; clicking
+    /// reports it in the status line. The `&str` names the feature.
+    NotImplemented(&'static str),
     // --- Operation-creation wizard ---
     /// Begin creating an operation of `kind` (enter geometry-pick mode).
     BeginOp(OpKind),
@@ -703,6 +708,9 @@ impl App {
                 self.fields.insert(field, value);
             }
             Message::Apply => self.apply_inspector(),
+            Message::NotImplemented(feature) => {
+                self.status = format!("{feature} is not yet implemented.");
+            }
             Message::NewProject => {
                 self.controller.new_project();
                 self.refresh_fields();
@@ -1427,6 +1435,11 @@ impl App {
                     cmd(Icon::Profile, "Profile", begin(OpKind::Profile)),
                     cmd(Icon::Pocket, "Pocket", begin(OpKind::Pocket)),
                     cmd(Icon::Drill, "Drill", begin(OpKind::Drill)),
+                    cmd(
+                        Icon::Thread,
+                        "Thread",
+                        Some(Message::NotImplemented("Threading")),
+                    ),
                     cmd(Icon::Face, "Face", begin(OpKind::Face)),
                 ],
             }],
