@@ -323,14 +323,15 @@ impl AppController {
     /// bundled sample and tests). Returns the number of regions.
     pub fn open_dxf(&mut self, text: &str, name: impl Into<String>) -> Result<usize, ImportError> {
         let import = read_dxf_str(text, &ImportOptions::default())?;
-        self.install_import(import.regions, name.into());
+        self.install_import(import.regions, name.into(), true);
         Ok(self.regions.len())
     }
 
     /// Import a CAD file (`.dxf` ASCII/binary or `.dwg`) via acadrust, replacing
-    /// any current drawing and generating a fresh document. Returns the region
-    /// count. This does not set the project path — an imported drawing is saved as
-    /// a new `.ocam` project.
+    /// any current drawing with **geometry only** — no operations are fabricated;
+    /// the user creates them by picking boundaries. Returns the region count. This
+    /// does not set the project path — an imported drawing is saved as a new
+    /// `.ocam` project.
     pub fn import_cad(&mut self, path: impl AsRef<Path>) -> Result<usize, ImportError> {
         let path = path.as_ref();
         let import = read_cad_file(path, &ImportOptions::default())?;
@@ -339,16 +340,18 @@ impl AppController {
             .and_then(|n| n.to_str())
             .unwrap_or("imported")
             .to_string();
-        self.install_import(import.regions, name);
+        self.install_import(import.regions, name, false);
         Ok(self.regions.len())
     }
 
     /// Install freshly imported regions: generate a document, select the first
-    /// operation, and reset derived state. Shared by every import path.
-    fn install_import(&mut self, regions: Vec<Polygon>, name: String) {
+    /// operation (or the Setup when none is seeded), and reset derived state.
+    /// Shared by every import path. `seed_ops` seeds a profile per boundary/hole
+    /// (the bundled sample demo) versus bringing in bare geometry (real imports).
+    fn install_import(&mut self, regions: Vec<Polygon>, name: String, seed_ops: bool) {
         self.regions = regions;
         self.source_name = name;
-        let document = self.generate_document();
+        let document = self.generate_document(seed_ops);
         self.document = History::new(document);
         self.excluded.clear();
         self.pending_op = None;
@@ -1001,9 +1004,12 @@ impl AppController {
         (vertices, surface.indices, sim.collisions)
     }
 
-    /// Build a document from the current geometry and seed defaults: an outside
-    /// profile for each region's boundary and an inside profile for each hole.
-    fn generate_document(&self) -> Document {
+    /// Build a document from the current geometry and seed defaults. When
+    /// `seed_ops` is set, seed an outside profile for each region's boundary and
+    /// an inside profile for each hole (the bundled sample demo); otherwise the
+    /// document carries the geometry, stock, and default tool but **no operations**
+    /// (a real import — the user creates ops by picking).
+    fn generate_document(&self, seed_ops: bool) -> Document {
         let p = self.defaults;
         let tool = Tool {
             number: 1,
@@ -1014,29 +1020,31 @@ impl AppController {
         };
 
         let mut operations = Vec::new();
-        let mut id = 0u32;
-        let mut push = |chain, side, operations: &mut Vec<Operation>| {
-            operations.push(Operation::Profile(ProfileOp {
-                id,
-                tool: 1,
-                chain,
-                side,
-                comp: Comp::Computed,
-                depth: p.depth,
-                stepdown: p.stepdown,
-                feed: p.feed,
-                plunge_feed: p.plunge_feed,
-                start: None,
-                lead_in: Lead::None,
-                lead_out: Lead::None,
-                plunge: Plunge::Straight,
-            }));
-            id += 1;
-        };
-        for region in &self.regions {
-            push(region.outer().clone(), Side::Outside, &mut operations);
-            for hole in region.holes() {
-                push(hole.clone(), Side::Inside, &mut operations);
+        if seed_ops {
+            let mut id = 0u32;
+            let mut push = |chain, side, operations: &mut Vec<Operation>| {
+                operations.push(Operation::Profile(ProfileOp {
+                    id,
+                    tool: 1,
+                    chain,
+                    side,
+                    comp: Comp::Computed,
+                    depth: p.depth,
+                    stepdown: p.stepdown,
+                    feed: p.feed,
+                    plunge_feed: p.plunge_feed,
+                    start: None,
+                    lead_in: Lead::None,
+                    lead_out: Lead::None,
+                    plunge: Plunge::Straight,
+                }));
+                id += 1;
+            };
+            for region in &self.regions {
+                push(region.outer().clone(), Side::Outside, &mut operations);
+                for hole in region.holes() {
+                    push(hole.clone(), Side::Inside, &mut operations);
+                }
             }
         }
 
@@ -1555,6 +1563,13 @@ mod tests {
             app.source_name(),
             path.file_name().unwrap().to_str().unwrap()
         );
+        // A real import brings in geometry only — no operations are fabricated
+        // (unlike the bundled sample); selection falls back to the Setup.
+        assert!(
+            app.document().setup.operations.is_empty(),
+            "import must not auto-create operations"
+        );
+        assert_eq!(app.selection(), Selection::Setup);
         std::fs::remove_file(&path).ok();
     }
 

@@ -2088,7 +2088,16 @@ fn group_width(n: usize, density: Density) -> f32 {
         Density::Tight => (TIGHT_W, 1),
     };
     let inner = buttons as f32 * btn_w + buttons.saturating_sub(1) as f32 * CMD_GAP;
-    inner + GROUP_PAD * 2.0
+    // Full/Compact groups wrap in `ribbon_group`, a container padded `GROUP_PAD`
+    // per side; Collapsed/Tight render as a bare fixed-width button with no such
+    // wrapper. Counting the padding for the popup densities made this width — and
+    // thus the popup x-offset that sums it over preceding groups — drift right by
+    // `2*GROUP_PAD` per collapsed group.
+    if density.is_popup() {
+        inner
+    } else {
+        inner + GROUP_PAD * 2.0
+    }
 }
 
 /// The total drawn width of the group row at the given densities (with gaps).
