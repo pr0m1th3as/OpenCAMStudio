@@ -40,14 +40,14 @@ pub fn build_job(
 
     program.push(Step::Comment(setup.name.clone()));
 
-    // Optional program start point: begin with a rapid to it, so the toolpath's
-    // first motion originates at a known safe spot. Resolved from its base +
-    // offset; tagged to the first op (Link) so it colours as a rapid.
-    if let Some(sp) = setup.start_point {
-        let [x, y, z] = sp.resolve(setup.origin);
+    // Optional program start point: begin with a rapid to origin + offset, so the
+    // toolpath's first motion originates at a known safe spot. Tagged to the first
+    // op (Link) so it colours as a rapid.
+    if let Some(off) = setup.start_offset {
+        let o = setup.origin;
         let op_id = setup.operations.first().map_or(0, Operation::id);
         program.push(Step::Rapid {
-            to: Point3::new(x, y, z),
+            to: Point3::new(o[0] + off[0], o[1] + off[1], o[2] + off[2]),
             tag: Tag::new(op_id, MoveKind::Link),
         });
     }

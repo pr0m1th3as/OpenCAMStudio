@@ -16,7 +16,7 @@ use cam_import::{read_cad_file, read_dxf_str, ImportError, ImportOptions};
 use crate::project::Project;
 use cam_model::{
     ChamferOp, Comp, Document, DrillOp, FaceOp, Hand, Heights, History, Lead, Machine, Operation,
-    Plunge, PocketOp, ProfileOp, Setup, Side, StartPoint, Stock, ThreadOp, Tool, ToolKind,
+    Plunge, PocketOp, ProfileOp, Setup, Side, Stock, ThreadOp, Tool, ToolKind,
 };
 use cam_post::{GrblPost, Post, PostError, PostOptions};
 use cam_render::{mesh_vertices, MeshVertex, Scene, PART};
@@ -86,6 +86,8 @@ pub enum Selection {
     /// The setup itself (its heights).
     #[default]
     Setup,
+    /// The workpiece origin (datum) and program start point.
+    Origin,
     /// The raw stock.
     Stock,
     /// A tool in the setup's tool list, by index.
@@ -321,7 +323,7 @@ impl AppController {
         self.selection = match selection {
             Selection::Tool(i) if i < self.document.current().setup.tools.len() => selection,
             Selection::Operation(id) if self.operation(id).is_some() => selection,
-            Selection::Setup | Selection::Stock => selection,
+            Selection::Setup | Selection::Origin | Selection::Stock => selection,
             _ => Selection::Setup,
         };
     }
@@ -488,9 +490,9 @@ impl AppController {
         self.invalidate();
     }
 
-    /// Edit the optional program start point as one undoable change.
-    pub fn edit_start_point(&mut self, f: impl FnOnce(&mut Option<StartPoint>)) {
-        self.document.edit(|doc| f(&mut doc.setup.start_point));
+    /// Edit the optional program start offset (from origin) as one undoable change.
+    pub fn edit_start_offset(&mut self, f: impl FnOnce(&mut Option<[f64; 3]>)) {
+        self.document.edit(|doc| f(&mut doc.setup.start_offset));
         self.invalidate();
     }
 
@@ -1406,7 +1408,7 @@ impl AppController {
             tools,
             operations,
             origin: [0.0, 0.0, 0.0],
-            start_point: None,
+            start_offset: None,
         })
     }
 
@@ -1667,7 +1669,7 @@ fn empty_document(p: &JobParams) -> Document {
         }],
         operations: Vec::new(),
         origin: [0.0, 0.0, 0.0],
-        start_point: None,
+        start_offset: None,
     })
 }
 

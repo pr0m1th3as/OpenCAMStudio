@@ -77,7 +77,7 @@ fn import_and_plan() -> (String, Vec<cam_toolpath::Diagnostic>, usize, usize) {
         }],
         operations: ops,
         origin: [0.0, 0.0, 0.0],
-        start_point: None,
+        start_offset: None,
     });
 
     let (program, diags) = build_job(&doc, 1000.0, SpindleDir::Cw, &CancelToken::new());

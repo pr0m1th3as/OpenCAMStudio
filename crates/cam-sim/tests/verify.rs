@@ -43,7 +43,7 @@ fn setup(operations: Vec<Operation>) -> Document {
         }],
         operations,
         origin: [0.0, 0.0, 0.0],
-        start_point: None,
+        start_offset: None,
     })
 }
 
@@ -207,7 +207,7 @@ fn a_bad_setup_that_rapids_low_is_caught() {
             plunge: Plunge::Straight,
         })],
         origin: [0.0, 0.0, 0.0],
-        start_point: None,
+        start_offset: None,
     });
     let (program, _) = build_job(&doc, 1000.0, SpindleDir::Cw, &CancelToken::new());
     let sim = simulate(

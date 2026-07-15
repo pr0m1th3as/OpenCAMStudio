@@ -14,7 +14,7 @@ use crate::Tool;
 /// present from the start so save-files are versioned before there is a loader.
 /// v2: `ToolKind` became a data-carrying enum (per-kind geometry).
 /// v3: `Stock` became a part-relative spec (offsets + top + thickness).
-/// v4: `Setup` gained a workpiece `origin` (datum) and optional `start_point`.
+/// v4: `Setup` gained a workpiece `origin` (datum) + optional `start_offset`.
 pub const SCHEMA_VERSION: u32 = 4;
 
 /// The safety planes for a setup, all **absolute Z in millimetres**. By
@@ -435,48 +435,12 @@ pub struct Setup {
     /// means the part frame *is* the program frame. Design/sim stay in part space.
     #[serde(default)]
     pub origin: [f64; 3],
-    /// Optional **program start point**: the toolpath begins with a rapid here,
-    /// so the first motion originates at a known safe spot. Defined as an offset
-    /// from a base (the origin, or a reference point) — see [`StartPoint`]. `None`
-    /// starts straight into the first operation.
+    /// Optional **program start point**, as an offset (mm, part axes) **from the
+    /// origin**: the toolpath begins with a rapid to `origin + start_offset`, so
+    /// the first motion originates at a known safe spot. `None` starts straight
+    /// into the first operation.
     #[serde(default)]
-    pub start_point: Option<StartPoint>,
-}
-
-/// Where a program start point sits: an offset from a base — either the workpiece
-/// origin (so "20 mm above zero") or an explicit reference point on the part
-/// (so "this corner, plus a clearance"). Resolved to a part-space point by
-/// [`StartPoint::resolve`].
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct StartPoint {
-    /// The base the offset is measured from.
-    pub base: StartBase,
-    /// Offset from `base`, mm, along the part axes.
-    pub offset: [f64; 3],
-}
-
-/// The base a [`StartPoint`] offset is measured from.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum StartBase {
-    /// Measured from the workpiece origin (datum).
-    Origin,
-    /// Measured from an explicit reference point on the part (part XY/Z).
-    Reference([f64; 3]),
-}
-
-impl StartPoint {
-    /// Resolve to a part-space point `[x, y, z]`, given the setup's `origin`.
-    pub fn resolve(&self, origin: [f64; 3]) -> [f64; 3] {
-        let base = match self.base {
-            StartBase::Origin => origin,
-            StartBase::Reference(p) => p,
-        };
-        [
-            base[0] + self.offset[0],
-            base[1] + self.offset[1],
-            base[2] + self.offset[2],
-        ]
-    }
+    pub start_offset: Option<[f64; 3]>,
 }
 
 /// The top-level document: a schema version and a setup.
@@ -542,23 +506,6 @@ mod tests {
             op.feed = 301.0; // one field differs
         }
         assert!(!a.same_work(&b), "a differing feed is different work");
-    }
-
-    #[test]
-    fn start_point_resolves_from_origin_or_a_reference() {
-        let origin = [10.0, 10.0, 0.0];
-        // Offset from the origin.
-        let s = StartPoint {
-            base: StartBase::Origin,
-            offset: [0.0, 0.0, 25.0],
-        };
-        assert_eq!(s.resolve(origin), [10.0, 10.0, 25.0]);
-        // Offset from an explicit reference point (origin irrelevant).
-        let s = StartPoint {
-            base: StartBase::Reference([70.0, 50.0, 0.0]),
-            offset: [-5.0, -5.0, 20.0],
-        };
-        assert_eq!(s.resolve(origin), [65.0, 45.0, 20.0]);
     }
 
     #[test]

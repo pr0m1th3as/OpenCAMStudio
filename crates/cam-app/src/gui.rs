@@ -599,14 +599,10 @@ enum Field {
     OriginX,
     OriginY,
     OriginZ,
-    /// Program start-point offset X / Y / Z from its base (mm).
+    /// Program start-point offset X / Y / Z from the origin (mm).
     StartOffX,
     StartOffY,
     StartOffZ,
-    /// Program start-point reference X / Y / Z (when the base is a point, mm).
-    StartRefX,
-    StartRefY,
-    StartRefZ,
     ToolDiameter,
     ToolLength,
     Flutes,
@@ -661,9 +657,6 @@ impl Field {
             Field::StartOffX => "Offset X (mm)",
             Field::StartOffY => "Offset Y (mm)",
             Field::StartOffZ => "Offset Z (mm)",
-            Field::StartRefX => "Ref X (mm)",
-            Field::StartRefY => "Ref Y (mm)",
-            Field::StartRefZ => "Ref Z (mm)",
             Field::ToolDiameter => "Tool ⌀ (mm)",
             Field::ToolLength => "Length (mm)",
             Field::Flutes => "Flutes",
@@ -825,6 +818,8 @@ struct App {
     /// "Set origin" pick mode: a viewport click drops the workpiece datum (using
     /// object snaps for corners/centres, or a free point elsewhere).
     setting_origin: bool,
+    /// Whether the workpiece-origin datum marker is drawn (View toggle).
+    show_origin: bool,
     status: String,
 }
 
@@ -844,11 +839,11 @@ fn op_uses_snaps(kind: OpKind) -> bool {
     matches!(kind, OpKind::Profile | OpKind::Chamfer | OpKind::Pocket)
 }
 
-/// The axis index (0=X, 1=Y, 2=Z) a start-point offset/reference field addresses.
+/// The axis index (0=X, 1=Y, 2=Z) a start-point offset field addresses.
 fn start_axis(field: Field) -> usize {
     match field {
-        Field::StartOffX | Field::StartRefX => 0,
-        Field::StartOffY | Field::StartRefY => 1,
+        Field::StartOffX => 0,
+        Field::StartOffY => 1,
         _ => 2,
     }
 }
@@ -856,15 +851,7 @@ fn start_axis(field: Field) -> usize {
 /// Whether a field belongs to the start-point section (rendered there, not in the
 /// generic Setup field loop).
 fn is_start_field(field: Field) -> bool {
-    matches!(
-        field,
-        Field::StartOffX
-            | Field::StartOffY
-            | Field::StartOffZ
-            | Field::StartRefX
-            | Field::StartRefY
-            | Field::StartRefZ
-    )
+    matches!(field, Field::StartOffX | Field::StartOffY | Field::StartOffZ)
 }
 
 /// Orientation-cube on-screen size (logical px): default and the slider's range.
@@ -1030,11 +1017,10 @@ enum Message {
     ToggleSnap(SnapKind),
     /// Enable/disable the program start point (Setup inspector).
     ToggleStartPoint(bool),
-    /// Switch the start-point base between a reference point (`true`) and the
-    /// workpiece origin (`false`).
-    SetStartFromReference(bool),
     /// Enter/leave "set workpiece origin" pick mode (ribbon Edit tab).
     ToggleSetOrigin,
+    /// Show or hide the workpiece-origin datum marker (View tab).
+    ToggleShowOrigin,
     /// A viewport click while setting the origin: the world `(x,y)` + aperture;
     /// resolved to a snapped or free point that becomes the datum.
     SetOriginPick([f32; 2], f32),
@@ -1179,6 +1165,7 @@ impl App {
             snap_aperture: 1.0,
             hover_loop: None,
             setting_origin: false,
+            show_origin: true,
             status: "Open the sample part to begin.".to_string(),
         };
         app.refresh_fields();
@@ -1361,26 +1348,11 @@ impl App {
                 }
             }
             Message::ToggleStartPoint(on) => {
-                self.controller.edit_start_point(|sp| {
-                    *sp = on.then_some(cam_model::StartPoint {
-                        base: cam_model::StartBase::Origin,
-                        offset: [0.0, 0.0, 0.0],
-                    });
-                });
+                self.controller
+                    .edit_start_offset(|off| *off = on.then_some([0.0, 0.0, 0.0]));
                 self.refresh_fields();
             }
-            Message::SetStartFromReference(on) => {
-                self.controller.edit_start_point(|sp| {
-                    if let Some(sp) = sp {
-                        sp.base = if on {
-                            cam_model::StartBase::Reference([0.0, 0.0, 0.0])
-                        } else {
-                            cam_model::StartBase::Origin
-                        };
-                    }
-                });
-                self.refresh_fields();
-            }
+            Message::ToggleShowOrigin => self.show_origin = !self.show_origin,
             Message::ToggleSetOrigin => {
                 self.setting_origin = !self.setting_origin;
                 self.snap_hover = None;
@@ -1388,7 +1360,7 @@ impl App {
                 if self.setting_origin {
                     // Mutually exclusive with the op wizard; show the origin fields.
                     self.controller.cancel_operation();
-                    self.controller.select(Selection::Setup);
+                    self.controller.select(Selection::Origin);
                     self.focus_ops.clear();
                     self.refresh_fields();
                     self.status =
@@ -1969,23 +1941,13 @@ impl App {
             return tool_fields(self.library.tools.get(self.lib_sel).map(|t| t.kind));
         }
         match self.controller.selection() {
-            Selection::Setup => {
-                let mut f = vec![
-                    Field::Clearance,
-                    Field::Retract,
-                    Field::TopOfStock,
-                    Field::OriginX,
-                    Field::OriginY,
-                    Field::OriginZ,
-                ];
-                // Start-point numeric fields, only when it is enabled (and the
-                // reference only when the base is a point). Rendered in the
+            Selection::Setup => vec![Field::Clearance, Field::Retract, Field::TopOfStock],
+            Selection::Origin => {
+                let mut f = vec![Field::OriginX, Field::OriginY, Field::OriginZ];
+                // Start-point offset fields, only when enabled. Rendered in the
                 // start-point section, not the generic field loop.
-                if let Some(sp) = self.controller.document().setup.start_point {
+                if self.controller.document().setup.start_offset.is_some() {
                     f.extend([Field::StartOffX, Field::StartOffY, Field::StartOffZ]);
-                    if matches!(sp.base, cam_model::StartBase::Reference(_)) {
-                        f.extend([Field::StartRefX, Field::StartRefY, Field::StartRefZ]);
-                    }
                 }
                 f
             }
@@ -2079,13 +2041,7 @@ impl App {
             Field::OriginY => Some(setup.origin[1]),
             Field::OriginZ => Some(setup.origin[2]),
             Field::StartOffX | Field::StartOffY | Field::StartOffZ => {
-                setup.start_point.map(|sp| sp.offset[start_axis(field)])
-            }
-            Field::StartRefX | Field::StartRefY | Field::StartRefZ => {
-                setup.start_point.and_then(|sp| match sp.base {
-                    cam_model::StartBase::Reference(p) => Some(p[start_axis(field)]),
-                    cam_model::StartBase::Origin => None,
-                })
+                setup.start_offset.map(|off| off[start_axis(field)])
             }
             Field::StockXOffset | Field::StockYOffset | Field::StockTop | Field::StockThickness => {
                 let cam_model::Stock::BoundingBox {
@@ -2163,18 +2119,18 @@ impl App {
         }
 
         match self.controller.selection() {
-            Selection::Setup => {
-                self.controller.edit_heights(|h| {
-                    if let Some(&v) = parsed.get(&Field::Clearance) {
-                        h.clearance = v;
-                    }
-                    if let Some(&v) = parsed.get(&Field::Retract) {
-                        h.retract = v;
-                    }
-                    if let Some(&v) = parsed.get(&Field::TopOfStock) {
-                        h.top_of_stock = v;
-                    }
-                });
+            Selection::Setup => self.controller.edit_heights(|h| {
+                if let Some(&v) = parsed.get(&Field::Clearance) {
+                    h.clearance = v;
+                }
+                if let Some(&v) = parsed.get(&Field::Retract) {
+                    h.retract = v;
+                }
+                if let Some(&v) = parsed.get(&Field::TopOfStock) {
+                    h.top_of_stock = v;
+                }
+            }),
+            Selection::Origin => {
                 self.controller.edit_origin(|o| {
                     if let Some(&v) = parsed.get(&Field::OriginX) {
                         o[0] = v;
@@ -2186,26 +2142,15 @@ impl App {
                         o[2] = v;
                     }
                 });
-                self.controller.edit_start_point(|start| {
-                    if let Some(sp) = start {
+                self.controller.edit_start_offset(|start| {
+                    if let Some(off) = start {
                         for (f, i) in [
                             (Field::StartOffX, 0),
                             (Field::StartOffY, 1),
                             (Field::StartOffZ, 2),
                         ] {
                             if let Some(&v) = parsed.get(&f) {
-                                sp.offset[i] = v;
-                            }
-                        }
-                        if let cam_model::StartBase::Reference(p) = &mut sp.base {
-                            for (f, i) in [
-                                (Field::StartRefX, 0),
-                                (Field::StartRefY, 1),
-                                (Field::StartRefZ, 2),
-                            ] {
-                                if let Some(&v) = parsed.get(&f) {
-                                    p[i] = v;
-                                }
+                                off[i] = v;
                             }
                         }
                     }
@@ -2517,6 +2462,12 @@ impl App {
                         self.show_gizmo,
                         Message::ToggleGizmo,
                     ),
+                    toggle_cmd(
+                        Icon::SetOrigin,
+                        "Origin",
+                        self.show_origin,
+                        Message::ToggleShowOrigin,
+                    ),
                 ],
             }],
             RibbonTab::Windows => return None,
@@ -2663,6 +2614,7 @@ impl App {
                     self.snap_hover.map(|h| (h, self.snap_aperture)),
                     self.hover_loop,
                     self.setting_origin,
+                    self.show_origin,
                 ))
                 .width(Length::Fill)
                 .height(Length::Fill),
@@ -2697,11 +2649,17 @@ impl App {
         let setup = &self.controller.document().setup;
         let sel = self.controller.selection();
 
+        let o = setup.origin;
         let mut list = column![
             select_row(
                 format!("Setup — {}", setup.name),
                 sel == Selection::Setup,
                 Message::Select(Selection::Setup),
+            ),
+            select_row(
+                format!("Origin — X{} Y{} Z{}", fmt_num(o[0]), fmt_num(o[1]), fmt_num(o[2])),
+                sel == Selection::Origin,
+                Message::Select(Selection::Origin),
             ),
             select_row(
                 "Stock".to_string(),
@@ -2942,44 +2900,25 @@ impl App {
     /// the reference when chosen). The numeric rows reuse the field pipeline
     /// (parse + Apply); the toggles commit immediately.
     fn start_point_editor(&self) -> Element<'_, Message> {
-        let sp = self.controller.document().setup.start_point;
-        let mut col = column![text("Program start point")
+        let on = self.controller.document().setup.start_offset.is_some();
+        let mut col = column![text("Program start point (offset from origin)")
             .size(12)
             .color(palette::GROUP_LABEL)]
         .spacing(6);
         col = col.push(
             row![
-                checkbox(sp.is_some())
-                    .size(15)
-                    .on_toggle(Message::ToggleStartPoint),
+                checkbox(on).size(15).on_toggle(Message::ToggleStartPoint),
                 text("Rapid to a start point").size(13),
             ]
             .spacing(6)
             .align_y(Alignment::Center),
         );
-        if let Some(sp) = sp {
-            let from_ref = matches!(sp.base, cam_model::StartBase::Reference(_));
-            col = col.push(
-                row![
-                    checkbox(from_ref)
-                        .size(15)
-                        .on_toggle(Message::SetStartFromReference),
-                    text("From a reference point (else origin)").size(13),
-                ]
-                .spacing(6)
-                .align_y(Alignment::Center),
-            );
-            let field = |f: Field| {
-                field_row(f, &self.fields.get(&f).cloned().unwrap_or_default())
-            };
+        if on {
+            let field =
+                |f: Field| field_row(f, &self.fields.get(&f).cloned().unwrap_or_default());
             col = col.push(field(Field::StartOffX));
             col = col.push(field(Field::StartOffY));
             col = col.push(field(Field::StartOffZ));
-            if from_ref {
-                col = col.push(field(Field::StartRefX));
-                col = col.push(field(Field::StartRefY));
-                col = col.push(field(Field::StartRefZ));
-            }
         }
         col.into()
     }
@@ -3039,6 +2978,7 @@ impl App {
         }
         let heading = match self.controller.selection() {
             Selection::Setup => "Setup".to_string(),
+            Selection::Origin => "Workpiece origin".to_string(),
             Selection::Stock => "Stock".to_string(),
             Selection::Tool(i) => format!("Tool {}", i + 1),
             Selection::Operation(id) => match self.controller.operation(id) {
@@ -3085,8 +3025,8 @@ impl App {
                 .align_y(Alignment::Center),
             );
         }
-        // The workpiece start-point editor (Setup only): enable, base, offset, ref.
-        if let Selection::Setup = self.controller.selection() {
+        // The program start-point editor lives on the Origin node (offset from it).
+        if let Selection::Origin = self.controller.selection() {
             list = list.push(self.start_point_editor());
         }
         // The tool geometry class is an enum, so it gets a picker (committed
@@ -3942,6 +3882,7 @@ impl Viewport {
         snap: Option<(SnapHit, f64)>,
         hover_loop: Option<LoopRef>,
         set_origin: bool,
+        show_origin: bool,
     ) -> Self {
         let picking = controller.pending_op().is_some();
         let pick_z = controller.document().setup.heights.top_of_stock as f32;
@@ -3981,13 +3922,15 @@ impl Viewport {
                 }
             }
         }
-        // The workpiece-origin datum, always visible so the G-code reference point
-        // is obvious. Sized to the scene so it reads at any part scale.
-        let origin = controller.document().setup.origin;
-        let r = bounds
-            .map(|(mn, mx)| ((mx[0] - mn[0]).max(mx[1] - mn[1]) * 0.06).max(1.0))
-            .unwrap_or(5.0);
-        add_origin_marker(&mut scene, origin, pick_z, r);
+        // The workpiece-origin datum marker (View toggle), only once geometry is
+        // loaded — never on an empty document at startup — and sized to the scene.
+        if show_origin && !controller.regions().is_empty() {
+            if let Some((mn, mx)) = bounds {
+                let origin = controller.document().setup.origin;
+                let r = ((mx[0] - mn[0]).max(mx[1] - mn[1]) * 0.06).max(1.0);
+                add_origin_marker(&mut scene, origin, pick_z, r);
+            }
+        }
         // The object-snap marker under the cursor (op pick *or* set-origin).
         if let Some((hit, aperture)) = snap {
             add_snap_marker(&mut scene, hit, aperture, pick_z);

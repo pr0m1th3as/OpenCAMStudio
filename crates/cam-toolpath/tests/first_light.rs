@@ -8,8 +8,8 @@
 use cam_cldata::{MoveKind, Point3, Program, SpindleDir, Step};
 use cam_geo::{Contour, Point};
 use cam_model::{
-    Comp, Document, Heights, Lead, Machine, Operation, Plunge, ProfileOp, Setup, Side, StartBase,
-    StartPoint, Stock, Tool, ToolKind,
+    Comp, Document, Heights, Lead, Machine, Operation, Plunge, ProfileOp, Setup, Side, Stock, Tool,
+    ToolKind,
 };
 use cam_post::{GrblPost, Post, PostOptions};
 use cam_toolpath::{build_job, CancelToken, JobEnv, ProfileStrategy, Strategy};
@@ -90,7 +90,7 @@ fn document() -> Document {
         tools: vec![tool],
         operations: vec![Operation::Profile(outer), Operation::Profile(hole)],
         origin: [0.0, 0.0, 0.0],
-        start_point: None,
+        start_offset: None,
     })
 }
 
@@ -108,12 +108,10 @@ fn plan_and_post() -> (Program, String, Vec<cam_toolpath::Diagnostic>) {
 #[test]
 fn a_start_point_prepends_a_rapid_to_it() {
     let mut doc = document();
-    doc.setup.start_point = Some(StartPoint {
-        base: StartBase::Reference([1.0, 2.0, 30.0]),
-        offset: [0.0, 0.0, 0.0],
-    });
+    doc.setup.origin = [1.0, 2.0, 0.0];
+    doc.setup.start_offset = Some([0.0, 0.0, 30.0]); // origin + offset ⇒ (1,2,30)
     let (program, _) = build_job(&doc, 1000.0, SpindleDir::Cw, &CancelToken::new());
-    // The very first motion is a rapid to the resolved start point.
+    // The very first motion is a rapid to origin + offset.
     let first_rapid = program
         .steps()
         .iter()
@@ -428,7 +426,7 @@ fn arc_lead_and_helix_plunge_post_to_helical_gcode() {
         tools: vec![tool],
         operations: vec![Operation::Profile(op)],
         origin: [0.0, 0.0, 0.0],
-        start_point: None,
+        start_offset: None,
     });
 
     let (program, diags) = build_job(&doc, 1000.0, SpindleDir::Cw, &CancelToken::new());
