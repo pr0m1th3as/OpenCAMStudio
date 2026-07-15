@@ -49,100 +49,132 @@ issue), force a software renderer:
 LIBGL_ALWAYS_SOFTWARE=1 WGPU_BACKEND=gl cargo run -p cam-app --features gui
 ```
 
-### Using the app
+### The window
 
-The window has a **menu bar** across the top and four docked, resizable panes:
-**Project**, **Viewport**, **Inspector**, and an **Output** console. Drag a
-border to resize, or a pane's title bar to rearrange.
+Across the top is a tabbed **icon ribbon**; below it are three docked panes —
+**Project** (left), **Viewport** (centre), **Inspector** (right) — over an
+**Output** console (bottom).
 
-The menu bar holds **File** (Open Sample · Export .nc), **Edit** (Undo · Redo ·
-Run), **View** (Show stock · Reset View · Show Cube), and **Windows** (a checkbox
-per pane to show/hide it; hiding one keeps the others' sizes, re-showing docks it
-back on its edge). Click a menu to open it; click anywhere off it to close. Each
-pane also has an individual minimum size, so dragging a border will not crush a
-pane narrower than its contents need. Re-showing the **Viewport** reclaims the
-room, squeezing the other open panes to their minimums so the view gets the rest.
+- **Layout is stable under resize.** Project, Inspector, and Output hold their
+  size when you resize the window; only the Viewport grows or shrinks. Drag a
+  divider to set a side pane's size — that size is remembered across later window
+  resizes. Panes are framed with visible separators.
+- The **Viewport is always visible.** The **Windows** ribbon tab has a checkbox
+  per pane to show/hide **Project / Inspector / Output** (not the Viewport);
+  hiding one hands its room to the Viewport.
 
-- **Project** (left) — the document tree: Setup, Stock, Tools, and Operations.
-  Click a node to select it; the selected node is marked with `▸`.
+### The ribbon
+
+- **Home** — *Project* (New · Open · Save · Save As), *Data* (Import · Export ·
+  Sample), *Edit* (Undo · Redo · Run). New/Open/Save/Import/Export use native
+  file dialogs; **Sample** loads a built-in rectangle-with-a-hole demo (no dialog).
+- **Operations** — *Create*: Profile · Pocket · Drill · **Thread** · Face.
+  Clicking a kind starts the operation-creation wizard. (Thread is a placeholder
+  for now — it reports "not yet implemented".)
+- **Tooling** — the cross-project **tool library** manager (New · Delete). While
+  this tab is active the Inspector becomes the library editor.
+- **View** — Show stock · Reset view · Cube on/off.
+- **Windows** — the pane show/hide checkboxes.
+
+The ribbon collapses responsively as the window narrows (groups degrade
+right-to-left; a collapsed group opens as a popup under its button).
+
+### The panes
+
+- **Project** (left) — the project tree: **Setup**, **Stock**, **Tools (in use)**,
+  and **Operations**. Click a row to select it (the selected row is highlighted).
+  - **Tools (in use)** is *read-only* and lists only the tools referenced by an
+    operation — tools are chosen from the library during op setup, not here.
+  - Each **operation** row has an include **checkbox** (untick to exclude it from
+    the toolpath and simulation — it stays in the tree, marked *(excluded)*),
+    inline **↑ / ↓** reorder arrows, and a **right-click menu** with **Duplicate**
+    and **Delete**.
 - **Viewport** (centre) — a native 3D `wgpu` view of the backplot and simulated
-  stock. **Left-drag** orbits (a turntable: horizontal spins about the vertical
-  axis, vertical tilts) with **no clamp**, so you can tilt all the way over to
-  the underside while the horizon stays level; **right-drag** pans, the **scroll
-  wheel** zooms; it opens top-down. A rotating **orientation cube** sits in the
-  top-right corner — chamfered edges, colour-coded faces each labelled with the
-  full word (**TOP / BOTTOM / FRONT / BACK / LEFT / RIGHT**) — turning with the
-  view so you always know which side you are looking at. **Click a cube face** to
-  snap the view square onto that side. The toolbar's **Reset view** returns to
-  the top view; **Cube: on/off** toggles the cube.
-- **Inspector** (right) — editable fields for the *selected* node.
-- **Output** (bottom) — the status line and run diagnostics.
+  stock. **Left-drag** orbits (a turntable, unclamped, so you can tilt to the
+  underside), **right-drag** pans, the **wheel** zooms; it opens top-down. A
+  rotating **orientation cube** sits top-right — click a face to snap the view
+  square onto that side; **View → Reset view** returns to top; **View → Cube**
+  toggles it. While an op pick is pending, a **pickbox** square + crosshair
+  follows the cursor.
+- **Inspector** (right) — editable fields for the *selected* node (Setup exposes
+  Clearance / Retract / Top of stock; an Operation exposes Depth / Stepdown /
+  (Stepover) / Feed / Plunge feed plus **Side / Lead-in / Lead-out / Plunge**
+  pickers). Press **Enter** or **Apply** to commit (one undo step, recomputes the
+  toolpath). The Inspector is instead the **library editor** while the Tooling tab
+  is active, and the **operation wizard** while a pick is pending.
+- **Output** (bottom) — the status line and run / collision diagnostics.
 
-Workflow:
+### Creating an operation
 
-1. **File → Open Sample** — loads a built-in rectangle-with-a-hole (no file
-   dialog yet; file loading is the next increment). The tree fills with two
-   profile operations and the viewport frames the geometry.
-2. Select a node in **Project**, then edit its fields in **Inspector**:
-   - a **Setup** exposes Clearance / Retract / Top of stock;
-   - a **Tool** exposes its diameter;
-   - an **Operation** exposes Depth / Stepdown / (Stepover) / Feed / Plunge feed.
-   Press **Enter** or **Apply** to commit — each Apply is one undo step and
-   recomputes the toolpath. Each operation row carries its own controls: a
-   **checkbox** (untick to exclude that op from the toolpath and simulation — it
-   stays in the tree, marked *(excluded)*) and inline **↑ / ↓** reorder arrows.
-   The buttons under the tree **New** an operation from the loaded geometry, or
-   (with one selected) **Duplicate** / **Delete** it.
-3. **Run** — recomputes for the current document. The backplot is colored by
-   move kind: green = cutting, yellow = rapid/link, red = plunge; the part
-   outline is light grey. **Output** shows toolpath diagnostics (e.g. a tool too
-   large) *and* material-removal **collisions** from the simulation — e.g. a
-   rapid plowing through remaining stock, which a green backplot would hide.
-4. **Undo / Redo** — step through document edits.
-5. **Show stock / Hide stock** — overlays the *simulated* stock surface (the
-   material left after the toolpath cuts) under the backplot, shaded so the
-   pocket walls and stepdowns read. Available after a **Run**.
-6. **Export .nc** — posts the toolpath to grbl G-code. Blocked if the run had
-   errors **or** the simulation found a rapid through stock (a crash hazard); the
-   status line says why. Otherwise it reports the line count.
+1. Load geometry — **Home → Sample**, or **Home → Import** a `.dxf`/`.dwg`. A real
+   import comes in as **geometry only**: no operations and no tools yet.
+2. **Operations** tab → pick a kind. The Inspector becomes the wizard: choose a
+   **tool from the library** dropdown (or **＋ New** to add one), then **click a
+   boundary line** in the Viewport. Picking is line-based — click the outer
+   contour *or* an inner hole; the click snaps to the nearest loop edge, and the
+   picked vertex sets the toolpath start. Choosing the tool embeds a copy into the
+   project.
+3. **Pocket** enters **island mode** after the boundary pick: click enclosed loops
+   to toggle them as excluded islands (highlighted gold), then **Confirm**.
+4. The operation appears in the tree, and its tool under **Tools (in use)**.
+5. Select the operation and edit its fields / Side / lead / plunge in the
+   Inspector; **Apply** to recompute.
+
+### The tool library
+
+- Cross-project and persistent, stored in the platform config directory
+  (`~/.config/OpenCAMStudio/tools.json` on Linux; `%APPDATA%` on Windows;
+  `~/Library/Application Support` on macOS). Seeded with a few default end mills
+  on first run.
+- **Tooling** tab: **New** adds a tool, **Delete** removes the selected one; select
+  a library tool to edit its **diameter / length / flutes / kind** in the Inspector
+  (saved to disk immediately).
+- A project **embeds copies** of the tools it uses, so `.ocam` files stay
+  self-contained; the library is the template you pick from.
+
+### Run / export
+
+- **Home → Run** recomputes for the current document. The backplot is coloured by
+  move kind: green = cutting, yellow = rapid/link, red = plunge; the part outline
+  is light grey. **Output** shows toolpath diagnostics (e.g. a tool too large)
+  *and* material-removal **collisions** from the simulation (e.g. a rapid plowing
+  through remaining stock, which a green backplot would hide).
+- **View → Show stock** overlays the *simulated* stock surface under the backplot.
+- **Home → Export** posts the toolpath to grbl G-code. It is blocked if the run
+  had errors **or** the simulation found a rapid through stock; the status line
+  says why. Otherwise it reports the line count.
+- **Undo / Redo** step through document edits.
 
 ### What to check when testing the GUI
 
 Because the GUI is the one part that cannot be verified by automated tests, the
 things worth eyeballing:
 
-- The window opens with all four panes; the sample part frames in the viewport
-  and the tree shows Setup / Stock / Tools / two Operations.
-- Selecting **Operation 0** shows its Depth/Stepdown/Feed in the Inspector;
-  changing **Depth** to `-8` and pressing **Apply** updates the backplot.
-- Selecting the **Tool** and setting ⌀ to `12`, then **Apply**, produces a
-  "tool too large" diagnostic in **Output** and blocks export (the 6 mm-radius
-  tool can't open the 10 mm hole).
-- **Undo** restores the previous value and the backplot updates.
-- **Show stock** overlays a shaded grey surface with the pockets/holes carved
-  out; the colored backplot stays visible on top. **Hide stock** removes it.
-- **Left-drag** orbits as a turntable — horizontal spins about the vertical axis,
-  vertical tilts; keep dragging up and the part tilts all the way over so you can
-  inspect its **underside** (no clamp), yet the horizon stays level so the control
-  feels predictable. With **Show stock** on, the solid should occlude itself
-  correctly (near faces hide far ones) while the toolpath lines stay on top.
-  **Right-drag** pans; the **wheel** zooms.
-- The **orientation cube** (top-right) rotates together with the part as you
-  orbit — the word on the face toward you (TOP/BOTTOM/FRONT/BACK/LEFT/RIGHT)
-  names the current side; the words are rendered from a real TrueType font
-  (Quicksand) so they should be crisp, and the cube edges softened (chamfered).
-- **Clicking a cube face** should snap the view square onto that side, the right
-  way up (Top/Bottom/Front/Back/Left/Right all upright). **Reset view** returns
-  to the top view; **Cube: off** hides the cube (and clicks no longer pick),
-  **Cube: on** restores it.
-- Dragging a pane's title bar re-docks it; dragging a border resizes.
-- The **Windows ▾** menu toggles each pane's visibility. Hide the Inspector or
-  Output to give the viewport more room; re-show it and it docks back on its
-  edge, leaving the other panes' sizes intact.
+- **Layout:** the window opens with the ribbon + Project / Viewport / Inspector /
+  Output. Resizing the window changes **only** the Viewport; the side panes and
+  Output keep their size. Drag a side divider, then resize the window — the pane
+  keeps its dragged size. Separators are visible. The **Windows** tab hides/shows
+  Project / Inspector / Output but never the Viewport.
+- **Project tree:** rows read as a tree (plain text, selected row highlighted —
+  not blue buttons). **Right-click an operation** → a Duplicate / Delete menu at
+  the cursor; clicking off dismisses it. The include checkbox and ↑ / ↓ work.
+- **Tools (in use):** after creating an op, its tool appears here read-only; with
+  no ops the section shows "(none yet …)".
+- **Operation wizard:** Operations → Profile, pick a tool from the library, click
+  the outer rectangle → it profiles the rectangle; click the inner circle → the
+  circle. A Pocket enters island mode (click islands gold, Confirm).
+- **Tool library:** Tooling tab → New / Delete; edit a tool's fields; **restart
+  the app** and confirm the edits persisted (`tools.json`).
+- **Files:** Import a real `.dwg` → geometry only (no ops). Save an `.ocam`,
+  reopen it → geometry and embedded tools survive.
+- **Viewport:** left-drag orbits (turntable, all the way to the underside), right-
+  drag pans, wheel zooms; the orientation cube tracks the view and its faces snap.
+  With **Show stock** on, the solid occludes itself while the toolpath stays on top.
 
 ## Notes
 
 - The `gui` feature is **not** enabled by default so that `cargo test
   --workspace` and the headless controller stay GPU-free and fully testable.
 - `cam-app`'s logic lives in the headless `AppController` (unit-tested); the iced
-  layer is a thin view over it.
+  layer is a thin view over it. The tool library
+  (`cam-app/src/tool_library.rs`) is the one piece of GUI-side persistent state.
