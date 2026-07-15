@@ -344,6 +344,31 @@ impl Operation {
             Operation::Thread(op) => op.tool,
         }
     }
+
+    /// Overwrite the operation's id, whatever its kind.
+    pub fn set_id(&mut self, id: u32) {
+        match self {
+            Operation::Profile(op) => op.id = id,
+            Operation::Drill(op) => op.id = id,
+            Operation::Pocket(op) => op.id = id,
+            Operation::Face(op) => op.id = id,
+            Operation::Chamfer(op) => op.id = id,
+            Operation::Thread(op) => op.id = id,
+        }
+    }
+
+    /// Whether two operations describe the **same work** — identical in every
+    /// field *except* their `id` (and so the same kind, tool, geometry, depths,
+    /// feeds, leads…). Two such operations emit byte-identical toolpaths, so if
+    /// both reach the post the machine cuts the same path twice. Used to flag
+    /// exact duplicates before export.
+    pub fn same_work(&self, other: &Operation) -> bool {
+        // Normalise the id on a copy, then lean on the derived structural
+        // equality — which automatically covers any field added later.
+        let mut probe = self.clone();
+        probe.set_id(other.id());
+        &probe == other
+    }
 }
 
 /// A machining setup: one fixturing of the stock, its safety planes, and the
@@ -378,5 +403,67 @@ impl Document {
             schema_version: SCHEMA_VERSION,
             setup,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Comp, Lead, Plunge, Side};
+    use cam_geo::{Contour, Point};
+
+    fn profile(id: u32) -> Operation {
+        Operation::Profile(ProfileOp {
+            id,
+            tool: 1,
+            chain: Contour::new(vec![
+                Point::new(0.0, 0.0),
+                Point::new(10.0, 0.0),
+                Point::new(10.0, 10.0),
+                Point::new(0.0, 10.0),
+            ]),
+            side: Side::Outside,
+            comp: Comp::Computed,
+            depth: -4.0,
+            stepdown: 2.0,
+            feed: 300.0,
+            plunge_feed: 100.0,
+            start: None,
+            lead_in: Lead::None,
+            lead_out: Lead::None,
+            plunge: Plunge::Straight,
+        })
+    }
+
+    #[test]
+    fn same_work_ignores_id_only() {
+        // Equal in everything but id → same work.
+        assert!(profile(0).same_work(&profile(7)));
+        assert!(profile(7).same_work(&profile(0)));
+    }
+
+    #[test]
+    fn same_work_sees_a_real_difference() {
+        let a = profile(0);
+        let mut b = profile(1);
+        if let Operation::Profile(op) = &mut b {
+            op.feed = 301.0; // one field differs
+        }
+        assert!(!a.same_work(&b), "a differing feed is different work");
+    }
+
+    #[test]
+    fn same_work_across_kinds_is_false() {
+        let prof = profile(0);
+        let drill = Operation::Drill(DrillOp {
+            id: 0,
+            tool: 1,
+            points: vec![[0.0, 0.0]],
+            depth: -4.0,
+            peck: None,
+            dwell: None,
+            feed: 100.0,
+        });
+        assert!(!prof.same_work(&drill));
     }
 }

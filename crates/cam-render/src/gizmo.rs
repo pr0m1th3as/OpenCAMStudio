@@ -10,10 +10,16 @@
 //! |-------|------|--------|--------|
 //! | Top   | +Z   | TOP    | blue   |
 //! | Bottom| −Z   | BOTTOM | dark blue |
-//! | Front | −Y   | FRONT  | green  |
-//! | Back  | +Y   | BACK   | dark green |
+//! | Front | −Y   | FRONT  | yellow |
+//! | Back  | +Y   | BACK   | teal   |
 //! | Left  | −X   | LEFT   | dark red |
 //! | Right | +X   | RIGHT  | red    |
+//!
+//! The Y axis is **not green**: red↔green is the classic confusable pair, so a
+//! green Front (−Y) and red Left (−X) read alike under red-green colour
+//! deficiency. Front is **yellow** and Back **teal** — both sit clear of red for
+//! that deficiency, so every face stays distinct (this axis trades one-hue-per-
+//! axis for two readily separable faces).
 //!
 //! Rendering it (the `gpu` feature's `GizmoRenderer`) samples [`label_atlas`];
 //! clicking a face snaps the view to it ([`pick_face`]). The geometry, UVs,
@@ -62,10 +68,10 @@ fn faces() -> [Face; 6] {
                 [-1.0, 1.0, -1.0],
             ],
         ),
-        // +Y Back — green, up = +Z
+        // +Y Back — teal, up = +Z
         (
             [0.0, 1.0, 0.0],
-            [0.22, 0.55, 0.28],
+            [0.10, 0.60, 0.62],
             [0.0, 0.0, 1.0],
             [
                 [-1.0, 1.0, -1.0],
@@ -74,10 +80,10 @@ fn faces() -> [Face; 6] {
                 [1.0, 1.0, -1.0],
             ],
         ),
-        // -Y Front — dark green, up = +Z
+        // -Y Front — bright yellow, up = +Z
         (
             [0.0, -1.0, 0.0],
-            [0.15, 0.40, 0.20],
+            [1.0, 0.90, 0.10],
             [0.0, 0.0, 1.0],
             [
                 [-1.0, -1.0, -1.0],

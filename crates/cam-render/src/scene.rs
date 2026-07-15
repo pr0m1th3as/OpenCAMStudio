@@ -20,6 +20,24 @@ pub const PLUNGE: Color = [0.90, 0.35, 0.25, 1.0];
 /// Chord tolerance (mm) used when flattening backplot arcs for display.
 const ARC_TOL: f64 = 0.02;
 
+/// A non-selected operation's strips fade this far (`0`=unchanged, `1`=full grey)
+/// toward [`DIM_GREY`] when another operation is in focus.
+const DIM_AMOUNT: f32 = 0.80;
+/// The muted, slightly-cool grey non-selected operations recede toward — dark
+/// enough to sit behind the (pale) part outline without vanishing.
+const DIM_GREY: [f32; 3] = [0.32, 0.33, 0.37];
+
+/// Fade a colour toward [`DIM_GREY`] by [`DIM_AMOUNT`], preserving alpha.
+fn dim(c: Color) -> Color {
+    let t = DIM_AMOUNT;
+    [
+        c[0] * (1.0 - t) + DIM_GREY[0] * t,
+        c[1] * (1.0 - t) + DIM_GREY[1] * t,
+        c[2] * (1.0 - t) + DIM_GREY[2] * t,
+        c[3],
+    ]
+}
+
 /// The colour a backplot move is drawn in, by its role.
 fn color_for(kind: MoveKind) -> Color {
     match kind {
@@ -44,6 +62,10 @@ pub struct Vertex {
 pub struct LineStrip {
     pub points: Vec<[f32; 3]>,
     pub color: Color,
+    /// The operation this strip belongs to, if any. Backplot motions carry their
+    /// CL-data `op_id`; part/stock outlines and pick highlights carry `None`.
+    /// Drives selection focus (see [`Scene::focus_operation`]).
+    pub op: Option<u32>,
 }
 
 /// A drawable scene: a set of colored polylines.
@@ -58,10 +80,15 @@ impl Scene {
         Self::default()
     }
 
-    /// Add a polyline strip.
+    /// Add a polyline strip with no operation identity (part outline, highlight).
     pub fn add_strip(&mut self, points: Vec<[f32; 3]>, color: Color) {
+        self.add_strip_op(points, color, None);
+    }
+
+    /// Add a polyline strip tagged with an operation id (a backplot motion).
+    pub fn add_strip_op(&mut self, points: Vec<[f32; 3]>, color: Color, op: Option<u32>) {
         if points.len() >= 2 {
-            self.strips.push(LineStrip { points, color });
+            self.strips.push(LineStrip { points, color, op });
         }
     }
 
@@ -90,11 +117,11 @@ impl Scene {
         for step in program.steps() {
             match step {
                 Step::Rapid { to, tag } => {
-                    push_segment(&mut scene, cur, *to, color_for(tag.kind));
+                    push_segment(&mut scene, cur, *to, color_for(tag.kind), tag.op_id);
                     cur = Some(*to);
                 }
                 Step::Linear { to, tag, .. } => {
-                    push_segment(&mut scene, cur, *to, color_for(tag.kind));
+                    push_segment(&mut scene, cur, *to, color_for(tag.kind), tag.op_id);
                     cur = Some(*to);
                 }
                 Step::Arc {
@@ -105,19 +132,28 @@ impl Scene {
                     ..
                 } => {
                     if let Some(start) = cur {
-                        push_arc(&mut scene, start, *end, *center, *dir, color_for(tag.kind));
+                        push_arc(
+                            &mut scene,
+                            start,
+                            *end,
+                            *center,
+                            *dir,
+                            color_for(tag.kind),
+                            tag.op_id,
+                        );
                     }
                     cur = Some(*end);
                 }
                 Step::Drill(cycle) => {
                     // A drilled hole shows as a plunge marker at each point.
                     for &[x, y] in &cycle.points {
-                        scene.add_strip(
+                        scene.add_strip_op(
                             vec![
                                 [x as f32, y as f32, cycle.z_top as f32],
                                 [x as f32, y as f32, cycle.depth as f32],
                             ],
                             color_for(cycle.tag.kind),
+                            Some(cycle.tag.op_id),
                         );
                     }
                     cur = None;
@@ -126,6 +162,40 @@ impl Scene {
             }
         }
         scene
+    }
+
+    /// Fade every operation's strips except those in `focus` toward a muted grey,
+    /// so the focused operations' toolpaths — keeping their full rapid/cut/plunge
+    /// colours — stand out among many. More than one op may be focused at once.
+    /// Strips with no op (part/stock outline, pick highlights) are left untouched;
+    /// an empty `focus` leaves the whole scene at full colour. Idempotent enough
+    /// for per-frame use on a freshly-cloned scene.
+    pub fn focus_operations(&mut self, focus: &[u32]) {
+        if focus.is_empty() {
+            return;
+        }
+        // Only dim if at least one focused op actually has toolpath here —
+        // otherwise (only not-yet-run or excluded ops are focused) leave the scene
+        // at full colour rather than greying everything against paths not drawn.
+        if !self
+            .strips
+            .iter()
+            .any(|s| s.op.is_some_and(|op| focus.contains(&op)))
+        {
+            return;
+        }
+        for strip in &mut self.strips {
+            if strip.op.is_some_and(|op| !focus.contains(&op)) {
+                strip.color = dim(strip.color);
+            }
+        }
+        // Draw focused strips last. The line pass writes no depth and always
+        // passes, so coincident segments are resolved by paint order — without
+        // this, a duplicated op sitting exactly on its original would let the
+        // dimmed copy overpaint the vivid one (only the non-overlapping approach
+        // moves would show through). A stable partition keeps each group's order.
+        self.strips
+            .sort_by_key(|s| s.op.is_some_and(|op| focus.contains(&op)));
     }
 
     /// Expand the strips into a flat `LineList` vertex buffer (two vertices per
@@ -165,18 +235,20 @@ impl Scene {
     }
 }
 
-fn push_segment(scene: &mut Scene, from: Option<Point3>, to: Point3, color: Color) {
+fn push_segment(scene: &mut Scene, from: Option<Point3>, to: Point3, color: Color, op: u32) {
     if let Some(a) = from {
-        scene.add_strip(
+        scene.add_strip_op(
             vec![
                 [a.x as f32, a.y as f32, a.z as f32],
                 [to.x as f32, to.y as f32, to.z as f32],
             ],
             color,
+            Some(op),
         );
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_arc(
     scene: &mut Scene,
     start: Point3,
@@ -184,6 +256,7 @@ fn push_arc(
     center: Point3,
     dir: cam_cldata::ArcDir,
     color: Color,
+    op: u32,
 ) {
     let r = ((start.x - center.x).powi(2) + (start.y - center.y).powi(2)).sqrt();
     let a0 = (start.y - center.y).atan2(start.x - center.x);
@@ -200,7 +273,7 @@ fn push_arc(
             [p.x as f32, p.y as f32, z as f32]
         })
         .collect();
-    scene.add_strip(pts, color);
+    scene.add_strip_op(pts, color, Some(op));
 }
 
 #[cfg(test)]
@@ -234,6 +307,78 @@ mod tests {
         let scene = Scene::from_program(&prog);
         assert_eq!(scene.strips.len(), 1);
         assert_eq!(scene.strips[0].color, RAPID);
+    }
+
+    /// A three-operation program: ops 0, 1, 2 each with a rapid + a cut.
+    fn three_op_program() -> Program {
+        ProgramBuilder::new()
+            .op(0)
+            .rapid(Point3::new(0.0, 0.0, 5.0), MoveKind::Link)
+            .linear(Point3::new(10.0, 0.0, -1.0), MoveKind::Cutting)
+            .op(1)
+            .rapid(Point3::new(0.0, 0.0, 5.0), MoveKind::Link)
+            .linear(Point3::new(0.0, 10.0, -1.0), MoveKind::Cutting)
+            .op(2)
+            .rapid(Point3::new(0.0, 0.0, 5.0), MoveKind::Link)
+            .linear(Point3::new(5.0, 5.0, -1.0), MoveKind::Cutting)
+            .build()
+    }
+
+    #[test]
+    fn focus_dims_other_operations_only() {
+        let mut scene = Scene::from_program(&three_op_program());
+        scene.add_strip(vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], PART); // op = None
+
+        // Focus two of the three operations at once.
+        scene.focus_operations(&[1, 2]);
+
+        // Order-independent (focus reorders strips): focused ops and the untagged
+        // part outline keep a full-palette colour; every other op is dimmed off it.
+        let vivid = [RAPID, CUT, PLUNGE, PART];
+        for strip in &scene.strips {
+            let is_vivid = vivid.contains(&strip.color);
+            match strip.op {
+                Some(1) | Some(2) | None => assert!(is_vivid, "focused/untagged strip stays vivid"),
+                Some(_) => assert!(!is_vivid, "unfocused op is dimmed"),
+            }
+        }
+    }
+
+    #[test]
+    fn focus_draws_focused_strips_last() {
+        // Focused ops must sort to the end so their vivid strips paint over any
+        // coincident dimmed ones (the duplicate-on-original case).
+        let mut scene = Scene::from_program(&three_op_program());
+        scene.focus_operations(&[0]);
+        let focused: Vec<bool> = scene
+            .strips
+            .iter()
+            .map(|s| s.op == Some(0))
+            .collect();
+        // Once we reach the first focused strip, all remaining are focused too.
+        let first_focused = focused.iter().position(|&f| f).unwrap();
+        assert!(
+            focused[first_focused..].iter().all(|&f| f),
+            "focused strips are contiguous at the end: {focused:?}"
+        );
+        assert!(focused.last().copied().unwrap_or(false), "last strip is focused");
+    }
+
+    #[test]
+    fn empty_focus_leaves_scene_untouched() {
+        let before = Scene::from_program(&three_op_program());
+        let mut after = before.clone();
+        after.focus_operations(&[]);
+        assert_eq!(before.strips, after.strips);
+    }
+
+    #[test]
+    fn focus_on_absent_op_leaves_scene_untouched() {
+        // Focusing only an op with no toolpath here must not grey everything.
+        let before = Scene::from_program(&three_op_program());
+        let mut after = before.clone();
+        after.focus_operations(&[99]);
+        assert_eq!(before.strips, after.strips);
     }
 
     #[test]

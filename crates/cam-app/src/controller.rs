@@ -941,6 +941,52 @@ impl AppController {
         self.excluded.contains(&id)
     }
 
+    /// Clusters of **included** operations that are exact duplicates of one
+    /// another — identical in every field but their id (see
+    /// [`Operation::same_work`]). Each returned group holds ≥2 ids in document
+    /// order; the first is the "original", the rest its exact copies.
+    ///
+    /// Excluded operations never reach the post, so they are ignored: excluding a
+    /// twin is the sanctioned way to keep an exact duplicate around (e.g. a spring
+    /// pass that is currently switched off) without tripping the warning.
+    pub fn duplicate_operation_groups(&self) -> Vec<Vec<u32>> {
+        let ops: Vec<&Operation> = self
+            .document()
+            .setup
+            .operations
+            .iter()
+            .filter(|op| !self.is_operation_excluded(op.id()))
+            .collect();
+        let mut groups: Vec<Vec<u32>> = Vec::new();
+        let mut taken = vec![false; ops.len()];
+        for i in 0..ops.len() {
+            if taken[i] {
+                continue;
+            }
+            let mut group = vec![ops[i].id()];
+            for j in (i + 1)..ops.len() {
+                if !taken[j] && ops[i].same_work(ops[j]) {
+                    taken[j] = true;
+                    group.push(ops[j].id());
+                }
+            }
+            if group.len() > 1 {
+                groups.push(group);
+            }
+        }
+        groups
+    }
+
+    /// The set of operation ids that are exact duplicates of another included
+    /// operation (the flattened [`Self::duplicate_operation_groups`]). Drives the
+    /// project-tree "duplicate" marker.
+    pub fn duplicate_operation_ids(&self) -> BTreeSet<u32> {
+        self.duplicate_operation_groups()
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
     /// Include or exclude operation `id` from toolpath generation (it stays in
     /// the tree either way).
     pub fn set_operation_excluded(&mut self, id: u32, excluded: bool) {
@@ -1283,14 +1329,7 @@ fn sim_profile(tool: &Tool) -> ToolProfile {
 
 /// Set an operation's id, whatever its kind.
 fn set_op_id(op: &mut Operation, id: u32) {
-    match op {
-        Operation::Profile(o) => o.id = id,
-        Operation::Drill(o) => o.id = id,
-        Operation::Pocket(o) => o.id = id,
-        Operation::Face(o) => o.id = id,
-        Operation::Chamfer(o) => o.id = id,
-        Operation::Thread(o) => o.id = id,
-    }
+    op.set_id(id);
 }
 
 /// An empty starting document: a zero-size box stock, one default end mill, no
@@ -1435,6 +1474,46 @@ mod tests {
             .iter()
             .map(|o| o.id())
             .collect()
+    }
+
+    #[test]
+    fn exact_duplicates_are_detected_and_gated_by_exclusion() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        // Two distinct ops (outer profile + hole) — nothing duplicated yet.
+        assert_eq!(op_ids(&app), vec![0, 1]);
+        assert!(app.duplicate_operation_groups().is_empty());
+
+        // Duplicate op 0: the copy is an exact twin of it.
+        app.select(Selection::Operation(0));
+        app.duplicate_selected_operation();
+        assert_eq!(op_ids(&app), vec![0, 2, 1]);
+        assert_eq!(
+            app.duplicate_operation_groups(),
+            vec![vec![0, 2]],
+            "op 0 and its copy 2 are exact duplicates"
+        );
+        assert_eq!(
+            app.duplicate_operation_ids(),
+            BTreeSet::from([0, 2])
+        );
+
+        // Excluding one twin removes it from output, so the pair no longer clashes.
+        app.set_operation_excluded(2, true);
+        assert!(
+            app.duplicate_operation_groups().is_empty(),
+            "an excluded twin does not reach the post, so it is not flagged"
+        );
+
+        // Editing the copy so it differs also clears the flag.
+        app.set_operation_excluded(2, false);
+        app.select(Selection::Operation(2));
+        app.edit_selected_operation(|op| {
+            if let Operation::Profile(o) = op {
+                o.feed = 999.0;
+            }
+        });
+        assert!(app.duplicate_operation_groups().is_empty(), "different work");
     }
 
     #[test]

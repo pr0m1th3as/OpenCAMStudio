@@ -10,14 +10,14 @@
 //! the controller; this module only translates messages and draws. Only compiled
 //! with the `gui` feature.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use iced::widget::pane_grid::{self, PaneGrid};
 use iced::widget::{
-    button, checkbox, column, container, mouse_area, pick_list, row, scrollable, shader, text,
-    text_input, Space,
+    button, checkbox, column, container, mouse_area, pick_list, row, scrollable, shader, slider,
+    text, text_input, Space,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
@@ -58,6 +58,9 @@ mod palette {
     pub const SEPARATOR: Color = rgb(0.34, 0.34, 0.34);
     /// Selected project-tree row highlight (a muted fill, not the loud button blue).
     pub const SELECT_BG: Color = rgb(0.20, 0.28, 0.38);
+    /// Warning accent (amber) — e.g. the exact-duplicate operation marker. Paired
+    /// with a ⚠ glyph so the meaning survives colour-vision deficiency.
+    pub const WARN: Color = rgb(0.95, 0.62, 0.10);
 }
 
 /// Ribbon command icons. Each variant is a small embedded SVG (see
@@ -178,6 +181,39 @@ async fn pick_save(
         .save_file()
         .await
         .map(|h| h.path().to_path_buf())
+}
+
+/// A short human-readable summary of the exact-duplicate operation groups, for
+/// the export confirm dialog. Each group is rendered as `#a = #b (= #c…)`.
+fn describe_duplicates(groups: &[Vec<u32>]) -> String {
+    let list = groups
+        .iter()
+        .map(|g| {
+            g.iter()
+                .map(|id| format!("#{id}"))
+                .collect::<Vec<_>>()
+                .join(" = ")
+        })
+        .collect::<Vec<_>>()
+        .join(";  ");
+    format!(
+        "These operations are exact duplicates and would each post the same \
+         toolpath — the machine would cut it more than once:\n\n    {list}\n\n\
+         Export all of them anyway?"
+    )
+}
+
+/// Native Yes/No warning dialog gating an export that contains exact-duplicate
+/// operations. Returns `true` only if the user chose to proceed.
+async fn confirm_export_duplicates(detail: String) -> bool {
+    rfd::AsyncMessageDialog::new()
+        .set_level(rfd::MessageLevel::Warning)
+        .set_title("Duplicate operations")
+        .set_description(detail)
+        .set_buttons(rfd::MessageButtons::YesNo)
+        .show()
+        .await
+        == rfd::MessageDialogResult::Yes
 }
 
 /// The docked panes. Any of them can be shown or hidden from the Windows ribbon
@@ -702,6 +738,9 @@ struct App {
     show_stock: bool,
     /// Whether the orientation-cube gizmo is shown (toggleable).
     show_gizmo: bool,
+    /// On-screen edge length of the orientation cube, in **logical pixels** —
+    /// fixed (not scaled with the window), adjustable at runtime via the View tab.
+    gizmo_size: f32,
     /// The orbit-camera orientation, owned here; clicking a cube face or dragging
     /// the viewport reports changes back as messages.
     view: ViewControls,
@@ -714,17 +753,34 @@ struct App {
     /// The library tool selected for editing in the Tooling-tab library editor.
     lib_sel: usize,
     /// The operation whose right-click context menu is open, and where to anchor it
-    /// (window coords, from the tree cursor tracker).
+    /// (window-absolute coords, captured from `window_cursor` at right-click time).
     open_op_menu: Option<u32>,
     op_menu_pos: iced::Point,
-    /// Last cursor position over the Project pane (window coords), for anchoring the
-    /// op context menu.
-    tree_cursor: iced::Point,
+    /// Last known cursor position in **window-absolute** coords (from a global
+    /// event subscription). Overlays are placed from the window origin, so this —
+    /// not a widget-local position — is what anchors the op context menu exactly
+    /// under the cursor.
+    window_cursor: iced::Point,
+    /// Operations whose toolpath is highlighted (vivid) in the viewport while all
+    /// others are dimmed. A *set* so several ops can be lit at once — this is the
+    /// viewport highlight, kept distinct from the single-item `Selection` (which
+    /// drives the inspector). Empty = show every operation at full colour.
+    focus_ops: BTreeSet<u32>,
+    /// Live keyboard modifiers (from a global subscription), so an op click can
+    /// tell a plain click (single focus) from ⌘/Ctrl-click (add/remove from set).
+    modifiers: iced::keyboard::Modifiers,
     status: String,
 }
 
 /// The pickbox aperture, px — its half-size is the vertex-snap tolerance.
 const PICKBOX_PX: f32 = 12.0;
+
+/// Orientation-cube on-screen size (logical px): default and the slider's range.
+const GIZMO_SIZE_DEFAULT: f32 = 110.0;
+const GIZMO_SIZE_MIN: f32 = 60.0;
+const GIZMO_SIZE_MAX: f32 = 220.0;
+/// Inset of the cube from the viewport's top-right corner (logical px).
+const GIZMO_MARGIN: f32 = 8.0;
 
 /// Highlight colour for a picked boundary loop (accent blue).
 const PICK_BOUNDARY: [f32; 4] = [0.20, 0.55, 0.90, 1.0];
@@ -793,6 +849,9 @@ enum Message {
     CadToImport(Option<PathBuf>),
     /// Prompt for a `.nc` export location.
     ExportNc,
+    /// Answer to the "export exact-duplicate operations anyway?" confirm dialog:
+    /// `true` proceeds to the save prompt, `false` aborts the export.
+    ExportDupConfirmed(bool),
     /// The chosen `.nc` path (`None` = cancelled).
     NcToExport(Option<PathBuf>),
     // --- Operation-creation wizard ---
@@ -833,6 +892,8 @@ enum Message {
     ResetView,
     /// Show or hide the orientation cube.
     ToggleGizmo,
+    /// Set the orientation cube's on-screen size (logical px).
+    SetGizmoSize(f32),
     PaneResized(pane_grid::ResizeEvent),
     PaneDragged(pane_grid::DragEvent),
     /// The window was resized (tracked for pixel-accurate pane minimums).
@@ -860,13 +921,20 @@ enum Message {
     SetPendingLibraryTool(usize),
     /// Select a library tool for editing in the Tooling-tab library editor.
     SelectLibraryTool(usize),
-    /// Open the right-click context menu for operation `id` (anchored at the tree
+    /// Open the right-click context menu for operation `id` (anchored under the
     /// cursor), and select that operation.
     OpMenu(u32),
     /// Dismiss the operation context menu.
     CloseOpMenu,
-    /// Track the cursor over the Project pane (window coords) for menu anchoring.
-    TreeCursor(iced::Point),
+    /// Track the window-absolute cursor position (global subscription) so overlays
+    /// can be placed exactly under the cursor.
+    WindowCursor(iced::Point),
+    /// A left-click on operation `id`'s tree row. Plain click focuses it alone;
+    /// ⌘/Ctrl-click toggles it in the viewport highlight set (multi-select);
+    /// plain-clicking the sole focused op clears the highlight.
+    ClickOp(u32),
+    /// Track live keyboard modifiers (global subscription) for click semantics.
+    ModifiersChanged(iced::keyboard::Modifiers),
 }
 
 fn default_machine() -> Machine {
@@ -931,13 +999,16 @@ impl App {
             fields: BTreeMap::new(),
             show_stock: false,
             show_gizmo: true,
+            gizmo_size: GIZMO_SIZE_DEFAULT,
             view: ViewControls::default(),
             cursor: None,
             library: ToolLibrary::load(),
             lib_sel: 0,
             open_op_menu: None,
             op_menu_pos: iced::Point::ORIGIN,
-            tree_cursor: iced::Point::ORIGIN,
+            window_cursor: iced::Point::ORIGIN,
+            focus_ops: BTreeSet::new(),
+            modifiers: iced::keyboard::Modifiers::default(),
             status: "Open the sample part to begin.".to_string(),
         };
         app.refresh_fields();
@@ -956,6 +1027,7 @@ impl App {
         match message {
             Message::OpenSample => match self.controller.open_dxf(SAMPLE_DXF, "sample.dxf") {
                 Ok(n) => {
+                    self.focus_ops.clear();
                     self.refresh_fields();
                     self.status = format!("Imported {n} region(s).");
                     self.rerun();
@@ -964,8 +1036,43 @@ impl App {
             },
             Message::Select(selection) => {
                 self.controller.select(selection);
+                // Keep the viewport highlight in step: a single operation focuses
+                // just it; any non-operation node (Setup/Stock/Tool) clears the
+                // highlight so everything shows vivid again.
+                self.focus_ops.clear();
+                if let Selection::Operation(id) = selection {
+                    self.focus_ops.insert(id);
+                }
                 self.refresh_fields();
             }
+            Message::ClickOp(id) => {
+                if self.modifiers.command() {
+                    // ⌘/Ctrl-click toggles this op in the highlight set.
+                    if !self.focus_ops.remove(&id) {
+                        self.focus_ops.insert(id);
+                    }
+                } else if self.focus_ops.len() == 1 && self.focus_ops.contains(&id) {
+                    // Plain-clicking the sole focused op clears the highlight.
+                    self.focus_ops.clear();
+                } else {
+                    // Plain click focuses just this op.
+                    self.focus_ops.clear();
+                    self.focus_ops.insert(id);
+                }
+                // The inspector tracks the clicked op if it stays focused, else any
+                // remaining focused op, else the setup (so edits don't target a
+                // path that is no longer highlighted).
+                let sel = if self.focus_ops.contains(&id) {
+                    Selection::Operation(id)
+                } else if let Some(&other) = self.focus_ops.iter().next_back() {
+                    Selection::Operation(other)
+                } else {
+                    Selection::Setup
+                };
+                self.controller.select(sel);
+                self.refresh_fields();
+            }
+            Message::ModifiersChanged(m) => self.modifiers = m,
             // Field edits only touch the local buffer; nothing is applied or
             // recomputed until Apply, so undo has one step per real change.
             Message::FieldChanged(field, value) => {
@@ -974,6 +1081,7 @@ impl App {
             Message::Apply => self.apply_inspector(),
             Message::NewProject => {
                 self.controller.new_project();
+                self.focus_ops.clear();
                 self.refresh_fields();
                 self.status = "New project.".to_string();
             }
@@ -986,6 +1094,7 @@ impl App {
             Message::ProjectToOpen(Some(path)) => {
                 self.status = match self.controller.open_project(&path) {
                     Ok(()) => {
+                        self.focus_ops.clear();
                         self.refresh_fields();
                         self.rerun();
                         format!("Opened {}.", path.display())
@@ -1018,6 +1127,7 @@ impl App {
             Message::CadToImport(Some(path)) => {
                 self.status = match self.controller.import_cad(&path) {
                     Ok(n) => {
+                        self.focus_ops.clear();
                         self.refresh_fields();
                         self.rerun();
                         format!("Imported {n} region(s) from {}.", path.display())
@@ -1026,10 +1136,30 @@ impl App {
                 };
             }
             Message::ExportNc => {
+                // Guardrail: if any included operations are exact duplicates, they
+                // would post the same toolpath twice. Confirm before the machine
+                // sees it — but don't block (a spring/finishing pass is legitimate).
+                let groups = self.controller.duplicate_operation_groups();
+                if groups.is_empty() {
+                    return iced::Task::perform(
+                        pick_save("G-code", "program.nc", &["nc"]),
+                        Message::NcToExport,
+                    );
+                }
+                return iced::Task::perform(
+                    confirm_export_duplicates(describe_duplicates(&groups)),
+                    Message::ExportDupConfirmed,
+                );
+            }
+            Message::ExportDupConfirmed(true) => {
                 return iced::Task::perform(
                     pick_save("G-code", "program.nc", &["nc"]),
                     Message::NcToExport,
                 );
+            }
+            Message::ExportDupConfirmed(false) => {
+                self.status =
+                    "Export cancelled — exclude or edit the duplicate operation(s).".to_string();
             }
             Message::NcToExport(Some(path)) => {
                 self.status = match self.controller.export_nc_to(&path) {
@@ -1122,6 +1252,7 @@ impl App {
             Message::DuplicateOp => {
                 self.open_op_menu = None;
                 self.controller.duplicate_selected_operation();
+                self.focus_selected_op();
                 self.refresh_fields();
                 self.rerun();
             }
@@ -1134,6 +1265,7 @@ impl App {
                 self.controller.delete_selected_operation();
                 // A tool no longer used by any op drops out of the setup.
                 self.controller.prune_unused_tools();
+                self.focus_selected_op();
                 self.refresh_fields();
                 self.rerun();
             }
@@ -1173,6 +1305,9 @@ impl App {
             }
             Message::ResetView => self.view = ViewControls::default(),
             Message::ToggleGizmo => self.show_gizmo = !self.show_gizmo,
+            Message::SetGizmoSize(v) => {
+                self.gizmo_size = v.clamp(GIZMO_SIZE_MIN, GIZMO_SIZE_MAX)
+            }
             Message::PaneResized(pane_grid::ResizeEvent { split, ratio }) => {
                 let ratio = self.clamp_resize(split, ratio);
                 self.panes.resize(split, ratio);
@@ -1291,12 +1426,14 @@ impl App {
             }
             Message::OpMenu(id) => {
                 self.controller.select(Selection::Operation(id));
+                self.focus_ops.clear();
+                self.focus_ops.insert(id);
                 self.refresh_fields();
                 self.open_op_menu = Some(id);
-                self.op_menu_pos = self.tree_cursor;
+                self.op_menu_pos = self.window_cursor;
             }
             Message::CloseOpMenu => self.open_op_menu = None,
-            Message::TreeCursor(p) => self.tree_cursor = p,
+            Message::WindowCursor(p) => self.window_cursor = p,
             Message::SelectRibbonTab(tab) => {
                 self.active_tab = tab;
                 // The Tooling tab turns the Inspector into the library editor, so the
@@ -1318,7 +1455,22 @@ impl App {
     }
 
     fn subscription(&self) -> iced::Subscription<Message> {
-        iced::window::resize_events().map(|(_id, size)| Message::WindowResized(size))
+        iced::Subscription::batch([
+            iced::window::resize_events().map(|(_id, size)| Message::WindowResized(size)),
+            // Track the window-absolute cursor so overlays (the op context menu)
+            // anchor exactly under the pointer — widget-local positions are offset
+            // by the pane's origin, which is what caused the menu to appear astray.
+            iced::event::listen_with(|event, _status, _window| match event {
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+                    Some(Message::WindowCursor(position))
+                }
+                // Live modifiers, so an op-row click can tell plain from ⌘/Ctrl.
+                iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(m)) => {
+                    Some(Message::ModifiersChanged(m))
+                }
+                _ => None,
+            }),
+        ])
     }
 
     /// Clamp a split's new `ratio` so neither side falls below its panes' pixel
@@ -1492,6 +1644,16 @@ impl App {
             if let Some(value) = self.field_value(field) {
                 self.fields.insert(field, fmt_num(value));
             }
+        }
+    }
+
+    /// Reset the viewport highlight to the controller's current single selection
+    /// (an operation, or nothing). Used after structural edits (duplicate/delete)
+    /// that move the selection, so the highlight set never keeps stale ids.
+    fn focus_selected_op(&mut self) {
+        self.focus_ops.clear();
+        if let Selection::Operation(id) = self.controller.selection() {
+            self.focus_ops.insert(id);
         }
     }
 
@@ -1750,9 +1912,10 @@ impl App {
         layers.into()
     }
 
-    /// The operation right-click context menu (Duplicate / Delete), anchored at the
-    /// tree cursor. `None` unless a menu is open. Reuses the ribbon-popup overlay
-    /// pattern: positioned in the top-level view stack over a click-off catcher.
+    /// The operation right-click context menu (Delete / Duplicate), its top-left
+    /// anchored exactly under the cursor. `None` unless a menu is open. Reuses the
+    /// ribbon-popup overlay pattern: positioned in the top-level view stack over a
+    /// click-off catcher.
     fn op_menu_overlay(&self) -> Option<Element<'_, Message>> {
         self.open_op_menu?;
         let item = |icon: Icon, label: &str, msg: Message| {
@@ -1768,8 +1931,8 @@ impl App {
         };
         let menu = container(
             column![
-                item(Icon::Duplicate, "Duplicate", Message::DuplicateOp),
                 item(Icon::Delete, "Delete", Message::DeleteOp),
+                item(Icon::Duplicate, "Duplicate", Message::DuplicateOp),
             ]
             .spacing(2),
         )
@@ -1965,7 +2128,42 @@ impl App {
         for (i, (spec, &density)) in specs.iter().zip(&densities).enumerate() {
             band = band.push(render_group(spec, density, i));
         }
+        // The View tab gets a live orientation-cube size control (a slider has no
+        // place in the icon-command band, so it is appended as its own group).
+        if self.active_tab == RibbonTab::View {
+            band = band.push(self.cube_size_group());
+        }
         band.into()
+    }
+
+    /// A labelled slider setting the orientation cube's on-screen size, appended
+    /// to the View tab. Disabled (greyed) while the cube is hidden.
+    fn cube_size_group(&self) -> Element<'_, Message> {
+        let control: Element<'_, Message> = if self.show_gizmo {
+            slider(
+                GIZMO_SIZE_MIN..=GIZMO_SIZE_MAX,
+                self.gizmo_size,
+                Message::SetGizmoSize,
+            )
+            .step(1.0_f32)
+            .width(Length::Fixed(120.0))
+            .into()
+        } else {
+            // Keep the footprint stable when the cube is off: an inert placeholder.
+            container(
+                Space::new()
+                    .width(Length::Fixed(120.0))
+                    .height(Length::Fixed(16.0)),
+            )
+            .into()
+        };
+        let value = text(format!("{} px", self.gizmo_size as i32))
+            .size(11)
+            .color(palette::GROUP_LABEL);
+        ribbon_group(
+            "Cube size",
+            column![control, value].spacing(4).align_x(Alignment::Center),
+        )
     }
 
     /// The Windows tab: a checkbox per pane (naturally narrow, no collapse).
@@ -2046,6 +2244,8 @@ impl App {
                     self.show_stock,
                     self.view,
                     self.show_gizmo,
+                    self.gizmo_size,
+                    &self.focus_ops.iter().copied().collect::<Vec<_>>(),
                 ))
                 .width(Length::Fill)
                 .height(Length::Fill),
@@ -2111,14 +2311,39 @@ impl App {
             );
         }
 
-        list = list.push(tree_header("Operations"));
+        // Exact-duplicate operations (identical bar their id, both included),
+        // computed once: `twins[id]` is the ids of the other ops it duplicates.
+        let dup_groups = self.controller.duplicate_operation_groups();
+        let mut twins: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        for group in &dup_groups {
+            for &id in group {
+                twins.insert(id, group.iter().copied().filter(|&x| x != id).collect());
+            }
+        }
+        // Header carries a ⚠ flag when any duplicate exists, so it reads at a glance.
+        list = list.push(if dup_groups.is_empty() {
+            tree_header("Operations")
+        } else {
+            container(
+                row![
+                    text("Operations").size(11).color(palette::GROUP_LABEL),
+                    text("⚠ duplicates exist").size(11).color(palette::WARN),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .padding(Padding::from([6.0, 4.0]))
+            .into()
+        });
         if setup.operations.is_empty() {
             list = list.push(tree_note("none — add one from the Operations tab"));
         }
         let op_count = setup.operations.len();
         for (i, op) in setup.operations.iter().enumerate() {
             let id = op.id();
-            let active = sel == Selection::Operation(id);
+            // Row highlight tracks the viewport focus set, so every op lit in the
+            // viewport reads as selected here — including a multi-selection.
+            let active = self.focus_ops.contains(&id);
             let excluded = self.controller.is_operation_excluded(id);
             // Inline controls: an include checkbox (checked = machined) and reorder
             // arrows. Left-click the row selects it; right-click opens Duplicate/Delete.
@@ -2138,8 +2363,21 @@ impl App {
                 .on_press_maybe((i > 0).then_some(Message::MoveOp(id, true)));
             let down = button(text("↓").size(12))
                 .on_press_maybe((i + 1 < op_count).then_some(Message::MoveOp(id, false)));
+            // On an exact duplicate, mark it ⚠ and name its twin(s) by id — both
+            // would post the same toolpath.
+            let mut controls = row![include, name].spacing(4).align_y(Alignment::Center);
+            if let Some(t) = twins.get(&id) {
+                let ids = t
+                    .iter()
+                    .map(|x| format!("#{x}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                controls = controls.push(text(format!("⚠ {ids}")).size(11).color(palette::WARN));
+            }
             let inner = container(
-                row![include, name, up, down]
+                controls
+                    .push(up)
+                    .push(down)
                     .spacing(4)
                     .align_y(Alignment::Center),
             )
@@ -2155,19 +2393,17 @@ impl App {
             });
             list = list.push(
                 mouse_area(inner)
-                    .on_press(Message::Select(Selection::Operation(id)))
+                    .on_press(Message::ClickOp(id))
                     .on_right_press(Message::OpMenu(id)),
             );
         }
 
-        // Track the cursor over the pane so the right-click menu can anchor to it.
-        mouse_area(
-            scrollable(list.padding(6))
-                .width(Length::Fill)
-                .height(Length::Fill),
-        )
-        .on_move(Message::TreeCursor)
-        .into()
+        // The right-click menu anchors to the window-absolute cursor tracked by the
+        // global subscription, so the pane itself needs no cursor tracking.
+        scrollable(list.padding(6))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     /// The inspector: editable fields for the selected node.
@@ -3099,17 +3335,27 @@ enum DragMode {
     Pan,
 }
 
-/// The shader widget's transient state: only the active drag. The camera lives
-/// in [`App`] so the view-cube buttons can drive it; drags report *relative*
-/// deltas back as messages (loss-free even across a burst of events).
+/// The shader widget's transient state: the active drag plus a pending cube
+/// snap. The camera lives in [`App`] so the view-cube buttons can drive it; drags
+/// report *relative* deltas back as messages (loss-free even across a burst of
+/// events).
 #[derive(Default)]
 struct ViewportState {
     drag: Option<DragMode>,
     last: Option<iced::Point>,
+    /// A gizmo-face snap `(yaw, pitch)` armed on press, fired on release only if
+    /// the press stays a click. Cleared the moment the press becomes a drag, so a
+    /// rotation that merely *begins* over the cube orbits instead of snapping.
+    gizmo_arm: Option<(f32, f32)>,
+    /// Where the (armed) press began, to measure click-vs-drag travel.
+    press: Option<iced::Point>,
 }
 
 /// Orbit sensitivity (radians per pixel).
 const ORBIT_SENS: f32 = 0.008;
+/// Cursor travel (logical px) past which an armed cube press becomes an orbit
+/// drag rather than a snap-to-view click.
+const GIZMO_CLICK_SLOP: f32 = 4.0;
 /// Zoom sensitivity (exponent per wheel line).
 const ZOOM_SENS: f32 = 0.15;
 
@@ -3127,12 +3373,13 @@ fn in_resize_band(pos: iced::Point, bounds: iced::Rectangle) -> bool {
         || bounds.y + bounds.height - pos.y < RESIZE_BAND
 }
 
-/// The orientation cube's square rectangle in the top-right of a `w × h`
-/// viewport (widget-local coordinates). Fractional, so it is the same in logical
-/// and physical pixels — the click hit-test and the drawn cube stay aligned.
-fn gizmo_rect(w: f32, h: f32) -> (f32, f32, f32) {
-    let size = (w.min(h) * 0.26).max(1.0);
-    let margin = 8.0;
+/// The orientation cube's square rectangle, anchored to the top-right of a
+/// `w × h` viewport. `size` and `margin` are given in the same units as `w,h`
+/// (logical px for the click hit-test, physical px for drawing), so the cube is a
+/// **fixed** on-screen size rather than a fraction of the window. Clamped so it
+/// always fits within the viewport with its margin.
+fn gizmo_rect(w: f32, h: f32, size: f32, margin: f32) -> (f32, f32, f32) {
+    let size = size.clamp(1.0, (w.min(h) - 2.0 * margin).max(1.0));
     (w - size - margin, margin, size)
 }
 
@@ -3143,6 +3390,8 @@ struct Viewport {
     bounds: Option<([f32; 3], [f32; 3])>,
     controls: ViewControls,
     show_gizmo: bool,
+    /// On-screen cube size, logical px (fixed; independent of window size).
+    gizmo_size: f32,
     /// Geometry-pick mode (a new-operation wizard is awaiting a region click).
     picking: bool,
     /// The world Z of the plane clicks are projected onto (top of stock).
@@ -3155,6 +3404,8 @@ impl Viewport {
         show_stock: bool,
         controls: ViewControls,
         show_gizmo: bool,
+        gizmo_size: f32,
+        focus_ops: &[u32],
     ) -> Self {
         let picking = controller.pending_op().is_some();
         let pick_z = controller.document().setup.heights.top_of_stock as f32;
@@ -3182,6 +3433,10 @@ impl Viewport {
                 }
             }
         }
+        // When one or more operations are focused, dim every *other* operation's
+        // toolpath so the focused ones stand out — vital when a part has dozens of
+        // ops. An empty focus set leaves everything vivid.
+        scene.focus_operations(focus_ops);
         // The simulated stock is drawn under the backplot, only when toggled on
         // and available (a run has produced it).
         let (mesh_vertices, mesh_indices) = match controller.outcome() {
@@ -3198,6 +3453,7 @@ impl Viewport {
             bounds: scene.bounds(),
             controls,
             show_gizmo,
+            gizmo_size,
             picking,
             pick_z,
         }
@@ -3226,7 +3482,7 @@ impl Viewport {
         if !self.show_gizmo {
             return None;
         }
-        let (gx, gy, size) = gizmo_rect(bounds.width, bounds.height);
+        let (gx, gy, size) = gizmo_rect(bounds.width, bounds.height, self.gizmo_size, GIZMO_MARGIN);
         let (gxa, gya) = (bounds.x + gx, bounds.y + gy);
         if pos.x < gxa || pos.x > gxa + size || pos.y < gya || pos.y > gya + size {
             return None;
@@ -3257,13 +3513,17 @@ impl shader::Program<Message> for Viewport {
         match mouse_event {
             Mouse::ButtonPressed(button) => {
                 let pos = cursor.position_over(bounds)?;
-                // A left-click on a gizmo face snaps the view to that side. (The
-                // gizmo sits inset from the edges, so it clears the band below.)
+                // A left-press on a gizmo face *arms* a snap-to-view: it fires on
+                // release only if the press stays a click (see ButtonReleased). We
+                // still begin an orbit drag, so if the user drags — a rotation that
+                // merely started over the cube — it orbits and the snap is dropped.
                 if matches!(button, Button::Left) {
-                    if let Some((yaw, pitch)) = self.gizmo_pick(pos, bounds) {
-                        return Some(
-                            shader::Action::publish(Message::SetView(yaw, pitch)).and_capture(),
-                        );
+                    if let Some(view) = self.gizmo_pick(pos, bounds) {
+                        state.gizmo_arm = Some(view);
+                        state.drag = Some(DragMode::Orbit);
+                        state.last = Some(pos);
+                        state.press = Some(pos);
+                        return Some(shader::Action::capture());
                     }
                 }
                 // In geometry-pick mode a left-click selects geometry (projected
@@ -3303,6 +3563,20 @@ impl shader::Program<Message> for Viewport {
             }
             Mouse::CursorMoved { position } => {
                 if let (Some(mode), Some(last)) = (state.drag, state.last) {
+                    // While a cube snap is armed, hold off orbiting: a small wiggle
+                    // still counts as a click, but travel past the slop commits to
+                    // an orbit and drops the snap.
+                    if let Some(press) = state.press {
+                        if state.gizmo_arm.is_some() {
+                            let moved = (position.x - press.x).hypot(position.y - press.y);
+                            if moved < GIZMO_CLICK_SLOP {
+                                return Some(shader::Action::capture());
+                            }
+                            state.gizmo_arm = None;
+                            state.last = Some(*position); // orbit from here, no jump
+                            return Some(shader::Action::capture());
+                        }
+                    }
                     let (dx, dy) = (position.x - last.x, position.y - last.y);
                     state.last = Some(*position);
                     // Report a relative change; App owns and accumulates it.
@@ -3329,8 +3603,18 @@ impl shader::Program<Message> for Viewport {
                 }
             }
             Mouse::ButtonReleased(_) => {
+                // A still-armed press never became a drag: it's a click — snap now.
+                if let Some((yaw, pitch)) = state.gizmo_arm.take() {
+                    state.drag = None;
+                    state.last = None;
+                    state.press = None;
+                    return Some(
+                        shader::Action::publish(Message::SetView(yaw, pitch)).and_capture(),
+                    );
+                }
                 if state.drag.take().is_some() {
                     state.last = None;
+                    state.press = None;
                     return Some(shader::Action::capture());
                 }
             }
@@ -3366,6 +3650,8 @@ impl shader::Program<Message> for Viewport {
             view_proj: self.camera().view_proj(aspect),
             gizmo_view_proj: self.gizmo_camera().view_proj(1.0),
             show_gizmo: self.show_gizmo,
+            gizmo_size: self.gizmo_size,
+            logical_width: bounds.width,
         }
     }
 
@@ -3457,6 +3743,11 @@ struct ScenePrimitive {
     gizmo_view_proj: [[f32; 4]; 4],
     /// Whether to draw the orientation cube.
     show_gizmo: bool,
+    /// The cube's on-screen edge length, logical px (fixed; window-independent).
+    gizmo_size: f32,
+    /// The widget's logical width, to recover the physical-per-logical scale in
+    /// `render` (which is handed physical `clip_bounds`) and size the cube in px.
+    logical_width: f32,
 }
 
 impl shader::Primitive for ScenePrimitive {
@@ -3543,7 +3834,20 @@ impl shader::Primitive for ScenePrimitive {
         if !self.show_gizmo {
             return;
         }
-        let (lx, ly, size) = gizmo_rect(clip_bounds.width as f32, clip_bounds.height as f32);
+        // `clip_bounds` is physical px; the cube size is fixed in logical px.
+        // Recover the physical-per-logical scale from the widget's logical width
+        // so the cube stays the same on-screen size at any DPI / window size.
+        let scale = if self.logical_width > 0.0 {
+            clip_bounds.width as f32 / self.logical_width
+        } else {
+            1.0
+        };
+        let (lx, ly, size) = gizmo_rect(
+            clip_bounds.width as f32,
+            clip_bounds.height as f32,
+            self.gizmo_size * scale,
+            GIZMO_MARGIN * scale,
+        );
         let size = size as u32;
         if size == 0 {
             return;
