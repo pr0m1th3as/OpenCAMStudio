@@ -21,7 +21,7 @@
 use std::f64::consts::PI;
 
 use cam_cldata::{ArcDir, MoveKind, Point3, Program, Step, Tag};
-use cam_model::{Hand, ThreadOp};
+use cam_model::{Hand, ThreadOp, ToolKind};
 
 use crate::{CancelToken, Diagnostic, JobEnv, Strategy, StrategyResult};
 
@@ -137,21 +137,49 @@ impl Strategy for ThreadStrategy {
             ArcDir::Cw
         };
         let z_up = (op.hand == Hand::Right) == (arc_dir == ArcDir::Ccw);
-        let (z_start, z_end) = if z_up {
-            (op.z_bottom, op.z_top)
+        // Full-profile mills (a tooth comb ground for a specific pitch) cut the
+        // whole thread in a single turn; a single-form mill runs one turn per
+        // pitch over the length. Same helix generator, different turn count.
+        let full_profile = match tool.kind {
+            ToolKind::ThreadMill { pitch: Some(p) } => {
+                if (p - op.pitch).abs() > 1e-6 {
+                    diagnostics.push(Diagnostic::warning(format!(
+                        "operation {}: full-profile tool pitch {:.3} differs from the thread pitch {:.3}",
+                        op.id, p, op.pitch
+                    )));
+                }
+                true
+            }
+            _ => false,
+        };
+
+        let length = op.z_top - op.z_bottom;
+        // Turns of the helix, and the Z it climbs while cutting: the full length
+        // for a single-form mill, exactly one pitch for a full-profile comb.
+        let (turns, z_span) = if full_profile {
+            (1.0, op.pitch.min(length))
         } else {
-            (op.z_top, op.z_bottom)
+            (length / op.pitch, length)
+        };
+        let (z_start, z_end) = if z_up {
+            (op.z_bottom, op.z_bottom + z_span)
+        } else {
+            (op.z_top, op.z_top - z_span)
         };
 
         // Total angular sweep of the helix: `turns · 2π`. Emitted as arc segments
         // of at most a half-turn — universally supported and unambiguous.
-        let turns = (op.z_top - op.z_bottom) / op.pitch;
         let sweep_total = turns * 2.0 * PI;
         let nseg = ((turns * 2.0).ceil() as usize).max(1);
 
         let mut program = Program::new();
         program.push(Step::Comment(format!(
-            "Thread mill: {} {} \u{00d8}{:.3}\u{00d7}{:.3}",
+            "Thread mill: {} {} {} \u{00d8}{:.3}\u{00d7}{:.3}",
+            if full_profile {
+                "full-profile"
+            } else {
+                "single-form"
+            },
             if op.internal { "internal" } else { "external" },
             match op.hand {
                 Hand::Right => "RH",
@@ -336,7 +364,7 @@ mod tests {
             diameter: dia,
             length: 30.0,
             flutes: 3,
-            kind: ToolKind::ThreadMill,
+            kind: ToolKind::ThreadMill { pitch: None },
         }
     }
 
@@ -431,6 +459,38 @@ mod tests {
             );
         }
         assert!((zs.last().unwrap() - 0.0).abs() < 1e-9, "ends at z_top");
+    }
+
+    fn full_profile_tool(pitch: f64) -> Tool {
+        Tool {
+            number: 1,
+            diameter: 5.0,
+            length: 30.0,
+            flutes: 3,
+            kind: ToolKind::ThreadMill { pitch: Some(pitch) },
+        }
+    }
+
+    /// A full-profile mill cuts the whole thread in one turn, climbing exactly one
+    /// pitch (its tooth comb spans the length) — not one turn per pitch.
+    #[test]
+    fn full_profile_cuts_one_turn_of_one_pitch() {
+        let r = run(op(true, Hand::Right, true), full_profile_tool(1.5));
+        assert!(!r.has_errors(), "{:?}", r.diagnostics);
+        let arcs = cutting_arcs(&r.program);
+        assert_eq!(arcs.len(), 2, "one turn → two half-turn segments");
+        let zmax = arcs.iter().map(|(e, _, _)| e.z).fold(f64::MIN, f64::max);
+        // Climbs from z_bottom (−6) by exactly one 1.5 mm pitch.
+        assert!((zmax - (-6.0 + 1.5)).abs() < 1e-9, "should climb one pitch");
+    }
+
+    #[test]
+    fn full_profile_pitch_mismatch_warns() {
+        // Tool ground for 2.0 mm, thread wants 1.5 mm.
+        let r = run(op(true, Hand::Right, true), full_profile_tool(2.0));
+        assert!(r.diagnostics.iter().any(
+            |d| d.severity == Severity::Warning && d.message.contains("pitch")
+        ));
     }
 
     /// Cutting stays on the tool-centre orbit about the hole centre, so the edge

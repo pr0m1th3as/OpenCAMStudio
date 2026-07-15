@@ -15,12 +15,12 @@ use cam_import::{read_cad_file, read_dxf_str, ImportError, ImportOptions};
 
 use crate::project::Project;
 use cam_model::{
-    Comp, Document, DrillOp, FaceOp, Hand, Heights, History, Lead, Machine, Operation, Plunge,
-    PocketOp, ProfileOp, Setup, Side, Stock, ThreadOp, Tool, ToolKind,
+    ChamferOp, Comp, Document, DrillOp, FaceOp, Hand, Heights, History, Lead, Machine, Operation,
+    Plunge, PocketOp, ProfileOp, Setup, Side, Stock, ThreadOp, Tool, ToolKind,
 };
 use cam_post::{GrblPost, Post, PostError, PostOptions};
 use cam_render::{mesh_vertices, MeshVertex, Scene, PART};
-use cam_sim::{simulate, Collision, CollisionKind, SimOptions};
+use cam_sim::{simulate, Collision, CollisionKind, ProfileShape, SimOptions, SimTool, ToolProfile};
 
 use cam_cldata::{Program, SpindleDir};
 use cam_toolpath::{build_job, CancelToken, Diagnostic, Severity};
@@ -68,6 +68,7 @@ pub enum OpKind {
     Pocket,
     Drill,
     Face,
+    Chamfer,
     Thread,
 }
 
@@ -716,6 +717,16 @@ impl AppController {
                 feed: p.feed,
                 plunge_feed: p.plunge_feed,
             }),
+            OpKind::Chamfer => Operation::Chamfer(ChamferOp {
+                id: 0,
+                tool,
+                chain,
+                side: Side::Outside,
+                width: 1.0,
+                top: p.top_of_stock,
+                feed: p.feed,
+                plunge_feed: p.plunge_feed,
+            }),
             OpKind::Thread => {
                 // Seed one thread at the picked loop's centre; a circular hole
                 // loop gives its diameter as the major diameter. Pitch/hand are
@@ -1070,14 +1081,20 @@ impl AppController {
         if min[0] >= max[0] || min[1] >= max[1] {
             return (Vec::new(), Vec::new(), Vec::new());
         }
-        let tool_diameter = self
-            .document
-            .current()
-            .setup
-            .tools
+        let setup_tools = &self.document.current().setup.tools;
+        let tool_diameter = setup_tools
             .first()
             .map(|t| t.diameter)
             .unwrap_or(self.defaults.tool_diameter);
+        // The sim's tool table: each setup tool as its cutting profile, selected by
+        // the program's tool-change numbers.
+        let sim_tools: Vec<SimTool> = setup_tools
+            .iter()
+            .map(|t| SimTool {
+                number: t.number,
+                profile: sim_profile(t),
+            })
+            .collect();
         // Aim for ~200 cells across the larger side, bounded so a big part stays
         // cheap and a small one stays crisp.
         let span = (max[0] - min[0]).max(max[1] - min[1]);
@@ -1090,6 +1107,7 @@ impl AppController {
                 resolution,
                 tool_radius: tool_diameter / 2.0,
             },
+            &sim_tools,
         );
         let surface = sim.field.to_mesh();
         let vertices = mesh_vertices(&surface.positions, &surface.normals);
@@ -1236,6 +1254,33 @@ fn same_tool_geometry(a: &Tool, b: &Tool) -> bool {
     a.diameter == b.diameter && a.length == b.length && a.flutes == b.flutes && a.kind == b.kind
 }
 
+/// Translate a document [`Tool`] into the simulator's [`ToolProfile`] — how its
+/// bottom removes material (flat, ball, bull-nose corner, or a chamfer/drill cone).
+fn sim_profile(tool: &Tool) -> ToolProfile {
+    let radius = tool.radius();
+    let shape = match tool.kind {
+        ToolKind::EndMill | ToolKind::FaceMill => ProfileShape::Flat,
+        ToolKind::BallMill => ProfileShape::Ball,
+        ToolKind::BullNose { corner_radius } => ProfileShape::BullNose {
+            corner_radius: corner_radius.clamp(0.0, radius),
+        },
+        ToolKind::ChamferMill {
+            included_angle_deg,
+            tip_diameter,
+        } => ProfileShape::Cone {
+            half_angle_rad: included_angle_deg.to_radians() / 2.0,
+            flat_radius: (tip_diameter / 2.0).clamp(0.0, radius),
+        },
+        ToolKind::Drill { point_angle_deg } => ProfileShape::Cone {
+            half_angle_rad: point_angle_deg.to_radians() / 2.0,
+            flat_radius: 0.0,
+        },
+        // A thread mill's material removal is approximated by its footprint.
+        ToolKind::ThreadMill { .. } => ProfileShape::Flat,
+    };
+    ToolProfile { radius, shape }
+}
+
 /// Set an operation's id, whatever its kind.
 fn set_op_id(op: &mut Operation, id: u32) {
     match op {
@@ -1243,6 +1288,7 @@ fn set_op_id(op: &mut Operation, id: u32) {
         Operation::Drill(o) => o.id = id,
         Operation::Pocket(o) => o.id = id,
         Operation::Face(o) => o.id = id,
+        Operation::Chamfer(o) => o.id = id,
         Operation::Thread(o) => o.id = id,
     }
 }
@@ -1304,6 +1350,7 @@ mod tests {
             Operation::Face(o) => o.depth,
             Operation::Drill(o) => o.depth,
             Operation::Thread(o) => o.z_bottom,
+            Operation::Chamfer(o) => o.top,
         }
     }
 
@@ -1472,6 +1519,20 @@ mod tests {
                 assert!((fmax(&ys) - bmax[1]).abs() < 1e-9);
             }
             other => panic!("expected face, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_chamfer_seeds_from_geometry() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        app.new_operation(OpKind::Chamfer);
+        match app.selected_operation() {
+            Some(Operation::Chamfer(o)) => {
+                assert!(o.width > 0.0, "a default chamfer width");
+                assert_eq!(o.side, Side::Outside, "chamfers default to the outside edge");
+            }
+            other => panic!("expected chamfer, got {other:?}"),
         }
     }
 

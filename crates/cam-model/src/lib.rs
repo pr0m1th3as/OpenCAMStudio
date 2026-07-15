@@ -18,8 +18,8 @@ mod history;
 
 pub use cam_cldata::Point3;
 pub use document::{
-    Comp, Document, DrillOp, FaceOp, Hand, Heights, Lead, Operation, Plunge, PocketOp, ProfileOp,
-    Setup, Side, Stock, ThreadOp, SCHEMA_VERSION,
+    ChamferOp, Comp, Document, DrillOp, FaceOp, Hand, Heights, Lead, Operation, Plunge, PocketOp,
+    ProfileOp, Setup, Side, Stock, ThreadOp, SCHEMA_VERSION,
 };
 pub use history::History;
 
@@ -86,33 +86,49 @@ impl Machine {
     }
 }
 
-/// The cutting-tool geometry a cycle/strategy reasons about.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// The cutting-tool geometry a cycle/strategy reasons about. A data-carrying enum:
+/// each kind holds the parameters that define its cutting profile (the ones that
+/// have any — `EndMill`, `BallMill` and `FaceMill` are fully described by the
+/// tool's diameter). The nominal cutting radius is always `Tool::radius()`; these
+/// refine the *shape* within that envelope.
+///
+/// Serde uses the default external tagging, so the parameter-free variants stay
+/// wire-compatible with the earlier flat enum (`"EndMill"` still round-trips).
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ToolKind {
     /// Flat-bottomed square end mill.
     EndMill,
-    /// Ball-nosed end mill.
+    /// Ball-nosed end mill (corner radius = tool radius).
     BallMill,
-    /// Twist drill.
-    Drill,
-    /// Chamfer/V mill.
-    ChamferMill,
+    /// Bull-nose (corner-radius) end mill: flat bottom with a rounded corner of
+    /// `corner_radius` mm (`0 < r ≤ radius`; `EndMill` and `BallMill` are the
+    /// degenerate ends of this family, kept as named kinds for clarity).
+    BullNose {
+        /// Corner radius, mm.
+        corner_radius: f64,
+    },
+    /// Chamfer / V mill: a point of `included_angle_deg` (full included angle),
+    /// optionally with a flat tip of `tip_diameter` mm (0 for a true V).
+    ChamferMill {
+        /// Full included point angle, degrees.
+        included_angle_deg: f64,
+        /// Flat-tip diameter, mm (0 for a sharp V).
+        tip_diameter: f64,
+    },
+    /// Twist drill with a point of `point_angle_deg` (full included angle).
+    Drill {
+        /// Full included point angle, degrees (commonly 118 or 135).
+        point_angle_deg: f64,
+    },
     /// Face mill.
     FaceMill,
     /// Thread mill — helically interpolated to cut internal/external threads.
-    ThreadMill,
-}
-
-impl ToolKind {
-    /// Every kind, in a stable order — for pickers and iteration.
-    pub const ALL: [ToolKind; 6] = [
-        ToolKind::EndMill,
-        ToolKind::BallMill,
-        ToolKind::Drill,
-        ToolKind::ChamferMill,
-        ToolKind::FaceMill,
-        ToolKind::ThreadMill,
-    ];
+    /// `pitch` is `None` for a single-form (pitch-agnostic) mill, or `Some(p)` for
+    /// a full-profile mill whose tooth comb is ground for pitch `p` mm.
+    ThreadMill {
+        /// Full-profile pitch, mm; `None` for a single-form mill.
+        pitch: Option<f64>,
+    },
 }
 
 impl std::fmt::Display for ToolKind {
@@ -120,10 +136,11 @@ impl std::fmt::Display for ToolKind {
         let s = match self {
             ToolKind::EndMill => "End mill",
             ToolKind::BallMill => "Ball mill",
-            ToolKind::Drill => "Drill",
-            ToolKind::ChamferMill => "Chamfer mill",
+            ToolKind::BullNose { .. } => "Bull-nose mill",
+            ToolKind::ChamferMill { .. } => "Chamfer mill",
+            ToolKind::Drill { .. } => "Drill",
             ToolKind::FaceMill => "Face mill",
-            ToolKind::ThreadMill => "Thread mill",
+            ToolKind::ThreadMill { .. } => "Thread mill",
         };
         f.write_str(s)
     }
@@ -197,5 +214,42 @@ mod tests {
             kind: ToolKind::EndMill,
         };
         assert_eq!(t.radius(), 3.0);
+    }
+
+    #[test]
+    fn tool_kind_variants_round_trip() {
+        for kind in [
+            ToolKind::EndMill,
+            ToolKind::BallMill,
+            ToolKind::BullNose { corner_radius: 1.5 },
+            ToolKind::ChamferMill {
+                included_angle_deg: 90.0,
+                tip_diameter: 0.5,
+            },
+            ToolKind::Drill {
+                point_angle_deg: 118.0,
+            },
+            ToolKind::FaceMill,
+            ToolKind::ThreadMill { pitch: Some(1.25) },
+            ToolKind::ThreadMill { pitch: None },
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let back: ToolKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(kind, back, "round-trip failed for {kind:?} via {json}");
+        }
+    }
+
+    #[test]
+    fn parameter_free_kinds_are_wire_compatible_with_v1() {
+        // The pre-v2 flat enum serialized unit variants as bare strings; those
+        // must still deserialize so existing tool libraries load unchanged.
+        assert_eq!(
+            serde_json::from_str::<ToolKind>("\"EndMill\"").unwrap(),
+            ToolKind::EndMill
+        );
+        assert_eq!(
+            serde_json::from_str::<ToolKind>("\"FaceMill\"").unwrap(),
+            ToolKind::FaceMill
+        );
     }
 }

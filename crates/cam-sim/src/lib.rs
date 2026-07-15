@@ -34,6 +34,98 @@ impl Default for SimOptions {
     }
 }
 
+/// The bottom shape of a tool within its cutting radius — what makes a ball mill
+/// leave a rounded floor where an end mill leaves a flat one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ProfileShape {
+    /// Flat bottom (end mill / face mill).
+    Flat,
+    /// Full ball nose — corner radius equals the tool radius.
+    Ball,
+    /// Flat centre with a rounded corner of `corner_radius` mm (bull-nose).
+    BullNose { corner_radius: f64 },
+    /// Conical point (chamfer/V mill, drill): the surface rises as `d/tan(α)`
+    /// outside an optional flat tip, where `half_angle_rad` (α) is measured from
+    /// the tool axis.
+    Cone {
+        /// Half of the included point angle, measured from the axis (radians).
+        half_angle_rad: f64,
+        /// Radius of the flat tip, mm (0 for a sharp point / drill).
+        flat_radius: f64,
+    },
+}
+
+/// The cutting profile of a tool: its radius and bottom shape. [`offset`] gives
+/// how far the cutting surface sits *above* the tool's lowest point at radial
+/// distance `d` from the axis, so the heightfield lowers a covered cell to
+/// `axis_bottom + offset(d)`.
+///
+/// [`offset`]: ToolProfile::offset
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ToolProfile {
+    /// Cutting radius, mm — the swept footprint.
+    pub radius: f64,
+    /// The bottom shape within that radius.
+    pub shape: ProfileShape,
+}
+
+impl ToolProfile {
+    /// A flat-bottomed tool of the given radius.
+    pub fn flat(radius: f64) -> Self {
+        Self {
+            radius,
+            shape: ProfileShape::Flat,
+        }
+    }
+
+    /// Height of the cutting surface above the tool's lowest point at radial
+    /// distance `d` from the axis (clamped to `[0, radius]`).
+    pub fn offset(&self, d: f64) -> f64 {
+        let d = d.clamp(0.0, self.radius);
+        match self.shape {
+            ProfileShape::Flat => 0.0,
+            ProfileShape::Ball => {
+                let r = self.radius;
+                r - (r * r - d * d).max(0.0).sqrt()
+            }
+            ProfileShape::BullNose { corner_radius } => {
+                let flat = (self.radius - corner_radius).max(0.0);
+                if d <= flat {
+                    0.0
+                } else {
+                    let x = d - flat; // distance into the corner arc
+                    corner_radius - (corner_radius * corner_radius - x * x).max(0.0).sqrt()
+                }
+            }
+            ProfileShape::Cone {
+                half_angle_rad,
+                flat_radius,
+            } => {
+                if d <= flat_radius {
+                    0.0
+                } else {
+                    let t = half_angle_rad.tan();
+                    if t <= 1e-9 {
+                        0.0
+                    } else {
+                        (d - flat_radius) / t
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A tool in the sim's tool table, keyed by the `Tn` number the program selects
+/// with a [`Step::ToolChange`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SimTool {
+    /// Tool number (matches `ToolChange { tool }`).
+    pub number: u32,
+    /// The tool's cutting profile.
+    pub profile: ToolProfile,
+}
+
 /// The kind of a detected problem.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CollisionKind {
@@ -73,12 +165,15 @@ impl SimResult {
 const CLEARANCE_EPS: f32 = 0.001;
 
 /// Simulate `program` removing material from a block of stock spanning `[min,
-/// max]`, using a tool of `options.tool_radius`.
+/// max]`. The tool in the spindle follows the program's `ToolChange` steps,
+/// looked up in `tools`; before the first change (or for any unlisted number) a
+/// flat tool of `options.tool_radius` is used.
 pub fn simulate(
     program: &Program,
     min: [f64; 3],
     max: [f64; 3],
     options: &SimOptions,
+    tools: &[SimTool],
 ) -> SimResult {
     let mut field = Heightfield::new(
         [min[0], min[1]],
@@ -86,16 +181,23 @@ pub fn simulate(
         options.resolution,
         max[2],
     );
-    let r = options.tool_radius;
+    let default_tool = ToolProfile::flat(options.tool_radius);
+    let mut tool = default_tool;
     let mut cur: Option<Point3> = None;
     let mut collisions = Vec::new();
 
     for step in program.steps() {
         match step {
+            Step::ToolChange { tool: number } => {
+                tool = tools
+                    .iter()
+                    .find(|t| t.number == *number)
+                    .map_or(default_tool, |t| t.profile);
+            }
             Step::Rapid { to, .. } => {
                 if let Some(a) = cur {
                     let clearance = a.z.min(to.z) as f32;
-                    let stock = field.max_height_along([a.x, a.y], [to.x, to.y], r);
+                    let stock = field.max_height_along([a.x, a.y], [to.x, to.y], tool.radius);
                     if stock > clearance + CLEARANCE_EPS {
                         collisions.push(Collision {
                             kind: CollisionKind::RapidThroughStock,
@@ -111,7 +213,7 @@ pub fn simulate(
             }
             Step::Linear { to, .. } => {
                 if let Some(a) = cur {
-                    field.cut_segment([a.x, a.y, a.z], [to.x, to.y, to.z], r);
+                    field.cut_segment_profile([a.x, a.y, a.z], [to.x, to.y, to.z], &tool);
                 }
                 cur = Some(*to);
             }
@@ -121,14 +223,14 @@ pub fn simulate(
                 if let Some(a) = cur {
                     let pts = arc_points(a, *end, *center, *dir);
                     for w in pts.windows(2) {
-                        field.cut_segment(w[0], w[1], r);
+                        field.cut_segment_profile(w[0], w[1], &tool);
                     }
                 }
                 cur = Some(*end);
             }
             Step::Drill(cycle) => {
                 for &[x, y] in &cycle.points {
-                    field.cut_segment([x, y, cycle.depth], [x, y, cycle.depth], r);
+                    field.cut_segment_profile([x, y, cycle.depth], [x, y, cycle.depth], &tool);
                 }
                 cur = None;
             }
@@ -210,7 +312,7 @@ mod tests {
             .linear(Point3::new(35.0, 20.0, -2.0), MoveKind::Cutting)
             .rapid(Point3::new(35.0, 20.0, 5.0), MoveKind::Retract)
             .build();
-        let sim = simulate(&prog, STOCK_MIN, STOCK_MAX, &opts());
+        let sim = simulate(&prog, STOCK_MIN, STOCK_MAX, &opts(), &[]);
         assert!(sim.is_clean(), "collisions: {:?}", sim.collisions);
         assert!(sim.removed_volume > 0.0, "some material removed");
     }
@@ -223,7 +325,7 @@ mod tests {
             .rapid(Point3::new(2.0, 20.0, -2.0), MoveKind::Link)
             .rapid(Point3::new(38.0, 20.0, -2.0), MoveKind::Link)
             .build();
-        let sim = simulate(&prog, STOCK_MIN, STOCK_MAX, &opts());
+        let sim = simulate(&prog, STOCK_MIN, STOCK_MAX, &opts(), &[]);
         assert!(!sim.is_clean(), "should flag the rapid");
         assert_eq!(sim.collisions[0].kind, CollisionKind::RapidThroughStock);
     }
@@ -239,7 +341,7 @@ mod tests {
             .linear(Point3::new(38.0, 20.0, -3.0), MoveKind::Cutting)
             .rapid(Point3::new(38.0, 20.0, 5.0), MoveKind::Retract)
             .build();
-        let sim = simulate(&prog, STOCK_MIN, STOCK_MAX, &opts());
+        let sim = simulate(&prog, STOCK_MIN, STOCK_MAX, &opts(), &[]);
         let mut target = Heightfield::new([0.0, 0.0], [40.0, 40.0], 0.5, 0.0);
         target.lower_rect([0.0, 16.0], [40.0, 24.0], -3.0);
         assert!(check_gouge(&sim.field, &target, 0.05).is_none());
@@ -256,7 +358,7 @@ mod tests {
             .linear(Point3::new(38.0, 20.0, -5.0), MoveKind::Cutting)
             .rapid(Point3::new(38.0, 20.0, 5.0), MoveKind::Retract)
             .build();
-        let sim = simulate(&prog, STOCK_MIN, STOCK_MAX, &opts());
+        let sim = simulate(&prog, STOCK_MIN, STOCK_MAX, &opts(), &[]);
         let mut target = Heightfield::new([0.0, 0.0], [40.0, 40.0], 0.5, 0.0);
         target.lower_rect([0.0, 16.0], [40.0, 24.0], -2.0);
         let gouge = check_gouge(&sim.field, &target, 0.05).expect("gouge must be caught");
@@ -282,12 +384,90 @@ mod tests {
                 tag: Tag::new(0, MoveKind::Plunge),
             })
             .build();
-        let sim = simulate(&prog, STOCK_MIN, STOCK_MAX, &opts());
+        let sim = simulate(&prog, STOCK_MIN, STOCK_MAX, &opts(), &[]);
         assert!(sim.field.sample(10.0, 10.0) < -4.9, "hole 1 drilled");
         assert!(sim.field.sample(30.0, 30.0) < -4.9, "hole 2 drilled");
         assert!(
             sim.field.sample(20.0, 20.0) > -0.1,
             "between holes untouched"
         );
+    }
+
+    #[test]
+    fn profile_offsets_match_geometry() {
+        // Flat: no rise anywhere.
+        let flat = ToolProfile::flat(2.0);
+        assert_eq!(flat.offset(0.0), 0.0);
+        assert_eq!(flat.offset(2.0), 0.0);
+
+        // Ball R2: sphere — 0 at the axis, R at the rim.
+        let ball = ToolProfile {
+            radius: 2.0,
+            shape: ProfileShape::Ball,
+        };
+        assert!(ball.offset(0.0).abs() < 1e-9);
+        assert!((ball.offset(2.0) - 2.0).abs() < 1e-9);
+        assert!((ball.offset(1.5) - (2.0 - (4.0_f64 - 2.25).sqrt())).abs() < 1e-9);
+
+        // Bull-nose R3, corner 1: flat out to d=2, then a 1 mm corner arc.
+        let bull = ToolProfile {
+            radius: 3.0,
+            shape: ProfileShape::BullNose { corner_radius: 1.0 },
+        };
+        assert_eq!(bull.offset(2.0), 0.0);
+        assert!((bull.offset(3.0) - 1.0).abs() < 1e-9);
+
+        // 90° cone (α=45°): rises 1:1 with radius past a 0.5 mm flat tip.
+        let cone = ToolProfile {
+            radius: 5.0,
+            shape: ProfileShape::Cone {
+                half_angle_rad: std::f64::consts::FRAC_PI_4,
+                flat_radius: 0.5,
+            },
+        };
+        assert_eq!(cone.offset(0.5), 0.0);
+        assert!((cone.offset(2.5) - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_ball_mill_leaves_a_rounded_floor() {
+        let mut hf = Heightfield::new([0.0, 0.0], [10.0, 10.0], 0.25, 0.0);
+        let ball = ToolProfile {
+            radius: 2.0,
+            shape: ProfileShape::Ball,
+        };
+        // Cut along y=5 at Z −3.
+        hf.cut_segment_profile([2.0, 5.0, -3.0], [8.0, 5.0, -3.0], &ball);
+        let center = hf.sample(5.0, 5.0); // on the tool axis → deepest
+        let side = hf.sample(5.0, 6.5); // 1.5 mm off → floor rises
+        assert!((center + 3.0).abs() < 0.3, "axis floor near −3: {center}");
+        assert!(side > center + 0.3, "floor rounds up toward the edge");
+    }
+
+    #[test]
+    fn simulate_honours_tool_change_profile() {
+        // Select tool 2 (a ball mill) and cut a straight slot; the floor must be
+        // rounded — proof the sim tracked the tool change, not the default flat.
+        let prog = ProgramBuilder::new()
+            .tool_change(2)
+            .op(0)
+            .feed(300.0)
+            .rapid(Point3::new(2.0, 20.0, 5.0), MoveKind::Link)
+            .linear(Point3::new(2.0, 20.0, -3.0), MoveKind::Plunge)
+            .linear(Point3::new(38.0, 20.0, -3.0), MoveKind::Cutting)
+            .rapid(Point3::new(38.0, 20.0, 5.0), MoveKind::Retract)
+            .build();
+        let tools = [SimTool {
+            number: 2,
+            profile: ToolProfile {
+                radius: 2.0,
+                shape: ProfileShape::Ball,
+            },
+        }];
+        let sim = simulate(&prog, STOCK_MIN, STOCK_MAX, &opts(), &tools);
+        let center = sim.field.sample(20.0, 20.0);
+        let side = sim.field.sample(20.0, 21.5);
+        assert!((center + 3.0).abs() < 0.3, "slot axis near −3: {center}");
+        assert!(side > center + 0.3, "ball tool leaves a rounded slot floor");
     }
 }

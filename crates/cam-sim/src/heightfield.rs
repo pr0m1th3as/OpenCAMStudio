@@ -6,6 +6,8 @@
 //! the simplest model that captures 2.5-D removal faithfully — enough to verify
 //! that a program clears what it should and never plows a rapid through stock.
 
+use crate::ToolProfile;
+
 /// How the simulated stock compares to a desired target surface — the raw
 /// material of gouge / residual verification.
 ///
@@ -87,9 +89,21 @@ impl Heightfield {
         }
     }
 
-    /// Lower every cell within `radius` of the segment `a→b` to the tool bottom,
-    /// interpolating the bottom Z along the segment.
+    /// Lower every cell within `radius` of the segment `a→b` to the (flat) tool
+    /// bottom, interpolating the bottom Z along the segment. A convenience for a
+    /// flat end mill; [`cut_segment_profile`](Self::cut_segment_profile) handles
+    /// shaped tools.
     pub fn cut_segment(&mut self, a: [f64; 3], b: [f64; 3], radius: f64) {
+        self.cut_segment_profile(a, b, &ToolProfile::flat(radius));
+    }
+
+    /// Lower every cell within the tool's radius of the segment `a→b` to the tool
+    /// bottom, accounting for the tool's [`ToolProfile`]: the axis bottom is
+    /// interpolated along the segment, and each cell is raised by the profile's
+    /// `offset` at its radial distance from the axis (so a ball mill leaves a
+    /// rounded floor, a V mill a groove, and a flat mill a flat floor).
+    pub fn cut_segment_profile(&mut self, a: [f64; 3], b: [f64; 3], tool: &ToolProfile) {
+        let radius = tool.radius;
         let (ix0, ix1) = self.index_range(a[0].min(b[0]) - radius, a[0].max(b[0]) + radius, 0);
         let (iy0, iy1) = self.index_range(a[1].min(b[1]) - radius, a[1].max(b[1]) + radius, 1);
         let r2 = radius * radius;
@@ -98,7 +112,8 @@ impl Heightfield {
                 let (cx, cy) = self.center(ix, iy);
                 let (t, dist2) = project(cx, cy, [a[0], a[1]], [b[0], b[1]]);
                 if dist2 <= r2 {
-                    let bottom = (a[2] + (b[2] - a[2]) * t) as f32;
+                    let axis_z = a[2] + (b[2] - a[2]) * t;
+                    let bottom = (axis_z + tool.offset(dist2.sqrt())) as f32;
                     let cell = &mut self.z[iy * self.nx + ix];
                     *cell = cell.min(bottom);
                 }

@@ -12,7 +12,8 @@ use crate::Tool;
 
 /// The document schema version. Bumped when the on-disk model format changes;
 /// present from the start so save-files are versioned before there is a loader.
-pub const SCHEMA_VERSION: u32 = 1;
+/// v2: `ToolKind` became a data-carrying enum (per-kind geometry).
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// The safety planes for a setup, all **absolute Z in millimetres**. By
 /// convention WCS Z0 is the top of stock, so `top_of_stock` is usually `0.0`.
@@ -276,6 +277,31 @@ pub struct ThreadOp {
     pub plunge_feed: f64,
 }
 
+/// A chamfer/bevel along a closed edge: run a chamfer/V mill around the contour
+/// at a computed depth so its cone flank forms a bevel of `width`. A single pass
+/// (chamfers are shallow); the tool runs on the air side of the edge, offset by
+/// its tip radius.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ChamferOp {
+    /// Operation id.
+    pub id: u32,
+    /// Tool number (must select a chamfer/V mill — the strategy reads its angle).
+    pub tool: u32,
+    /// The closed edge to chamfer, in the part/WCS frame.
+    pub chain: Contour,
+    /// Which side of the chain holds material; the tool runs on the other (air)
+    /// side, offset by its tip radius.
+    pub side: Side,
+    /// Horizontal chamfer width, mm (> 0). The depth follows from the tool angle.
+    pub width: f64,
+    /// Absolute Z of the top edge, where the chamfer begins (usually the stock top).
+    pub top: f64,
+    /// Cutting feed, mm/min.
+    pub feed: f64,
+    /// Plunge feed for the approach in Z, mm/min.
+    pub plunge_feed: f64,
+}
+
 /// An operation in a setup. An enum so a setup holds a heterogeneous, ordered
 /// list.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -288,6 +314,8 @@ pub enum Operation {
     Pocket(PocketOp),
     /// A facing operation.
     Face(FaceOp),
+    /// A chamfering operation.
+    Chamfer(ChamferOp),
     /// A thread-milling operation.
     Thread(ThreadOp),
 }
@@ -300,6 +328,7 @@ impl Operation {
             Operation::Drill(op) => op.id,
             Operation::Pocket(op) => op.id,
             Operation::Face(op) => op.id,
+            Operation::Chamfer(op) => op.id,
             Operation::Thread(op) => op.id,
         }
     }
@@ -311,6 +340,7 @@ impl Operation {
             Operation::Drill(op) => op.tool,
             Operation::Pocket(op) => op.tool,
             Operation::Face(op) => op.tool,
+            Operation::Chamfer(op) => op.tool,
             Operation::Thread(op) => op.tool,
         }
     }

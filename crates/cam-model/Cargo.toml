@@ -12,3 +12,6 @@ repository.workspace = true
 cam-cldata = { path = "../cam-cldata" }
 cam-geo = { path = "../cam-geo" }
 serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

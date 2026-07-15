@@ -412,6 +412,129 @@ impl std::fmt::Display for CutStyle {
     }
 }
 
+/// The tool-geometry class as a plain discriminant, for the inspector picker
+/// (a friendlier face on the data-carrying [`ToolKind`], mirroring `PlungeKind`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolKindPick {
+    EndMill,
+    BallMill,
+    BullNose,
+    ChamferMill,
+    Drill,
+    FaceMill,
+    ThreadMill,
+}
+
+impl ToolKindPick {
+    const ALL: [ToolKindPick; 7] = [
+        ToolKindPick::EndMill,
+        ToolKindPick::BallMill,
+        ToolKindPick::BullNose,
+        ToolKindPick::ChamferMill,
+        ToolKindPick::Drill,
+        ToolKindPick::FaceMill,
+        ToolKindPick::ThreadMill,
+    ];
+
+    fn of(kind: ToolKind) -> Self {
+        match kind {
+            ToolKind::EndMill => ToolKindPick::EndMill,
+            ToolKind::BallMill => ToolKindPick::BallMill,
+            ToolKind::BullNose { .. } => ToolKindPick::BullNose,
+            ToolKind::ChamferMill { .. } => ToolKindPick::ChamferMill,
+            ToolKind::Drill { .. } => ToolKindPick::Drill,
+            ToolKind::FaceMill => ToolKindPick::FaceMill,
+            ToolKind::ThreadMill { .. } => ToolKindPick::ThreadMill,
+        }
+    }
+
+    /// A `ToolKind` of this class with sensible default parameters.
+    fn to_kind(self) -> ToolKind {
+        match self {
+            ToolKindPick::EndMill => ToolKind::EndMill,
+            ToolKindPick::BallMill => ToolKind::BallMill,
+            ToolKindPick::BullNose => ToolKind::BullNose { corner_radius: 1.0 },
+            ToolKindPick::ChamferMill => ToolKind::ChamferMill {
+                included_angle_deg: 90.0,
+                tip_diameter: 0.0,
+            },
+            ToolKindPick::Drill => ToolKind::Drill {
+                point_angle_deg: 118.0,
+            },
+            ToolKindPick::FaceMill => ToolKind::FaceMill,
+            ToolKindPick::ThreadMill => ToolKind::ThreadMill { pitch: None },
+        }
+    }
+}
+
+impl std::fmt::Display for ToolKindPick {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.to_kind().to_string().as_str())
+    }
+}
+
+/// The kind-specific inspector fields for a tool of `kind` (empty for kinds fully
+/// described by diameter).
+fn tool_kind_fields(kind: ToolKind) -> Vec<Field> {
+    match kind {
+        ToolKind::BullNose { .. } => vec![Field::CornerRadius],
+        ToolKind::ChamferMill { .. } => vec![Field::ChamferAngle, Field::TipDiameter],
+        ToolKind::Drill { .. } => vec![Field::PointAngle],
+        ToolKind::ThreadMill { .. } => vec![Field::ToolThreadPitch],
+        ToolKind::EndMill | ToolKind::BallMill | ToolKind::FaceMill => Vec::new(),
+    }
+}
+
+/// Read a tool's kind-specific parameter for a field, if it applies.
+fn tool_kind_field(kind: ToolKind, field: Field) -> Option<f64> {
+    match (kind, field) {
+        (ToolKind::BullNose { corner_radius }, Field::CornerRadius) => Some(corner_radius),
+        (ToolKind::ChamferMill { included_angle_deg, .. }, Field::ChamferAngle) => {
+            Some(included_angle_deg)
+        }
+        (ToolKind::ChamferMill { tip_diameter, .. }, Field::TipDiameter) => Some(tip_diameter),
+        (ToolKind::Drill { point_angle_deg }, Field::PointAngle) => Some(point_angle_deg),
+        // Single-form (None) shows as 0 — "any pitch".
+        (ToolKind::ThreadMill { pitch }, Field::ToolThreadPitch) => Some(pitch.unwrap_or(0.0)),
+        _ => None,
+    }
+}
+
+/// Write the parsed inspector fields onto a tool's kind-specific parameters.
+fn apply_tool_kind_fields(kind: &mut ToolKind, parsed: &BTreeMap<Field, f64>) {
+    let get = |f: Field| parsed.get(&f).copied();
+    match kind {
+        ToolKind::BullNose { corner_radius } => {
+            if let Some(v) = get(Field::CornerRadius) {
+                *corner_radius = v;
+            }
+        }
+        ToolKind::ChamferMill {
+            included_angle_deg,
+            tip_diameter,
+        } => {
+            if let Some(v) = get(Field::ChamferAngle) {
+                *included_angle_deg = v;
+            }
+            if let Some(v) = get(Field::TipDiameter) {
+                *tip_diameter = v;
+            }
+        }
+        ToolKind::Drill { point_angle_deg } => {
+            if let Some(v) = get(Field::PointAngle) {
+                *point_angle_deg = v;
+            }
+        }
+        ToolKind::ThreadMill { pitch } => {
+            if let Some(v) = get(Field::ToolThreadPitch) {
+                // 0 (or negative) means single-form; a positive value is full-profile.
+                *pitch = (v > 0.0).then_some(v);
+            }
+        }
+        ToolKind::EndMill | ToolKind::BallMill | ToolKind::FaceMill => {}
+    }
+}
+
 /// An editable inspector field, keyed independently of which node owns it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Field {
@@ -421,6 +544,16 @@ enum Field {
     ToolDiameter,
     ToolLength,
     Flutes,
+    /// Bull-nose corner radius (mm).
+    CornerRadius,
+    /// Chamfer/V mill included point angle (deg).
+    ChamferAngle,
+    /// Chamfer/V mill flat-tip diameter (mm).
+    TipDiameter,
+    /// Drill point angle (deg).
+    PointAngle,
+    /// Thread mill's ground pitch (mm); 0 means single-form (any pitch).
+    ToolThreadPitch,
     Depth,
     Stepdown,
     Stepover,
@@ -434,6 +567,8 @@ enum Field {
     ThreadTop,
     /// Absolute Z of the bottom of a threaded length (mm).
     ThreadBottom,
+    /// Chamfer width (mm).
+    ChamferWidth,
     /// Lead-in size (length for Linear, radius for Arc).
     LeadInSize,
     /// Lead-out size.
@@ -453,6 +588,11 @@ impl Field {
             Field::ToolDiameter => "Tool ⌀ (mm)",
             Field::ToolLength => "Length (mm)",
             Field::Flutes => "Flutes",
+            Field::CornerRadius => "Corner radius (mm)",
+            Field::ChamferAngle => "Point angle (deg)",
+            Field::TipDiameter => "Tip ⌀ (mm)",
+            Field::PointAngle => "Point angle (deg)",
+            Field::ToolThreadPitch => "Tool pitch (mm, 0=any)",
             Field::Depth => "Depth (mm)",
             Field::Stepdown => "Stepdown (mm)",
             Field::Stepover => "Stepover (mm)",
@@ -462,6 +602,7 @@ impl Field {
             Field::Pitch => "Pitch (mm)",
             Field::ThreadTop => "Thread top (mm)",
             Field::ThreadBottom => "Thread bottom (mm)",
+            Field::ChamferWidth => "Chamfer width (mm)",
             Field::LeadInSize => "Lead-in size (mm)",
             Field::LeadOutSize => "Lead-out size (mm)",
             Field::PlungeA => "Plunge angle/radius",
@@ -1047,11 +1188,20 @@ impl App {
                 self.apply_fixed_layout();
             }
             Message::ToolKindChanged(kind) => {
-                // Library-tool editing (Tooling tab): edit the library entry.
-                if let Some(t) = self.library.tools.get_mut(self.lib_sel) {
-                    t.kind = kind;
-                    self.library.save();
+                // Route to whichever tool the inspector is editing: the library
+                // entry (Tooling tab) or the selected setup tool. Switching kind
+                // resets its parameters to the new kind's defaults.
+                if self.library_mode() {
+                    if let Some(t) = self.library.tools.get_mut(self.lib_sel) {
+                        t.kind = kind;
+                        self.library.save();
+                    }
+                } else if let Selection::Tool(i) = self.controller.selection() {
+                    self.controller.edit_tool(i, |t| t.kind = kind);
+                    self.rerun();
                 }
+                // The kind-specific fields depend on the kind — repopulate them.
+                self.refresh_fields();
             }
             Message::LeadInKindChanged(kind) => {
                 self.controller.edit_selected_operation(|op| {
@@ -1081,10 +1231,10 @@ impl App {
                 self.rerun();
             }
             Message::SideChanged(side) => {
-                self.controller.edit_selected_operation(|op| {
-                    if let Operation::Profile(p) = op {
-                        p.side = side;
-                    }
+                self.controller.edit_selected_operation(|op| match op {
+                    Operation::Profile(p) => p.side = side,
+                    Operation::Chamfer(c) => c.side = side,
+                    _ => {}
                 });
                 self.rerun();
             }
@@ -1351,12 +1501,22 @@ impl App {
 
     /// Which fields the inspector shows for the current selection.
     fn inspector_fields(&self) -> Vec<Field> {
+        // Common tool fields plus the selected tool's kind-specific parameters.
+        let tool_fields = |kind: Option<ToolKind>| {
+            let mut f = vec![Field::ToolDiameter, Field::ToolLength, Field::Flutes];
+            if let Some(k) = kind {
+                f.extend(tool_kind_fields(k));
+            }
+            f
+        };
         if self.library_mode() {
-            return vec![Field::ToolDiameter, Field::ToolLength, Field::Flutes];
+            return tool_fields(self.library.tools.get(self.lib_sel).map(|t| t.kind));
         }
         match self.controller.selection() {
             Selection::Setup => vec![Field::Clearance, Field::Retract, Field::TopOfStock],
-            Selection::Tool(_) => vec![Field::ToolDiameter, Field::ToolLength, Field::Flutes],
+            Selection::Tool(i) => {
+                tool_fields(self.controller.document().setup.tools.get(i).map(|t| t.kind))
+            }
             Selection::Stock => Vec::new(),
             Selection::Operation(id) => match self.controller.operation(id) {
                 Some(Operation::Profile(p)) => {
@@ -1403,6 +1563,9 @@ impl App {
                 }
                 Some(Operation::Face(_)) => vec![Field::Depth, Field::Stepdown, Field::Feed],
                 Some(Operation::Drill(_)) => vec![Field::Depth, Field::Feed],
+                Some(Operation::Chamfer(_)) => {
+                    vec![Field::ChamferWidth, Field::Feed, Field::PlungeFeed]
+                }
                 Some(Operation::Thread(_)) => vec![
                     Field::MajorDia,
                     Field::Pitch,
@@ -1424,7 +1587,7 @@ impl App {
                 Field::ToolDiameter => Some(t.diameter),
                 Field::ToolLength => Some(t.length),
                 Field::Flutes => Some(t.flutes as f64),
-                _ => None,
+                _ => tool_kind_field(t.kind, field),
             };
         }
         let setup = &self.controller.document().setup;
@@ -1444,10 +1607,16 @@ impl App {
                 Selection::Tool(i) => setup.tools.get(i).map(|t| t.flutes as f64),
                 _ => None,
             },
-            _ => self
-                .controller
-                .selected_operation()
-                .and_then(|op| op_field(op, field)),
+            _ => match self.controller.selection() {
+                // Kind-specific tool parameters (corner radius, chamfer angle, …).
+                Selection::Tool(i) => {
+                    setup.tools.get(i).and_then(|t| tool_kind_field(t.kind, field))
+                }
+                _ => self
+                    .controller
+                    .selected_operation()
+                    .and_then(|op| op_field(op, field)),
+            },
         }
     }
 
@@ -1480,6 +1649,7 @@ impl App {
                 if let Some(&v) = parsed.get(&Field::Flutes) {
                     t.flutes = v.round().max(1.0) as u32;
                 }
+                apply_tool_kind_fields(&mut t.kind, &parsed);
             }
             self.library.save();
             self.refresh_fields();
@@ -1509,6 +1679,7 @@ impl App {
                     // Flutes is an integer count; round the typed value.
                     t.flutes = v.round().max(1.0) as u32;
                 }
+                apply_tool_kind_fields(&mut t.kind, &parsed);
             }),
             Selection::Operation(_) => self
                 .controller
@@ -1735,6 +1906,8 @@ impl App {
                     cmd(Icon::Pocket, "Pocket", begin(OpKind::Pocket)),
                     cmd(Icon::Drill, "Drill", begin(OpKind::Drill)),
                     cmd(Icon::Thread, "Thread", begin(OpKind::Thread)),
+                    // Reuses the Profile icon until a chamfer glyph is drawn.
+                    cmd(Icon::Profile, "Chamfer", begin(OpKind::Chamfer)),
                     cmd(Icon::Face, "Face", begin(OpKind::Face)),
                 ],
             }],
@@ -2005,6 +2178,7 @@ impl App {
             OpKind::Pocket => "Pocket",
             OpKind::Drill => "Drill",
             OpKind::Face => "Face",
+            OpKind::Chamfer => "Chamfer",
             OpKind::Thread => "Thread",
         };
         // The tool is picked from the cross-project library; picking embeds a copy
@@ -2108,9 +2282,11 @@ impl App {
         if let Some(t) = self.library.tools.get(self.lib_sel) {
             list = list.push(row![
                 text("Type").width(Length::Fixed(150.0)).size(13),
-                pick_list(&ToolKind::ALL[..], Some(t.kind), Message::ToolKindChanged)
-                    .text_size(13)
-                    .width(Length::Fixed(140.0)),
+                pick_list(&ToolKindPick::ALL[..], Some(ToolKindPick::of(t.kind)), |p| {
+                    Message::ToolKindChanged(p.to_kind())
+                })
+                .text_size(13)
+                .width(Length::Fixed(140.0)),
             ]);
             list = list.push(button("Apply").on_press(Message::Apply));
         }
@@ -2183,9 +2359,9 @@ impl App {
                     row![
                         text("Type").width(Length::Fixed(150.0)).size(13),
                         pick_list(
-                            &ToolKind::ALL[..],
-                            Some(tool.kind),
-                            Message::ToolKindChanged
+                            &ToolKindPick::ALL[..],
+                            Some(ToolKindPick::of(tool.kind)),
+                            |p| Message::ToolKindChanged(p.to_kind())
                         )
                         .text_size(13)
                         .width(Length::Fixed(140.0)),
@@ -2232,6 +2408,14 @@ impl App {
                         PlungeKind::of(p.plunge),
                         &PlungeKind::ALL[..],
                         Message::PlungeKindChanged,
+                    ));
+                }
+                Some(Operation::Chamfer(c)) => {
+                    list = list.push(profile_picker(
+                        "Side",
+                        c.side,
+                        &Side::ALL[..],
+                        Message::SideChanged,
                     ));
                 }
                 Some(Operation::Thread(t)) => {
@@ -2672,6 +2856,7 @@ fn op_kind(op: &Operation) -> &'static str {
         Operation::Drill(_) => "Drill",
         Operation::Pocket(_) => "Pocket",
         Operation::Face(_) => "Face",
+        Operation::Chamfer(_) => "Chamfer",
         Operation::Thread(_) => "Thread",
     }
 }
@@ -2699,6 +2884,9 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Face(o), Field::Feed) => Some(o.feed),
         (Operation::Drill(o), Field::Depth) => Some(o.depth),
         (Operation::Drill(o), Field::Feed) => Some(o.feed),
+        (Operation::Chamfer(o), Field::ChamferWidth) => Some(o.width),
+        (Operation::Chamfer(o), Field::Feed) => Some(o.feed),
+        (Operation::Chamfer(o), Field::PlungeFeed) => Some(o.plunge_feed),
         (Operation::Thread(o), Field::MajorDia) => Some(o.major_dia),
         (Operation::Thread(o), Field::Pitch) => Some(o.pitch),
         (Operation::Thread(o), Field::ThreadTop) => Some(o.z_top),
@@ -2775,6 +2963,17 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
             }
             if let Some(v) = get(Field::Feed) {
                 o.feed = v;
+            }
+        }
+        Operation::Chamfer(o) => {
+            if let Some(v) = get(Field::ChamferWidth) {
+                o.width = v;
+            }
+            if let Some(v) = get(Field::Feed) {
+                o.feed = v;
+            }
+            if let Some(v) = get(Field::PlungeFeed) {
+                o.plunge_feed = v;
             }
         }
         Operation::Thread(o) => {

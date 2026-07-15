@@ -59,6 +59,7 @@ fn run(doc: &Document) -> cam_sim::SimResult {
             resolution: 0.5,
             tool_radius: TOOL_DIA / 2.0,
         },
+        &[],
     )
 }
 
@@ -207,6 +208,7 @@ fn a_bad_setup_that_rapids_low_is_caught() {
             resolution: 0.5,
             tool_radius: TOOL_DIA / 2.0,
         },
+        &[],
     );
     assert!(!sim.is_clean(), "an unsafe retract plane must be flagged");
 }

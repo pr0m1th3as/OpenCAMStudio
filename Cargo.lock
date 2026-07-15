@@ -501,6 +501,7 @@ dependencies = [
  "cam-cldata",
  "cam-geo",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
