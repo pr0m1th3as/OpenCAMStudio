@@ -16,7 +16,7 @@ use cam_import::{read_cad_file, read_dxf_str, ImportError, ImportOptions};
 use crate::project::Project;
 use cam_model::{
     ChamferOp, Comp, Document, DrillOp, FaceOp, Hand, Heights, History, Lead, Machine, Operation,
-    Plunge, PocketOp, ProfileOp, Setup, Side, Stock, ThreadOp, Tool, ToolKind,
+    Plunge, PocketOp, ProfileOp, Setup, Side, StartPoint, Stock, ThreadOp, Tool, ToolKind,
 };
 use cam_post::{GrblPost, Post, PostError, PostOptions};
 use cam_render::{mesh_vertices, MeshVertex, Scene, PART};
@@ -477,6 +477,20 @@ impl AppController {
     /// Edit the setup's heights as one undoable change.
     pub fn edit_heights(&mut self, f: impl FnOnce(&mut Heights)) {
         self.document.edit(|doc| f(&mut doc.setup.heights));
+        self.invalidate();
+    }
+
+    /// Edit the workpiece origin (datum) as one undoable change. Re-references the
+    /// posted G-code; the design/sim frame is unaffected, so no re-run is needed —
+    /// but `invalidate` keeps the pipeline honest.
+    pub fn edit_origin(&mut self, f: impl FnOnce(&mut [f64; 3])) {
+        self.document.edit(|doc| f(&mut doc.setup.origin));
+        self.invalidate();
+    }
+
+    /// Edit the optional program start point as one undoable change.
+    pub fn edit_start_point(&mut self, f: impl FnOnce(&mut Option<StartPoint>)) {
+        self.document.edit(|doc| f(&mut doc.setup.start_point));
         self.invalidate();
     }
 
@@ -1280,7 +1294,12 @@ impl AppController {
             program_name: Some(self.program_name()),
             ..Default::default()
         };
-        let nc = GrblPost.post(&outcome.program, &self.machine, &options)?;
+        // Re-reference the whole job to the workpiece origin (datum): shift every
+        // coordinate by −origin so the chosen part point becomes G-code (0,0,0),
+        // matched by the operator's G54 touch-off. Design/sim stay in part space.
+        let origin = self.document.current().setup.origin;
+        let program = outcome.program.translated([-origin[0], -origin[1], -origin[2]]);
+        let nc = GrblPost.post(&program, &self.machine, &options)?;
         self.nc = Some(nc);
         Ok(self.nc.as_deref().unwrap())
     }
@@ -1386,6 +1405,8 @@ impl AppController {
             stock: self.stock(p.top_of_stock, p.depth),
             tools,
             operations,
+            origin: [0.0, 0.0, 0.0],
+            start_point: None,
         })
     }
 
@@ -1645,6 +1666,8 @@ fn empty_document(p: &JobParams) -> Document {
             kind: ToolKind::EndMill,
         }],
         operations: Vec::new(),
+        origin: [0.0, 0.0, 0.0],
+        start_point: None,
     })
 }
 

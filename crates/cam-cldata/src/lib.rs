@@ -227,4 +227,85 @@ impl Program {
     pub fn is_empty(&self) -> bool {
         self.steps.is_empty()
     }
+
+    /// A copy of the program with every absolute coordinate shifted by `d` (mm).
+    /// Used to re-reference a whole job to a **work origin** before posting (pass
+    /// `-origin`): arc `I/J` offsets are relative to the start, so they survive a
+    /// uniform shift unchanged; comments/spindle/coolant carry through untouched.
+    pub fn translated(&self, d: [f64; 3]) -> Program {
+        Program {
+            steps: self.steps.iter().map(|s| s.translated(d)).collect(),
+        }
+    }
+}
+
+impl Step {
+    /// This step with every absolute coordinate shifted by `d` (mm).
+    pub fn translated(&self, d: [f64; 3]) -> Step {
+        let p = |q: Point3| Point3::new(q.x + d[0], q.y + d[1], q.z + d[2]);
+        match self {
+            Step::Rapid { to, tag } => Step::Rapid { to: p(*to), tag: *tag },
+            Step::Linear { to, feed, tag } => Step::Linear {
+                to: p(*to),
+                feed: *feed,
+                tag: *tag,
+            },
+            Step::Arc {
+                end,
+                center,
+                dir,
+                feed,
+                tag,
+            } => Step::Arc {
+                end: p(*end),
+                center: p(*center),
+                dir: *dir,
+                feed: *feed,
+                tag: *tag,
+            },
+            Step::Drill(c) => Step::Drill(DrillCycle {
+                points: c.points.iter().map(|[x, y]| [x + d[0], y + d[1]]).collect(),
+                z_top: c.z_top + d[2],
+                depth: c.depth + d[2],
+                retract: c.retract + d[2],
+                ..c.clone()
+            }),
+            other => other.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod translate_tests {
+    use super::*;
+
+    #[test]
+    fn translated_shifts_moves_and_arc_end_but_preserves_relative_ij() {
+        let prog = ProgramBuilder::new()
+            .op(0)
+            .feed(300.0)
+            .rapid(Point3::new(10.0, 10.0, 5.0), MoveKind::Link)
+            .arc(
+                Point3::new(20.0, 10.0, 5.0),
+                Point3::new(15.0, 10.0, 5.0),
+                ArcDir::Cw,
+                MoveKind::Cutting,
+            )
+            .build();
+        let t = prog.translated([-10.0, -10.0, 0.0]);
+        match &t.steps()[0] {
+            Step::Rapid { to, .. } => assert_eq!(*to, Point3::new(0.0, 0.0, 5.0)),
+            other => panic!("{other:?}"),
+        }
+        match &t.steps()[1] {
+            Step::Arc { end, center, .. } => {
+                assert_eq!(*end, Point3::new(10.0, 0.0, 5.0), "end shifted");
+                assert_eq!(*center, Point3::new(5.0, 0.0, 5.0), "center shifted");
+                // I/J = center - start, preserved by a uniform shift (both moved).
+                let ij = (center.x - end.x, center.y - end.y);
+                assert_eq!(ij, (-5.0, 0.0));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 }

@@ -42,6 +42,8 @@ fn setup(operations: Vec<Operation>) -> Document {
             kind: ToolKind::EndMill,
         }],
         operations,
+        origin: [0.0, 0.0, 0.0],
+        start_point: None,
     })
 }
 
@@ -204,6 +206,8 @@ fn a_bad_setup_that_rapids_low_is_caught() {
             lead_out: Lead::None,
             plunge: Plunge::Straight,
         })],
+        origin: [0.0, 0.0, 0.0],
+        start_point: None,
     });
     let (program, _) = build_job(&doc, 1000.0, SpindleDir::Cw, &CancelToken::new());
     let sim = simulate(

@@ -5,11 +5,11 @@
 //! **semantic check** on the emitted G-code, and an **ASCII backplot** of the
 //! cutting motions (a visual golden).
 
-use cam_cldata::{MoveKind, Program, SpindleDir, Step};
+use cam_cldata::{MoveKind, Point3, Program, SpindleDir, Step};
 use cam_geo::{Contour, Point};
 use cam_model::{
-    Comp, Document, Heights, Lead, Machine, Operation, Plunge, ProfileOp, Setup, Side, Stock, Tool,
-    ToolKind,
+    Comp, Document, Heights, Lead, Machine, Operation, Plunge, ProfileOp, Setup, Side, StartBase,
+    StartPoint, Stock, Tool, ToolKind,
 };
 use cam_post::{GrblPost, Post, PostOptions};
 use cam_toolpath::{build_job, CancelToken, JobEnv, ProfileStrategy, Strategy};
@@ -89,6 +89,8 @@ fn document() -> Document {
         },
         tools: vec![tool],
         operations: vec![Operation::Profile(outer), Operation::Profile(hole)],
+        origin: [0.0, 0.0, 0.0],
+        start_point: None,
     })
 }
 
@@ -101,6 +103,26 @@ fn plan_and_post() -> (Program, String, Vec<cam_toolpath::Diagnostic>) {
     };
     let nc = GrblPost.post(&program, &machine(), &opts).expect("post ok");
     (program, nc, diags)
+}
+
+#[test]
+fn a_start_point_prepends_a_rapid_to_it() {
+    let mut doc = document();
+    doc.setup.start_point = Some(StartPoint {
+        base: StartBase::Reference([1.0, 2.0, 30.0]),
+        offset: [0.0, 0.0, 0.0],
+    });
+    let (program, _) = build_job(&doc, 1000.0, SpindleDir::Cw, &CancelToken::new());
+    // The very first motion is a rapid to the resolved start point.
+    let first_rapid = program
+        .steps()
+        .iter()
+        .find_map(|s| match s {
+            Step::Rapid { to, .. } => Some(*to),
+            _ => None,
+        })
+        .expect("a rapid");
+    assert_eq!(first_rapid, Point3::new(1.0, 2.0, 30.0));
 }
 
 #[test]
@@ -405,6 +427,8 @@ fn arc_lead_and_helix_plunge_post_to_helical_gcode() {
         },
         tools: vec![tool],
         operations: vec![Operation::Profile(op)],
+        origin: [0.0, 0.0, 0.0],
+        start_point: None,
     });
 
     let (program, diags) = build_job(&doc, 1000.0, SpindleDir::Cw, &CancelToken::new());

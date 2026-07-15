@@ -89,6 +89,7 @@ enum Icon {
     ShowStock,
     ResetView,
     ShowCube,
+    SetOrigin,
 }
 
 impl Icon {
@@ -114,6 +115,7 @@ impl Icon {
             Icon::ShowStock => include_bytes!("../assets/icons/box3d.svg"),
             Icon::ResetView => include_bytes!("../assets/icons/zoom_ext.svg"),
             Icon::ShowCube => include_bytes!("../assets/icons/viewcube.svg"),
+            Icon::SetOrigin => include_bytes!("../assets/icons/origin.svg"),
         }
     }
 
@@ -271,6 +273,7 @@ const ALL_PANES: [Pane; 4] = [Pane::Project, Pane::Viewport, Pane::Inspector, Pa
 enum RibbonTab {
     Home,
     Operations,
+    Edit,
     Tooling,
     View,
     Windows,
@@ -278,9 +281,10 @@ enum RibbonTab {
 
 impl RibbonTab {
     /// The tabs shown in the strip, left to right.
-    const ALL: [RibbonTab; 5] = [
+    const ALL: [RibbonTab; 6] = [
         RibbonTab::Home,
         RibbonTab::Operations,
+        RibbonTab::Edit,
         RibbonTab::Tooling,
         RibbonTab::View,
         RibbonTab::Windows,
@@ -290,6 +294,7 @@ impl RibbonTab {
         match self {
             RibbonTab::Home => "Home",
             RibbonTab::Operations => "Operations",
+            RibbonTab::Edit => "Edit",
             RibbonTab::Tooling => "Tooling",
             RibbonTab::View => "View",
             RibbonTab::Windows => "Windows",
@@ -590,6 +595,10 @@ enum Field {
     StockTop,
     /// Stock: block thickness below the top (mm); bottom = top − thickness.
     StockThickness,
+    /// Workpiece origin (datum) X / Y / Z, part-space mm.
+    OriginX,
+    OriginY,
+    OriginZ,
     ToolDiameter,
     ToolLength,
     Flutes,
@@ -638,6 +647,9 @@ impl Field {
             Field::StockYOffset => "Y offset (mm)",
             Field::StockTop => "Stock top (mm)",
             Field::StockThickness => "Thickness (mm)",
+            Field::OriginX => "Origin X (mm)",
+            Field::OriginY => "Origin Y (mm)",
+            Field::OriginZ => "Origin Z (mm)",
             Field::ToolDiameter => "Tool ⌀ (mm)",
             Field::ToolLength => "Length (mm)",
             Field::Flutes => "Flutes",
@@ -796,6 +808,9 @@ struct App {
     /// The loop under the cursor while a pick is pending — highlighted so it is
     /// obvious which loop a click will select (vital for concentric circles).
     hover_loop: Option<LoopRef>,
+    /// "Set origin" pick mode: a viewport click drops the workpiece datum (using
+    /// object snaps for corners/centres, or a free point elsewhere).
+    setting_origin: bool,
     status: String,
 }
 
@@ -831,6 +846,28 @@ const PICK_ISLAND: [f32; 4] = [0.90, 0.65, 0.10, 1.0];
 const PICK_HOVER: [f32; 4] = [0.95, 0.92, 0.25, 1.0];
 /// Object-snap marker colour (bright cyan — reads over part and stock alike).
 const SNAP_MARK: [f32; 4] = [0.20, 0.95, 0.95, 1.0];
+/// Workpiece-origin datum marker colour (magenta — distinct from the snaps/loops
+/// and legible under red-green colour deficiency).
+const ORIGIN_MARK: [f32; 4] = [0.95, 0.30, 0.85, 1.0];
+
+/// Draw the workpiece-origin datum: a ringed crosshair at `origin` (part XY at
+/// `z`), sized `r` (mm). Always shown, so the datum the G-code is referenced to
+/// is visible in the viewport.
+fn add_origin_marker(scene: &mut Scene, origin: [f64; 3], z: f32, r: f32) {
+    let (cx, cy) = (origin[0] as f32, origin[1] as f32);
+    // Cross.
+    scene.add_strip(vec![[cx - r, cy, z], [cx + r, cy, z]], ORIGIN_MARK);
+    scene.add_strip(vec![[cx, cy - r, z], [cx, cy + r, z]], ORIGIN_MARK);
+    // Ring (octagon at 0.6·r).
+    let rr = r * 0.6;
+    let ring: Vec<[f32; 3]> = (0..=8)
+        .map(|i| {
+            let a = i as f32 / 8.0 * std::f32::consts::TAU;
+            [cx + rr * a.cos(), cy + rr * a.sin(), z]
+        })
+        .collect();
+    scene.add_strip(ring, ORIGIN_MARK);
+}
 
 /// Draw the object-snap marker at `hit.point` as a glyph specific to the snap
 /// kind (AutoCAD idiom: square = End, triangle = Mid, diamond = Quadrant,
@@ -954,6 +991,11 @@ enum Message {
     ViewportCursor(iced::Point),
     /// Toggle a viewport object-snap on/off during operation picking.
     ToggleSnap(SnapKind),
+    /// Enter/leave "set workpiece origin" pick mode (ribbon Edit tab).
+    ToggleSetOrigin,
+    /// A viewport click while setting the origin: the world `(x,y)` + aperture;
+    /// resolved to a snapped or free point that becomes the datum.
+    SetOriginPick([f32; 2], f32),
     /// Structural edits to the selected operation.
     DuplicateOp,
     DeleteOp,
@@ -1094,6 +1136,7 @@ impl App {
             snap_hover: None,
             snap_aperture: 1.0,
             hover_loop: None,
+            setting_origin: false,
             status: "Open the sample part to begin.".to_string(),
         };
         app.refresh_fields();
@@ -1275,7 +1318,40 @@ impl App {
                     self.status = "Nothing to redo.".to_string();
                 }
             }
+            Message::ToggleSetOrigin => {
+                self.setting_origin = !self.setting_origin;
+                self.snap_hover = None;
+                self.hover_loop = None;
+                if self.setting_origin {
+                    // Mutually exclusive with the op wizard; show the origin fields.
+                    self.controller.cancel_operation();
+                    self.controller.select(Selection::Setup);
+                    self.focus_ops.clear();
+                    self.refresh_fields();
+                    self.status =
+                        "Set origin: click a corner/centre (snaps) or any point.".to_string();
+                }
+            }
+            Message::SetOriginPick(w, aperture) => {
+                let world = [w[0] as f64, w[1] as f64];
+                // Snap to geometry if a snap catches, else take the free point.
+                let p = self
+                    .controller
+                    .snap_at(world, aperture as f64, &self.snaps)
+                    .map(|h| h.point)
+                    .unwrap_or(world);
+                self.controller.edit_origin(|o| {
+                    o[0] = p[0];
+                    o[1] = p[1]; // Z stays; edit it in the Setup fields
+                });
+                self.setting_origin = false;
+                self.snap_hover = None;
+                self.hover_loop = None;
+                self.refresh_fields();
+                self.status = format!("Origin set to X{:.3} Y{:.3}.", p[0], p[1]);
+            }
             Message::BeginOp(kind) => {
+                self.setting_origin = false;
                 self.controller.begin_operation(kind);
                 // Seed the op with the first library tool so it always has a valid
                 // tool; the user can change it in the wizard picker.
@@ -1365,30 +1441,35 @@ impl App {
             Message::HoverWorld(screen, w, aperture) => {
                 self.cursor = Some(screen);
                 self.snap_aperture = aperture as f64;
-                // Preview the object-snap under the cursor (drawn as a marker), but
-                // only for op kinds that use a start — inert for Face/Drill/Thread.
-                let use_snaps = self
-                    .controller
-                    .pending_op()
-                    .is_some_and(|p| op_uses_snaps(p.kind));
+                // Preview the object-snap under the cursor (drawn as a marker).
+                // Active for set-origin, and for op kinds that use a start (inert
+                // for Face/Drill/Thread).
+                let use_snaps = self.setting_origin
+                    || self
+                        .controller
+                        .pending_op()
+                        .is_some_and(|p| op_uses_snaps(p.kind));
                 self.snap_hover = if use_snaps {
                     self.controller
                         .snap_at([w[0] as f64, w[1] as f64], aperture as f64, &self.snaps)
                 } else {
                     None
                 };
-                // Highlight the loop a click would select (snap's loop, else the
-                // nearest one under the box) — disambiguates concentric circles.
-                // Drill/thread only engage circular loops (holes).
-                let circles = self
-                    .controller
-                    .pending_op()
-                    .is_some_and(|p| op_selects_circles(p.kind));
-                self.hover_loop = self.snap_hover.map(|h| h.loop_ref).or_else(|| {
-                    self.controller
-                        .nearest_loop_point([w[0] as f64, w[1] as f64], aperture as f64, circles)
-                        .map(|(l, _)| l)
-                });
+                // Highlight the loop a click would select (op picks only —
+                // disambiguates concentric circles; drill/thread → circles only).
+                self.hover_loop = if self.setting_origin {
+                    None
+                } else {
+                    let circles = self
+                        .controller
+                        .pending_op()
+                        .is_some_and(|p| op_selects_circles(p.kind));
+                    self.snap_hover.map(|h| h.loop_ref).or_else(|| {
+                        self.controller
+                            .nearest_loop_point([w[0] as f64, w[1] as f64], aperture as f64, circles)
+                            .map(|(l, _)| l)
+                    })
+                };
             }
             Message::ToggleSnap(kind) => {
                 if let Some(pos) = self.snaps.iter().position(|k| *k == kind) {
@@ -1825,7 +1906,14 @@ impl App {
             return tool_fields(self.library.tools.get(self.lib_sel).map(|t| t.kind));
         }
         match self.controller.selection() {
-            Selection::Setup => vec![Field::Clearance, Field::Retract, Field::TopOfStock],
+            Selection::Setup => vec![
+                Field::Clearance,
+                Field::Retract,
+                Field::TopOfStock,
+                Field::OriginX,
+                Field::OriginY,
+                Field::OriginZ,
+            ],
             Selection::Tool(i) => {
                 tool_fields(self.controller.document().setup.tools.get(i).map(|t| t.kind))
             }
@@ -1912,6 +2000,9 @@ impl App {
             Field::Clearance => Some(setup.heights.clearance),
             Field::Retract => Some(setup.heights.retract),
             Field::TopOfStock => Some(setup.heights.top_of_stock),
+            Field::OriginX => Some(setup.origin[0]),
+            Field::OriginY => Some(setup.origin[1]),
+            Field::OriginZ => Some(setup.origin[2]),
             Field::StockXOffset | Field::StockYOffset | Field::StockTop | Field::StockThickness => {
                 let cam_model::Stock::BoundingBox {
                     x_offset,
@@ -1988,17 +2079,30 @@ impl App {
         }
 
         match self.controller.selection() {
-            Selection::Setup => self.controller.edit_heights(|h| {
-                if let Some(&v) = parsed.get(&Field::Clearance) {
-                    h.clearance = v;
-                }
-                if let Some(&v) = parsed.get(&Field::Retract) {
-                    h.retract = v;
-                }
-                if let Some(&v) = parsed.get(&Field::TopOfStock) {
-                    h.top_of_stock = v;
-                }
-            }),
+            Selection::Setup => {
+                self.controller.edit_heights(|h| {
+                    if let Some(&v) = parsed.get(&Field::Clearance) {
+                        h.clearance = v;
+                    }
+                    if let Some(&v) = parsed.get(&Field::Retract) {
+                        h.retract = v;
+                    }
+                    if let Some(&v) = parsed.get(&Field::TopOfStock) {
+                        h.top_of_stock = v;
+                    }
+                });
+                self.controller.edit_origin(|o| {
+                    if let Some(&v) = parsed.get(&Field::OriginX) {
+                        o[0] = v;
+                    }
+                    if let Some(&v) = parsed.get(&Field::OriginY) {
+                        o[1] = v;
+                    }
+                    if let Some(&v) = parsed.get(&Field::OriginZ) {
+                        o[2] = v;
+                    }
+                });
+            }
             Selection::Tool(i) => self.controller.edit_tool(i, |t| {
                 if let Some(&v) = parsed.get(&Field::ToolDiameter) {
                     t.diameter = v;
@@ -2150,7 +2254,9 @@ impl App {
     /// pick is pending, its half-size the vertex-snap aperture. Purely visual — it
     /// does not intercept clicks (they fall through to the viewport).
     fn pickbox_overlay(&self) -> Option<Element<'_, Message>> {
-        self.controller.pending_op()?;
+        if self.controller.pending_op().is_none() && !self.setting_origin {
+            return None;
+        }
         // Once a snap engages, its (bolder) in-scene marker stands in for the
         // pickbox — so the blue aperture square shows only while nothing snaps.
         if self.snap_hover.is_some() {
@@ -2265,6 +2371,15 @@ impl App {
                     cmd(Icon::Chamfer, "Chamfer", begin(OpKind::Chamfer)),
                     cmd(Icon::Face, "Face", begin(OpKind::Face)),
                 ],
+            }],
+            RibbonTab::Edit => vec![GroupSpec {
+                title: "Workpiece",
+                commands: vec![toggle_cmd(
+                    Icon::SetOrigin,
+                    "Set Origin",
+                    self.setting_origin,
+                    Message::ToggleSetOrigin,
+                )],
             }],
             RibbonTab::Tooling => vec![GroupSpec {
                 title: "Library",
@@ -2439,6 +2554,7 @@ impl App {
                     &self.focus_ops.iter().copied().collect::<Vec<_>>(),
                     self.snap_hover.map(|h| (h, self.snap_aperture)),
                     self.hover_loop,
+                    self.setting_origin,
                 ))
                 .width(Length::Fill)
                 .height(Length::Fill),
@@ -3642,6 +3758,8 @@ struct Viewport {
     gizmo_size: f32,
     /// Geometry-pick mode (a new-operation wizard is awaiting a region click).
     picking: bool,
+    /// "Set origin" pick mode — a click drops the workpiece datum.
+    set_origin: bool,
     /// An object-snap is engaged under the cursor — its marker replaces the
     /// crosshair/pickbox.
     snap_engaged: bool,
@@ -3660,6 +3778,7 @@ impl Viewport {
         focus_ops: &[u32],
         snap: Option<(SnapHit, f64)>,
         hover_loop: Option<LoopRef>,
+        set_origin: bool,
     ) -> Self {
         let picking = controller.pending_op().is_some();
         let pick_z = controller.document().setup.heights.top_of_stock as f32;
@@ -3698,10 +3817,17 @@ impl Viewport {
                     add_loop_highlight(&mut scene, c, PICK_ISLAND);
                 }
             }
-            // The object-snap marker under the cursor (a glyph per snap kind).
-            if let Some((hit, aperture)) = snap {
-                add_snap_marker(&mut scene, hit, aperture, pick_z);
-            }
+        }
+        // The workpiece-origin datum, always visible so the G-code reference point
+        // is obvious. Sized to the scene so it reads at any part scale.
+        let origin = controller.document().setup.origin;
+        let r = bounds
+            .map(|(mn, mx)| ((mx[0] - mn[0]).max(mx[1] - mn[1]) * 0.06).max(1.0))
+            .unwrap_or(5.0);
+        add_origin_marker(&mut scene, origin, pick_z, r);
+        // The object-snap marker under the cursor (op pick *or* set-origin).
+        if let Some((hit, aperture)) = snap {
+            add_snap_marker(&mut scene, hit, aperture, pick_z);
         }
         // When one or more operations are focused, dim every *other* operation's
         // toolpath so the focused ones stand out — vital when a part has dozens of
@@ -3725,6 +3851,7 @@ impl Viewport {
             show_gizmo,
             gizmo_size,
             picking,
+            set_origin,
             snap_engaged: snap.is_some(),
             pick_z,
         }
@@ -3800,7 +3927,7 @@ impl shader::Program<Message> for Viewport {
                 // In geometry-pick mode a left-click selects geometry (projected
                 // onto the stock-top plane) instead of orbiting; the pickbox
                 // half-size becomes the world-space snap aperture.
-                if self.picking && matches!(button, Button::Left) {
+                if (self.picking || self.set_origin) && matches!(button, Button::Left) {
                     let aspect = if bounds.height > 0.0 {
                         bounds.width / bounds.height
                     } else {
@@ -3811,9 +3938,12 @@ impl shader::Program<Message> for Viewport {
                     let cam = self.camera();
                     if let Some(w) = cam.pick_plane(u, v, aspect, self.pick_z) {
                         let aperture = 0.5 * SNAP_PICK_PX * cam.world_per_pixel(bounds.height);
-                        return Some(
-                            shader::Action::publish(Message::PickWorld(w, aperture)).and_capture(),
-                        );
+                        let msg = if self.set_origin {
+                            Message::SetOriginPick(w, aperture)
+                        } else {
+                            Message::PickWorld(w, aperture)
+                        };
+                        return Some(shader::Action::publish(msg).and_capture());
                     }
                     return Some(shader::Action::capture());
                 }
@@ -3867,9 +3997,9 @@ impl shader::Program<Message> for Viewport {
                     };
                     return Some(shader::Action::publish(message).and_capture());
                 }
-                // While a pick is pending, track the cursor (pickbox) and its world
-                // point (object-snap preview). Don't capture — passive tracking.
-                if self.picking && cursor.position_over(bounds).is_some() {
+                // While a pick is pending (op or set-origin), track the cursor
+                // (pickbox) and its world point (snap preview). Passive tracking.
+                if (self.picking || self.set_origin) && cursor.position_over(bounds).is_some() {
                     let aspect = if bounds.height > 0.0 {
                         bounds.width / bounds.height
                     } else {
@@ -3948,7 +4078,7 @@ impl shader::Program<Message> for Viewport {
         cursor: iced::mouse::Cursor,
     ) -> iced::mouse::Interaction {
         let over = cursor.position_over(bounds).is_some();
-        if self.picking && over {
+        if (self.picking || self.set_origin) && over {
             // Aiming a pick: a crosshair, but a plain arrow once a snap engages so
             // its marker reads on its own. Never the orbit "hand" while picking.
             if self.snap_engaged {

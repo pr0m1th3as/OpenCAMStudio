@@ -5,7 +5,7 @@
 //! job-level machine control — tool changes, spindle, coolant — and splices the
 //! operation fragments together in order.
 
-use cam_cldata::{Coolant, Program, SpindleDir, Step};
+use cam_cldata::{Coolant, MoveKind, Point3, Program, SpindleDir, Step, Tag};
 use cam_model::{Document, Operation};
 
 use crate::{
@@ -39,6 +39,18 @@ pub fn build_job(
     let mut diagnostics = Vec::new();
 
     program.push(Step::Comment(setup.name.clone()));
+
+    // Optional program start point: begin with a rapid to it, so the toolpath's
+    // first motion originates at a known safe spot. Resolved from its base +
+    // offset; tagged to the first op (Link) so it colours as a rapid.
+    if let Some(sp) = setup.start_point {
+        let [x, y, z] = sp.resolve(setup.origin);
+        let op_id = setup.operations.first().map_or(0, Operation::id);
+        program.push(Step::Rapid {
+            to: Point3::new(x, y, z),
+            tag: Tag::new(op_id, MoveKind::Link),
+        });
+    }
 
     let mut spindle_started = false;
     let mut current_tool: Option<u32> = None;
