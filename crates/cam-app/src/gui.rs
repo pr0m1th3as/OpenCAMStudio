@@ -1065,8 +1065,8 @@ impl App {
             window_cursor: iced::Point::ORIGIN,
             focus_ops: BTreeSet::new(),
             modifiers: iced::keyboard::Modifiers::default(),
-            // End + Mid on by default; Nearest is opt-in (AutoCAD-style).
-            snaps: vec![SnapKind::End, SnapKind::Mid],
+            // End + Mid + Quadrant on by default; Nearest is opt-in (AutoCAD-style).
+            snaps: vec![SnapKind::End, SnapKind::Mid, SnapKind::Quadrant],
             snap_hover: None,
             snap_aperture: 1.0,
             status: "Open the sample part to begin.".to_string(),
@@ -2634,6 +2634,7 @@ impl App {
             row![
                 toggle(SnapKind::End, "End"),
                 toggle(SnapKind::Mid, "Mid"),
+                toggle(SnapKind::Quadrant, "Quad"),
                 toggle(SnapKind::Nearest, "Nearest"),
             ]
             .spacing(6),

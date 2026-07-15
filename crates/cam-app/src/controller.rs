@@ -948,7 +948,15 @@ impl AppController {
                     consider(SnapKind::Mid, m, loop_ref);
                 }
             }
-            // Quadrant is Phase 2 (needs arc awareness) — resolved elsewhere.
+            // Quadrant: the cardinal points of a **circular** loop (a cornerless
+            // loop that fits a circle). Partial arcs await the arc-carrying model.
+            if enabled.contains(&SnapKind::Quadrant) && corners.is_empty() {
+                if let Some(([cx, cy], r)) = fit_circle(pts) {
+                    for (dx, dy) in [(1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0)] {
+                        consider(SnapKind::Quadrant, [cx + dx * r, cy + dy * r], loop_ref);
+                    }
+                }
+            }
             if enabled.contains(&SnapKind::Nearest) {
                 let (q, _) = nearest_point_on_contour(pts, w);
                 consider(SnapKind::Nearest, q, loop_ref);
@@ -1512,6 +1520,30 @@ fn loop_mids(pts: &[Point], corners: &[usize]) -> Vec<[f64; 2]> {
         mids.push(mid);
     }
     mids
+}
+
+/// Fit a circle to a closed loop, returning `(center, radius)` only if the loop
+/// really is round: enough points, and every one within 5% of the mean radius
+/// about the centroid. Used for **Quadrant** snaps on circular holes/bosses; a
+/// polygon (few points, or corners) or an ellipse is rejected. Partial arcs need
+/// the deferred arc-carrying geometry model.
+fn fit_circle(pts: &[Point]) -> Option<([f64; 2], f64)> {
+    if pts.len() < 8 {
+        return None; // a rectangle/hexagon is not a circle
+    }
+    let n = pts.len() as f64;
+    let cx = pts.iter().map(|p| p.x).sum::<f64>() / n;
+    let cy = pts.iter().map(|p| p.y).sum::<f64>() / n;
+    let radii: Vec<f64> = pts
+        .iter()
+        .map(|p| ((p.x - cx).powi(2) + (p.y - cy).powi(2)).sqrt())
+        .collect();
+    let r = radii.iter().sum::<f64>() / n;
+    if r < 1e-6 {
+        return None;
+    }
+    let max_dev = radii.iter().map(|ri| (ri - r).abs()).fold(0.0, f64::max);
+    (max_dev / r <= 0.05).then_some(([cx, cy], r))
 }
 
 /// The nearest point on a closed contour to `w`, and its squared distance.
@@ -2319,6 +2351,22 @@ mod tests {
 
         // The circle has no corners ⇒ End finds nothing there.
         assert!(app.snap_at([45.0, 30.0], 1.5, &[SnapKind::End]).is_none());
+    }
+
+    #[test]
+    fn quadrant_snap_finds_a_circle_cardinal_but_not_a_polygon() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        // The hole (centre 40,30, r5) → +X quadrant at (45,30).
+        let h = app.snap_at([44.6, 30.0], 1.5, &[SnapKind::Quadrant]).unwrap();
+        assert_eq!(h.kind, SnapKind::Quadrant);
+        assert!(
+            (h.point[0] - 45.0).abs() < 0.1 && (h.point[1] - 30.0).abs() < 0.1,
+            "quadrant {:?}",
+            h.point
+        );
+        // The rectangle has corners ⇒ it is not treated as a circle: no quadrant.
+        assert!(app.snap_at([69.5, 30.0], 1.5, &[SnapKind::Quadrant]).is_none());
     }
 
     #[test]
