@@ -43,6 +43,19 @@ pub struct SurfaceMesh {
     pub indices: Vec<u32>,
 }
 
+/// Unit normal of triangle `a→b→c` from its winding (CCW ⇒ toward the viewer).
+fn tri_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
+    let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let n = [
+        u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2],
+        u[0] * v[1] - u[1] * v[0],
+    ];
+    let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-9);
+    [n[0] / len, n[1] / len, n[2] / len]
+}
+
 /// A grid of remaining-stock heights.
 #[derive(Clone, Debug)]
 pub struct Heightfield {
@@ -253,9 +266,15 @@ impl Heightfield {
     /// smooth sheet with no thickness — the block shows its full depth; and unlike
     /// a pure voxel block it keeps gentle slopes smooth, so a chamfer bevel is a
     /// clean ramp while a pocket wall stays crisply vertical. A cell cut to or
-    /// below `floor` is left open, so a through feature is see-through. Faces carry
-    /// geometric normals from their (CCW-outward) winding — flat per triangle, so a
-    /// planar bevel shades uniformly and no step smears.
+    /// below `floor` is left open, so a through feature is see-through.
+    ///
+    /// Top/bottom faces carry geometric (per-triangle) normals from their
+    /// CCW-outward winding. **Wall** normals, though, come from the local *boundary
+    /// gradient* — the summed direction to the cell's open neighbours — so a curved
+    /// wall (a round hole) shades as a smooth cylinder rather than a granular
+    /// stack of axis-aligned facets, while a straight wall's gradient is already
+    /// axis-aligned and looks unchanged. This smooths the *shading*; the stepped
+    /// silhouette is a heightfield limit deferred to the 3D-milling/kernel work.
     pub fn to_solid_mesh(&self, floor: f64) -> SurfaceMesh {
         let f = floor as f32;
         let res = self.res as f32;
@@ -268,25 +287,12 @@ impl Heightfield {
         let mut positions: Vec<[f32; 3]> = Vec::new();
         let mut normals: Vec<[f32; 3]> = Vec::new();
         let mut indices: Vec<u32> = Vec::new();
-        // One triangle with a flat normal from its winding (CCW ⇒ outward).
-        let mut tri = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
-            let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-            let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-            let mut n = [
-                u[1] * v[2] - u[2] * v[1],
-                u[2] * v[0] - u[0] * v[2],
-                u[0] * v[1] - u[1] * v[0],
-            ];
-            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-9);
-            n = [n[0] / len, n[1] / len, n[2] / len];
+        // One triangle with an explicit per-vertex normal.
+        let mut tri = |a: [f32; 3], b: [f32; 3], c: [f32; 3], n: [f32; 3]| {
             let base = positions.len() as u32;
             positions.extend_from_slice(&[a, b, c]);
             normals.extend_from_slice(&[n; 3]);
             indices.extend_from_slice(&[base, base + 1, base + 2]);
-        };
-        let mut quad = |a, b, c, d| {
-            tri(a, b, c);
-            tri(a, c, d);
         };
         // Cell height, or `None` off-grid.
         let h = |ix: i64, iy: i64| -> Option<f32> {
@@ -329,33 +335,67 @@ impl Heightfield {
                 let c_nw = corner(z, [w, n_, nw]);
                 let (x0, y0) = (ox + ix as f32 * res, oy + iy as f32 * res);
                 let (x1, y1) = (x0 + res, y0 + res);
-                // Sloped top and flat bottom.
-                quad(
+                // Sloped top — geometric normal per triangle (a planar bevel shades
+                // uniformly; a flat top is +Z).
+                let (p_sw, p_se, p_ne, p_nw) = (
                     [x0, y0, c_sw],
                     [x1, y0, c_se],
                     [x1, y1, c_ne],
                     [x0, y1, c_nw],
                 );
-                quad([x0, y0, f], [x0, y1, f], [x1, y1, f], [x1, y0, f]);
-                // A vertical wall on a side only where the drop to that neighbour is
-                // steep (or it is off-grid / cut through) — from this cell's two
-                // edge corners down to the neighbour level, clamped to the floor.
+                tri(p_sw, p_se, p_ne, tri_normal(p_sw, p_se, p_ne));
+                tri(p_sw, p_ne, p_nw, tri_normal(p_sw, p_ne, p_nw));
+                // Flat bottom (−Z).
+                let down = [0.0, 0.0, -1.0];
+                tri([x0, y0, f], [x0, y1, f], [x1, y1, f], down);
+                tri([x0, y0, f], [x1, y1, f], [x1, y0, f], down);
+
+                // Is a neighbour "open" (off-grid / cut through / a steep drop)?
+                let open = |nb: Option<f32>| match nb {
+                    None => true,
+                    Some(zn) => zn <= f + 1e-4 || z - zn > wall_step,
+                };
+                // Wall shading normal: sum the (unit) directions to every open
+                // neighbour in the 8-ring → points into the void, radial around a
+                // hole. Falls back to the geometric wall direction if it cancels.
+                let mut g = [0.0f32, 0.0];
+                for (dx, dy, nb) in [
+                    (1, 0, e), (-1, 0, w), (0, 1, n_), (0, -1, s),
+                    (1, 1, ne), (-1, 1, nw), (1, -1, se), (-1, -1, sw),
+                ] {
+                    if open(nb) {
+                        let l = ((dx * dx + dy * dy) as f32).sqrt();
+                        g[0] += dx as f32 / l;
+                        g[1] += dy as f32 / l;
+                    }
+                }
+                let glen = (g[0] * g[0] + g[1] * g[1]).sqrt();
+                let grad = (glen > 1e-3).then(|| [g[0] / glen, g[1] / glen, 0.0]);
+
+                // A vertical wall on a side only where that neighbour is open — from
+                // this cell's two edge corners down to the neighbour level (clamped
+                // to the floor). Shaded by the gradient normal, or the face axis.
                 let level = |nb: Option<f32>| nb.map_or(f, |v| v.max(f));
-                let lw = level(w);
-                if z - lw > wall_step {
-                    quad([x0, y0, c_sw], [x0, y1, c_nw], [x0, y1, lw], [x0, y0, lw]);
+                let mut wall = |a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3], axis: [f32; 3]| {
+                    let n = grad.unwrap_or(axis);
+                    tri(a, b, c, n);
+                    tri(a, c, d, n);
+                };
+                if open(w) {
+                    let l = level(w);
+                    wall([x0, y0, c_sw], [x0, y1, c_nw], [x0, y1, l], [x0, y0, l], [-1.0, 0.0, 0.0]);
                 }
-                let le = level(e);
-                if z - le > wall_step {
-                    quad([x1, y1, c_ne], [x1, y0, c_se], [x1, y0, le], [x1, y1, le]);
+                if open(e) {
+                    let l = level(e);
+                    wall([x1, y1, c_ne], [x1, y0, c_se], [x1, y0, l], [x1, y1, l], [1.0, 0.0, 0.0]);
                 }
-                let ls = level(s);
-                if z - ls > wall_step {
-                    quad([x1, y0, c_se], [x0, y0, c_sw], [x0, y0, ls], [x1, y0, ls]);
+                if open(s) {
+                    let l = level(s);
+                    wall([x1, y0, c_se], [x0, y0, c_sw], [x0, y0, l], [x1, y0, l], [0.0, -1.0, 0.0]);
                 }
-                let ln = level(n_);
-                if z - ln > wall_step {
-                    quad([x0, y1, c_nw], [x1, y1, c_ne], [x1, y1, ln], [x0, y1, ln]);
+                if open(n_) {
+                    let l = level(n_);
+                    wall([x0, y1, c_nw], [x1, y1, c_ne], [x1, y1, l], [x0, y1, l], [0.0, 1.0, 0.0]);
                 }
             }
         }
@@ -540,6 +580,24 @@ mod tests {
             "deep {} vs shallow {}: a deep pocket walls its edge; a shallow one ramps",
             wall_faces(&deep),
             wall_faces(&shallow)
+        );
+    }
+
+    #[test]
+    fn curved_walls_shade_radially_not_just_axis_aligned() {
+        // A round hole's walls take gradient (radial) normals, so some wall face
+        // points diagonally — impossible for pure ±X/±Y voxel walls.
+        let mut hf = Heightfield::new([0.0, 0.0], [20.0, 20.0], 0.5, 0.0);
+        // A cylindrical hole (radius 4) cut through the floor at the centre.
+        hf.cut_segment([9.99, 10.0, -6.0], [10.01, 10.0, -6.0], 4.0);
+        let mesh = hf.to_solid_mesh(-5.0);
+        let diagonal = mesh
+            .normals
+            .iter()
+            .any(|n| n[2].abs() < 0.2 && n[0].abs() > 0.3 && n[1].abs() > 0.3);
+        assert!(
+            diagonal,
+            "round-hole walls should shade radially (a diagonal normal), not only ±X/±Y"
         );
     }
 

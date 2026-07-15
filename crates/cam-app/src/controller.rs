@@ -1141,10 +1141,11 @@ impl AppController {
                 profile: sim_profile(t),
             })
             .collect();
-        // Aim for ~200 cells across the larger side, bounded so a big part stays
-        // cheap and a small one stays crisp.
+        // Aim for ~300 cells across the larger side, bounded so a big part stays
+        // cheap and a small one stays crisp. (A modest, 2.5D-cosmetic bump from
+        // 200 to sharpen curved-feature silhouettes; dial back if a rerun lags.)
         let span = (max[0] - min[0]).max(max[1] - min[1]);
-        let resolution = (span / 200.0).clamp(0.25, 2.0);
+        let resolution = (span / 300.0).clamp(0.15, 2.0);
         let sim = simulate(
             program,
             min,
