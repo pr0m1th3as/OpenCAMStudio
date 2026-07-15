@@ -78,6 +78,7 @@ fn a_pocket_clears_its_floor_without_collisions() {
         feed: 300.0,
         plunge_feed: 100.0,
         plunge: Plunge::Straight,
+        start: None,
     };
     let sim = run(&setup(vec![Operation::Pocket(op)]));
 
@@ -137,6 +138,7 @@ fn pocket_op() -> PocketOp {
         feed: 300.0,
         plunge_feed: 100.0,
         plunge: Plunge::Straight,
+        start: None,
     }
 }
 

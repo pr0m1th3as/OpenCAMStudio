@@ -122,7 +122,10 @@ impl Strategy for PocketStrategy {
                 };
             }
             for ring in &rings {
-                emit_ring(&mut program, ring, op, &env.heights, z);
+                // Begin each ring near the operator's chosen lead-in point, so the
+                // plunge/entry witness marks line up there; `None` keeps the default.
+                let rotated = crate::profile::rotate_to_start(ring, op.start);
+                emit_ring(&mut program, &rotated, op, &env.heights, z);
             }
         }
 
@@ -229,6 +232,7 @@ mod tests {
             feed: 300.0,
             plunge_feed: 100.0,
             plunge: Plunge::Straight,
+            start: None,
         };
         let ts = tools(8.0);
         let env = JobEnv {
@@ -256,6 +260,7 @@ mod tests {
                 radius: 1.0,
                 pitch: 0.5,
             },
+            start: None,
         };
         let ts = tools(8.0);
         let env = JobEnv {
@@ -297,6 +302,7 @@ mod tests {
             feed: 300.0,
             plunge_feed: 100.0,
             plunge: Plunge::Straight,
+            start: None,
         };
         let ts = tools(12.0); // radius 6 > half of 10 ⇒ cannot enter
         let env = JobEnv {

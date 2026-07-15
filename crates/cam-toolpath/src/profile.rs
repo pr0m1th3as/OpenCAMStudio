@@ -526,27 +526,68 @@ fn emit_oscillating_ramp(
     }
 }
 
-/// Rotate a closed loop so it begins at the vertex nearest `start` (part XY).
-/// `None` leaves the loop unchanged. The winding order is preserved — only the
-/// starting index changes.
+/// Rotate a closed loop so it begins **exactly at the point on the loop nearest
+/// `start`** (part XY), preserving winding. `None` leaves the loop unchanged.
+///
+/// Unlike a nearest-*vertex* rotation, this projects `start` onto the closest
+/// edge and, when that lands mid-edge, splits the edge — inserting the projected
+/// point as the first vertex — so a Mid or Nearest object-snap really does begin
+/// where the operator pointed, not at the corner beside it. A projection onto an
+/// existing vertex just rotates (no split).
 pub(crate) fn rotate_to_start(
     pts: &[cam_geo::Point],
     start: Option<[f64; 2]>,
 ) -> Vec<cam_geo::Point> {
+    use cam_geo::Point;
     let Some(s) = start else {
         return pts.to_vec();
     };
-    let Some((k, _)) = pts.iter().enumerate().min_by(|(_, a), (_, b)| {
-        let da = (a.x - s[0]).powi(2) + (a.y - s[1]).powi(2);
-        let db = (b.x - s[0]).powi(2) + (b.y - s[1]).powi(2);
-        da.total_cmp(&db)
-    }) else {
+    let n = pts.len();
+    if n < 2 {
         return pts.to_vec();
+    }
+    let sp = Point::new(s[0], s[1]);
+    // The closest point on any edge, and which edge it lies on.
+    let (mut best_k, mut best_q, mut best_d2) = (0usize, pts[0], f64::MAX);
+    for k in 0..n {
+        let q = project_point_seg(sp, pts[k], pts[(k + 1) % n]);
+        let d2 = q.distance_sq(sp);
+        if d2 < best_d2 {
+            (best_k, best_q, best_d2) = (k, q, d2);
+        }
+    }
+    const EPS2: f64 = 1e-12;
+    let kb = (best_k + 1) % n;
+    let rotate_from = |i: usize| {
+        let mut out = Vec::with_capacity(n);
+        out.extend_from_slice(&pts[i..]);
+        out.extend_from_slice(&pts[..i]);
+        out
     };
-    let mut out = Vec::with_capacity(pts.len());
-    out.extend_from_slice(&pts[k..]);
-    out.extend_from_slice(&pts[..k]);
+    // Snap to an existing endpoint → plain rotation, no split.
+    if best_q.distance_sq(pts[best_k]) <= EPS2 {
+        return rotate_from(best_k);
+    }
+    if best_q.distance_sq(pts[kb]) <= EPS2 {
+        return rotate_from(kb);
+    }
+    // Mid-edge: begin at the projected point, then the rest of the loop from `kb`
+    // around to `best_k` (which the caller closes back to the projected point).
+    let mut out = Vec::with_capacity(n + 1);
+    out.push(best_q);
+    out.extend(rotate_from(kb));
     out
+}
+
+/// The closest point to `p` on the segment `a→b` (clamped to the endpoints).
+fn project_point_seg(p: cam_geo::Point, a: cam_geo::Point, b: cam_geo::Point) -> cam_geo::Point {
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    let len2 = dx * dx + dy * dy;
+    if len2 <= f64::EPSILON {
+        return a;
+    }
+    let t = (((p.x - a.x) * dx + (p.y - a.y) * dy) / len2).clamp(0.0, 1.0);
+    cam_geo::Point::new(a.x + dx * t, a.y + dy * t)
 }
 
 /// The absolute Z of each stepdown pass, from just below `top` down to `depth`
@@ -704,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn rotate_to_start_leads_with_nearest_vertex() {
+    fn rotate_to_start_begins_exactly_at_the_projected_point() {
         use cam_geo::Point;
         let sq = [
             Point::new(0.0, 0.0),
@@ -714,8 +755,23 @@ mod tests {
         ];
         // None leaves it unchanged.
         assert_eq!(rotate_to_start(&sq, None), sq.to_vec());
-        // Near the third vertex (10,10) → the loop begins there, winding intact.
+
+        // A point off the right edge (x=10) → begins exactly at its projection
+        // (10, 9), splitting that edge; winding intact; loop closes back to it.
         let r = rotate_to_start(&sq, Some([9.5, 9.0]));
+        assert_eq!(
+            r,
+            vec![
+                Point::new(10.0, 9.0),
+                Point::new(10.0, 10.0),
+                Point::new(0.0, 10.0),
+                Point::new(0.0, 0.0),
+                Point::new(10.0, 0.0),
+            ]
+        );
+
+        // A point at a vertex (a corner / End snap) just rotates — no split.
+        let r = rotate_to_start(&sq, Some([10.0, 10.0]));
         assert_eq!(
             r,
             vec![

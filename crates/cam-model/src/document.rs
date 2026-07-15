@@ -254,6 +254,10 @@ pub struct PocketOp {
     pub plunge_feed: f64,
     /// How the tool enters the material in Z at each pass.
     pub plunge: Plunge,
+    /// Preferred lead-in location (part XY): the clearing begins on the ring point
+    /// nearest here, so the plunge/entry witness mark lands where the machinist
+    /// chose. `None` uses the strategy's default entry.
+    pub start: Option<[f64; 2]>,
 }
 
 /// A facing operation: clear the top of the stock over a boundary with parallel
@@ -335,6 +339,10 @@ pub struct ChamferOp {
     pub feed: f64,
     /// Plunge feed for the approach in Z, mm/min.
     pub plunge_feed: f64,
+    /// Preferred start location (part XY): the chamfer loop begins on the point
+    /// nearest here (where the lead/entry lands). `None` starts at the chain's
+    /// first vertex.
+    pub start: Option<[f64; 2]>,
 }
 
 /// An operation in a setup. An enum so a setup holds a heterogeneous, ordered

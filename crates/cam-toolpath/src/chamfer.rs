@@ -167,6 +167,10 @@ impl Strategy for ChamferStrategy {
             if pts.len() < 3 {
                 continue;
             }
+            // Begin the loop at the operator's chosen start (object-snap point),
+            // so the plunge/entry lands there; `None` keeps the offset's first vertex.
+            let rotated = crate::profile::rotate_to_start(pts, op.start);
+            let pts = rotated.as_slice();
             let start = pts[0];
 
             // Approach: rapid over the start at clearance and down to the edge top,
@@ -238,6 +242,7 @@ mod tests {
             top: 0.0,
             feed: 200.0,
             plunge_feed: 100.0,
+            start: None,
         }
     }
 

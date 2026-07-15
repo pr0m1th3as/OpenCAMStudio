@@ -171,7 +171,7 @@ pub struct LoopRef {
 /// An operation being created via the pick wizard: the kind, the tool, the picked
 /// boundary/path loop (once chosen), and — for a pocket — the loops toggled as
 /// excluded islands.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PendingOp {
     pub kind: OpKind,
     pub tool: u32,
@@ -179,6 +179,42 @@ pub struct PendingOp {
     pub boundary: Option<LoopRef>,
     /// Loops toggled as excluded islands (pocket island mode).
     pub islands: Vec<LoopRef>,
+    /// The snapped start/lead-in point (part XY) captured with the boundary pick.
+    pub start: Option<[f64; 2]>,
+}
+
+/// A viewport object-snap: which kind of point on the geometry the cursor
+/// resolves to during an operation pick. Priority runs End → Mid → Quadrant →
+/// Nearest (Nearest is the always-catches fallback when enabled).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SnapKind {
+    /// A real corner (segment endpoint at an angle).
+    End,
+    /// The midpoint of a straight edge (between two corners).
+    Mid,
+    /// A cardinal quadrant of an arc/circle (Phase 2).
+    Quadrant,
+    /// The nearest point on the edge under the cursor (opt-in fallback).
+    Nearest,
+}
+
+impl SnapKind {
+    fn priority(self) -> u8 {
+        match self {
+            SnapKind::End => 0,
+            SnapKind::Mid => 1,
+            SnapKind::Quadrant => 2,
+            SnapKind::Nearest => 3,
+        }
+    }
+}
+
+/// A resolved object-snap: the loop it sits on, the point (part XY), and kind.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SnapHit {
+    pub loop_ref: LoopRef,
+    pub point: [f64; 2],
+    pub kind: SnapKind,
 }
 
 /// The result of a viewport pick during the wizard.
@@ -696,6 +732,7 @@ impl AppController {
                     feed: p.feed,
                     plunge_feed: p.plunge_feed,
                     plunge: Plunge::Straight,
+                    start,
                 })
             }
             OpKind::Drill => Operation::Drill(DrillOp {
@@ -726,6 +763,7 @@ impl AppController {
                 top: p.top_of_stock,
                 feed: p.feed,
                 plunge_feed: p.plunge_feed,
+                start,
             }),
             OpKind::Thread => {
                 // Seed one thread at the picked loop's centre; a circular hole
@@ -801,6 +839,7 @@ impl AppController {
             tool: self.first_tool_number(),
             boundary: None,
             islands: Vec::new(),
+            start: None,
         });
     }
 
@@ -853,6 +892,93 @@ impl AppController {
             .map(|(l, v, _)| (l, v))
     }
 
+    /// The loop whose edge is closest to `world` within `aperture`, together with
+    /// the exact **nearest point on that edge** (not a vertex). The always-works
+    /// fallback for boundary selection when no object-snap catches.
+    pub fn nearest_loop_point(&self, world: [f64; 2], aperture: f64) -> Option<(LoopRef, [f64; 2])> {
+        let w = Point::new(world[0], world[1]);
+        let mut best: Option<(LoopRef, [f64; 2], f64)> = None;
+        for (loop_ref, contour) in self.iter_loops() {
+            let (pt, d2) = nearest_point_on_contour(contour.points(), w);
+            if best.is_none_or(|(_, _, bd2)| d2 < bd2) {
+                best = Some((loop_ref, pt, d2));
+            }
+        }
+        best.filter(|(_, _, d2)| *d2 <= aperture * aperture)
+            .map(|(l, p, _)| (l, p))
+    }
+
+    /// The best object-snap under the cursor among the `enabled` kinds, within
+    /// `aperture` world-mm, or `None`. Higher-priority kinds (End → Mid →
+    /// Quadrant → Nearest) win over lower ones even if slightly farther, so a
+    /// corner beats a mere nearest-point when both are in the box. Read-only —
+    /// the GUI calls it on hover to preview the snap marker and on click to set
+    /// the start.
+    pub fn snap_at(&self, world: [f64; 2], aperture: f64, enabled: &[SnapKind]) -> Option<SnapHit> {
+        let w = Point::new(world[0], world[1]);
+        let ap2 = aperture * aperture;
+        // (priority, dist², hit) — lower priority number wins.
+        let mut best: Option<(u8, f64, SnapHit)> = None;
+        let mut consider = |kind: SnapKind, point: [f64; 2], loop_ref: LoopRef| {
+            let d2 = w.distance_sq(Point::new(point[0], point[1]));
+            if d2 > ap2 {
+                return;
+            }
+            let prio = kind.priority();
+            let better = best
+                .as_ref()
+                .is_none_or(|(bp, bd, _)| prio < *bp || (prio == *bp && d2 < *bd));
+            if better {
+                best = Some((prio, d2, SnapHit { loop_ref, point, kind }));
+            }
+        };
+        for (loop_ref, contour) in self.iter_loops() {
+            let pts = contour.points();
+            if pts.len() < 2 {
+                continue;
+            }
+            let corners = loop_corners(pts);
+            if enabled.contains(&SnapKind::End) {
+                for &ci in &corners {
+                    consider(SnapKind::End, [pts[ci].x, pts[ci].y], loop_ref);
+                }
+            }
+            if enabled.contains(&SnapKind::Mid) {
+                for m in loop_mids(pts, &corners) {
+                    consider(SnapKind::Mid, m, loop_ref);
+                }
+            }
+            // Quadrant is Phase 2 (needs arc awareness) — resolved elsewhere.
+            if enabled.contains(&SnapKind::Nearest) {
+                let (q, _) = nearest_point_on_contour(pts, w);
+                consider(SnapKind::Nearest, q, loop_ref);
+            }
+        }
+        best.map(|(_, _, hit)| hit)
+    }
+
+    /// Every closed loop across all regions as `(ref, contour)`.
+    fn iter_loops(&self) -> impl Iterator<Item = (LoopRef, &Contour)> {
+        self.regions.iter().enumerate().flat_map(|(ri, region)| {
+            std::iter::once((
+                LoopRef {
+                    region: ri,
+                    part: LoopPart::Outer,
+                },
+                region.outer(),
+            ))
+            .chain(region.holes().iter().enumerate().map(move |(hi, h)| {
+                (
+                    LoopRef {
+                        region: ri,
+                        part: LoopPart::Hole(hi),
+                    },
+                    h,
+                )
+            }))
+        })
+    }
+
     /// Complete or advance the pending operation from a viewport pick at `world`
     /// with a pickbox of `aperture` world-mm.
     /// - The **first** pick selects the boundary/path loop under the box. For every
@@ -860,17 +986,30 @@ impl AppController {
     /// - For a **Pocket**, the first pick sets the boundary and the wizard stays in
     ///   island mode; each further pick toggles that loop as an excluded island
     ///   (the boundary loop itself is ignored). [`confirm_operation`] finalises it.
-    pub fn pick_operation_geometry(&mut self, world: [f64; 2], aperture: f64) -> PickResult {
+    pub fn pick_operation_geometry(
+        &mut self,
+        world: [f64; 2],
+        aperture: f64,
+        snaps: &[SnapKind],
+    ) -> PickResult {
         let Some(pending) = self.pending_op.clone() else {
             return PickResult::Missed;
         };
-        let Some((picked, start)) = self.nearest_loop(world, aperture) else {
-            return PickResult::Missed;
+        // Resolve the loop and start point: prefer an object-snap (corner / mid /
+        // …), else the nearest point on the loop under the box.
+        let (picked, start) = match self.snap_at(world, aperture, snaps) {
+            Some(hit) => (hit.loop_ref, hit.point),
+            None => match self.nearest_loop_point(world, aperture) {
+                Some(lp) => lp,
+                None => return PickResult::Missed,
+            },
         };
         match pending.boundary {
             None => {
                 if pending.kind == OpKind::Pocket {
-                    self.pending_op.as_mut().unwrap().boundary = Some(picked);
+                    let p = self.pending_op.as_mut().unwrap();
+                    p.boundary = Some(picked);
+                    p.start = Some(start); // remembered for Confirm's lead-in
                     PickResult::Selecting
                 } else if let Some(op) =
                     self.build_op(pending.kind, picked, &[], pending.tool, Some(start))
@@ -908,7 +1047,7 @@ impl AppController {
             return false;
         };
         if let Some(op) =
-            self.build_op(pending.kind, boundary, &pending.islands, pending.tool, None)
+            self.build_op(pending.kind, boundary, &pending.islands, pending.tool, pending.start)
         {
             self.add_operation(op);
             self.pending_op = None;
@@ -1310,6 +1449,91 @@ fn dist_point_seg2(p: Point, a: Point, b: Point) -> f64 {
     };
     let (cx, cy) = (a.x + t * abx, a.y + t * aby);
     (p.x - cx).powi(2) + (p.y - cy).powi(2)
+}
+
+/// Closed-loop corner detection: indices of vertices where the turn between the
+/// incoming and outgoing edge exceeds ~20° — real corners, not the many small
+/// turns of a flattened arc (whose facets stay well under the threshold).
+const CORNER_COS: f64 = 0.94; // cos(20°) ≈ 0.9397
+
+fn loop_corners(pts: &[Point]) -> Vec<usize> {
+    let n = pts.len();
+    let mut out = Vec::new();
+    if n < 3 {
+        return out;
+    }
+    for i in 0..n {
+        let (prev, cur, next) = (pts[(i + n - 1) % n], pts[i], pts[(i + 1) % n]);
+        let (ax, ay) = (cur.x - prev.x, cur.y - prev.y);
+        let (bx, by) = (next.x - cur.x, next.y - cur.y);
+        let (la, lb) = ((ax * ax + ay * ay).sqrt(), (bx * bx + by * by).sqrt());
+        if la < 1e-9 || lb < 1e-9 {
+            continue;
+        }
+        // Angle between successive edge directions; a corner turns more than ~20°.
+        if (ax * bx + ay * by) / (la * lb) < CORNER_COS {
+            out.push(i);
+        }
+    }
+    out
+}
+
+/// Arc-length midpoints of the spans between consecutive corners — the "mid" of
+/// each real edge. A loop with no corners (a circle) has no straight edges, so
+/// returns nothing (its mid is a Phase-2 arc concern).
+fn loop_mids(pts: &[Point], corners: &[usize]) -> Vec<[f64; 2]> {
+    if corners.len() < 2 {
+        return Vec::new();
+    }
+    let n = pts.len();
+    let mut mids = Vec::with_capacity(corners.len());
+    for k in 0..corners.len() {
+        let (c0, c1) = (corners[k], corners[(k + 1) % corners.len()]);
+        // Walk the span c0 → c1 (cyclic), accumulating arc length to its half.
+        let mut span = vec![pts[c0]];
+        let mut i = c0;
+        while i != c1 {
+            i = (i + 1) % n;
+            span.push(pts[i]);
+        }
+        let total: f64 = span.windows(2).map(|w| w[0].distance_sq(w[1]).sqrt()).sum();
+        let half = total / 2.0;
+        let mut acc = 0.0;
+        let mut mid = [span[0].x, span[0].y];
+        for w in span.windows(2) {
+            let seg = w[0].distance_sq(w[1]).sqrt();
+            if acc + seg >= half {
+                let t = if seg > 1e-9 { (half - acc) / seg } else { 0.0 };
+                mid = [w[0].x + (w[1].x - w[0].x) * t, w[0].y + (w[1].y - w[0].y) * t];
+                break;
+            }
+            acc += seg;
+        }
+        mids.push(mid);
+    }
+    mids
+}
+
+/// The nearest point on a closed contour to `w`, and its squared distance.
+fn nearest_point_on_contour(pts: &[Point], w: Point) -> ([f64; 2], f64) {
+    let n = pts.len();
+    let mut best = ([pts.first().map_or(0.0, |p| p.x), pts.first().map_or(0.0, |p| p.y)], f64::MAX);
+    for k in 0..n {
+        let (a, b) = (pts[k], pts[(k + 1) % n]);
+        let (abx, aby) = (b.x - a.x, b.y - a.y);
+        let len2 = abx * abx + aby * aby;
+        let t = if len2 > 0.0 {
+            (((w.x - a.x) * abx + (w.y - a.y) * aby) / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let (cx, cy) = (a.x + t * abx, a.y + t * aby);
+        let d2 = (w.x - cx).powi(2) + (w.y - cy).powi(2);
+        if d2 < best.1 {
+            best = ([cx, cy], d2);
+        }
+    }
+    best
 }
 
 /// Whether two tools have the same cutting geometry, ignoring their numbers — used
@@ -1993,14 +2217,14 @@ mod tests {
 
         // A click far from any line misses; the wizard stays active.
         assert_eq!(
-            app.pick_operation_geometry([30.0, 25.0], 2.0),
+            app.pick_operation_geometry([30.0, 25.0], 2.0, &[SnapKind::End]),
             PickResult::Missed
         );
         assert!(app.pending_op().is_some());
 
         // Near the (70,50) corner → a profile on the outer loop, tool 2, start there.
         assert_eq!(
-            app.pick_operation_geometry([69.6, 49.6], 2.0),
+            app.pick_operation_geometry([69.6, 49.6], 2.0, &[SnapKind::End]),
             PickResult::Created
         );
         assert!(app.pending_op().is_none());
@@ -2021,7 +2245,7 @@ mod tests {
         app.begin_operation(OpKind::Profile);
         // Click on the circle edge (centre 40,30, r5) → the profile follows the hole.
         assert_eq!(
-            app.pick_operation_geometry([45.4, 30.0], 2.0),
+            app.pick_operation_geometry([45.4, 30.0], 2.0, &[SnapKind::End]),
             PickResult::Created
         );
         let hole = app.regions()[0].holes()[0].clone();
@@ -2039,7 +2263,7 @@ mod tests {
 
         // First pick = the boundary (outer). Stays in island mode.
         assert_eq!(
-            app.pick_operation_geometry([10.4, 25.0], 2.0),
+            app.pick_operation_geometry([10.4, 25.0], 2.0, &[SnapKind::End]),
             PickResult::Selecting
         );
         let pending = app.pending_op().unwrap();
@@ -2047,18 +2271,71 @@ mod tests {
         assert!(pending.islands.is_empty());
 
         // Click the circle → adds it as an island; clicking again removes it.
-        app.pick_operation_geometry([45.4, 30.0], 2.0);
+        app.pick_operation_geometry([45.4, 30.0], 2.0, &[SnapKind::End]);
         assert_eq!(app.pending_op().unwrap().islands.len(), 1);
-        app.pick_operation_geometry([45.4, 30.0], 2.0);
+        app.pick_operation_geometry([45.4, 30.0], 2.0, &[SnapKind::End]);
         assert!(app.pending_op().unwrap().islands.is_empty());
 
         // Re-add it and confirm → a pocket bounded by the rectangle with one island.
-        app.pick_operation_geometry([45.4, 30.0], 2.0);
+        app.pick_operation_geometry([45.4, 30.0], 2.0, &[SnapKind::End]);
         assert!(app.confirm_operation());
         assert!(app.pending_op().is_none());
         match app.selected_operation() {
             Some(Operation::Pocket(o)) => assert_eq!(o.islands.len(), 1),
             other => panic!("expected a pocket with one island, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snap_at_resolves_end_mid_and_nearest_by_priority() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        let close = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).abs() < 0.05 && (a[1] - b[1]).abs() < 0.05;
+
+        // End near the (70,50) corner.
+        let h = app.snap_at([69.4, 49.4], 1.5, &[SnapKind::End]).unwrap();
+        assert_eq!(h.kind, SnapKind::End);
+        assert!(close(h.point, [70.0, 50.0]), "end {:?}", h.point);
+
+        // Mid of the right edge (70,10)–(70,50) → (70,30).
+        let h = app.snap_at([69.5, 30.0], 1.5, &[SnapKind::Mid]).unwrap();
+        assert_eq!(h.kind, SnapKind::Mid);
+        assert!(close(h.point, [70.0, 30.0]), "mid {:?}", h.point);
+
+        // Nearest on the right edge, away from corner and mid.
+        let h = app.snap_at([69.6, 20.0], 1.5, &[SnapKind::Nearest]).unwrap();
+        assert_eq!(h.kind, SnapKind::Nearest);
+        assert!(close(h.point, [70.0, 20.0]), "nearest {:?}", h.point);
+
+        // Priority: at a corner with all on, End beats Mid/Nearest.
+        let h = app
+            .snap_at([69.6, 49.6], 1.5, &[SnapKind::End, SnapKind::Mid, SnapKind::Nearest])
+            .unwrap();
+        assert_eq!(h.kind, SnapKind::End);
+
+        // Mid-edge with only End enabled ⇒ nothing catches (the pick then falls
+        // back to the nearest point on its own).
+        assert!(app.snap_at([70.0, 20.0], 1.5, &[SnapKind::End]).is_none());
+
+        // The circle has no corners ⇒ End finds nothing there.
+        assert!(app.snap_at([45.0, 30.0], 1.5, &[SnapKind::End]).is_none());
+    }
+
+    #[test]
+    fn picking_with_mid_snap_starts_the_profile_at_the_edge_midpoint() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        app.begin_operation(OpKind::Profile);
+        assert_eq!(
+            app.pick_operation_geometry([69.5, 30.0], 1.5, &[SnapKind::Mid]),
+            PickResult::Created
+        );
+        match app.selected_operation() {
+            Some(Operation::Profile(o)) => {
+                let s = o.start.expect("mid snap sets a start");
+                assert!((s[0] - 70.0).abs() < 0.05 && (s[1] - 30.0).abs() < 0.05, "start {s:?}");
+            }
+            other => panic!("expected a profile, got {other:?}"),
         }
     }
 
