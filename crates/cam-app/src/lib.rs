@@ -13,8 +13,8 @@ mod controller;
 mod project;
 
 pub use controller::{
-    AppController, ExportError, ExportToError, JobParams, OpKind, PendingOp, ProjectError,
-    RunOutcome, Selection,
+    AppController, ExportError, ExportToError, JobParams, LoopPart, LoopRef, OpKind, PendingOp,
+    PickResult, ProjectError, RunOutcome, Selection,
 };
 pub use project::Project;
 

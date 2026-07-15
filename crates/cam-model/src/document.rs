@@ -61,6 +61,21 @@ pub enum Side {
     On,
 }
 
+impl Side {
+    /// Every side, in a stable order — for pickers.
+    pub const ALL: [Side; 3] = [Side::Outside, Side::Inside, Side::On];
+}
+
+impl std::fmt::Display for Side {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Side::Outside => "Outside",
+            Side::Inside => "Inside",
+            Side::On => "On",
+        })
+    }
+}
+
 /// How cutter-radius compensation is applied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Comp {

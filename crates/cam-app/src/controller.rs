@@ -150,12 +150,44 @@ pub struct AppController {
     nc: Option<String>,
 }
 
-/// An operation being created via the pick-geometry wizard: the kind and the tool
-/// it will use, pending a geometry pick.
+/// Which closed loop of an imported region a pick refers to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoopPart {
+    /// The region's outer boundary.
+    Outer,
+    /// The region's `n`-th hole.
+    Hole(usize),
+}
+
+/// A reference to one closed loop (outer or a hole) of one region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoopRef {
+    pub region: usize,
+    pub part: LoopPart,
+}
+
+/// An operation being created via the pick wizard: the kind, the tool, the picked
+/// boundary/path loop (once chosen), and — for a pocket — the loops toggled as
+/// excluded islands.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingOp {
     pub kind: OpKind,
     pub tool: u32,
+    /// The boundary/path loop, set on the first pick. `None` while awaiting it.
+    pub boundary: Option<LoopRef>,
+    /// Loops toggled as excluded islands (pocket island mode).
+    pub islands: Vec<LoopRef>,
+}
+
+/// The result of a viewport pick during the wizard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PickResult {
+    /// An operation was created (finalised).
+    Created,
+    /// A loop was selected/toggled; the wizard is still active (pocket island mode).
+    Selecting,
+    /// The pick missed every boundary line.
+    Missed,
 }
 
 /// Why a project save/open failed.
@@ -527,35 +559,40 @@ impl AppController {
             return;
         }
         let tool = self.first_tool_number();
-        let op = self.build_op(kind, 0, tool, None);
-        if let Some(op) = op {
+        let boundary = LoopRef {
+            region: 0,
+            part: LoopPart::Outer,
+        };
+        if let Some(op) = self.build_op(kind, boundary, &[], tool, None) {
             self.add_operation(op);
         }
     }
 
-    /// Build a default operation of `kind` on region `index` using tool number
-    /// `tool`. Returns `None` if the region index is out of range. The result is a
-    /// sane starting point the user edits in the inspector:
-    /// - **Profile** — an outside profile of the region's outer boundary.
-    /// - **Pocket** — clear the region's outer boundary, leaving its holes as islands.
-    /// - **Drill** — one hole at each of the region's hole centroids (its outer
-    ///   centroid if it has none).
-    /// - **Face** — face the region's XY bounding rectangle.
+    /// Build a default operation of `kind` on the picked `boundary` loop with tool
+    /// `tool`, treating each of `islands` as an excluded loop (pocket only). Returns
+    /// `None` if a loop reference does not resolve. A sane starting point the user
+    /// then edits in the inspector:
+    /// - **Profile** — profile the picked loop; `side` defaults Outside (flip in the
+    ///   inspector), `start` at the picked vertex.
+    /// - **Pocket** — clear inside the picked loop, leaving the chosen islands.
+    /// - **Drill** — one hole at the picked loop's centroid.
+    /// - **Face** — face inside the picked loop.
     fn build_op(
         &self,
         kind: OpKind,
-        index: usize,
+        boundary: LoopRef,
+        islands: &[LoopRef],
         tool: u32,
         start: Option<[f64; 2]>,
     ) -> Option<Operation> {
-        let region = self.regions.get(index)?;
+        let chain = self.loop_contour(boundary)?.clone();
         let p = self.defaults;
         // id 0 is a placeholder — add_operation renumbers with a fresh id.
         let op = match kind {
             OpKind::Profile => Operation::Profile(ProfileOp {
                 id: 0,
                 tool,
-                chain: region.outer().clone(),
+                chain,
                 side: Side::Outside,
                 comp: Comp::Computed,
                 depth: p.depth,
@@ -567,47 +604,43 @@ impl AppController {
                 lead_out: Lead::None,
                 plunge: Plunge::Straight,
             }),
-            OpKind::Pocket => Operation::Pocket(PocketOp {
-                id: 0,
-                tool,
-                boundary: region.outer().clone(),
-                islands: region.holes().to_vec(),
-                depth: p.depth,
-                stepdown: p.stepdown,
-                stepover: p.stepover,
-                feed: p.feed,
-                plunge_feed: p.plunge_feed,
-                plunge: Plunge::Straight,
-            }),
-            OpKind::Drill => {
-                let points = if region.holes().is_empty() {
-                    vec![centroid(region.outer())]
-                } else {
-                    region.holes().iter().map(centroid).collect()
-                };
-                Operation::Drill(DrillOp {
+            OpKind::Pocket => {
+                let island_contours = islands
+                    .iter()
+                    .filter_map(|l| self.loop_contour(*l).cloned())
+                    .collect();
+                Operation::Pocket(PocketOp {
                     id: 0,
                     tool,
-                    points,
-                    depth: p.depth,
-                    peck: None,
-                    dwell: None,
-                    feed: p.plunge_feed,
-                })
-            }
-            OpKind::Face => {
-                let (min, max) = self.bounds_xy();
-                Operation::Face(FaceOp {
-                    id: 0,
-                    tool,
-                    boundary: rect_contour(min, max),
+                    boundary: chain,
+                    islands: island_contours,
                     depth: p.depth,
                     stepdown: p.stepdown,
                     stepover: p.stepover,
                     feed: p.feed,
                     plunge_feed: p.plunge_feed,
+                    plunge: Plunge::Straight,
                 })
             }
+            OpKind::Drill => Operation::Drill(DrillOp {
+                id: 0,
+                tool,
+                points: vec![centroid(&chain)],
+                depth: p.depth,
+                peck: None,
+                dwell: None,
+                feed: p.plunge_feed,
+            }),
+            OpKind::Face => Operation::Face(FaceOp {
+                id: 0,
+                tool,
+                boundary: chain,
+                depth: p.depth,
+                stepdown: p.stepdown,
+                stepover: p.stepover,
+                feed: p.feed,
+                plunge_feed: p.plunge_feed,
+            }),
         };
         Some(op)
     }
@@ -626,9 +659,18 @@ impl AppController {
 
     // --- Operation-creation wizard (pick a tool, then geometry) ----------------
 
-    /// The operation currently being created (kind + tool), if the wizard is active.
+    /// The operation currently being created, if the wizard is active.
     pub fn pending_op(&self) -> Option<PendingOp> {
-        self.pending_op
+        self.pending_op.clone()
+    }
+
+    /// The contour of a loop reference, if it resolves.
+    pub fn loop_contour(&self, l: LoopRef) -> Option<&Contour> {
+        let region = self.regions.get(l.region)?;
+        match l.part {
+            LoopPart::Outer => Some(region.outer()),
+            LoopPart::Hole(i) => region.holes().get(i),
+        }
     }
 
     /// Begin creating an operation of `kind`: enter geometry-pick mode with the
@@ -648,7 +690,12 @@ impl AppController {
                 .map_or_else(|| self.first_tool_number(), |t| t.number),
             _ => self.first_tool_number(),
         };
-        self.pending_op = Some(PendingOp { kind, tool });
+        self.pending_op = Some(PendingOp {
+            kind,
+            tool,
+            boundary: None,
+            islands: Vec::new(),
+        });
     }
 
     /// Change the tool of the pending operation. A no-op unless the wizard is active.
@@ -663,55 +710,100 @@ impl AppController {
         self.pending_op = None;
     }
 
-    /// The index of the topmost region whose filled area contains `world` (last
-    /// drawn wins on overlap), or `None`.
-    pub fn region_at(&self, world: [f64; 2]) -> Option<usize> {
-        let p = cam_geo::Point::new(world[0], world[1]);
-        self.regions
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, region)| region.contains(p))
-            .map(|(i, _)| i)
-    }
-
-    /// The nearest vertex (of any region's outer boundary or holes) within
-    /// `aperture` world-mm of `world`, as `(region index, vertex XY)`. This is the
-    /// pickbox hit-test: `aperture` is the box half-size mapped to world units.
-    pub fn nearest_vertex(&self, world: [f64; 2], aperture: f64) -> Option<(usize, [f64; 2])> {
-        let mut best: Option<(usize, [f64; 2], f64)> = None;
-        for (i, region) in self.regions.iter().enumerate() {
-            let rings = std::iter::once(region.outer()).chain(region.holes());
-            for ring in rings {
-                for pt in ring.points() {
-                    let d2 = (pt.x - world[0]).powi(2) + (pt.y - world[1]).powi(2);
-                    if best.is_none_or(|(_, _, bd2)| d2 < bd2) {
-                        best = Some((i, [pt.x, pt.y], d2));
-                    }
+    /// The boundary loop whose **edge** is closest to `world` within `aperture`
+    /// world-mm, together with the nearest vertex on it (the start point). This is
+    /// line picking: a point-to-segment distance to each closed loop's edges across
+    /// every region — a click inside an empty area (near no edge) returns `None`.
+    pub fn nearest_loop(&self, world: [f64; 2], aperture: f64) -> Option<(LoopRef, [f64; 2])> {
+        let w = Point::new(world[0], world[1]);
+        // (loop, nearest vertex, closest edge distance²)
+        let mut best: Option<(LoopRef, [f64; 2], f64)> = None;
+        for (ri, region) in self.regions.iter().enumerate() {
+            let loops = std::iter::once((LoopPart::Outer, region.outer())).chain(
+                region
+                    .holes()
+                    .iter()
+                    .enumerate()
+                    .map(|(hi, h)| (LoopPart::Hole(hi), h)),
+            );
+            for (part, contour) in loops {
+                let pts = contour.points();
+                if pts.len() < 2 {
+                    continue;
+                }
+                let edge_d2 = (0..pts.len())
+                    .map(|k| dist_point_seg2(w, pts[k], pts[(k + 1) % pts.len()]))
+                    .fold(f64::MAX, f64::min);
+                if best.is_none_or(|(_, _, bd2)| edge_d2 < bd2) {
+                    let nv = pts
+                        .iter()
+                        .min_by(|p, q| w.distance_sq(**p).total_cmp(&w.distance_sq(**q)))
+                        .unwrap();
+                    best = Some((LoopRef { region: ri, part }, [nv.x, nv.y], edge_d2));
                 }
             }
         }
         best.filter(|(_, _, d2)| *d2 <= aperture * aperture)
-            .map(|(i, pt, _)| (i, pt))
+            .map(|(l, v, _)| (l, v))
     }
 
-    /// Complete the pending operation from a viewport pick at `world`, with a
-    /// pickbox of `aperture` world-mm. A vertex inside the box sets the region **and**
-    /// the start point; otherwise the region whose area contains the point is used
-    /// (for pocket/face). Returns `true` if an operation was created. A miss leaves
-    /// the wizard active so the user can click again.
-    pub fn pick_operation_geometry(&mut self, world: [f64; 2], aperture: f64) -> bool {
-        let Some(pending) = self.pending_op else {
+    /// Complete or advance the pending operation from a viewport pick at `world`
+    /// with a pickbox of `aperture` world-mm.
+    /// - The **first** pick selects the boundary/path loop under the box. For every
+    ///   kind except Pocket the operation is created immediately.
+    /// - For a **Pocket**, the first pick sets the boundary and the wizard stays in
+    ///   island mode; each further pick toggles that loop as an excluded island
+    ///   (the boundary loop itself is ignored). [`confirm_operation`] finalises it.
+    pub fn pick_operation_geometry(&mut self, world: [f64; 2], aperture: f64) -> PickResult {
+        let Some(pending) = self.pending_op.clone() else {
+            return PickResult::Missed;
+        };
+        let Some((picked, start)) = self.nearest_loop(world, aperture) else {
+            return PickResult::Missed;
+        };
+        match pending.boundary {
+            None => {
+                if pending.kind == OpKind::Pocket {
+                    self.pending_op.as_mut().unwrap().boundary = Some(picked);
+                    PickResult::Selecting
+                } else if let Some(op) =
+                    self.build_op(pending.kind, picked, &[], pending.tool, Some(start))
+                {
+                    self.add_operation(op);
+                    self.pending_op = None;
+                    PickResult::Created
+                } else {
+                    PickResult::Missed
+                }
+            }
+            Some(boundary) => {
+                // Pocket island mode: toggle the clicked loop (not the boundary).
+                if picked == boundary {
+                    return PickResult::Selecting;
+                }
+                let islands = &mut self.pending_op.as_mut().unwrap().islands;
+                if let Some(pos) = islands.iter().position(|l| *l == picked) {
+                    islands.remove(pos);
+                } else {
+                    islands.push(picked);
+                }
+                PickResult::Selecting
+            }
+        }
+    }
+
+    /// Finalise a pending operation from its picked boundary + islands (used by the
+    /// Pocket wizard's Confirm). Returns `true` if an operation was created.
+    pub fn confirm_operation(&mut self) -> bool {
+        let Some(pending) = self.pending_op.clone() else {
             return false;
         };
-        let (index, start) = match self.nearest_vertex(world, aperture) {
-            Some((i, pt)) => (i, Some(pt)),
-            None => match self.region_at(world) {
-                Some(i) => (i, None),
-                None => return false,
-            },
+        let Some(boundary) = pending.boundary else {
+            return false;
         };
-        if let Some(op) = self.build_op(pending.kind, index, pending.tool, start) {
+        if let Some(op) =
+            self.build_op(pending.kind, boundary, &pending.islands, pending.tool, None)
+        {
             self.add_operation(op);
             self.pending_op = None;
             return true;
@@ -1018,14 +1110,17 @@ fn centroid(c: &Contour) -> [f64; 2] {
     [sx / n, sy / n]
 }
 
-/// A CCW rectangle contour spanning `[min, max]` in XY.
-fn rect_contour(min: [f64; 2], max: [f64; 2]) -> Contour {
-    Contour::new(vec![
-        Point::new(min[0], min[1]),
-        Point::new(max[0], min[1]),
-        Point::new(max[0], max[1]),
-        Point::new(min[0], max[1]),
-    ])
+/// Squared distance from point `p` to the segment `a`–`b`.
+fn dist_point_seg2(p: Point, a: Point, b: Point) -> f64 {
+    let (abx, aby) = (b.x - a.x, b.y - a.y);
+    let len2 = abx * abx + aby * aby;
+    let t = if len2 > 0.0 {
+        (((p.x - a.x) * abx + (p.y - a.y) * aby) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let (cx, cy) = (a.x + t * abx, a.y + t * aby);
+    (p.x - cx).powi(2) + (p.y - cy).powi(2)
 }
 
 /// Set an operation's id, whatever its kind.
@@ -1229,15 +1324,13 @@ mod tests {
     fn new_operation_builds_each_kind_from_geometry() {
         let mut app = AppController::new(machine());
         app.open_dxf(PART_DXF, "part.dxf").unwrap();
-        let region = &app.regions()[0];
-        let n_holes = region.holes().len();
         let (bmin, bmax) = app.bounds_xy();
 
+        // The convenience builder targets the first region's outer loop with no islands.
         app.new_operation(OpKind::Pocket);
         match app.selected_operation() {
             Some(Operation::Pocket(o)) => {
-                // Boundary is the outer loop; holes become islands.
-                assert_eq!(o.islands.len(), n_holes);
+                assert!(o.islands.is_empty(), "no islands by default");
                 assert!(o.stepover > 0.0);
             }
             other => panic!("expected pocket, got {other:?}"),
@@ -1245,8 +1338,8 @@ mod tests {
 
         app.new_operation(OpKind::Drill);
         match app.selected_operation() {
-            // The sample part has one circular hole → one drill point.
-            Some(Operation::Drill(o)) => assert_eq!(o.points.len(), n_holes.max(1)),
+            // One drill point at the outer loop's centroid.
+            Some(Operation::Drill(o)) => assert_eq!(o.points.len(), 1),
             other => panic!("expected drill, got {other:?}"),
         }
 
@@ -1466,65 +1559,106 @@ mod tests {
     }
 
     #[test]
-    fn region_at_hits_inside_misses_hole_and_outside() {
+    fn nearest_loop_picks_edges_not_areas() {
         let mut app = AppController::new(machine());
         app.open_dxf(PART_DXF, "part.dxf").unwrap();
-        // The part is a 10..70 × 10..50 rectangle with a ⌀10 hole at (40, 30).
-        assert_eq!(app.region_at([20.0, 20.0]), Some(0)); // inside the plate
-        assert_eq!(app.region_at([40.0, 30.0]), None); // in the hole
-        assert_eq!(app.region_at([100.0, 100.0]), None); // off the part
+        // The part is a 10..70 × 10..50 rectangle (Outer) with a ⌀10 hole at (40,30)
+        // (Hole 0). Near the left edge → the outer loop.
+        assert_eq!(
+            app.nearest_loop([10.4, 25.0], 2.0).map(|(l, _)| l),
+            Some(LoopRef {
+                region: 0,
+                part: LoopPart::Outer
+            })
+        );
+        // Near the circle edge → the hole.
+        assert_eq!(
+            app.nearest_loop([45.4, 30.0], 2.0).map(|(l, _)| l),
+            Some(LoopRef {
+                region: 0,
+                part: LoopPart::Hole(0)
+            })
+        );
+        // Inside the plate but far from every edge → nothing (this is line picking).
+        assert_eq!(app.nearest_loop([30.0, 25.0], 2.0), None);
     }
 
     #[test]
-    fn wizard_creates_op_on_the_picked_region_with_the_chosen_tool() {
+    fn picking_a_loop_creates_a_profile_with_the_start_at_the_picked_vertex() {
         let mut app = AppController::new(machine());
         app.open_dxf(PART_DXF, "part.dxf").unwrap();
-        app.add_tool(); // a second tool, number 2
-        let before = op_ids(&app).len();
-
-        app.begin_operation(OpKind::Pocket);
-        assert!(app.pending_op().is_some());
+        app.add_tool(); // tool number 2
+        app.begin_operation(OpKind::Profile);
         app.set_pending_tool(2);
 
-        // A miss leaves the wizard active and creates nothing.
-        assert!(!app.pick_operation_geometry([100.0, 100.0], 2.0));
+        // A click far from any line misses; the wizard stays active.
+        assert_eq!(
+            app.pick_operation_geometry([30.0, 25.0], 2.0),
+            PickResult::Missed
+        );
         assert!(app.pending_op().is_some());
-        assert_eq!(op_ids(&app).len(), before);
 
-        // A click in the plate interior (no vertex within the aperture) falls back
-        // to region fill and creates the pocket on that region with tool 2.
-        assert!(app.pick_operation_geometry([20.0, 20.0], 2.0));
+        // Near the (70,50) corner → a profile on the outer loop, tool 2, start there.
+        assert_eq!(
+            app.pick_operation_geometry([69.6, 49.6], 2.0),
+            PickResult::Created
+        );
         assert!(app.pending_op().is_none());
-        assert_eq!(op_ids(&app).len(), before + 1);
         match app.selected_operation() {
-            Some(Operation::Pocket(o)) => assert_eq!(o.tool, 2),
-            other => panic!("expected pocket on tool 2, got {other:?}"),
+            Some(Operation::Profile(o)) => {
+                assert_eq!(o.tool, 2);
+                assert_eq!(o.start, Some([70.0, 50.0]));
+                assert_eq!(o.side, Side::Outside);
+            }
+            other => panic!("expected a profile, got {other:?}"),
         }
     }
 
     #[test]
-    fn nearest_vertex_snaps_within_aperture_only() {
-        let mut app = AppController::new(machine());
-        app.open_dxf(PART_DXF, "part.dxf").unwrap();
-        // The plate's corner is at (10, 10). A click just off it, within aperture, snaps.
-        assert_eq!(
-            app.nearest_vertex([10.6, 10.4], 2.0),
-            Some((0, [10.0, 10.0]))
-        );
-        // Same click with a tiny aperture finds nothing.
-        assert_eq!(app.nearest_vertex([10.6, 10.4], 0.1), None);
-    }
-
-    #[test]
-    fn picking_a_vertex_sets_the_profile_start() {
+    fn clicking_the_inner_circle_profiles_the_circle_not_the_rectangle() {
         let mut app = AppController::new(machine());
         app.open_dxf(PART_DXF, "part.dxf").unwrap();
         app.begin_operation(OpKind::Profile);
-        // Click near the (70, 50) corner with a generous aperture.
-        assert!(app.pick_operation_geometry([69.5, 49.6], 2.0));
+        // Click on the circle edge (centre 40,30, r5) → the profile follows the hole.
+        assert_eq!(
+            app.pick_operation_geometry([45.4, 30.0], 2.0),
+            PickResult::Created
+        );
+        let hole = app.regions()[0].holes()[0].clone();
         match app.selected_operation() {
-            Some(Operation::Profile(o)) => assert_eq!(o.start, Some([70.0, 50.0])),
-            other => panic!("expected a profile with a start, got {other:?}"),
+            Some(Operation::Profile(o)) => assert_eq!(o.chain, hole, "chain is the circle"),
+            other => panic!("expected a profile on the circle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pocket_wizard_picks_a_boundary_then_toggles_islands() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        app.begin_operation(OpKind::Pocket);
+
+        // First pick = the boundary (outer). Stays in island mode.
+        assert_eq!(
+            app.pick_operation_geometry([10.4, 25.0], 2.0),
+            PickResult::Selecting
+        );
+        let pending = app.pending_op().unwrap();
+        assert_eq!(pending.boundary.unwrap().part, LoopPart::Outer);
+        assert!(pending.islands.is_empty());
+
+        // Click the circle → adds it as an island; clicking again removes it.
+        app.pick_operation_geometry([45.4, 30.0], 2.0);
+        assert_eq!(app.pending_op().unwrap().islands.len(), 1);
+        app.pick_operation_geometry([45.4, 30.0], 2.0);
+        assert!(app.pending_op().unwrap().islands.is_empty());
+
+        // Re-add it and confirm → a pocket bounded by the rectangle with one island.
+        app.pick_operation_geometry([45.4, 30.0], 2.0);
+        assert!(app.confirm_operation());
+        assert!(app.pending_op().is_none());
+        match app.selected_operation() {
+            Some(Operation::Pocket(o)) => assert_eq!(o.islands.len(), 1),
+            other => panic!("expected a pocket with one island, got {other:?}"),
         }
     }
 

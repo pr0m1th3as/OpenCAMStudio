@@ -21,7 +21,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
-use cam_model::{Envelope, Lead, Machine, Operation, Plunge, Point3, ToolKind};
+use cam_model::{Envelope, Lead, Machine, Operation, Plunge, Point3, Side, ToolKind};
 
 /// Ribbon palette and metrics, adopted from **OpenCADStudio**'s ribbon
 /// (`HakanSeven12/OpenCADStudio`, GPL-3.0) so users moving CAD → CAM meet a
@@ -119,7 +119,7 @@ fn icon_svg(icon: Icon, size: f32) -> Element<'static, Message> {
 use cam_render::{MeshVertex, OrbitCamera, Scene, Vertex, PART};
 use cam_toolpath::{CancelToken, Severity};
 
-use crate::{AppController, OpKind, PendingOp, Selection};
+use crate::{AppController, OpKind, PendingOp, PickResult, Selection};
 
 /// A small sample part (rectangle + circular hole) so the app is useful without
 /// a file dialog on first run.
@@ -479,6 +479,24 @@ struct App {
 /// The pickbox aperture, px — its half-size is the vertex-snap tolerance.
 const PICKBOX_PX: f32 = 12.0;
 
+/// Highlight colour for a picked boundary loop (accent blue).
+const PICK_BOUNDARY: [f32; 4] = [0.20, 0.55, 0.90, 1.0];
+/// Highlight colour for an excluded island loop (gold).
+const PICK_ISLAND: [f32; 4] = [0.90, 0.65, 0.10, 1.0];
+
+/// Add a closed contour to the scene as a highlight strip in `color`.
+fn add_loop_highlight(scene: &mut Scene, c: &cam_geo::Contour, color: [f32; 4]) {
+    let mut strip: Vec<[f32; 3]> = c
+        .points()
+        .iter()
+        .map(|p| [p.x as f32, p.y as f32, 0.0])
+        .collect();
+    if let Some(&first) = strip.first() {
+        strip.push(first); // close the loop
+    }
+    scene.add_strip(strip, color);
+}
+
 /// The `(yaw, pitch)` that views a cube face (given by its outward normal)
 /// straight on, **the right way up** — the orientation a click on that gizmo face
 /// snaps to. Side and front/back views use `pitch = −90°` so world +Z is screen
@@ -537,6 +555,10 @@ enum Message {
     SetPendingTool(u32),
     /// Cancel the pending operation.
     CancelOp,
+    /// Confirm a pending operation (finalise a pocket boundary + islands).
+    ConfirmOp,
+    /// Change the selected profile's cut side.
+    SideChanged(Side),
     /// A world `(x, y)` picked in the viewport plus the pickbox aperture in world
     /// mm (completes a pending operation).
     PickWorld([f32; 2], f32),
@@ -773,7 +795,8 @@ impl App {
                 self.controller.begin_operation(kind);
                 self.refresh_fields();
                 self.status = if self.controller.pending_op().is_some() {
-                    "Pick a region in the viewport (or Cancel in the Inspector).".to_string()
+                    "Click a boundary line in the viewport (or Cancel in the Inspector)."
+                        .to_string()
                 } else {
                     "Open a part and add a tool first.".to_string()
                 };
@@ -783,17 +806,33 @@ impl App {
                 self.controller.cancel_operation();
                 self.status = "Cancelled operation creation.".to_string();
             }
-            Message::PickWorld(w, aperture) => {
-                if self
-                    .controller
-                    .pick_operation_geometry([w[0] as f64, w[1] as f64], aperture as f64)
-                {
+            Message::ConfirmOp => {
+                if self.controller.confirm_operation() {
                     self.cursor = None;
                     self.refresh_fields();
                     self.rerun();
                     self.status = "Operation created.".to_string();
-                } else {
-                    self.status = "No geometry there — click a vertex or region.".to_string();
+                }
+            }
+            Message::PickWorld(w, aperture) => {
+                match self
+                    .controller
+                    .pick_operation_geometry([w[0] as f64, w[1] as f64], aperture as f64)
+                {
+                    PickResult::Created => {
+                        self.cursor = None;
+                        self.refresh_fields();
+                        self.rerun();
+                        self.status = "Operation created.".to_string();
+                    }
+                    PickResult::Selecting => {
+                        let n = self.controller.pending_op().map_or(0, |p| p.islands.len());
+                        self.status =
+                            format!("Boundary set — click areas to exclude ({n}), then Confirm.");
+                    }
+                    PickResult::Missed => {
+                        self.status = "No line there — click a boundary edge.".to_string();
+                    }
                 }
             }
             Message::ViewportCursor(p) => self.cursor = Some(p),
@@ -895,6 +934,14 @@ impl App {
                     _ => {}
                 });
                 self.refresh_fields();
+                self.rerun();
+            }
+            Message::SideChanged(side) => {
+                self.controller.edit_selected_operation(|op| {
+                    if let Operation::Profile(p) = op {
+                        p.side = side;
+                    }
+                });
                 self.rerun();
             }
             Message::NewTool => {
@@ -1646,16 +1693,35 @@ impl App {
         let picker = pick_list(tools, selected, |c| Message::SetPendingTool(c.number))
             .text_size(13)
             .width(Length::Fill);
-        column![
+        let mut col = column![
             text(format!("New {kind} operation")).size(15),
             text("Tool").size(12),
             picker,
-            text("Click a region in the viewport to place it.").size(12),
-            button(text("Cancel").size(13)).on_press(Message::CancelOp),
         ]
         .spacing(10)
-        .padding(8)
-        .into()
+        .padding(8);
+
+        // Pocket island mode begins once the boundary is picked.
+        if pending.kind == OpKind::Pocket && pending.boundary.is_some() {
+            col = col.push(
+                text(format!(
+                    "Click enclosed areas to exclude ({} selected), then Confirm.",
+                    pending.islands.len()
+                ))
+                .size(12),
+            );
+            col = col.push(
+                row![
+                    button(text("Confirm").size(13)).on_press(Message::ConfirmOp),
+                    button(text("Cancel").size(13)).on_press(Message::CancelOp),
+                ]
+                .spacing(8),
+            );
+        } else {
+            col = col.push(text("Click a boundary line in the viewport.").size(12));
+            col = col.push(button(text("Cancel").size(13)).on_press(Message::CancelOp));
+        }
+        col.into()
     }
 
     fn inspector(&self) -> Element<'_, Message> {
@@ -1734,6 +1800,12 @@ impl App {
         if let Selection::Operation(id) = self.controller.selection() {
             match self.controller.operation(id) {
                 Some(Operation::Profile(p)) => {
+                    list = list.push(profile_picker(
+                        "Side",
+                        p.side,
+                        &Side::ALL[..],
+                        Message::SideChanged,
+                    ));
                     list = list.push(profile_picker(
                         "Lead-in",
                         LeadKind::of(p.lead_in),
@@ -2382,7 +2454,7 @@ impl Viewport {
         let pick_z = controller.document().setup.heights.top_of_stock as f32;
         // After a run, show the full backplot; before it, at least show the
         // imported part outlines so opening a file is visibly reflected.
-        let scene = match controller.outcome() {
+        let mut scene = match controller.outcome() {
             Some(outcome) => outcome.scene.clone(),
             None => {
                 let mut scene = Scene::new();
@@ -2392,6 +2464,18 @@ impl Viewport {
                 scene
             }
         };
+        // While the pick wizard is active, highlight the chosen boundary (accent)
+        // and any excluded islands (gold) so the user sees what they picked.
+        if let Some(pending) = controller.pending_op() {
+            if let Some(c) = pending.boundary.and_then(|b| controller.loop_contour(b)) {
+                add_loop_highlight(&mut scene, c, PICK_BOUNDARY);
+            }
+            for island in &pending.islands {
+                if let Some(c) = controller.loop_contour(*island) {
+                    add_loop_highlight(&mut scene, c, PICK_ISLAND);
+                }
+            }
+        }
         // The simulated stock is drawn under the backplot, only when toggled on
         // and available (a run has produced it).
         let (mesh_vertices, mesh_indices) = match controller.outcome() {
