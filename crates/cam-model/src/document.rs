@@ -76,6 +76,31 @@ impl std::fmt::Display for Side {
     }
 }
 
+/// The hand of a thread — which way the helix winds. Right-hand is the common
+/// case (advances into the work when turned clockwise, viewed from the entering
+/// end); left-hand is used where a right-hand thread would loosen in service.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Hand {
+    /// Right-hand thread.
+    Right,
+    /// Left-hand thread.
+    Left,
+}
+
+impl Hand {
+    /// Both hands, in a stable order — for pickers.
+    pub const ALL: [Hand; 2] = [Hand::Right, Hand::Left];
+}
+
+impl std::fmt::Display for Hand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Hand::Right => "Right-hand",
+            Hand::Left => "Left-hand",
+        })
+    }
+}
+
 /// How cutter-radius compensation is applied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Comp {
@@ -217,6 +242,40 @@ pub struct FaceOp {
     pub plunge_feed: f64,
 }
 
+/// A thread-milling operation: cut internal or external threads at a set of hole
+/// centres by helically interpolating a thread mill. The thread *form* (a full-
+/// profile mill cutting the whole length in one turn vs. a single-form mill
+/// stacking one turn per pitch) is chosen by the strategy; this describes the
+/// geometry to cut.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ThreadOp {
+    /// Operation id.
+    pub id: u32,
+    /// Tool number.
+    pub tool: u32,
+    /// Thread-hole (or boss) centres in the part/WCS frame.
+    pub points: Vec<[f64; 2]>,
+    /// Internal thread (bore) when `true`; external thread (boss) when `false`.
+    pub internal: bool,
+    /// Thread hand — which way the helix winds.
+    pub hand: Hand,
+    /// Nominal major diameter of the thread, mm.
+    pub major_dia: f64,
+    /// Thread pitch (Z advance per turn), mm (> 0).
+    pub pitch: f64,
+    /// Absolute Z of the top of the threaded length.
+    pub z_top: f64,
+    /// Absolute Z of the bottom of the threaded length.
+    pub z_bottom: f64,
+    /// Climb-mill when `true`, conventional when `false` — together with `hand`
+    /// and `internal` this fixes the helix direction and travel sense.
+    pub climb: bool,
+    /// Cutting feed, mm/min.
+    pub feed: f64,
+    /// Plunge feed for the approach in Z, mm/min.
+    pub plunge_feed: f64,
+}
+
 /// An operation in a setup. An enum so a setup holds a heterogeneous, ordered
 /// list.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -229,6 +288,8 @@ pub enum Operation {
     Pocket(PocketOp),
     /// A facing operation.
     Face(FaceOp),
+    /// A thread-milling operation.
+    Thread(ThreadOp),
 }
 
 impl Operation {
@@ -239,6 +300,7 @@ impl Operation {
             Operation::Drill(op) => op.id,
             Operation::Pocket(op) => op.id,
             Operation::Face(op) => op.id,
+            Operation::Thread(op) => op.id,
         }
     }
 
@@ -249,6 +311,7 @@ impl Operation {
             Operation::Drill(op) => op.tool,
             Operation::Pocket(op) => op.tool,
             Operation::Face(op) => op.tool,
+            Operation::Thread(op) => op.tool,
         }
     }
 }

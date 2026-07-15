@@ -22,6 +22,7 @@ mod face;
 mod plan;
 mod pocket;
 mod profile;
+mod thread;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -34,6 +35,7 @@ pub use face::FaceStrategy;
 pub use plan::build_job;
 pub use pocket::PocketStrategy;
 pub use profile::ProfileStrategy;
+pub use thread::ThreadStrategy;
 
 /// Severity of a [`Diagnostic`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

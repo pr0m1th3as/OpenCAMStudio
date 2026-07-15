@@ -15,8 +15,8 @@ use cam_import::{read_cad_file, read_dxf_str, ImportError, ImportOptions};
 
 use crate::project::Project;
 use cam_model::{
-    Comp, Document, DrillOp, FaceOp, Heights, History, Lead, Machine, Operation, Plunge, PocketOp,
-    ProfileOp, Setup, Side, Stock, Tool, ToolKind,
+    Comp, Document, DrillOp, FaceOp, Hand, Heights, History, Lead, Machine, Operation, Plunge,
+    PocketOp, ProfileOp, Setup, Side, Stock, ThreadOp, Tool, ToolKind,
 };
 use cam_post::{GrblPost, Post, PostError, PostOptions};
 use cam_render::{mesh_vertices, MeshVertex, Scene, PART};
@@ -68,6 +68,7 @@ pub enum OpKind {
     Pocket,
     Drill,
     Face,
+    Thread,
 }
 
 /// Which node of the document is currently selected — what the tree highlights
@@ -715,6 +716,35 @@ impl AppController {
                 feed: p.feed,
                 plunge_feed: p.plunge_feed,
             }),
+            OpKind::Thread => {
+                // Seed one thread at the picked loop's centre; a circular hole
+                // loop gives its diameter as the major diameter. Pitch/hand are
+                // refined in the inspector.
+                let pts = chain.points();
+                let (mut xmin, mut xmax) = (f64::MAX, f64::MIN);
+                let (mut ymin, mut ymax) = (f64::MAX, f64::MIN);
+                for pt in pts {
+                    xmin = xmin.min(pt.x);
+                    xmax = xmax.max(pt.x);
+                    ymin = ymin.min(pt.y);
+                    ymax = ymax.max(pt.y);
+                }
+                let dia = (xmax - xmin).max(ymax - ymin);
+                Operation::Thread(ThreadOp {
+                    id: 0,
+                    tool,
+                    points: vec![centroid(&chain)],
+                    internal: true,
+                    hand: Hand::Right,
+                    major_dia: if dia.is_finite() && dia > 0.0 { dia } else { 6.0 },
+                    pitch: 1.0,
+                    z_top: p.top_of_stock,
+                    z_bottom: p.depth,
+                    climb: true,
+                    feed: p.feed,
+                    plunge_feed: p.plunge_feed,
+                })
+            }
         };
         Some(op)
     }
@@ -1213,6 +1243,7 @@ fn set_op_id(op: &mut Operation, id: u32) {
         Operation::Drill(o) => o.id = id,
         Operation::Pocket(o) => o.id = id,
         Operation::Face(o) => o.id = id,
+        Operation::Thread(o) => o.id = id,
     }
 }
 
@@ -1272,6 +1303,7 @@ mod tests {
             Operation::Pocket(o) => o.depth,
             Operation::Face(o) => o.depth,
             Operation::Drill(o) => o.depth,
+            Operation::Thread(o) => o.z_bottom,
         }
     }
 
@@ -1441,6 +1473,48 @@ mod tests {
             }
             other => panic!("expected face, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn new_thread_seeds_from_geometry_and_lowers_to_helical_arcs() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        app.new_operation(OpKind::Thread);
+
+        let id = match app.selection() {
+            Selection::Operation(i) => i,
+            other => panic!("expected an operation selection, got {other:?}"),
+        };
+        match app.selected_operation() {
+            Some(Operation::Thread(o)) => {
+                assert!(o.internal, "threads default to internal");
+                assert!(o.major_dia > 0.0, "major diameter seeded from geometry");
+                assert_eq!(o.points.len(), 1, "one thread at the loop centre");
+            }
+            other => panic!("expected thread, got {other:?}"),
+        }
+
+        // The whole pipeline (document → build_job → CL-data) must emit the
+        // thread's cutting arcs, and their end Z must advance — a helix, not a
+        // flat circle.
+        let out = app.run(&CancelToken::new());
+        let cut_zs: Vec<f64> = out
+            .program
+            .steps()
+            .iter()
+            .filter_map(|s| match s {
+                cam_cldata::Step::Arc { end, tag, .. }
+                    if tag.op_id == id && tag.kind == cam_cldata::MoveKind::Cutting =>
+                {
+                    Some(end.z)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(cut_zs.len() >= 2, "thread should emit several cutting arcs");
+        let zmin = cut_zs.iter().cloned().fold(f64::MAX, f64::min);
+        let zmax = cut_zs.iter().cloned().fold(f64::MIN, f64::max);
+        assert!(zmax - zmin > 1e-6, "cutting arcs must climb in Z (helix)");
     }
 
     #[test]

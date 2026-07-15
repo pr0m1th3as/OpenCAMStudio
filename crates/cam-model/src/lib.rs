@@ -18,8 +18,8 @@ mod history;
 
 pub use cam_cldata::Point3;
 pub use document::{
-    Comp, Document, DrillOp, FaceOp, Heights, Lead, Operation, Plunge, PocketOp, ProfileOp, Setup,
-    Side, Stock, SCHEMA_VERSION,
+    Comp, Document, DrillOp, FaceOp, Hand, Heights, Lead, Operation, Plunge, PocketOp, ProfileOp,
+    Setup, Side, Stock, ThreadOp, SCHEMA_VERSION,
 };
 pub use history::History;
 
@@ -99,16 +99,19 @@ pub enum ToolKind {
     ChamferMill,
     /// Face mill.
     FaceMill,
+    /// Thread mill — helically interpolated to cut internal/external threads.
+    ThreadMill,
 }
 
 impl ToolKind {
     /// Every kind, in a stable order — for pickers and iteration.
-    pub const ALL: [ToolKind; 5] = [
+    pub const ALL: [ToolKind; 6] = [
         ToolKind::EndMill,
         ToolKind::BallMill,
         ToolKind::Drill,
         ToolKind::ChamferMill,
         ToolKind::FaceMill,
+        ToolKind::ThreadMill,
     ];
 }
 
@@ -120,6 +123,7 @@ impl std::fmt::Display for ToolKind {
             ToolKind::Drill => "Drill",
             ToolKind::ChamferMill => "Chamfer mill",
             ToolKind::FaceMill => "Face mill",
+            ToolKind::ThreadMill => "Thread mill",
         };
         f.write_str(s)
     }

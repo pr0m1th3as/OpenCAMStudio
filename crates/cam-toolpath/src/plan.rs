@@ -10,7 +10,7 @@ use cam_model::{Document, Operation};
 
 use crate::{
     CancelToken, Diagnostic, DrillStrategy, FaceStrategy, JobEnv, PocketStrategy, ProfileStrategy,
-    Strategy, StrategyResult,
+    Strategy, StrategyResult, ThreadStrategy,
 };
 
 /// Assemble a whole-job [`Program`] from a [`Document`].
@@ -90,6 +90,7 @@ fn compute(operation: &Operation, env: &JobEnv, cancel: &CancelToken) -> Strateg
         Operation::Drill(op) => DrillStrategy::new(op.clone()).compute(env, cancel),
         Operation::Pocket(op) => PocketStrategy::new(op.clone()).compute(env, cancel),
         Operation::Face(op) => FaceStrategy::new(op.clone()).compute(env, cancel),
+        Operation::Thread(op) => ThreadStrategy::new(op.clone()).compute(env, cancel),
     }
 }
 
@@ -99,5 +100,6 @@ fn operation_tool(operation: &Operation) -> u32 {
         Operation::Drill(op) => op.tool,
         Operation::Pocket(op) => op.tool,
         Operation::Face(op) => op.tool,
+        Operation::Thread(op) => op.tool,
     }
 }

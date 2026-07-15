@@ -21,7 +21,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
-use cam_model::{Envelope, Lead, Machine, Operation, Plunge, Point3, Side, ToolKind};
+use cam_model::{Envelope, Hand, Lead, Machine, Operation, Plunge, Point3, Side, ToolKind};
 
 use crate::tool_library::ToolLibrary;
 
@@ -354,6 +354,64 @@ impl std::fmt::Display for PlungeKind {
     }
 }
 
+/// Whether a thread is cut into a bore or onto a boss, for the inspector picker
+/// (a friendlier face on `ThreadOp::internal`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bore {
+    Internal,
+    External,
+}
+
+impl Bore {
+    const ALL: [Bore; 2] = [Bore::Internal, Bore::External];
+
+    fn of(internal: bool) -> Self {
+        if internal {
+            Bore::Internal
+        } else {
+            Bore::External
+        }
+    }
+}
+
+impl std::fmt::Display for Bore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Bore::Internal => "Internal",
+            Bore::External => "External",
+        })
+    }
+}
+
+/// Climb vs. conventional milling, for the inspector picker (a friendlier face on
+/// `ThreadOp::climb`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CutStyle {
+    Climb,
+    Conventional,
+}
+
+impl CutStyle {
+    const ALL: [CutStyle; 2] = [CutStyle::Climb, CutStyle::Conventional];
+
+    fn of(climb: bool) -> Self {
+        if climb {
+            CutStyle::Climb
+        } else {
+            CutStyle::Conventional
+        }
+    }
+}
+
+impl std::fmt::Display for CutStyle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            CutStyle::Climb => "Climb",
+            CutStyle::Conventional => "Conventional",
+        })
+    }
+}
+
 /// An editable inspector field, keyed independently of which node owns it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Field {
@@ -368,6 +426,14 @@ enum Field {
     Stepover,
     Feed,
     PlungeFeed,
+    /// Thread major diameter (mm).
+    MajorDia,
+    /// Thread pitch (mm).
+    Pitch,
+    /// Absolute Z of the top of a threaded length (mm).
+    ThreadTop,
+    /// Absolute Z of the bottom of a threaded length (mm).
+    ThreadBottom,
     /// Lead-in size (length for Linear, radius for Arc).
     LeadInSize,
     /// Lead-out size.
@@ -392,6 +458,10 @@ impl Field {
             Field::Stepover => "Stepover (mm)",
             Field::Feed => "Feed (mm/min)",
             Field::PlungeFeed => "Plunge feed (mm/min)",
+            Field::MajorDia => "Major ⌀ (mm)",
+            Field::Pitch => "Pitch (mm)",
+            Field::ThreadTop => "Thread top (mm)",
+            Field::ThreadBottom => "Thread bottom (mm)",
             Field::LeadInSize => "Lead-in size (mm)",
             Field::LeadOutSize => "Lead-out size (mm)",
             Field::PlungeA => "Plunge angle/radius",
@@ -582,9 +652,6 @@ enum Message {
     ExportNc,
     /// The chosen `.nc` path (`None` = cancelled).
     NcToExport(Option<PathBuf>),
-    /// A ribbon command that is present but not yet wired to an operation; clicking
-    /// reports it in the status line. The `&str` names the feature.
-    NotImplemented(&'static str),
     // --- Operation-creation wizard ---
     /// Begin creating an operation of `kind` (enter geometry-pick mode).
     BeginOp(OpKind),
@@ -594,6 +661,12 @@ enum Message {
     ConfirmOp,
     /// Change the selected profile's cut side.
     SideChanged(Side),
+    /// Change the selected thread between internal (bore) and external (boss).
+    ThreadInternalChanged(bool),
+    /// Change the selected thread's hand.
+    ThreadHandChanged(Hand),
+    /// Change the selected thread between climb and conventional milling.
+    ThreadClimbChanged(bool),
     /// A world `(x, y)` picked in the viewport plus the pickbox aperture in world
     /// mm (completes a pending operation).
     PickWorld([f32; 2], f32),
@@ -756,9 +829,6 @@ impl App {
                 self.fields.insert(field, value);
             }
             Message::Apply => self.apply_inspector(),
-            Message::NotImplemented(feature) => {
-                self.status = format!("{feature} is not yet implemented.");
-            }
             Message::NewProject => {
                 self.controller.new_project();
                 self.refresh_fields();
@@ -1014,6 +1084,30 @@ impl App {
                 self.controller.edit_selected_operation(|op| {
                     if let Operation::Profile(p) = op {
                         p.side = side;
+                    }
+                });
+                self.rerun();
+            }
+            Message::ThreadInternalChanged(internal) => {
+                self.controller.edit_selected_operation(|op| {
+                    if let Operation::Thread(t) = op {
+                        t.internal = internal;
+                    }
+                });
+                self.rerun();
+            }
+            Message::ThreadHandChanged(hand) => {
+                self.controller.edit_selected_operation(|op| {
+                    if let Operation::Thread(t) = op {
+                        t.hand = hand;
+                    }
+                });
+                self.rerun();
+            }
+            Message::ThreadClimbChanged(climb) => {
+                self.controller.edit_selected_operation(|op| {
+                    if let Operation::Thread(t) = op {
+                        t.climb = climb;
                     }
                 });
                 self.rerun();
@@ -1309,6 +1403,14 @@ impl App {
                 }
                 Some(Operation::Face(_)) => vec![Field::Depth, Field::Stepdown, Field::Feed],
                 Some(Operation::Drill(_)) => vec![Field::Depth, Field::Feed],
+                Some(Operation::Thread(_)) => vec![
+                    Field::MajorDia,
+                    Field::Pitch,
+                    Field::ThreadTop,
+                    Field::ThreadBottom,
+                    Field::Feed,
+                    Field::PlungeFeed,
+                ],
                 None => Vec::new(),
             },
         }
@@ -1632,11 +1734,7 @@ impl App {
                     cmd(Icon::Profile, "Profile", begin(OpKind::Profile)),
                     cmd(Icon::Pocket, "Pocket", begin(OpKind::Pocket)),
                     cmd(Icon::Drill, "Drill", begin(OpKind::Drill)),
-                    cmd(
-                        Icon::Thread,
-                        "Thread",
-                        Some(Message::NotImplemented("Threading")),
-                    ),
+                    cmd(Icon::Thread, "Thread", begin(OpKind::Thread)),
                     cmd(Icon::Face, "Face", begin(OpKind::Face)),
                 ],
             }],
@@ -1907,6 +2005,7 @@ impl App {
             OpKind::Pocket => "Pocket",
             OpKind::Drill => "Drill",
             OpKind::Face => "Face",
+            OpKind::Thread => "Thread",
         };
         // The tool is picked from the cross-project library; picking embeds a copy
         // into the setup (see `use_tool`). The current selection is the library entry
@@ -2133,6 +2232,26 @@ impl App {
                         PlungeKind::of(p.plunge),
                         &PlungeKind::ALL[..],
                         Message::PlungeKindChanged,
+                    ));
+                }
+                Some(Operation::Thread(t)) => {
+                    list = list.push(profile_picker(
+                        "Bore",
+                        Bore::of(t.internal),
+                        &Bore::ALL[..],
+                        |b| Message::ThreadInternalChanged(b == Bore::Internal),
+                    ));
+                    list = list.push(profile_picker(
+                        "Hand",
+                        t.hand,
+                        &Hand::ALL[..],
+                        Message::ThreadHandChanged,
+                    ));
+                    list = list.push(profile_picker(
+                        "Cut",
+                        CutStyle::of(t.climb),
+                        &CutStyle::ALL[..],
+                        |c| Message::ThreadClimbChanged(c == CutStyle::Climb),
                     ));
                 }
                 _ => {}
@@ -2553,6 +2672,7 @@ fn op_kind(op: &Operation) -> &'static str {
         Operation::Drill(_) => "Drill",
         Operation::Pocket(_) => "Pocket",
         Operation::Face(_) => "Face",
+        Operation::Thread(_) => "Thread",
     }
 }
 
@@ -2579,6 +2699,12 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Face(o), Field::Feed) => Some(o.feed),
         (Operation::Drill(o), Field::Depth) => Some(o.depth),
         (Operation::Drill(o), Field::Feed) => Some(o.feed),
+        (Operation::Thread(o), Field::MajorDia) => Some(o.major_dia),
+        (Operation::Thread(o), Field::Pitch) => Some(o.pitch),
+        (Operation::Thread(o), Field::ThreadTop) => Some(o.z_top),
+        (Operation::Thread(o), Field::ThreadBottom) => Some(o.z_bottom),
+        (Operation::Thread(o), Field::Feed) => Some(o.feed),
+        (Operation::Thread(o), Field::PlungeFeed) => Some(o.plunge_feed),
         _ => None,
     }
 }
@@ -2649,6 +2775,26 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
             }
             if let Some(v) = get(Field::Feed) {
                 o.feed = v;
+            }
+        }
+        Operation::Thread(o) => {
+            if let Some(v) = get(Field::MajorDia) {
+                o.major_dia = v;
+            }
+            if let Some(v) = get(Field::Pitch) {
+                o.pitch = v;
+            }
+            if let Some(v) = get(Field::ThreadTop) {
+                o.z_top = v;
+            }
+            if let Some(v) = get(Field::ThreadBottom) {
+                o.z_bottom = v;
+            }
+            if let Some(v) = get(Field::Feed) {
+                o.feed = v;
+            }
+            if let Some(v) = get(Field::PlungeFeed) {
+                o.plunge_feed = v;
             }
         }
     }
