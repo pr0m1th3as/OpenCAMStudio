@@ -635,6 +635,9 @@ enum Field {
     LeadInSize,
     /// Lead-out size.
     LeadOutSize,
+    /// Closure overlap: distance kept cutting past the start to erase the
+    /// entry/exit witness (profile, pocket, chamfer).
+    LeadOverlap,
     /// Plunge parameter A: ramp/zig-zag angle, or helix radius.
     PlungeA,
     /// Plunge parameter B: zig-zag length, or helix pitch.
@@ -677,6 +680,7 @@ impl Field {
             Field::ChamferWidth => "Chamfer width (mm)",
             Field::LeadInSize => "Lead-in size (mm)",
             Field::LeadOutSize => "Lead-out size (mm)",
+            Field::LeadOverlap => "Lead overlap (mm)",
             Field::PlungeA => "Plunge angle/radius",
             Field::PlungeB => "Plunge length/pitch",
         }
@@ -1653,19 +1657,19 @@ impl App {
                 self.refresh_fields();
             }
             Message::LeadInKindChanged(kind) => {
-                self.controller.edit_selected_operation(|op| {
-                    if let Operation::Profile(p) = op {
-                        p.lead_in = kind.to_lead(p.lead_in);
-                    }
+                self.controller.edit_selected_operation(|op| match op {
+                    Operation::Profile(p) => p.lead_in = kind.to_lead(p.lead_in),
+                    Operation::Chamfer(c) => c.lead_in = kind.to_lead(c.lead_in),
+                    _ => {}
                 });
                 self.refresh_fields();
                 self.rerun();
             }
             Message::LeadOutKindChanged(kind) => {
-                self.controller.edit_selected_operation(|op| {
-                    if let Operation::Profile(p) = op {
-                        p.lead_out = kind.to_lead(p.lead_out);
-                    }
+                self.controller.edit_selected_operation(|op| match op {
+                    Operation::Profile(p) => p.lead_out = kind.to_lead(p.lead_out),
+                    Operation::Chamfer(c) => c.lead_out = kind.to_lead(c.lead_out),
+                    _ => {}
                 });
                 self.refresh_fields();
                 self.rerun();
@@ -2028,6 +2032,7 @@ impl App {
                     if p.lead_out != Lead::None {
                         fields.push(Field::LeadOutSize);
                     }
+                    fields.push(Field::LeadOverlap);
                     match p.plunge {
                         Plunge::Straight => {}
                         Plunge::Ramp { .. } => fields.push(Field::PlungeA),
@@ -2045,6 +2050,7 @@ impl App {
                         Field::Stepover,
                         Field::Feed,
                         Field::PlungeFeed,
+                        Field::LeadOverlap,
                     ];
                     match p.plunge {
                         Plunge::Straight => {}
@@ -2058,8 +2064,16 @@ impl App {
                 }
                 Some(Operation::Face(_)) => vec![Field::Depth, Field::Stepdown, Field::Feed],
                 Some(Operation::Drill(_)) => vec![Field::Depth, Field::Feed],
-                Some(Operation::Chamfer(_)) => {
-                    vec![Field::ChamferWidth, Field::Feed, Field::PlungeFeed]
+                Some(Operation::Chamfer(c)) => {
+                    let mut fields = vec![Field::ChamferWidth, Field::Feed, Field::PlungeFeed];
+                    if c.lead_in != Lead::None {
+                        fields.push(Field::LeadInSize);
+                    }
+                    if c.lead_out != Lead::None {
+                        fields.push(Field::LeadOutSize);
+                    }
+                    fields.push(Field::LeadOverlap);
+                    fields
                 }
                 Some(Operation::Thread(_)) => vec![
                     Field::MajorDia,
@@ -3157,6 +3171,18 @@ impl App {
                         &Side::ALL[..],
                         Message::SideChanged,
                     ));
+                    list = list.push(profile_picker(
+                        "Lead-in",
+                        LeadKind::of(c.lead_in),
+                        &LeadKind::ALL[..],
+                        Message::LeadInKindChanged,
+                    ));
+                    list = list.push(profile_picker(
+                        "Lead-out",
+                        LeadKind::of(c.lead_out),
+                        &LeadKind::ALL[..],
+                        Message::LeadOutKindChanged,
+                    ));
                 }
                 Some(Operation::Thread(t)) => {
                     list = list.push(profile_picker(
@@ -3636,6 +3662,7 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Profile(o), Field::PlungeFeed) => Some(o.plunge_feed),
         (Operation::Profile(o), Field::LeadInSize) => Some(lead_size(o.lead_in)),
         (Operation::Profile(o), Field::LeadOutSize) => Some(lead_size(o.lead_out)),
+        (Operation::Profile(o), Field::LeadOverlap) => Some(o.lead_overlap),
         (Operation::Profile(o), Field::PlungeA) => Some(plunge_params(o.plunge).0),
         (Operation::Profile(o), Field::PlungeB) => Some(plunge_params(o.plunge).1),
         (Operation::Pocket(o), Field::Depth) => Some(o.depth),
@@ -3643,6 +3670,7 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Pocket(o), Field::Stepover) => Some(o.stepover),
         (Operation::Pocket(o), Field::Feed) => Some(o.feed),
         (Operation::Pocket(o), Field::PlungeFeed) => Some(o.plunge_feed),
+        (Operation::Pocket(o), Field::LeadOverlap) => Some(o.lead_overlap),
         (Operation::Pocket(o), Field::PlungeA) => Some(plunge_params(o.plunge).0),
         (Operation::Pocket(o), Field::PlungeB) => Some(plunge_params(o.plunge).1),
         (Operation::Face(o), Field::Depth) => Some(o.depth),
@@ -3653,6 +3681,9 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Chamfer(o), Field::ChamferWidth) => Some(o.width),
         (Operation::Chamfer(o), Field::Feed) => Some(o.feed),
         (Operation::Chamfer(o), Field::PlungeFeed) => Some(o.plunge_feed),
+        (Operation::Chamfer(o), Field::LeadInSize) => Some(lead_size(o.lead_in)),
+        (Operation::Chamfer(o), Field::LeadOutSize) => Some(lead_size(o.lead_out)),
+        (Operation::Chamfer(o), Field::LeadOverlap) => Some(o.lead_overlap),
         (Operation::Thread(o), Field::MajorDia) => Some(o.major_dia),
         (Operation::Thread(o), Field::Pitch) => Some(o.pitch),
         (Operation::Thread(o), Field::ThreadTop) => Some(o.z_top),
@@ -3686,6 +3717,9 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
             if let Some(v) = get(Field::LeadOutSize) {
                 o.lead_out = set_lead_size(o.lead_out, v);
             }
+            if let Some(v) = get(Field::LeadOverlap) {
+                o.lead_overlap = v.max(0.0);
+            }
             let (a, b) = plunge_params(o.plunge);
             let a = get(Field::PlungeA).unwrap_or(a);
             let b = get(Field::PlungeB).unwrap_or(b);
@@ -3706,6 +3740,9 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
             }
             if let Some(v) = get(Field::PlungeFeed) {
                 o.plunge_feed = v;
+            }
+            if let Some(v) = get(Field::LeadOverlap) {
+                o.lead_overlap = v.max(0.0);
             }
             let (a, b) = plunge_params(o.plunge);
             let a = get(Field::PlungeA).unwrap_or(a);
@@ -3740,6 +3777,15 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
             }
             if let Some(v) = get(Field::PlungeFeed) {
                 o.plunge_feed = v;
+            }
+            if let Some(v) = get(Field::LeadInSize) {
+                o.lead_in = set_lead_size(o.lead_in, v);
+            }
+            if let Some(v) = get(Field::LeadOutSize) {
+                o.lead_out = set_lead_size(o.lead_out, v);
+            }
+            if let Some(v) = get(Field::LeadOverlap) {
+                o.lead_overlap = v.max(0.0);
             }
         }
         Operation::Thread(o) => {

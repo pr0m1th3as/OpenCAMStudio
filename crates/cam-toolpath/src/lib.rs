@@ -20,6 +20,7 @@ mod chamfer;
 mod drill;
 mod emit;
 mod face;
+mod leads;
 mod plan;
 mod pocket;
 mod profile;

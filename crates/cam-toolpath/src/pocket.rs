@@ -174,9 +174,13 @@ fn emit_ring(prog: &mut Program, pts: &[Point], op: &PocketOp, h: &Heights, z: f
         op.feed,
         plunge,
     );
-    crate::emit::cut_loop(prog, pts, op.feed, cut, z);
+    // Cut the ring, keeping on past the start by `lead_overlap` to re-machine the
+    // plunge/closure witness, then retract from wherever the overlap ended (the
+    // start itself when the overlap is zero — byte-identical to before).
+    let (loop_pts, exit_pt, _tan) = crate::emit::loop_with_overlap(pts, op.lead_overlap);
+    crate::emit::cut_polyline(prog, &loop_pts, op.feed, cut, z);
     prog.push(Step::Rapid {
-        to: Point3::new(start.x, start.y, h.clearance),
+        to: Point3::new(exit_pt.x, exit_pt.y, h.clearance),
         tag: retract,
     });
 }
@@ -233,6 +237,7 @@ mod tests {
             plunge_feed: 100.0,
             plunge: Plunge::Straight,
             start: None,
+            lead_overlap: 0.0,
         };
         let ts = tools(8.0);
         let env = JobEnv {
@@ -261,6 +266,7 @@ mod tests {
                 pitch: 0.5,
             },
             start: None,
+            lead_overlap: 0.0,
         };
         let ts = tools(8.0);
         let env = JobEnv {
@@ -303,6 +309,7 @@ mod tests {
             plunge_feed: 100.0,
             plunge: Plunge::Straight,
             start: None,
+            lead_overlap: 0.0,
         };
         let ts = tools(12.0); // radius 6 > half of 10 ⇒ cannot enter
         let env = JobEnv {
@@ -312,5 +319,79 @@ mod tests {
         let result = PocketStrategy::new(op).compute(&env, &CancelToken::new());
         assert!(result.has_errors());
         assert!(result.program.is_empty());
+    }
+
+    /// Each ring's straight plunge (at its start) and the retract that follows it,
+    /// paired in emission order.
+    fn plunge_retract_pairs(result: &StrategyResult) -> Vec<(Point3, Point3)> {
+        let mut pairs = Vec::new();
+        let mut pending: Option<Point3> = None;
+        for s in result.program.steps() {
+            match s {
+                Step::Linear { to, tag, .. } if tag.kind == MoveKind::Plunge => pending = Some(*to),
+                Step::Rapid { to, tag } if tag.kind == MoveKind::Retract => {
+                    if let Some(p) = pending.take() {
+                        pairs.push((p, *to));
+                    }
+                }
+                _ => {}
+            }
+        }
+        pairs
+    }
+
+    fn pocket_op(lead_overlap: f64) -> PocketOp {
+        PocketOp {
+            id: 0,
+            tool: 1,
+            boundary: square(40.0),
+            islands: vec![],
+            depth: -1.5,
+            stepdown: 1.5,
+            stepover: 4.0,
+            feed: 300.0,
+            plunge_feed: 100.0,
+            plunge: Plunge::Straight,
+            start: None,
+            lead_overlap,
+        }
+    }
+
+    #[test]
+    fn zero_overlap_closes_each_ring_at_its_start() {
+        let env = JobEnv {
+            heights: Heights::new(5.0, 2.0, 0.0),
+            tools: &tools(8.0),
+        };
+        let result = PocketStrategy::new(pocket_op(0.0)).compute(&env, &CancelToken::new());
+        let pairs = plunge_retract_pairs(&result);
+        assert!(!pairs.is_empty());
+        for (plunge, retract) in pairs {
+            assert!(
+                (plunge.x - retract.x).abs() < 1e-9 && (plunge.y - retract.y).abs() < 1e-9,
+                "with no overlap the ring retracts exactly where it plunged"
+            );
+        }
+    }
+
+    #[test]
+    fn overlap_retracts_each_ring_past_its_start() {
+        let overlap = 2.0;
+        let env = JobEnv {
+            heights: Heights::new(5.0, 2.0, 0.0),
+            tools: &tools(8.0),
+        };
+        let result = PocketStrategy::new(pocket_op(overlap)).compute(&env, &CancelToken::new());
+        let pairs = plunge_retract_pairs(&result);
+        assert!(!pairs.is_empty());
+        for (plunge, retract) in pairs {
+            let d = ((retract.x - plunge.x).powi(2) + (retract.y - plunge.y).powi(2)).sqrt();
+            // Moved off the start, by no more than the overlap arc-length (a chord
+            // on a rounded corner can be a touch shorter, never longer).
+            assert!(
+                d > 1e-6 && d <= overlap + 1e-6,
+                "ring should retract past its start by up to {overlap} mm, got {d}"
+            );
+        }
     }
 }

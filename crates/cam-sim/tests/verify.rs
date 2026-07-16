@@ -81,6 +81,7 @@ fn a_pocket_clears_its_floor_without_collisions() {
         plunge_feed: 100.0,
         plunge: Plunge::Straight,
         start: None,
+        lead_overlap: 0.0,
     };
     let sim = run(&setup(vec![Operation::Pocket(op)]));
 
@@ -141,6 +142,7 @@ fn pocket_op() -> PocketOp {
         plunge_feed: 100.0,
         plunge: Plunge::Straight,
         start: None,
+        lead_overlap: 0.0,
     }
 }
 
@@ -204,6 +206,7 @@ fn a_bad_setup_that_rapids_low_is_caught() {
             start: None,
             lead_in: Lead::None,
             lead_out: Lead::None,
+            lead_overlap: 0.0,
             plunge: Plunge::Straight,
         })],
         origin: [0.0, 0.0, 0.0],

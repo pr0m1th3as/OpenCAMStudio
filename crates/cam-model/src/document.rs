@@ -152,9 +152,10 @@ pub enum Comp {
 
 /// How the tool eases onto (lead-in) or off (lead-out) a profiled contour at the
 /// start point, to avoid a witness mark from a direct plunge.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Lead {
     /// No lead — plunge directly onto the contour (the default).
+    #[default]
     None,
     /// A straight lead of `length` mm, tangent (collinear) to the contour.
     Linear { length: f64 },
@@ -205,6 +206,11 @@ pub struct ProfileOp {
     pub lead_in: Lead,
     /// Lead-out off the contour after the cut.
     pub lead_out: Lead,
+    /// Distance (mm, >= 0) to keep cutting past the start point before leading off,
+    /// so the lead-in/lead-out junction is re-machined and leaves no witness dent.
+    /// `0.0` (the default) leads off exactly at the start, as before.
+    #[serde(default)]
+    pub lead_overlap: f64,
     /// How the tool enters the material in Z at each pass.
     pub plunge: Plunge,
 }
@@ -259,6 +265,11 @@ pub struct PocketOp {
     /// nearest here, so the plunge/entry witness mark lands where the machinist
     /// chose. `None` uses the strategy's default entry.
     pub start: Option<[f64; 2]>,
+    /// Distance (mm, >= 0) each ring keeps cutting past its plunge/start point
+    /// before retracting, so the loop-closure junction is re-machined and leaves
+    /// no witness dent. `0.0` (the default) closes exactly at the start, as before.
+    #[serde(default)]
+    pub lead_overlap: f64,
 }
 
 /// A facing operation: clear the top of the stock over a boundary with parallel
@@ -344,6 +355,18 @@ pub struct ChamferOp {
     /// nearest here (where the lead/entry lands). `None` starts at the chain's
     /// first vertex.
     pub start: Option<[f64; 2]>,
+    /// Lead-in onto the edge at the start point (eases the tool on, off the air
+    /// side). `None` (the default) plunges directly onto the edge, as before.
+    #[serde(default)]
+    pub lead_in: Lead,
+    /// Lead-out off the edge after the cut. `None` (the default) retracts in place.
+    #[serde(default)]
+    pub lead_out: Lead,
+    /// Distance (mm, >= 0) to keep cutting past the start point before leading off,
+    /// so the loop-closure junction is re-machined and leaves no witness dent.
+    /// `0.0` (the default) closes exactly at the start, as before.
+    #[serde(default)]
+    pub lead_overlap: f64,
 }
 
 /// An operation in a setup. An enum so a setup holds a heterogeneous, ordered
@@ -487,6 +510,7 @@ mod tests {
             start: None,
             lead_in: Lead::None,
             lead_out: Lead::None,
+            lead_overlap: 0.0,
             plunge: Plunge::Straight,
         })
     }

@@ -737,6 +737,7 @@ impl AppController {
                 start,
                 lead_in: Lead::None,
                 lead_out: Lead::None,
+                lead_overlap: 0.0,
                 plunge: Plunge::Straight,
             }),
             OpKind::Pocket => {
@@ -756,6 +757,7 @@ impl AppController {
                     plunge_feed: p.plunge_feed,
                     plunge: Plunge::Straight,
                     start,
+                    lead_overlap: 0.0,
                 })
             }
             OpKind::Drill => Operation::Drill(DrillOp {
@@ -787,6 +789,9 @@ impl AppController {
                 feed: p.feed,
                 plunge_feed: p.plunge_feed,
                 start,
+                lead_in: Lead::None,
+                lead_out: Lead::None,
+                lead_overlap: 0.0,
             }),
             OpKind::Thread => {
                 // Seed one thread at the picked loop's centre; a circular hole
@@ -1389,6 +1394,7 @@ impl AppController {
                     start: None,
                     lead_in: Lead::None,
                     lead_out: Lead::None,
+                    lead_overlap: 0.0,
                     plunge: Plunge::Straight,
                 }));
                 id += 1;

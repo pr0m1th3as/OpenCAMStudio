@@ -61,6 +61,7 @@ fn document() -> Document {
         start: None,
         lead_in: Lead::None,
         lead_out: Lead::None,
+        lead_overlap: 0.0,
         plunge: Plunge::Straight,
     };
     let hole = ProfileOp {
@@ -76,6 +77,7 @@ fn document() -> Document {
         start: None,
         lead_in: Lead::None,
         lead_out: Lead::None,
+        lead_overlap: 0.0,
         plunge: Plunge::Straight,
     };
     Document::new(Setup {
@@ -197,6 +199,7 @@ fn tool_too_large_for_hole_reports_error() {
         start: None,
         lead_in: Lead::None,
         lead_out: Lead::None,
+        lead_overlap: 0.0,
         plunge: Plunge::Straight,
     };
     let tools = [tool];
@@ -231,6 +234,7 @@ fn cancellation_stops_before_emitting() {
         start: None,
         lead_in: Lead::None,
         lead_out: Lead::None,
+        lead_overlap: 0.0,
         plunge: Plunge::Straight,
     };
     let tools = [tool];
@@ -243,6 +247,87 @@ fn cancellation_stops_before_emitting() {
     let result = ProfileStrategy::new(op).compute(&env, &cancel);
     assert!(result.cancelled, "should report cancellation");
     assert!(result.program.is_empty(), "no motions when cancelled");
+}
+
+#[test]
+fn lead_overlap_recuts_past_the_start() {
+    // No leads, but a 2 mm closure overlap: after the loop closes back at the
+    // plunge point, the tool keeps *cutting* 2 mm along the contour before it
+    // retracts — re-machining the entry/exit witness. On-line comp (Side::On)
+    // cuts the sharp chain itself, so the geometry is exact: start (10,10),
+    // first edge +X, overlap point (12,10).
+    let tool = Tool {
+        number: 1,
+        diameter: 6.0,
+        length: 30.0,
+        flutes: 2,
+        kind: ToolKind::EndMill,
+    };
+    let overlap = 2.0;
+    let op = ProfileOp {
+        id: 0,
+        tool: 1,
+        chain: rect(10.0, 10.0, 70.0, 50.0),
+        side: Side::On,
+        comp: Comp::Computed,
+        depth: -2.0,
+        stepdown: 2.0,
+        feed: 300.0,
+        plunge_feed: 100.0,
+        start: None,
+        lead_in: Lead::None,
+        lead_out: Lead::None,
+        lead_overlap: overlap,
+        plunge: Plunge::Straight,
+    };
+    let tools = [tool];
+    let env = JobEnv {
+        heights: Heights::new(5.0, 2.0, 0.0),
+        tools: &tools,
+    };
+    let result = ProfileStrategy::new(op).compute(&env, &CancelToken::new());
+    assert!(!result.has_errors(), "{:?}", result.diagnostics);
+    let steps = result.program.steps();
+
+    // The straight plunge lands on the start (no lead-in).
+    let plunge = steps
+        .iter()
+        .find_map(|s| match s {
+            Step::Linear { to, tag, .. } if tag.kind == MoveKind::Plunge => Some(*to),
+            _ => None,
+        })
+        .expect("a straight plunge");
+    assert!((plunge.x - 10.0).abs() < 1e-6 && (plunge.y - 10.0).abs() < 1e-6);
+
+    // The retract lifts from the overlap point, 2 mm along +X from the start.
+    let retract = steps
+        .iter()
+        .find_map(|s| match s {
+            Step::Rapid { to, tag } if tag.kind == MoveKind::Retract => Some(*to),
+            _ => None,
+        })
+        .expect("a retract");
+    assert!(
+        (retract.x - 12.0).abs() < 1e-6 && (retract.y - 10.0).abs() < 1e-6,
+        "retract should lift 2 mm past the start, got ({}, {})",
+        retract.x,
+        retract.y
+    );
+
+    // The overlap is *cut*, not rapided: the last cutting move ends where we lift.
+    let last_cut = steps
+        .iter()
+        .rev()
+        .find_map(|s| match s {
+            Step::Linear { to, tag, .. } if tag.kind == MoveKind::Cutting => Some(*to),
+            Step::Arc { end, tag, .. } if tag.kind == MoveKind::Cutting => Some(*end),
+            _ => None,
+        })
+        .expect("cutting moves");
+    assert!(
+        (last_cut.x - 12.0).abs() < 1e-6 && (last_cut.y - 10.0).abs() < 1e-6,
+        "the last cut should end at the overlap point"
+    );
 }
 
 /// Parse grbl output (modal, absolute) and assert safety/correctness invariants:
@@ -402,6 +487,7 @@ fn arc_lead_and_helix_plunge_post_to_helical_gcode() {
         start: None,
         lead_in: Lead::Arc { radius: 3.0 },
         lead_out: Lead::Arc { radius: 3.0 },
+        lead_overlap: 0.0,
         plunge: Plunge::Helix {
             radius: 2.0,
             pitch: 1.0,

@@ -174,9 +174,14 @@ fn emit_loop(
     let pts = rotated.as_slice();
     let start = pts[0];
 
-    // Rich entry (leads and/or a non-straight plunge) takes a separate path; the
-    // default (no lead + straight plunge) keeps the original, byte-stable emission.
-    if op.lead_in != Lead::None || op.lead_out != Lead::None || op.plunge != Plunge::Straight {
+    // Rich entry (leads, a closure overlap, and/or a non-straight plunge) takes a
+    // separate path; the default (no lead + no overlap + straight plunge) keeps the
+    // original, byte-stable emission.
+    if op.lead_in != Lead::None
+        || op.lead_out != Lead::None
+        || op.lead_overlap > 0.0
+        || op.plunge != Plunge::Straight
+    {
         emit_loop_rich(prog, pts, op, h, levels, comp);
         return;
     }
@@ -233,16 +238,26 @@ fn emit_loop_rich(
 ) {
     let start = pts[0];
     let tan_in = start_tangent(pts); // leaving start, into the cut
-    let tan_out = end_tangent(pts); // arriving back at start
-    let out = outward_normal(pts); // away from the loop interior
+    let out = outward_normal(pts); // away from the loop interior (leaving tangent)
     let link = Tag::new(op.id, MoveKind::Link);
     let lead = Tag::new(op.id, MoveKind::LeadIn);
     let cut = Tag::new(op.id, MoveKind::Cutting);
     let retract = Tag::new(op.id, MoveKind::Retract);
     let plunge_tag = Tag::new(op.id, MoveKind::Plunge);
 
-    let entry = lead_start_point(start, tan_in, out, op.lead_in);
-    let exit = lead_end_point(start, tan_out, out, op.lead_out);
+    // The cut runs the loop and then keeps going `lead_overlap` mm past the start
+    // to a point `exit_on`, so the lead-off (and its junction) is re-machined. With
+    // no overlap, `exit_on == start`, `tan_out` is the arrival tangent, and the cut
+    // polyline is exactly the closed loop — byte-identical to the prior emission.
+    let (loop_pts, exit_on, tan_out) = crate::emit::loop_with_overlap(pts, op.lead_overlap);
+    let out_exit = if op.lead_overlap > 0.0 {
+        outward_normal_at(tan_out, signed_area2(pts) > 0.0)
+    } else {
+        out
+    };
+
+    let entry = crate::leads::lead_start_point(start, tan_in, out, op.lead_in);
+    let exit = crate::leads::lead_end_point(exit_on, tan_out, out_exit, op.lead_out);
 
     let mut prev_z = h.top_of_stock;
     for &z in levels {
@@ -269,18 +284,18 @@ fn emit_loop_rich(
         );
 
         // Lead onto the contour at depth: entry → start.
-        emit_lead(prog, entry, start, start, out, op.lead_in, z, op.feed, lead);
+        crate::leads::emit_lead(prog, entry, start, start, out, op.lead_in, z, op.feed, lead);
 
         if let Some(c) = comp {
             prog.push(Step::CutterComp(c));
         }
-        crate::emit::cut_loop(prog, pts, op.feed, cut, z);
+        crate::emit::cut_polyline(prog, &loop_pts, op.feed, cut, z);
         if comp.is_some() {
             prog.push(Step::CutterComp(CutterComp::Off));
         }
 
-        // Lead off the contour at depth: start → exit.
-        emit_lead(prog, start, exit, start, out, op.lead_out, z, op.feed, lead);
+        // Lead off the contour at depth: exit_on (start, or the overlap point) → exit.
+        crate::leads::emit_lead(prog, exit_on, exit, exit_on, out_exit, op.lead_out, z, op.feed, lead);
 
         prog.push(Step::Rapid {
             to: Point3::new(exit.x, exit.y, h.clearance),
@@ -291,7 +306,7 @@ fn emit_loop_rich(
 }
 
 /// Unit vector, or `(1,0)` if degenerate.
-fn unit(x: f64, y: f64) -> (f64, f64) {
+pub(crate) fn unit(x: f64, y: f64) -> (f64, f64) {
     let l = (x * x + y * y).sqrt();
     if l > 1e-12 {
         (x / l, y / l)
@@ -303,12 +318,6 @@ fn unit(x: f64, y: f64) -> (f64, f64) {
 /// Unit tangent leaving the start vertex (start → pts[1]).
 pub(crate) fn start_tangent(pts: &[Point]) -> (f64, f64) {
     unit(pts[1].x - pts[0].x, pts[1].y - pts[0].y)
-}
-
-/// Unit tangent arriving back at the start vertex (pts[last] → start).
-fn end_tangent(pts: &[Point]) -> (f64, f64) {
-    let n = pts.len();
-    unit(pts[0].x - pts[n - 1].x, pts[0].y - pts[n - 1].y)
 }
 
 /// Twice the signed area of the closed loop (shoelace); `> 0` is CCW.
@@ -323,89 +332,29 @@ fn signed_area2(pts: &[Point]) -> f64 {
         .sum()
 }
 
+/// Whether the closed loop winds counter-clockwise — the orientation needed to
+/// place a lead's outward normal (see [`outward_normal_at`]).
+pub(crate) fn is_ccw(pts: &[Point]) -> bool {
+    signed_area2(pts) > 0.0
+}
+
 /// The outward normal at the start (away from the loop interior), for placing leads
 /// and helix centres on the non-material side.
 pub(crate) fn outward_normal(pts: &[Point]) -> (f64, f64) {
-    let t = start_tangent(pts);
+    outward_normal_at(start_tangent(pts), signed_area2(pts) > 0.0)
+}
+
+/// The outward normal for a given travel tangent on a loop of the given
+/// orientation (`ccw`), away from the interior — the point-agnostic core of
+/// [`outward_normal`], reused at an overlap point where the tangent differs from
+/// the start's.
+pub(crate) fn outward_normal_at(t: (f64, f64), ccw: bool) -> (f64, f64) {
     // Interior is left of travel for a CCW loop, so outward is the right normal;
     // the reverse for CW.
-    if signed_area2(pts) > 0.0 {
+    if ccw {
         (t.1, -t.0)
     } else {
         (-t.1, t.0)
-    }
-}
-
-/// The point the tool plunges at for a lead-in (off the contour), given the start,
-/// its tangent, the outward normal, and the lead. `None` plunges on the contour.
-fn lead_start_point(start: Point, tan: (f64, f64), out: (f64, f64), lead: Lead) -> Point {
-    match lead {
-        Lead::None => start,
-        Lead::Linear { length } => Point::new(start.x - tan.0 * length, start.y - tan.1 * length),
-        // The far end of a 90° tangent arc: centre − tangent·r, centre = start + out·r.
-        Lead::Arc { radius } => Point::new(
-            start.x + (out.0 - tan.0) * radius,
-            start.y + (out.1 - tan.1) * radius,
-        ),
-    }
-}
-
-/// The point a lead-out departs to, mirroring [`lead_start_point`] with the arrival
-/// tangent.
-fn lead_end_point(start: Point, tan: (f64, f64), out: (f64, f64), lead: Lead) -> Point {
-    match lead {
-        Lead::None => start,
-        Lead::Linear { length } => Point::new(start.x + tan.0 * length, start.y + tan.1 * length),
-        Lead::Arc { radius } => Point::new(
-            start.x + (out.0 + tan.0) * radius,
-            start.y + (out.1 + tan.1) * radius,
-        ),
-    }
-}
-
-/// CW/CCW of the short arc from `from` to `to` about `centre`.
-fn short_arc_dir(centre: Point, from: Point, to: Point) -> ArcDir {
-    let a = (from.x - centre.x, from.y - centre.y);
-    let b = (to.x - centre.x, to.y - centre.y);
-    if a.0 * b.1 - a.1 * b.0 > 0.0 {
-        ArcDir::Ccw
-    } else {
-        ArcDir::Cw
-    }
-}
-
-/// Emit a lead move `from → to` at height `z` (linear, or a tangent arc centred at
-/// `on + out·radius`, where `on` is the on-contour endpoint). `None` emits nothing.
-#[allow(clippy::too_many_arguments)]
-fn emit_lead(
-    prog: &mut Program,
-    from: Point,
-    to: Point,
-    on: Point,
-    out: (f64, f64),
-    lead: Lead,
-    z: f64,
-    feed: f64,
-    tag: Tag,
-) {
-    match lead {
-        Lead::None => {}
-        Lead::Linear { .. } => prog.push(Step::Linear {
-            to: Point3::new(to.x, to.y, z),
-            feed,
-            tag,
-        }),
-        Lead::Arc { radius } => {
-            let centre = Point::new(on.x + out.0 * radius, on.y + out.1 * radius);
-            let dir = short_arc_dir(centre, from, to);
-            prog.push(Step::Arc {
-                end: Point3::new(to.x, to.y, z),
-                center: Point3::new(centre.x, centre.y, z),
-                dir,
-                feed,
-                tag,
-            });
-        }
     }
 }
 
@@ -702,8 +651,8 @@ mod tests {
         let start = Point::new(0.0, 0.0);
         let (tan, out) = ((1.0, 0.0), (0.0, 1.0));
         let r = 3.0;
-        let entry = lead_start_point(start, tan, out, Lead::Arc { radius: r });
-        let exit = lead_end_point(start, tan, out, Lead::Arc { radius: r });
+        let entry = crate::leads::lead_start_point(start, tan, out, Lead::Arc { radius: r });
+        let exit = crate::leads::lead_end_point(start, tan, out, Lead::Arc { radius: r });
         let centre = Point::new(start.x + out.0 * r, start.y + out.1 * r);
         for pt in [entry, exit, start] {
             let d = (pt.x - centre.x).hypot(pt.y - centre.y);
@@ -722,11 +671,11 @@ mod tests {
         let start = Point::new(1.0, 1.0);
         let (tan, out) = ((0.0, 1.0), (1.0, 0.0));
         assert_eq!(
-            lead_start_point(start, tan, out, Lead::Linear { length: 4.0 }),
+            crate::leads::lead_start_point(start, tan, out, Lead::Linear { length: 4.0 }),
             Point::new(1.0, -3.0)
         );
         assert_eq!(
-            lead_end_point(start, tan, out, Lead::Linear { length: 4.0 }),
+            crate::leads::lead_end_point(start, tan, out, Lead::Linear { length: 4.0 }),
             Point::new(1.0, 5.0)
         );
     }

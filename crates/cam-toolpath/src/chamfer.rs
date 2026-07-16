@@ -147,6 +147,7 @@ impl Strategy for ChamferStrategy {
         let link = Tag::new(op.id, MoveKind::Link);
         let plunge = Tag::new(op.id, MoveKind::Plunge);
         let cut = Tag::new(op.id, MoveKind::Cutting);
+        let lead = Tag::new(op.id, MoveKind::LeadIn);
         let retract = Tag::new(op.id, MoveKind::Retract);
 
         let mut program = Program::new();
@@ -173,24 +174,65 @@ impl Strategy for ChamferStrategy {
             let pts = rotated.as_slice();
             let start = pts[0];
 
-            // Approach: rapid over the start at clearance and down to the edge top,
-            // plunge to the chamfer depth, cut the loop once, retract.
+            // Lead geometry: the tool eases onto the edge at the start (off the air
+            // side when there's a lead-in) and off it after the cut. The cut runs
+            // the loop plus any closure overlap to a point `exit_on`; the lead-off
+            // recomputes its outward normal there. With no leads and no overlap this
+            // reduces to a straight plunge at the start and an in-place retract —
+            // byte-identical to before.
+            let tan_in = crate::profile::start_tangent(pts);
+            let out = crate::profile::outward_normal(pts);
+            let (loop_pts, exit_on, tan_out) =
+                crate::emit::loop_with_overlap(pts, op.lead_overlap);
+            let out_exit = if op.lead_overlap > 0.0 {
+                crate::profile::outward_normal_at(tan_out, crate::profile::is_ccw(pts))
+            } else {
+                out
+            };
+            let entry = crate::leads::lead_start_point(start, tan_in, out, op.lead_in);
+            let exit = crate::leads::lead_end_point(exit_on, tan_out, out_exit, op.lead_out);
+
+            // Approach: rapid over the entry at clearance and down to the edge top,
+            // plunge to the chamfer depth, lead on, cut the loop once, lead off,
+            // retract.
             program.push(Step::Rapid {
-                to: Point3::new(start.x, start.y, env.heights.clearance),
+                to: Point3::new(entry.x, entry.y, env.heights.clearance),
                 tag: link,
             });
             program.push(Step::Rapid {
-                to: Point3::new(start.x, start.y, op.top),
+                to: Point3::new(entry.x, entry.y, op.top),
                 tag: link,
             });
             program.push(Step::Linear {
-                to: Point3::new(start.x, start.y, depth),
+                to: Point3::new(entry.x, entry.y, depth),
                 feed: op.plunge_feed,
                 tag: plunge,
             });
-            crate::emit::cut_loop(&mut program, pts, op.feed, cut, depth);
+            crate::leads::emit_lead(
+                &mut program,
+                entry,
+                start,
+                start,
+                out,
+                op.lead_in,
+                depth,
+                op.feed,
+                lead,
+            );
+            crate::emit::cut_polyline(&mut program, &loop_pts, op.feed, cut, depth);
+            crate::leads::emit_lead(
+                &mut program,
+                exit_on,
+                exit,
+                exit_on,
+                out_exit,
+                op.lead_out,
+                depth,
+                op.feed,
+                lead,
+            );
             program.push(Step::Rapid {
-                to: Point3::new(start.x, start.y, env.heights.clearance),
+                to: Point3::new(exit.x, exit.y, env.heights.clearance),
                 tag: retract,
             });
         }
@@ -208,7 +250,7 @@ mod tests {
     use super::*;
     use cam_cldata::Step;
     use cam_geo::{Contour, Point};
-    use cam_model::{Heights, Tool};
+    use cam_model::{Heights, Lead, Tool};
 
     fn chamfer_tool(included_angle_deg: f64, tip_diameter: f64) -> Tool {
         Tool {
@@ -243,6 +285,9 @@ mod tests {
             feed: 200.0,
             plunge_feed: 100.0,
             start: None,
+            lead_in: Lead::None,
+            lead_out: Lead::None,
+            lead_overlap: 0.0,
         }
     }
 
@@ -298,5 +343,85 @@ mod tests {
     fn nonpositive_width_errors() {
         let r = run(op(0.0), chamfer_tool(90.0, 0.0));
         assert!(r.has_errors());
+    }
+
+    /// The retract lifts from the start with no overlap, and 2 mm past it (along
+    /// the +X first edge) with a 2 mm closure overlap. A sharp V (tip ⌀0) cuts the
+    /// chain itself, so the start is (0,0) and the overlap point is exactly (2,0).
+    #[test]
+    fn overlap_retracts_past_the_start() {
+        let retract_xy = |op: ChamferOp| -> Point3 {
+            let r = run(op, chamfer_tool(90.0, 0.0));
+            assert!(!r.has_errors(), "{:?}", r.diagnostics);
+            r.program
+                .steps()
+                .iter()
+                .find_map(|s| match s {
+                    Step::Rapid { to, tag } if tag.kind == MoveKind::Retract => Some(*to),
+                    _ => None,
+                })
+                .expect("a retract")
+        };
+
+        let at_zero = retract_xy(op(1.5));
+        assert!(at_zero.x.abs() < 1e-9 && at_zero.y.abs() < 1e-9, "closes at the start");
+
+        let mut with_overlap = op(1.5);
+        with_overlap.lead_overlap = 2.0;
+        let past = retract_xy(with_overlap);
+        assert!(
+            (past.x - 2.0).abs() < 1e-9 && past.y.abs() < 1e-9,
+            "should retract 2 mm past the start, got ({}, {})",
+            past.x,
+            past.y
+        );
+    }
+
+    /// Arc leads ease the tool onto and off the edge: the plunge moves off the
+    /// contour to the lead-in entry, a lead-in arc curves onto the start, and a
+    /// lead-out arc curves back off. Sharp V (tip ⌀0) cuts the chain, so the
+    /// CCW square starts at (0,0) with tangent +X and outward normal −Y; a radius-2
+    /// tangent-arc lead-in therefore enters at (−2,−2).
+    #[test]
+    fn arc_leads_ease_on_and_off_the_edge() {
+        let r = 2.0;
+        let mut o = op(1.5);
+        o.lead_in = Lead::Arc { radius: r };
+        o.lead_out = Lead::Arc { radius: r };
+        let result = run(o, chamfer_tool(90.0, 0.0));
+        assert!(!result.has_errors(), "{:?}", result.diagnostics);
+        let steps = result.program.steps();
+
+        // The plunge lands off the contour, at the lead-in entry (−2, −2).
+        let plunge = steps
+            .iter()
+            .find_map(|s| match s {
+                Step::Linear { to, tag, .. } if tag.kind == MoveKind::Plunge => Some(*to),
+                _ => None,
+            })
+            .expect("a plunge");
+        assert!(
+            (plunge.x + r).abs() < 1e-9 && (plunge.y + r).abs() < 1e-9,
+            "plunge should sit at the lead-in entry, got ({}, {})",
+            plunge.x,
+            plunge.y
+        );
+
+        // One lead-in arc and one lead-out arc, both tagged as leads.
+        let lead_arcs: Vec<Point3> = steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Arc { end, tag, .. } if tag.kind == MoveKind::LeadIn => Some(*end),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lead_arcs.len(), 2, "a lead-in and a lead-out arc");
+        // The lead-in arc lands on the edge start (0,0); cutting begins there.
+        assert!(
+            lead_arcs[0].x.abs() < 1e-9 && lead_arcs[0].y.abs() < 1e-9,
+            "lead-in should end at the edge start, got ({}, {})",
+            lead_arcs[0].x,
+            lead_arcs[0].y
+        );
     }
 }

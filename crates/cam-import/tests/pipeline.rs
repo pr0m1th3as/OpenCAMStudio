@@ -43,6 +43,7 @@ fn profile_op(id: u32, chain: cam_geo::Contour, side: Side) -> Operation {
         start: None,
         lead_in: Lead::None,
         lead_out: Lead::None,
+        lead_overlap: 0.0,
         plunge: Plunge::Straight,
     })
 }
