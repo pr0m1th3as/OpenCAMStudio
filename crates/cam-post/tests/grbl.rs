@@ -270,15 +270,38 @@ fn feed_over_machine_max_is_rejected() {
 }
 
 #[test]
-fn coordinate_outside_envelope_is_rejected() {
+fn a_toolpath_wider_than_the_travel_is_rejected() {
+    // The machine travels 300 mm in X; a path spanning 0..400 can't fit no matter
+    // where the operator zeroes it.
     let prog = ProgramBuilder::new()
         .op(0)
-        .rapid(Point3::new(400.0, 0.0, 5.0), MoveKind::Link) // X 400 > envelope max 300
+        .rapid(Point3::new(0.0, 0.0, 5.0), MoveKind::Link)
+        .rapid(Point3::new(400.0, 0.0, 5.0), MoveKind::Link)
         .build();
     assert!(matches!(
         GrblPost.post(&prog, &machine(), &PostOptions::default()),
-        Err(PostError::OutOfEnvelope { .. })
+        Err(PostError::TravelExceeded { axis: 'X', .. })
     ));
+}
+
+#[test]
+fn negative_work_coordinates_that_fit_the_travel_post_fine() {
+    // Outside profiling with the datum on the part corner puts moves at negative
+    // work coordinates (x = -radius). As long as the *span* fits the travel that is
+    // valid — the operator's G54 offset places it within the machine. This is the
+    // case the old absolute-position check wrongly rejected.
+    let prog = ProgramBuilder::new()
+        .op(0)
+        .rapid(Point3::new(-3.0, 40.0, 5.0), MoveKind::Link)
+        .feed(300.0)
+        .linear(Point3::new(60.0, 40.0, -2.0), MoveKind::Cutting)
+        .build();
+    assert!(
+        GrblPost
+            .post(&prog, &machine(), &PostOptions::default())
+            .is_ok(),
+        "a small path at negative work coords must post"
+    );
 }
 
 #[test]

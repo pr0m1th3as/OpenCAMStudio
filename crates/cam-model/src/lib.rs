@@ -48,6 +48,18 @@ impl Envelope {
             && z >= self.min.z
             && z <= self.max.z
     }
+
+    /// The machine's travel extent `(x, y, z)` — how far it can move on each axis.
+    /// This, not the absolute corners, is what a toolpath must fit within: the
+    /// operator's work offset (G54) can place the datum anywhere in travel, so a
+    /// program in work coordinates is checked by span, not absolute position.
+    pub fn extent(&self) -> (f64, f64, f64) {
+        (
+            self.max.x - self.min.x,
+            self.max.y - self.min.y,
+            self.max.z - self.min.z,
+        )
+    }
 }
 
 /// The physical machine a post drives. Its fields are the questions a post (or a

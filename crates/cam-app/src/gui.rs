@@ -595,6 +595,10 @@ enum Field {
     StockTop,
     /// Stock: block thickness below the top (mm); bottom = top − thickness.
     StockThickness,
+    /// Machine travel (working volume) on X / Y / Z, mm.
+    MachineTravelX,
+    MachineTravelY,
+    MachineTravelZ,
     /// Workpiece origin (datum) X / Y / Z, part-space mm.
     OriginX,
     OriginY,
@@ -666,6 +670,9 @@ impl Field {
             Field::StockYOffset => "Y offset (mm)",
             Field::StockTop => "Stock top (mm)",
             Field::StockThickness => "Thickness (mm)",
+            Field::MachineTravelX => "X travel (mm)",
+            Field::MachineTravelY => "Y travel (mm)",
+            Field::MachineTravelZ => "Z travel (mm)",
             Field::OriginX => "Origin X (mm)",
             Field::OriginY => "Origin Y (mm)",
             Field::OriginZ => "Origin Z (mm)",
@@ -986,6 +993,8 @@ enum Message {
     OpenSample,
     Select(Selection),
     FieldChanged(Field, String),
+    /// Rename the machine.
+    MachineNameChanged(String),
     /// Commit the inspector fields (one undo step) and recompute the toolpath.
     Apply,
     Undo,
@@ -1269,6 +1278,9 @@ impl App {
             // recomputed until Apply, so undo has one step per real change.
             Message::FieldChanged(field, value) => {
                 self.fields.insert(field, value);
+            }
+            Message::MachineNameChanged(name) => {
+                self.controller.edit_machine(|m| m.name = name);
             }
             Message::Apply => self.apply_inspector(),
             Message::NewProject => {
@@ -2041,6 +2053,11 @@ impl App {
         }
         match self.controller.selection() {
             Selection::Setup => vec![Field::Clearance, Field::Retract, Field::TopOfStock],
+            Selection::Machine => vec![
+                Field::MachineTravelX,
+                Field::MachineTravelY,
+                Field::MachineTravelZ,
+            ],
             Selection::Origin => {
                 let mut f = vec![Field::OriginX, Field::OriginY, Field::OriginZ];
                 // Start-point offset fields, only when enabled. Rendered in the
@@ -2163,6 +2180,14 @@ impl App {
                 _ => tool_kind_field(t.kind, field),
             };
         }
+        if let Field::MachineTravelX | Field::MachineTravelY | Field::MachineTravelZ = field {
+            let (x, y, z) = self.controller.machine().envelope.extent();
+            return Some(match field {
+                Field::MachineTravelX => x,
+                Field::MachineTravelY => y,
+                _ => z,
+            });
+        }
         let setup = &self.controller.document().setup;
         match field {
             Field::Clearance => Some(setup.heights.clearance),
@@ -2259,6 +2284,20 @@ impl App {
                 }
                 if let Some(&v) = parsed.get(&Field::TopOfStock) {
                     h.top_of_stock = v;
+                }
+            }),
+            Selection::Machine => self.controller.edit_machine(|m| {
+                // Travel is the working-volume extent; keep the min corner and set
+                // the max to min + travel (clamped positive).
+                let e = &mut m.envelope;
+                if let Some(&v) = parsed.get(&Field::MachineTravelX) {
+                    e.max.x = e.min.x + v.max(0.0);
+                }
+                if let Some(&v) = parsed.get(&Field::MachineTravelY) {
+                    e.max.y = e.min.y + v.max(0.0);
+                }
+                if let Some(&v) = parsed.get(&Field::MachineTravelZ) {
+                    e.max.z = e.min.z + v.max(0.0);
                 }
             }),
             Selection::Origin => {
@@ -2556,23 +2595,33 @@ impl App {
                     cmd(Icon::Face, "Face", begin(OpKind::Face)),
                 ],
             }],
-            RibbonTab::Edit => vec![GroupSpec {
-                title: "Workpiece",
-                commands: vec![
-                    toggle_cmd(
-                        Icon::SetOrigin,
-                        "Set Origin",
-                        self.setting_origin,
-                        Message::ToggleSetOrigin,
-                    ),
-                    toggle_cmd(
-                        Icon::SetOrigin,
-                        "Origin 2-pt",
-                        self.setting_origin_2pt,
-                        Message::ToggleSetOrigin2pt,
-                    ),
-                ],
-            }],
+            RibbonTab::Edit => vec![
+                GroupSpec {
+                    title: "Workpiece",
+                    commands: vec![
+                        toggle_cmd(
+                            Icon::SetOrigin,
+                            "Set Origin",
+                            self.setting_origin,
+                            Message::ToggleSetOrigin,
+                        ),
+                        toggle_cmd(
+                            Icon::SetOrigin,
+                            "Origin 2-pt",
+                            self.setting_origin_2pt,
+                            Message::ToggleSetOrigin2pt,
+                        ),
+                    ],
+                },
+                GroupSpec {
+                    title: "Machine",
+                    commands: vec![cmd(
+                        Icon::ShowStock,
+                        "Machine",
+                        Some(Message::Select(Selection::Machine)),
+                    )],
+                },
+            ],
             RibbonTab::Tooling => vec![GroupSpec {
                 title: "Library",
                 commands: vec![
@@ -3120,6 +3169,7 @@ impl App {
             Selection::Setup => "Setup".to_string(),
             Selection::Origin => "Workpiece origin".to_string(),
             Selection::Stock => "Stock".to_string(),
+            Selection::Machine => "Machine".to_string(),
             Selection::Tool(i) => format!("Tool {}", i + 1),
             Selection::Operation(id) => match self.controller.operation(id) {
                 Some(op) => format!("Operation {id} — {}", op_kind(op)),
@@ -3140,6 +3190,21 @@ impl App {
                 ))
                 .size(11)
                 .color(palette::GROUP_LABEL),
+            );
+        }
+
+        if let Selection::Machine = self.controller.selection() {
+            // Machine name (a free-text tag), above the travel fields. Committed on
+            // change so multiple machines can be told apart later.
+            list = list.push(
+                row![
+                    text("Name").width(Length::Fixed(150.0)).size(13),
+                    text_input("machine", &self.controller.machine().name)
+                        .on_input(Message::MachineNameChanged)
+                        .width(Length::Fixed(160.0)),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
             );
         }
 

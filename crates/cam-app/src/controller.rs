@@ -90,6 +90,8 @@ pub enum Selection {
     Origin,
     /// The raw stock.
     Stock,
+    /// The machine (travel limits + name).
+    Machine,
     /// A tool in the setup's tool list, by index.
     Tool(usize),
     /// An operation, by its id.
@@ -302,6 +304,13 @@ impl AppController {
         &self.machine
     }
 
+    /// Edit the machine (envelope/name/limits). No re-run needed: the backplot is
+    /// independent of the machine, and `export_nc` always re-posts against the
+    /// current machine, so limit changes are re-checked at the next export.
+    pub fn edit_machine(&mut self, f: impl FnOnce(&mut Machine)) {
+        f(&mut self.machine);
+    }
+
     /// The current document.
     pub fn document(&self) -> &Document {
         self.document.current()
@@ -323,7 +332,9 @@ impl AppController {
         self.selection = match selection {
             Selection::Tool(i) if i < self.document.current().setup.tools.len() => selection,
             Selection::Operation(id) if self.operation(id).is_some() => selection,
-            Selection::Setup | Selection::Origin | Selection::Stock => selection,
+            Selection::Setup | Selection::Origin | Selection::Stock | Selection::Machine => {
+                selection
+            }
             _ => Selection::Setup,
         };
     }

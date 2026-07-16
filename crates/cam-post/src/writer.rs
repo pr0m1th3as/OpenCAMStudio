@@ -62,18 +62,6 @@ impl<'a> Writer<'a> {
         s
     }
 
-    pub(crate) fn check_envelope(&self, p: Point3) -> Result<(), PostError> {
-        if self.machine.envelope.contains(p.x, p.y, p.z) {
-            Ok(())
-        } else {
-            Err(PostError::OutOfEnvelope {
-                x: p.x,
-                y: p.y,
-                z: p.z,
-            })
-        }
-    }
-
     pub(crate) fn check_feed(&self, feed: f64) -> Result<(), PostError> {
         if feed > self.machine.max_feed {
             Err(PostError::FeedOutOfRange(feed))
@@ -139,14 +127,12 @@ impl<'a> Writer<'a> {
 
     /// Rapid traverse (`G0`).
     pub(crate) fn rapid(&mut self, to: Point3) -> Result<(), PostError> {
-        self.check_envelope(to)?;
         self.motion(0, to, None, None)
     }
 
     /// Linear feed move (`G1`).
     pub(crate) fn feed_move(&mut self, to: Point3, feed: f64) -> Result<(), PostError> {
         self.check_feed(feed)?;
-        self.check_envelope(to)?;
         self.motion(1, to, Some(feed), None)
     }
 
@@ -161,7 +147,6 @@ impl<'a> Writer<'a> {
     ) -> Result<(), PostError> {
         self.check_feed(feed)?;
         let start = self.cur.ok_or(PostError::ArcWithoutStart)?;
-        self.check_envelope(end)?;
         let ij = (center.x - start.x, center.y - start.y);
         let g = match dir {
             ArcDir::Cw => 2,

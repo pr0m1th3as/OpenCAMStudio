@@ -45,6 +45,7 @@ impl Post for GrblPost {
         machine: &Machine,
         options: &PostOptions,
     ) -> Result<String, PostError> {
+        crate::check_travel(program, machine)?;
         let mut w = Writer::new(machine, options.precision);
 
         // Preamble: header comment, then modal defaults and the work offset.

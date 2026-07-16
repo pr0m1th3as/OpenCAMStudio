@@ -22,7 +22,7 @@ pub use grbl::GrblPost;
 
 use core::fmt;
 
-use cam_cldata::Program;
+use cam_cldata::{Point3, Program, Step};
 use cam_model::Machine;
 
 /// What a controller's dialect can express. A post lowers CL-data according to
@@ -103,8 +103,10 @@ impl Default for PostOptions {
 pub enum PostError {
     /// The program uses a feature this post cannot express or synthesise.
     Unsupported(String),
-    /// A coordinate falls outside the machine's work envelope.
-    OutOfEnvelope { x: f64, y: f64, z: f64 },
+    /// The toolpath is larger than the machine's travel on some axis. Reported as
+    /// a *span*, not an absolute coordinate: the operator's work offset (G54) can
+    /// place the datum anywhere in travel, so only the size has to fit.
+    TravelExceeded { axis: char, span: f64, travel: f64 },
     /// A requested spindle speed exceeds the machine's maximum.
     SpindleOutOfRange(f64),
     /// A requested feed exceeds the machine's maximum.
@@ -117,10 +119,10 @@ impl fmt::Display for PostError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PostError::Unsupported(what) => write!(f, "unsupported by this post: {what}"),
-            PostError::OutOfEnvelope { x, y, z } => {
+            PostError::TravelExceeded { axis, span, travel } => {
                 write!(
                     f,
-                    "coordinate ({x}, {y}, {z}) is outside the machine envelope"
+                    "toolpath spans {span:.1} mm in {axis}, over the machine's {travel:.1} mm of travel"
                 )
             }
             PostError::SpindleOutOfRange(rpm) => {
@@ -137,6 +139,66 @@ impl fmt::Display for PostError {
 }
 
 impl std::error::Error for PostError {}
+
+/// Grow `min`/`max` to include `p`.
+fn expand(min: &mut Point3, max: &mut Point3, p: Point3) {
+    min.x = min.x.min(p.x);
+    min.y = min.y.min(p.y);
+    min.z = min.z.min(p.z);
+    max.x = max.x.max(p.x);
+    max.y = max.y.max(p.y);
+    max.z = max.z.max(p.z);
+}
+
+/// The XYZ bounding box of every tool position in the program, or `None` if it has
+/// no moves.
+fn program_bounds(program: &Program) -> Option<(Point3, Point3)> {
+    let mut min = Point3::new(f64::MAX, f64::MAX, f64::MAX);
+    let mut max = Point3::new(f64::MIN, f64::MIN, f64::MIN);
+    let mut any = false;
+    for step in program.steps() {
+        match step {
+            Step::Rapid { to, .. } | Step::Linear { to, .. } => {
+                expand(&mut min, &mut max, *to);
+                any = true;
+            }
+            Step::Arc { end, .. } => {
+                expand(&mut min, &mut max, *end);
+                any = true;
+            }
+            Step::Drill(c) => {
+                for pt in &c.points {
+                    expand(&mut min, &mut max, Point3::new(pt[0], pt[1], c.retract));
+                    expand(&mut min, &mut max, Point3::new(pt[0], pt[1], c.depth));
+                    any = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    any.then_some((min, max))
+}
+
+/// Verify the toolpath fits within the machine's **travel** on every axis — its
+/// span, not its absolute position (the operator's work offset places the datum
+/// within travel, so a program in work coordinates only needs to fit by size).
+pub(crate) fn check_travel(program: &Program, machine: &Machine) -> Result<(), PostError> {
+    let Some((min, max)) = program_bounds(program) else {
+        return Ok(());
+    };
+    let (ex, ey, ez) = machine.envelope.extent();
+    const EPS: f64 = 1e-6;
+    for (axis, span, travel) in [
+        ('X', max.x - min.x, ex),
+        ('Y', max.y - min.y, ey),
+        ('Z', max.z - min.z, ez),
+    ] {
+        if span > travel + EPS {
+            return Err(PostError::TravelExceeded { axis, span, travel });
+        }
+    }
+    Ok(())
+}
 
 /// A post-processor: a controller dialect that lowers CL-data to G-code text.
 pub trait Post {

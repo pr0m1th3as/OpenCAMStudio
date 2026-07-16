@@ -42,6 +42,7 @@ impl Post for FanucPost {
         machine: &Machine,
         options: &PostOptions,
     ) -> Result<String, PostError> {
+        crate::check_travel(program, machine)?;
         let mut w = Writer::new(machine, options.precision);
 
         // Fanuc programs are bracketed by `%` and carry an O-number.
@@ -108,10 +109,6 @@ fn drill(w: &mut Writer, c: &DrillCycle) -> Result<(), PostError> {
     w.check_feed(c.feed)?;
     if c.points.is_empty() {
         return Ok(());
-    }
-    for &[x, y] in &c.points {
-        w.check_envelope(Point3::new(x, y, c.z_top))?;
-        w.check_envelope(Point3::new(x, y, c.depth))?;
     }
 
     let p = w.precision();
