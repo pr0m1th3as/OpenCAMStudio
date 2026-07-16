@@ -199,6 +199,7 @@ fn a_bad_setup_that_rapids_low_is_caught() {
             chain: square(10.0, 10.0, 30.0, 30.0),
             side: Side::Outside,
             comp: Comp::Computed,
+            offset: 0.0,
             depth: 3.0,
             stepdown: 1.5,
             feed: 300.0,

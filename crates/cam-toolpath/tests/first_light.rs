@@ -54,6 +54,7 @@ fn document() -> Document {
         chain: rect(10.0, 10.0, 70.0, 50.0),
         side: Side::Outside,
         comp: Comp::Computed,
+        offset: 0.0,
         depth: 4.0,
         stepdown: 2.0,
         feed: 300.0,
@@ -70,6 +71,7 @@ fn document() -> Document {
         chain: rect(35.0, 25.0, 45.0, 35.0),
         side: Side::Inside,
         comp: Comp::Computed,
+        offset: 0.0,
         depth: 4.0,
         stepdown: 2.0,
         feed: 300.0,
@@ -192,6 +194,7 @@ fn tool_too_large_for_hole_reports_error() {
         chain: rect(35.0, 25.0, 45.0, 35.0),
         side: Side::Inside,
         comp: Comp::Computed,
+        offset: 0.0,
         depth: 4.0,
         stepdown: 2.0,
         feed: 300.0,
@@ -227,6 +230,7 @@ fn cancellation_stops_before_emitting() {
         chain: rect(10.0, 10.0, 70.0, 50.0),
         side: Side::Outside,
         comp: Comp::Computed,
+        offset: 0.0,
         depth: 4.0,
         stepdown: 2.0,
         feed: 300.0,
@@ -270,6 +274,7 @@ fn lead_overlap_recuts_past_the_start() {
         chain: rect(10.0, 10.0, 70.0, 50.0),
         side: Side::On,
         comp: Comp::Computed,
+        offset: 0.0,
         depth: 2.0,
         stepdown: 2.0,
         feed: 300.0,
@@ -327,6 +332,63 @@ fn lead_overlap_recuts_past_the_start() {
     assert!(
         (last_cut.x - 12.0).abs() < 1e-6 && (last_cut.y - 10.0).abs() < 1e-6,
         "the last cut should end at the overlap point"
+    );
+}
+
+#[test]
+fn offset_leaves_stock_on_the_wall() {
+    // An outside profile of a 60×40 rect with a ⌀6 tool (r=3) runs at the chain
+    // edge + radius; a finishing `offset` pushes the whole path that much further
+    // out, leaving `offset` mm of stock on the wall for a later finishing pass.
+    let run_offset = |offset: f64| {
+        let op = ProfileOp {
+            id: 0,
+            tool: 1,
+            chain: rect(10.0, 10.0, 70.0, 50.0),
+            side: Side::Outside,
+            comp: Comp::Computed,
+            offset,
+            depth: 2.0,
+            stepdown: 2.0,
+            feed: 300.0,
+            plunge_feed: 100.0,
+            start: None,
+            lead_in: Lead::None,
+            lead_out: Lead::None,
+            lead_overlap: 0.0,
+            plunge: Plunge::Straight,
+        };
+        let tools = [Tool {
+            number: 1,
+            diameter: 6.0,
+            length: 30.0,
+            flutes: 2,
+            kind: ToolKind::EndMill,
+        }];
+        let env = JobEnv {
+            heights: Heights::new(5.0, 2.0, 0.0),
+            tools: &tools,
+        };
+        let result = ProfileStrategy::new(op).compute(&env, &CancelToken::new());
+        assert!(!result.has_errors(), "{:?}", result.diagnostics);
+        result
+            .program
+            .steps()
+            .iter()
+            .filter_map(|s| match s {
+                Step::Linear { to, tag, .. } if tag.kind == MoveKind::Cutting => Some(to.x),
+                Step::Arc { end, tag, .. } if tag.kind == MoveKind::Cutting => Some(end.x),
+                _ => None,
+            })
+            .fold(f64::MIN, f64::max)
+    };
+
+    let base = run_offset(0.0); // right edge 70 + radius 3
+    assert!((base - 73.0).abs() < 1e-6, "path runs at edge + radius, got {base}");
+    let left = run_offset(2.0); // + 2 mm allowance
+    assert!(
+        (left - base - 2.0).abs() < 1e-6,
+        "a 2 mm offset leaves the wall 2 mm proud, got {left}"
     );
 }
 
@@ -480,6 +542,7 @@ fn arc_lead_and_helix_plunge_post_to_helical_gcode() {
         chain: rect(40.0, 40.0, 100.0, 80.0),
         side: Side::Outside,
         comp: Comp::Computed,
+        offset: 0.0,
         depth: 4.0,
         stepdown: 2.0,
         feed: 300.0,

@@ -190,6 +190,12 @@ pub struct ProfileOp {
     pub side: Side,
     /// How radius compensation is applied.
     pub comp: Comp,
+    /// Finishing allowance left on the wall (mm): the profile stops this far short
+    /// of the chain edge, on the same side as the tool, so a later finishing
+    /// operation can take the whole vertical face in one pass. `0.0` (the default)
+    /// profiles to size. Applied on top of the tool-radius offset.
+    #[serde(default)]
+    pub offset: f64,
     /// Cut depth below the reference plane (Z=0), as a positive magnitude (mm).
     /// The final (deepest) pass sits at absolute Z `-depth`.
     pub depth: f64,
@@ -572,6 +578,7 @@ mod tests {
             ]),
             side: Side::Outside,
             comp: Comp::Computed,
+            offset: 0.0,
             depth: 4.0,
             stepdown: 2.0,
             feed: 300.0,

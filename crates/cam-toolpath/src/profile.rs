@@ -89,19 +89,23 @@ impl Strategy for ProfileStrategy {
         };
 
         // Computed comp offsets the geometry ourselves; control comp keeps the
-        // path on the contour and lets the controller (G41/G42) do the offset.
-        let (signed, comp) = match op.comp {
-            Comp::Computed => {
-                let s = match op.side {
-                    Side::Outside => tool.radius(),
-                    Side::Inside => -tool.radius(),
-                    Side::On => 0.0,
-                };
-                (s, None)
-            }
+        // path on the contour and lets the controller (G41/G42) do the radius. The
+        // finishing allowance (`offset`) leaves stock on the wall — it moves the
+        // path the same way the tool radius does (outward for Outside, inward for
+        // Inside), and is baked into the programmed path for control comp too so a
+        // roughing pass stops short of the edge. Its direction follows `side`
+        // (ignored for `On`, which has no material side).
+        let side_sign = match op.side {
+            Side::Outside => 1.0,
+            Side::Inside => -1.0,
+            Side::On => 0.0,
+        };
+        let (radius, comp) = match op.comp {
+            Comp::Computed => (tool.radius(), None),
             Comp::ControlLeft => (0.0, Some(CutterComp::Left(op.tool))),
             Comp::ControlRight => (0.0, Some(CutterComp::Right(op.tool))),
         };
+        let signed = side_sign * (radius + op.offset);
 
         let loops = if signed == 0.0 {
             vec![region]

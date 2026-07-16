@@ -36,6 +36,7 @@ fn profile_op(id: u32, chain: cam_geo::Contour, side: Side) -> Operation {
         chain,
         side,
         comp: Comp::Computed,
+        offset: 0.0,
         depth: 4.0,
         stepdown: 2.0,
         feed: 300.0,

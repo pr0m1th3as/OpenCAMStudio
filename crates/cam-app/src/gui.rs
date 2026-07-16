@@ -619,6 +619,8 @@ enum Field {
     Depth,
     Stepdown,
     Stepover,
+    /// Profile finishing allowance left on the wall (mm).
+    ProfileOffset,
     Feed,
     PlungeFeed,
     /// Thread major diameter (mm).
@@ -679,6 +681,7 @@ impl Field {
             Field::PointAngle => "Point angle (deg)",
             Field::ToolThreadPitch => "Tool pitch (mm, 0=any)",
             Field::Depth => "Depth (mm)",
+            Field::ProfileOffset => "Offset / leave (mm)",
             Field::Stepdown => "Stepdown (mm)",
             Field::Stepover => "Stepover (mm)",
             Field::Feed => "Feed (mm/min)",
@@ -2059,6 +2062,7 @@ impl App {
                     let mut fields = vec![
                         Field::Depth,
                         Field::Stepdown,
+                        Field::ProfileOffset,
                         Field::Feed,
                         Field::PlungeFeed,
                     ];
@@ -3728,6 +3732,7 @@ fn op_kind(op: &Operation) -> &'static str {
 fn op_field(op: &Operation, field: Field) -> Option<f64> {
     match (op, field) {
         (Operation::Profile(o), Field::Depth) => Some(o.depth),
+        (Operation::Profile(o), Field::ProfileOffset) => Some(o.offset),
         (Operation::Profile(o), Field::Stepdown) => Some(o.stepdown),
         (Operation::Profile(o), Field::Feed) => Some(o.feed),
         (Operation::Profile(o), Field::PlungeFeed) => Some(o.plunge_feed),
@@ -3781,6 +3786,9 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
             }
             if let Some(v) = get(Field::Stepdown) {
                 o.stepdown = v;
+            }
+            if let Some(v) = get(Field::ProfileOffset) {
+                o.offset = v;
             }
             if let Some(v) = get(Field::Feed) {
                 o.feed = v;
