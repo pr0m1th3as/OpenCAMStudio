@@ -222,6 +222,11 @@ impl Strategy for ProfileStrategy {
             };
         }
 
+        // Which side of the tool-centre loop is cleared air the lead eases in from:
+        // outside the loop for an outside profile, the hole interior for an inside
+        // one (On has no material side — leave the lead on its default normal).
+        let air_sign = if side_sign < 0.0 { -1.0 } else { 1.0 };
+
         let levels = depth_levels(env.heights.top_of_stock, floor, op.stepdown);
         let mut program = Program::new();
         for poly in &loops {
@@ -239,6 +244,7 @@ impl Strategy for ProfileStrategy {
                 &env.heights,
                 &levels,
                 comp,
+                air_sign,
             );
         }
 
@@ -299,6 +305,7 @@ fn emit_loop(
     h: &Heights,
     levels: &[f64],
     comp: Option<CutterComp>,
+    air_sign: f64,
 ) {
     if pts.len() < 3 {
         return;
@@ -315,7 +322,7 @@ fn emit_loop(
         || op.lead_overlap > 0.0
         || op.plunge != Plunge::Straight
     {
-        emit_loop_rich(prog, pts, op, h, levels, comp);
+        emit_loop_rich(prog, pts, op, h, levels, comp, air_sign);
         return;
     }
 
@@ -368,10 +375,25 @@ fn emit_loop_rich(
     h: &Heights,
     levels: &[f64],
     comp: Option<CutterComp>,
+    air_sign: f64,
 ) {
     let start = pts[0];
     let tan_in = start_tangent(pts); // leaving start, into the cut
-    let out = outward_normal(pts); // away from the loop interior (leaving tangent)
+    // The cleared/air side the lead eases in from. For an outside profile that is
+    // outward (away from the part); for an inside one it flips inward, into the hole
+    // — otherwise the lead would swing onto the material side and gouge the wall.
+    let out = {
+        let o = outward_normal(pts);
+        (o.0 * air_sign, o.1 * air_sign)
+    };
+    // An inside profile eases in from the bounded hole interior, so guard the lead
+    // against overshooting it (a hole narrower than the lead drops to a plain pass);
+    // an outside profile leads into open stock, which needs no bound.
+    let guard: Vec<Polygon> = if air_sign < 0.0 {
+        Polygon::new(Contour::new(pts.to_vec())).into_iter().collect()
+    } else {
+        Vec::new()
+    };
     let link = Tag::new(op.id, MoveKind::Link);
     let lead = Tag::new(op.id, MoveKind::LeadIn);
     let cut = Tag::new(op.id, MoveKind::Cutting);
@@ -383,14 +405,21 @@ fn emit_loop_rich(
     // no overlap, `exit_on == start`, `tan_out` is the arrival tangent, and the cut
     // polyline is exactly the closed loop — byte-identical to the prior emission.
     let (loop_pts, exit_on, tan_out) = crate::emit::loop_with_overlap(pts, op.lead_overlap);
-    let out_exit = if op.lead_overlap > 0.0 {
-        outward_normal_at(tan_out, signed_area2(pts) > 0.0)
-    } else {
-        out
+    // The lead-off normal follows the *arrival* tangent, which differs from the
+    // start's whenever the loop closes at a corner (a sharp inner offset) — reusing
+    // the start normal there yields a degenerate lead. Mid-edge the two coincide, so
+    // this stays byte-identical to the shortcut it replaces.
+    let out_exit = {
+        let o = outward_normal_at(tan_out, signed_area2(pts) > 0.0);
+        (o.0 * air_sign, o.1 * air_sign)
     };
 
-    let entry = crate::leads::lead_start_point(start, tan_in, out, op.lead_in);
-    let exit = crate::leads::lead_end_point(exit_on, tan_out, out_exit, op.lead_out);
+    // Drop a lead that would overshoot the hole interior to a plain pass (guard is
+    // empty for outside profiles, so this leaves them untouched).
+    let lead_in = crate::leads::guard_lead(&guard, start, tan_in, out, op.lead_in, true);
+    let lead_out = crate::leads::guard_lead(&guard, exit_on, tan_out, out_exit, op.lead_out, false);
+    let entry = crate::leads::lead_start_point(start, tan_in, out, lead_in);
+    let exit = crate::leads::lead_end_point(exit_on, tan_out, out_exit, lead_out);
 
     let mut prev_z = h.top_of_stock;
     for &z in levels {
@@ -417,7 +446,7 @@ fn emit_loop_rich(
         );
 
         // Lead onto the contour at depth: entry → start.
-        crate::leads::emit_lead(prog, entry, start, start, out, op.lead_in, z, op.feed, lead);
+        crate::leads::emit_lead(prog, entry, start, start, out, lead_in, z, op.feed, lead);
 
         if let Some(c) = comp {
             prog.push(Step::CutterComp(c));
@@ -428,7 +457,7 @@ fn emit_loop_rich(
         }
 
         // Lead off the contour at depth: exit_on (start, or the overlap point) → exit.
-        crate::leads::emit_lead(prog, exit_on, exit, exit_on, out_exit, op.lead_out, z, op.feed, lead);
+        crate::leads::emit_lead(prog, exit_on, exit, exit_on, out_exit, lead_out, z, op.feed, lead);
 
         prog.push(Step::Rapid {
             to: Point3::new(exit.x, exit.y, h.clearance),
@@ -863,5 +892,124 @@ mod tests {
                 Point::new(10.0, 0.0),
             ]
         );
+    }
+
+    use cam_model::{Tool, ToolKind};
+
+    fn inner_op(hole: f64, lead_r: f64, start: Option<[f64; 2]>) -> ProfileOp {
+        ProfileOp {
+            id: 0,
+            tool: 1,
+            chain: Contour::new(vec![
+                Point::new(0.0, 0.0),
+                Point::new(hole, 0.0),
+                Point::new(hole, hole),
+                Point::new(0.0, hole),
+            ]),
+            side: Side::Inside,
+            comp: Comp::Computed,
+            depth: 2.0,
+            stepdown: 2.0,
+            offset: 0.0,
+            stepover: 0.0,
+            feed: 300.0,
+            plunge_feed: 100.0,
+            plunge: Plunge::Straight,
+            start,
+            lead_in: Lead::Arc { radius: lead_r },
+            lead_out: Lead::Arc { radius: lead_r },
+            lead_overlap: 0.0,
+        }
+    }
+
+    fn run_inner(op: ProfileOp) -> StrategyResult {
+        let ts = [Tool {
+            number: 1,
+            diameter: 6.0,
+            length: 30.0,
+            flutes: 2,
+            kind: ToolKind::EndMill,
+        }];
+        let env = crate::JobEnv {
+            heights: Heights::new(5.0, 2.0, 0.0),
+            tools: &ts,
+            stock: None,
+        };
+        ProfileStrategy::new(op).compute(&env, &crate::CancelToken::new())
+    }
+
+    fn lead_arcs(r: &StrategyResult) -> Vec<(Point, Point)> {
+        let mut pos = Point::new(0.0, 0.0);
+        let mut arcs = Vec::new();
+        for s in r.program.steps() {
+            match s {
+                Step::Rapid { to, .. } | Step::Linear { to, .. } => pos = Point::new(to.x, to.y),
+                Step::Arc { end, tag, .. } => {
+                    if tag.kind == MoveKind::LeadIn {
+                        arcs.push((pos, Point::new(end.x, end.y)));
+                    }
+                    pos = Point::new(end.x, end.y);
+                }
+                _ => {}
+            }
+        }
+        arcs
+    }
+
+    #[test]
+    fn inner_profile_leads_ease_in_from_the_hole_not_the_wall() {
+        // ⌀40 square hole, ⌀6 tool: the tool-centre wall loop is [3,37], hole centre
+        // (20,20). Starting mid-edge (top edge at x=20), the lead must ease in from the
+        // interior — historically it swung the wrong way, out toward the wall (once as
+        // far as x=−3, into solid material).
+        let r = run_inner(inner_op(40.0, 3.0, Some([20.0, 40.0])));
+        assert!(!r.has_errors(), "{:?}", r.diagnostics);
+        let arcs = lead_arcs(&r);
+        assert_eq!(arcs.len(), 2, "a lead-in and a lead-out");
+        let d = |p: Point| (p.x - 20.0).hypot(p.y - 20.0);
+        for (a, b) in &arcs {
+            for p in [a, b] {
+                assert!(
+                    (-1e-6..=40.0 + 1e-6).contains(&p.x) && (-1e-6..=40.0 + 1e-6).contains(&p.y),
+                    "lead point ({}, {}) left the hole",
+                    p.x,
+                    p.y
+                );
+            }
+        }
+        let (entry, wall) = arcs[0];
+        assert!(
+            d(entry) < d(wall),
+            "inner lead must come from the interior: entry {:?} wall {:?}",
+            (entry.x, entry.y),
+            (wall.x, wall.y)
+        );
+    }
+
+    #[test]
+    fn inner_profile_lead_too_big_for_the_hole_is_dropped() {
+        // ⌀8 hole, ⌀6 tool: the wall loop is [3,5] — only 2 mm to the centre — so a
+        // radius-3 arc lead can't fit even mid-edge; it must drop to a plain pass,
+        // never overshoot the wall.
+        let r = run_inner(inner_op(8.0, 3.0, Some([4.0, 8.0])));
+        assert!(!r.has_errors(), "{:?}", r.diagnostics);
+        assert!(
+            lead_arcs(&r).is_empty(),
+            "an oversized inner lead must be dropped: {:?}",
+            lead_arcs(&r)
+        );
+        for s in r.program.steps() {
+            let p = match s {
+                Step::Linear { to, tag, .. } if tag.kind == MoveKind::Cutting => Some((to.x, to.y)),
+                Step::Arc { end, tag, .. } if tag.kind == MoveKind::Cutting => Some((end.x, end.y)),
+                _ => None,
+            };
+            if let Some((x, y)) = p {
+                assert!(
+                    (-1e-6..=8.0 + 1e-6).contains(&x) && (-1e-6..=8.0 + 1e-6).contains(&y),
+                    "cut left the hole at ({x}, {y})"
+                );
+            }
+        }
     }
 }

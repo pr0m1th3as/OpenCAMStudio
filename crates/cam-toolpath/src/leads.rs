@@ -8,7 +8,7 @@
 //! the off-contour entry/exit points and the emitted move.
 
 use cam_cldata::{ArcDir, Point3, Program, Step, Tag};
-use cam_geo::Point;
+use cam_geo::{Point, Polygon};
 use cam_model::Lead;
 
 /// The point the tool plunges at for a lead-in (off the contour), given the start,
@@ -35,6 +35,78 @@ pub(crate) fn lead_end_point(start: Point, tan: (f64, f64), out: (f64, f64), lea
             start.x + (out.0 + tan.0) * radius,
             start.y + (out.1 + tan.1) * radius,
         ),
+    }
+}
+
+/// Sample points along a lead move, for containment testing against the cleared
+/// region. `on` is the on-contour endpoint (start of a lead-in, end of a lead-out),
+/// `off` the off-contour end, `out` the cleared-side normal — the same geometry
+/// [`emit_lead`] draws. A linear lead is a straight segment, so its far end is the
+/// extreme; an arc is a 90° tangent arc about `on + out·radius`, sampled along its
+/// sweep so a bulge that pokes past the far wall is caught, not just the endpoints.
+pub(crate) fn lead_samples(on: Point, off: Point, out: (f64, f64), lead: Lead) -> Vec<Point> {
+    match lead {
+        Lead::None => Vec::new(),
+        Lead::Linear { .. } => vec![off],
+        Lead::Arc { radius } => {
+            let centre = Point::new(on.x + out.0 * radius, on.y + out.1 * radius);
+            arc_samples(centre, on, off, 8)
+        }
+    }
+}
+
+/// Points evenly spaced along the short arc from `a` to `b` about `centre`
+/// (inclusive of both ends).
+fn arc_samples(centre: Point, a: Point, b: Point, n: usize) -> Vec<Point> {
+    let r = (a.x - centre.x).hypot(a.y - centre.y);
+    let a0 = (a.y - centre.y).atan2(a.x - centre.x);
+    let b0 = (b.y - centre.y).atan2(b.x - centre.x);
+    let mut sweep = b0 - a0;
+    while sweep > std::f64::consts::PI {
+        sweep -= std::f64::consts::TAU;
+    }
+    while sweep < -std::f64::consts::PI {
+        sweep += std::f64::consts::TAU;
+    }
+    (0..=n)
+        .map(|i| {
+            let ang = a0 + sweep * (i as f64) / (n as f64);
+            Point::new(centre.x + r * ang.cos(), centre.y + r * ang.sin())
+        })
+        .collect()
+}
+
+/// Whether every sampled point of a lead stays inside the cleared/air region (the
+/// union of `guard` polygons — the area bounded by the walls the lead must not cross).
+/// An empty guard carries no information, so it never blocks a lead.
+pub(crate) fn lead_fits(guard: &[Polygon], samples: &[Point]) -> bool {
+    guard.is_empty() || samples.iter().all(|p| guard.iter().any(|g| g.contains(*p)))
+}
+
+/// A lead resolved through the overshoot guard: the lead unchanged when its whole
+/// swept move (arc bulge included) stays inside `guard` — the cleared/air region the
+/// cutter approaches from — otherwise [`Lead::None`], so a lead too big for the
+/// feature falls back to a plain pass instead of easing on across a finished wall.
+/// `on` is the on-contour endpoint, `tan` the travel tangent there, `out` the
+/// cleared-side normal. `is_in` selects lead-in vs lead-out geometry. An empty
+/// `guard` leaves the lead untouched (used where the air side is unbounded).
+pub(crate) fn guard_lead(
+    guard: &[Polygon],
+    on: Point,
+    tan: (f64, f64),
+    out: (f64, f64),
+    lead: Lead,
+    is_in: bool,
+) -> Lead {
+    let off = if is_in {
+        lead_start_point(on, tan, out, lead)
+    } else {
+        lead_end_point(on, tan, out, lead)
+    };
+    if lead_fits(guard, &lead_samples(on, off, out, lead)) {
+        lead
+    } else {
+        Lead::None
     }
 }
 

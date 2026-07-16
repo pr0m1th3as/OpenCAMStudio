@@ -203,6 +203,12 @@ fn approach(
 /// Cut a finished-wall ring with a lead-in/out eased from the cleared side, and
 /// return the exit point. Handles boundary (lead inward) and island (lead outward)
 /// walls uniformly via the loop winding.
+///
+/// A lead that would overshoot the cleared area — an arc or line whose swept
+/// geometry pokes past the far wall, which happens when the pocket is narrower than
+/// the lead radius — is dropped back to a plain (no-lead) approach on that side, so
+/// the cutter never eases on across the finished wall (`guard` bounds the cleared
+/// region; see [`lead_fits`]). Lead-in and lead-out are judged independently.
 #[allow(clippy::too_many_arguments)]
 fn emit_wall_ring(
     prog: &mut Program,
@@ -216,6 +222,7 @@ fn emit_wall_ring(
     lead_overlap: f64,
     lead_in: Lead,
     lead_out: Lead,
+    guard: &[Polygon],
     h: &Heights,
     link_threshold: f64,
 ) -> Point {
@@ -224,17 +231,21 @@ fn emit_wall_ring(
     let ccw = crate::profile::is_ccw(&ri);
     let tan_in = crate::profile::start_tangent(&ri);
     let cin = cleared_normal(tan_in, ccw);
-    let entry = crate::leads::lead_start_point(start, tan_in, cin, lead_in);
     let (loop_pts, exit_on, tan_out) = crate::emit::loop_with_overlap(&ri, lead_overlap);
     let cout = cleared_normal(tan_out, ccw);
-    let exit = crate::leads::lead_end_point(exit_on, tan_out, cout, lead_out);
+
+    // Drop any lead that would swing past the far wall down to a plain pass.
+    let eff_in = crate::leads::guard_lead(guard, start, tan_in, cin, lead_in, true);
+    let eff_out = crate::leads::guard_lead(guard, exit_on, tan_out, cout, lead_out, false);
+    let entry = crate::leads::lead_start_point(start, tan_in, cin, eff_in);
+    let exit = crate::leads::lead_end_point(exit_on, tan_out, cout, eff_out);
 
     let lead = Tag::new(id, MoveKind::LeadIn);
     let cut = Tag::new(id, MoveKind::Cutting);
     approach(prog, prev_end, entry, from_z, z, h, feed, plunge_feed, id, link_threshold);
-    crate::leads::emit_lead(prog, entry, start, start, cin, lead_in, z, feed, lead);
+    crate::leads::emit_lead(prog, entry, start, start, cin, eff_in, z, feed, lead);
     crate::emit::cut_polyline(prog, &loop_pts, feed, cut, z);
-    crate::leads::emit_lead(prog, exit_on, exit, exit_on, cout, lead_out, z, feed, lead);
+    crate::leads::emit_lead(prog, exit_on, exit, exit_on, cout, eff_out, z, feed, lead);
     exit
 }
 
@@ -249,7 +260,8 @@ fn emit_wall_ring(
 ///
 /// `rings` must be ordered **inner-first** (innermost at index 0, walls last).
 /// `link_threshold` is the hop above which a stay-down link would cut across uncut
-/// material, so we lift instead.
+/// material, so we lift instead. `guard` is the cleared region (the area bounded by
+/// the wall rings); a wall lead that would overshoot it is dropped to a plain pass.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_stay_down(
     prog: &mut Program,
@@ -262,6 +274,7 @@ pub(crate) fn emit_stay_down(
     lead_overlap: f64,
     lead_in: Lead,
     lead_out: Lead,
+    guard: &[Polygon],
     h: &Heights,
     levels: &[f64],
     link_threshold: f64,
@@ -319,6 +332,7 @@ pub(crate) fn emit_stay_down(
                     lead_overlap,
                     lead_in,
                     lead_out,
+                    guard,
                     h,
                     link_threshold,
                 );

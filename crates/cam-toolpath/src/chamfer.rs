@@ -16,7 +16,7 @@
 //! the cone so the tip lands at the bevel bottom (see the project notes).
 
 use cam_cldata::{MoveKind, Point3, Program, Step, Tag};
-use cam_geo::{offset, JoinStyle, Polygon};
+use cam_geo::{offset, Contour, JoinStyle, Polygon};
 use cam_model::{ChamferOp, Side, ToolKind};
 
 use crate::{CancelToken, Diagnostic, JobEnv, Strategy, StrategyResult};
@@ -147,6 +147,10 @@ impl Strategy for ChamferStrategy {
             Side::Inside => -off,
             Side::On => 0.0,
         };
+        // The cleared/air side the lead eases in from: outward for an external edge,
+        // the bore interior for an internal one (flip the normal, or the lead swings
+        // onto the material side and gouges).
+        let air_sign = if op.side == Side::Inside { -1.0 } else { 1.0 };
         let loops = if signed == 0.0 {
             vec![region]
         } else {
@@ -213,16 +217,31 @@ impl Strategy for ChamferStrategy {
             // reduces to a straight plunge at the start and an in-place retract —
             // byte-identical to before.
             let tan_in = crate::profile::start_tangent(pts);
-            let out = crate::profile::outward_normal(pts);
+            let out = {
+                let o = crate::profile::outward_normal(pts);
+                (o.0 * air_sign, o.1 * air_sign)
+            };
+            // An internal chamfer eases in from the bounded bore interior — guard the
+            // lead against overshooting it; an external one leads into open air.
+            let guard: Vec<Polygon> = if air_sign < 0.0 {
+                Polygon::new(Contour::new(pts.to_vec())).into_iter().collect()
+            } else {
+                Vec::new()
+            };
             let (loop_pts, exit_on, tan_out) =
                 crate::emit::loop_with_overlap(pts, op.lead_overlap);
-            let out_exit = if op.lead_overlap > 0.0 {
-                crate::profile::outward_normal_at(tan_out, crate::profile::is_ccw(pts))
-            } else {
-                out
+            // The lead-off normal follows the arrival tangent (see the profile note):
+            // at a corner start it differs from the start's, so deriving it here avoids
+            // a degenerate lead; mid-edge the two coincide.
+            let out_exit = {
+                let o = crate::profile::outward_normal_at(tan_out, crate::profile::is_ccw(pts));
+                (o.0 * air_sign, o.1 * air_sign)
             };
-            let entry = crate::leads::lead_start_point(start, tan_in, out, op.lead_in);
-            let exit = crate::leads::lead_end_point(exit_on, tan_out, out_exit, op.lead_out);
+            let lead_in = crate::leads::guard_lead(&guard, start, tan_in, out, op.lead_in, true);
+            let lead_out =
+                crate::leads::guard_lead(&guard, exit_on, tan_out, out_exit, op.lead_out, false);
+            let entry = crate::leads::lead_start_point(start, tan_in, out, lead_in);
+            let exit = crate::leads::lead_end_point(exit_on, tan_out, out_exit, lead_out);
 
             // One pass per cumulative width, shallow to deep. Each: rapid over the
             // entry at clearance and down through the already-cut air, plunge to the
@@ -249,7 +268,7 @@ impl Strategy for ChamferStrategy {
                     start,
                     start,
                     out,
-                    op.lead_in,
+                    lead_in,
                     z,
                     op.feed,
                     lead,
@@ -261,7 +280,7 @@ impl Strategy for ChamferStrategy {
                     exit,
                     exit_on,
                     out_exit,
-                    op.lead_out,
+                    lead_out,
                     z,
                     op.feed,
                     lead,
@@ -501,6 +520,44 @@ mod tests {
             lead_arcs[0].x,
             lead_arcs[0].y
         );
+    }
+
+    #[test]
+    fn internal_chamfer_leads_ease_in_from_the_bore_not_the_wall() {
+        // An internal chamfer on a ⌀20 bore (the [0,20] edge) with a sharp V cuts the
+        // edge itself. Starting mid-edge (top, x=10), the arc lead must ease in from
+        // the bore interior (nearer the centre 10,10), not swing out past the wall.
+        let mut o = op(1.5);
+        o.side = Side::Inside;
+        o.start = Some([10.0, 20.0]);
+        o.lead_in = Lead::Arc { radius: 2.0 };
+        o.lead_out = Lead::Arc { radius: 2.0 };
+        let r = run(o, chamfer_tool(90.0, 0.0));
+        assert!(!r.has_errors(), "{:?}", r.diagnostics);
+        // The plunge lands at the lead-in entry; it must sit inside the bore [0,20]
+        // and on the interior side of the (10,20) edge point (y < 20, toward centre).
+        let plunge = r
+            .program
+            .steps()
+            .iter()
+            .find_map(|s| match s {
+                Step::Linear { to, tag, .. } if tag.kind == MoveKind::Plunge => Some(*to),
+                _ => None,
+            })
+            .expect("a plunge at the lead entry");
+        assert!(
+            plunge.y < 20.0 - 1e-6 && (0.0..=20.0).contains(&plunge.x) && plunge.y >= 0.0,
+            "internal chamfer lead must enter from the bore, got ({}, {})",
+            plunge.x,
+            plunge.y
+        );
+        let leads = r
+            .program
+            .steps()
+            .iter()
+            .filter(|s| matches!(s, Step::Arc { tag, .. } if tag.kind == MoveKind::LeadIn))
+            .count();
+        assert_eq!(leads, 2, "a lead-in and a lead-out on the bore edge");
     }
 
     fn plunge_count(r: &StrategyResult) -> usize {

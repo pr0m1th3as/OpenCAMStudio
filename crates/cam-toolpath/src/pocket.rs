@@ -7,7 +7,7 @@
 //! and left standing.
 
 use cam_cldata::Program;
-use cam_geo::Polygon;
+use cam_geo::{offset, JoinStyle, Polygon};
 use cam_model::PocketOp;
 
 use crate::profile::depth_levels;
@@ -105,6 +105,11 @@ impl Strategy for PocketStrategy {
         // (innermost first, wall last).
         rings.reverse();
 
+        // The cleared region the wall leads must stay inside: the region held back by
+        // the wall ring's own offset. A lead-in/out that would swing past this (a
+        // pocket narrower than the lead) is dropped to a plain wall pass.
+        let guard = offset(std::slice::from_ref(&region), -first, JoinStyle::Round).unwrap_or_default();
+
         let levels = depth_levels(env.heights.top_of_stock, floor, op.stepdown);
         let mut program = Program::new();
         // Stay down within each level; only lift where the next ring is more than a
@@ -120,6 +125,7 @@ impl Strategy for PocketStrategy {
             op.lead_overlap,
             op.lead_in,
             op.lead_out,
+            &guard,
             &env.heights,
             &levels,
             1.5 * spacing,
@@ -462,6 +468,60 @@ mod tests {
         plain.lead_out = Lead::None;
         let r2 = PocketStrategy::new(plain).compute(&env, &CancelToken::new());
         assert!(leadin_arcs(&r2).is_empty(), "no leads when unset");
+    }
+
+    #[test]
+    fn a_lead_too_big_for_the_pocket_is_dropped_not_overshot() {
+        // A 10×10 pocket with a ⌀6 tool clears to a 4×4 wall ring — only 2 mm of
+        // room from that wall to the centre. A radius-3 arc lead cannot fit without
+        // swinging past the far wall, so it must be dropped to a plain pass (no lead
+        // arc), never emitted overshooting the boundary. High overlap gives the
+        // multiple rings that put the wall ring on the leaded path in the first place.
+        let small = PocketOp {
+            id: 0,
+            tool: 1,
+            boundary: square(10.0),
+            islands: vec![],
+            depth: 1.5,
+            stepdown: 1.5,
+            overlap: 0.9,
+            offset: 0.0,
+            feed: 300.0,
+            plunge_feed: 100.0,
+            plunge: Plunge::Straight,
+            start: None,
+            lead_overlap: 0.0,
+            lead_in: Lead::Arc { radius: 3.0 },
+            lead_out: Lead::Arc { radius: 3.0 },
+        };
+        let ts = tools(6.0);
+        let env = JobEnv {
+            heights: Heights::new(5.0, 2.0, 0.0),
+            tools: &ts,
+            stock: None,
+        };
+        let result = PocketStrategy::new(small).compute(&env, &CancelToken::new());
+        assert!(!result.has_errors(), "{:?}", result.diagnostics);
+        assert!(
+            leadin_arcs(&result).is_empty(),
+            "an oversized lead must be dropped, not emitted past the wall: {:?}",
+            leadin_arcs(&result)
+        );
+
+        // Every emitted cut stays inside the pocket boundary [0,10]² (no overshoot).
+        for s in result.program.steps() {
+            let p = match s {
+                Step::Linear { to, tag, .. } if tag.kind == MoveKind::Cutting => Some((to.x, to.y)),
+                Step::Arc { end, tag, .. } if tag.kind == MoveKind::Cutting => Some((end.x, end.y)),
+                _ => None,
+            };
+            if let Some((x, y)) = p {
+                assert!(
+                    (-1e-6..=10.0 + 1e-6).contains(&x) && (-1e-6..=10.0 + 1e-6).contains(&y),
+                    "cut left the pocket at ({x}, {y})"
+                );
+            }
+        }
     }
 
     #[test]
