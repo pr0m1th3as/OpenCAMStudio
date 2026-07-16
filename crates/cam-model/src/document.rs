@@ -227,6 +227,11 @@ pub struct ProfileOp {
     pub lead_overlap: f64,
     /// How the tool enters the material in Z at each pass.
     pub plunge: Plunge,
+    /// Constant-engagement clearing parameters for outside-roughing (used when
+    /// `stepover > 0`). `engagement <= 0` (the default) keeps plain concentric
+    /// roughing.
+    #[serde(default)]
+    pub clearing: Clearing,
 }
 
 /// A drilling operation: a set of holes taken to a depth, optionally pecked and
@@ -249,6 +254,37 @@ pub struct DrillOp {
     pub dwell: Option<f64>,
     /// Plunge feed, mm/min.
     pub feed: f64,
+}
+
+/// Default for a `#[serde(default)]` boolean field that should default to `true`.
+pub(crate) fn default_true() -> bool {
+    true
+}
+
+/// Constant-engagement (trochoidal) clearing parameters, shared by pocket clearing
+/// and profile outside-roughing. When `engagement > 0` the region is cleared with a
+/// path that keeps the tool's radial engagement bounded (higher feeds, kinder to the
+/// tool); `engagement <= 0` (the default) falls back to plain concentric-ring
+/// clearing, so existing documents are unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Clearing {
+    /// Maximum radial width of cut (mm) — the engagement cap. Bounds how much fresh
+    /// material the tool takes at once. `<= 0` disables adaptive clearing.
+    #[serde(default)]
+    pub engagement: f64,
+    /// Climb milling (`true`, the default) vs conventional (`false`) for the
+    /// clearing path.
+    #[serde(default = "default_true")]
+    pub climb: bool,
+}
+
+impl Default for Clearing {
+    fn default() -> Self {
+        Self {
+            engagement: 0.0,
+            climb: true,
+        }
+    }
 }
 
 /// A 2.5-D pocket-clearing operation: remove all material inside a closed
@@ -302,6 +338,10 @@ pub struct PocketOp {
     /// in place.
     #[serde(default)]
     pub lead_out: Lead,
+    /// Constant-engagement clearing parameters. `engagement <= 0` (the default)
+    /// keeps the plain concentric clearing.
+    #[serde(default)]
+    pub clearing: Clearing,
 }
 
 /// A principal axis in the XY plane — used to orient facing passes.
@@ -650,6 +690,7 @@ mod tests {
 
     fn profile(id: u32) -> Operation {
         Operation::Profile(ProfileOp {
+            clearing: Clearing::default(),
             id,
             tool: 1,
             chain: Contour::new(vec![

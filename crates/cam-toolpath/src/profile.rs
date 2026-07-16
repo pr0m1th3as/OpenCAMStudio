@@ -898,6 +898,7 @@ mod tests {
 
     fn inner_op(hole: f64, lead_r: f64, start: Option<[f64; 2]>) -> ProfileOp {
         ProfileOp {
+            clearing: cam_model::Clearing::default(),
             id: 0,
             tool: 1,
             chain: Contour::new(vec![

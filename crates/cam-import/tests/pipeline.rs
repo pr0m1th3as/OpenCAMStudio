@@ -31,6 +31,7 @@ fn fixture_path() -> String {
 
 fn profile_op(id: u32, chain: cam_geo::Contour, side: Side) -> Operation {
     Operation::Profile(ProfileOp {
+        clearing: cam_model::Clearing::default(),
         id,
         tool: 1,
         chain,

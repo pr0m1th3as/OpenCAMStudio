@@ -198,6 +198,7 @@ mod tests {
         // Depth 3 at 1.5 stepdown ⇒ 2 levels. Staying down means one plunge and one
         // retract *per level*, not per ring — and the rings are still all cut.
         let op = PocketOp {
+            clearing: cam_model::Clearing::default(),
             id: 0,
             tool: 1,
             boundary: square(40.0),
@@ -233,6 +234,7 @@ mod tests {
     #[test]
     fn helix_plunge_pocket_enters_on_helical_arcs() {
         let op = PocketOp {
+            clearing: cam_model::Clearing::default(),
             id: 0,
             tool: 1,
             boundary: square(40.0),
@@ -283,6 +285,7 @@ mod tests {
     #[test]
     fn tool_too_large_for_pocket_errors() {
         let op = PocketOp {
+            clearing: cam_model::Clearing::default(),
             id: 0,
             tool: 1,
             boundary: square(10.0),
@@ -330,6 +333,7 @@ mod tests {
         // Finer overlap ⇒ smaller spacing ⇒ more rings ⇒ more cutting moves.
         let run = |overlap: f64| {
             let mut op = PocketOp {
+                clearing: cam_model::Clearing::default(),
                 id: 0,
                 tool: 1,
                 boundary: square(40.0),
@@ -366,6 +370,7 @@ mod tests {
         // boundary, so the deepest cut into the +X wall is 2 mm shallower.
         let run = |offset: f64| {
             let op = PocketOp {
+                clearing: cam_model::Clearing::default(),
                 id: 0,
                 tool: 1,
                 boundary: square(40.0),
@@ -421,6 +426,7 @@ mod tests {
 
     fn leaded_op(islands: Vec<Contour>) -> PocketOp {
         PocketOp {
+            clearing: cam_model::Clearing::default(),
             id: 0,
             tool: 1,
             boundary: square(40.0),
@@ -478,6 +484,7 @@ mod tests {
         // arc), never emitted overshooting the boundary. High overlap gives the
         // multiple rings that put the wall ring on the leaded path in the first place.
         let small = PocketOp {
+            clearing: cam_model::Clearing::default(),
             id: 0,
             tool: 1,
             boundary: square(10.0),

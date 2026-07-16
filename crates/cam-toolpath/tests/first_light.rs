@@ -49,6 +49,7 @@ fn document() -> Document {
         kind: ToolKind::EndMill,
     };
     let outer = ProfileOp {
+        clearing: cam_model::Clearing::default(),
         id: 0,
         tool: 1,
         chain: rect(10.0, 10.0, 70.0, 50.0),
@@ -67,6 +68,7 @@ fn document() -> Document {
         plunge: Plunge::Straight,
     };
     let hole = ProfileOp {
+        clearing: cam_model::Clearing::default(),
         id: 1,
         tool: 1,
         chain: rect(35.0, 25.0, 45.0, 35.0),
@@ -191,6 +193,7 @@ fn tool_too_large_for_hole_reports_error() {
         kind: ToolKind::EndMill,
     };
     let op = ProfileOp {
+        clearing: cam_model::Clearing::default(),
         id: 0,
         tool: 1,
         chain: rect(35.0, 25.0, 45.0, 35.0),
@@ -229,6 +232,7 @@ fn cancellation_stops_before_emitting() {
         kind: ToolKind::EndMill,
     };
     let op = ProfileOp {
+        clearing: cam_model::Clearing::default(),
         id: 0,
         tool: 1,
         chain: rect(10.0, 10.0, 70.0, 50.0),
@@ -275,6 +279,7 @@ fn lead_overlap_recuts_past_the_start() {
     };
     let overlap = 2.0;
     let op = ProfileOp {
+        clearing: cam_model::Clearing::default(),
         id: 0,
         tool: 1,
         chain: rect(10.0, 10.0, 70.0, 50.0),
@@ -350,6 +355,7 @@ fn offset_leaves_stock_on_the_wall() {
     // out, leaving `offset` mm of stock on the wall for a later finishing pass.
     let run_offset = |offset: f64| {
         let op = ProfileOp {
+            clearing: cam_model::Clearing::default(),
             id: 0,
             tool: 1,
             chain: rect(10.0, 10.0, 70.0, 50.0),
@@ -411,6 +417,7 @@ fn plunge_count(prog: &Program) -> usize {
 
 fn rough_op(side: Side, chain: Contour, stepover: f64) -> ProfileOp {
     ProfileOp {
+        clearing: cam_model::Clearing::default(),
         id: 0,
         tool: 1,
         chain,
@@ -647,6 +654,7 @@ fn ascii_backplot(prog: &Program, w: usize, h: usize) -> String {
 #[test]
 fn arc_lead_and_helix_plunge_post_to_helical_gcode() {
     let op = ProfileOp {
+        clearing: cam_model::Clearing::default(),
         id: 0,
         tool: 1,
         // Sited well inside the envelope so the outward leads keep clear of x=0/y=0.

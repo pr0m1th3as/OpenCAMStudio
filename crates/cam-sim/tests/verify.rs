@@ -70,6 +70,7 @@ fn run(doc: &Document) -> cam_sim::SimResult {
 #[test]
 fn a_pocket_clears_its_floor_without_collisions() {
     let op = PocketOp {
+        clearing: cam_model::Clearing::default(),
         id: 0,
         tool: 1,
         boundary: square(5.0, 5.0, 35.0, 35.0),
@@ -134,6 +135,7 @@ fn pocket_target(intended_depth: f64) -> Heightfield {
 
 fn pocket_op() -> PocketOp {
     PocketOp {
+        clearing: cam_model::Clearing::default(),
         id: 0,
         tool: 1,
         boundary: square(5.0, 5.0, 35.0, 35.0),
@@ -200,6 +202,7 @@ fn a_bad_setup_that_rapids_low_is_caught() {
             kind: ToolKind::EndMill,
         }],
         operations: vec![Operation::Profile(ProfileOp {
+            clearing: cam_model::Clearing::default(),
             id: 0,
             tool: 1,
             chain: square(10.0, 10.0, 30.0, 30.0),

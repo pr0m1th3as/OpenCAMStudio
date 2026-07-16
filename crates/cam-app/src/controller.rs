@@ -750,6 +750,7 @@ impl AppController {
         // id 0 is a placeholder — add_operation renumbers with a fresh id.
         let op = match kind {
             OpKind::Profile => Operation::Profile(ProfileOp {
+                clearing: cam_model::Clearing::default(),
                 id: 0,
                 tool,
                 chain,
@@ -773,6 +774,7 @@ impl AppController {
                     .filter_map(|l| self.loop_contour(*l).cloned())
                     .collect();
                 Operation::Pocket(PocketOp {
+                    clearing: cam_model::Clearing::default(),
                     id: 0,
                     tool,
                     boundary: chain,
@@ -1443,6 +1445,7 @@ impl AppController {
             let mut id = 0u32;
             let outer_profile = |id, chain| {
                 Operation::Profile(ProfileOp {
+                    clearing: cam_model::Clearing::default(),
                     id,
                     tool: 1,
                     chain,
@@ -1490,6 +1493,7 @@ impl AppController {
                         }));
                     } else {
                         operations.push(Operation::Pocket(PocketOp {
+                            clearing: cam_model::Clearing::default(),
                             id,
                             tool: 1,
                             boundary: hole.clone(),
