@@ -392,10 +392,30 @@ pub struct ChamferOp {
     /// Which side of the chain holds material; the tool runs on the other (air)
     /// side, offset by its tip radius.
     pub side: Side,
-    /// Horizontal chamfer width, mm (> 0). The depth follows from the tool angle.
+    /// Horizontal chamfer width, mm (> 0). Together with the tool angle this fixes
+    /// the finished bevel; `depth` then chooses which section of the flank cuts it.
     pub width: f64,
     /// Absolute Z of the top edge, where the chamfer begins (usually the stock top).
     pub top: f64,
+    /// Tip depth below the top edge, mm — where the tool's bottom edge rides, which
+    /// selects the section of the cutting flank used. `0` (or anything up to the
+    /// natural `width/tan(α)`) uses the very tip at the bevel bottom (the classic
+    /// case). Larger plunges the tip deeper into the air so a higher flank section
+    /// cuts the same bevel — useful when the tip section is worn or there is no room
+    /// to plunge further with the tip.
+    #[serde(default)]
+    pub depth: f64,
+    /// Chamfer-width increment per pass, mm. `0` (or `>= width`) cuts the whole
+    /// bevel in a single pass; otherwise the bevel is reached in steps so the tool
+    /// is not overloaded (protects the tool and cleans the cut on wide bevels/hard
+    /// stock).
+    #[serde(default)]
+    pub step: f64,
+    /// When `true`, pass widths are sized for **equal material per pass** (widths
+    /// `step·√k`) instead of equal width increments, since a fixed width step
+    /// removes more material as the bevel widens. `step` sets the first pass.
+    #[serde(default)]
+    pub gradual: bool,
     /// Cutting feed, mm/min.
     pub feed: f64,
     /// Plunge feed for the approach in Z, mm/min.

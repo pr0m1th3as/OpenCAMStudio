@@ -101,8 +101,31 @@ impl Strategy for ChamferStrategy {
             bail!();
         }
 
-        let depth = op.top - op.width / tan_a;
         let tip_radius = 0.5 * tip_diameter;
+        // The tool flank shares the bevel's angle, so it lies along the finished
+        // bevel plane; sliding the tool down that plane changes which flank section
+        // cuts. `d_min` is the tip's natural depth (tip exactly at the bevel bottom).
+        // A chosen `depth` beyond that plunges the tip `delta` deeper — into the air
+        // on an external edge — so a higher flank section does the work. Sliding the
+        // tool down the plane by `delta` also shifts its axis to the air side by
+        // `delta·tan α`, and — crucially — that shift is the *same* for every
+        // partial-width pass, so a multi-pass chamfer is one XY contour cut at a
+        // sequence of Z depths.
+        let d_min = op.width / tan_a;
+        let tip_depth = op.depth.max(d_min);
+        let delta = tip_depth - d_min;
+        if op.depth > 0.0 && op.depth < d_min {
+            diagnostics.push(Diagnostic::warning(format!(
+                "operation {}: depth {:.3} is above the tip's natural depth {:.3}; using the tip",
+                op.id, op.depth, d_min
+            )));
+        }
+        if op.side == Side::Inside && delta > 1e-9 {
+            diagnostics.push(Diagnostic::warning(format!(
+                "operation {}: internal chamfer plunges the tip {:.3} mm past the bevel — not collision-checked against the bore floor/opposite wall",
+                op.id, delta
+            )));
+        }
 
         let region = match Polygon::new(op.chain.clone()) {
             Ok(p) => p,
@@ -115,11 +138,13 @@ impl Strategy for ChamferStrategy {
             }
         };
 
-        // Offset the tool axis to the air side by the tip radius (0 for a sharp V
-        // keeps it on the edge). Sign follows the profile convention.
+        // Offset the tool axis to the air side by the deep-plunge shift plus the tip
+        // radius (0 for a sharp V at the tip keeps it on the edge). Sign follows the
+        // profile convention.
+        let off = delta * tan_a + tip_radius;
         let signed = match op.side {
-            Side::Outside => tip_radius,
-            Side::Inside => -tip_radius,
+            Side::Outside => off,
+            Side::Inside => -off,
             Side::On => 0.0,
         };
         let loops = if signed == 0.0 {
@@ -150,10 +175,17 @@ impl Strategy for ChamferStrategy {
         let lead = Tag::new(op.id, MoveKind::LeadIn);
         let retract = Tag::new(op.id, MoveKind::Retract);
 
+        // Cumulative bevel widths per pass, ending exactly at the target width. The
+        // deepest (final) pass reaches `tip_depth`; shallower passes ride the same
+        // XY contour at a smaller plunge.
+        let widths = pass_widths(op.width, op.step, op.gradual);
+
         let mut program = Program::new();
         program.push(Step::Comment(format!(
-            "Chamfer: {:.3} mm wide at {}\u{00b0}",
-            op.width, included_angle_deg
+            "Chamfer: {:.3} mm wide at {}\u{00b0} in {} pass(es)",
+            op.width,
+            included_angle_deg,
+            widths.len()
         )));
 
         for poly in &loops {
@@ -192,49 +224,54 @@ impl Strategy for ChamferStrategy {
             let entry = crate::leads::lead_start_point(start, tan_in, out, op.lead_in);
             let exit = crate::leads::lead_end_point(exit_on, tan_out, out_exit, op.lead_out);
 
-            // Approach: rapid over the entry at clearance and down to the edge top,
-            // plunge to the chamfer depth, lead on, cut the loop once, lead off,
-            // retract.
-            program.push(Step::Rapid {
-                to: Point3::new(entry.x, entry.y, env.heights.clearance),
-                tag: link,
-            });
-            program.push(Step::Rapid {
-                to: Point3::new(entry.x, entry.y, op.top),
-                tag: link,
-            });
-            program.push(Step::Linear {
-                to: Point3::new(entry.x, entry.y, depth),
-                feed: op.plunge_feed,
-                tag: plunge,
-            });
-            crate::leads::emit_lead(
-                &mut program,
-                entry,
-                start,
-                start,
-                out,
-                op.lead_in,
-                depth,
-                op.feed,
-                lead,
-            );
-            crate::emit::cut_polyline(&mut program, &loop_pts, op.feed, cut, depth);
-            crate::leads::emit_lead(
-                &mut program,
-                exit_on,
-                exit,
-                exit_on,
-                out_exit,
-                op.lead_out,
-                depth,
-                op.feed,
-                lead,
-            );
-            program.push(Step::Rapid {
-                to: Point3::new(exit.x, exit.y, env.heights.clearance),
-                tag: retract,
-            });
+            // One pass per cumulative width, shallow to deep. Each: rapid over the
+            // entry at clearance and down through the already-cut air, plunge to the
+            // pass depth, lead on, cut the loop (+ overlap), lead off, retract.
+            let mut prev_z = op.top;
+            for &wk in &widths {
+                let z = op.top - (wk / tan_a + delta);
+                program.push(Step::Rapid {
+                    to: Point3::new(entry.x, entry.y, env.heights.clearance),
+                    tag: link,
+                });
+                program.push(Step::Rapid {
+                    to: Point3::new(entry.x, entry.y, prev_z),
+                    tag: link,
+                });
+                program.push(Step::Linear {
+                    to: Point3::new(entry.x, entry.y, z),
+                    feed: op.plunge_feed,
+                    tag: plunge,
+                });
+                crate::leads::emit_lead(
+                    &mut program,
+                    entry,
+                    start,
+                    start,
+                    out,
+                    op.lead_in,
+                    z,
+                    op.feed,
+                    lead,
+                );
+                crate::emit::cut_polyline(&mut program, &loop_pts, op.feed, cut, z);
+                crate::leads::emit_lead(
+                    &mut program,
+                    exit_on,
+                    exit,
+                    exit_on,
+                    out_exit,
+                    op.lead_out,
+                    z,
+                    op.feed,
+                    lead,
+                );
+                program.push(Step::Rapid {
+                    to: Point3::new(exit.x, exit.y, env.heights.clearance),
+                    tag: retract,
+                });
+                prev_z = z;
+            }
         }
 
         StrategyResult {
@@ -243,6 +280,43 @@ impl Strategy for ChamferStrategy {
             cancelled: false,
         }
     }
+}
+
+/// The cumulative bevel width at each pass, always ending exactly at `width`.
+///
+/// - `step <= 0` or `step >= width`: a single pass at the full width.
+/// - **uniform** (`!gradual`): equal width increments `step, 2·step, …` — simplest,
+///   but the material removed grows each pass (bevel area ∝ width²).
+/// - **gradual**: equal *material* per pass, so widths follow `step·√k` (the first
+///   pass is `step` wide); the increments shrink as the bevel widens.
+fn pass_widths(width: f64, step: f64, gradual: bool) -> Vec<f64> {
+    if step <= 0.0 || step >= width {
+        return vec![width];
+    }
+    let mut ws = Vec::new();
+    if gradual {
+        let mut k = 1.0_f64;
+        loop {
+            let w = step * k.sqrt();
+            if w >= width {
+                break;
+            }
+            ws.push(w);
+            k += 1.0;
+        }
+    } else {
+        let mut w = step;
+        while w < width {
+            ws.push(w);
+            w += step;
+        }
+    }
+    // Land the final pass exactly on the target (avoid a duplicate/sliver pass).
+    if ws.last().is_some_and(|&l| (width - l).abs() < 1e-9) {
+        ws.pop();
+    }
+    ws.push(width);
+    ws
 }
 
 #[cfg(test)]
@@ -282,6 +356,9 @@ mod tests {
             side: Side::Outside,
             width,
             top: 0.0,
+            depth: 0.0,
+            step: 0.0,
+            gradual: false,
             feed: 200.0,
             plunge_feed: 100.0,
             start: None,
@@ -423,5 +500,82 @@ mod tests {
             lead_arcs[0].x,
             lead_arcs[0].y
         );
+    }
+
+    fn plunge_count(r: &StrategyResult) -> usize {
+        r.program
+            .steps()
+            .iter()
+            .filter(|s| matches!(s, Step::Linear { tag, .. } if tag.kind == MoveKind::Plunge))
+            .count()
+    }
+
+    #[test]
+    fn pass_widths_uniform_and_gradual() {
+        assert_eq!(pass_widths(3.0, 0.0, false), vec![3.0], "no step ⇒ one pass");
+        assert_eq!(pass_widths(3.0, 5.0, false), vec![3.0], "step ≥ width ⇒ one pass");
+        assert_eq!(pass_widths(3.0, 1.0, false), vec![1.0, 2.0, 3.0], "uniform steps");
+
+        // Gradual, equal material per pass: widths step·√k, ending on the target.
+        // width 3, step 1 ⇒ √1..√9, i.e. exactly 9 passes (√9 = 3).
+        let g = pass_widths(3.0, 1.0, true);
+        assert_eq!(g.len(), 9, "equal-area passes: {g:?}");
+        assert!((g[1] - std::f64::consts::SQRT_2).abs() < 1e-9, "2nd pass at √2");
+        assert!((g.last().unwrap() - 3.0).abs() < 1e-9, "ends exactly at width");
+    }
+
+    #[test]
+    fn deeper_depth_plunges_the_tip_lower() {
+        // 90° tool (tan α = 1): the tip's natural depth for a 1.5 mm bevel is 1.5.
+        // Setting depth 2.0 plunges the tip 0.5 mm deeper to use a higher flank.
+        let base = cut_depth(&run(op(1.5), chamfer_tool(90.0, 0.0)).program).unwrap();
+        assert!((base + 1.5).abs() < 1e-9, "tip at bevel bottom by default");
+
+        let mut deep = op(1.5);
+        deep.depth = 2.0;
+        let z = cut_depth(&run(deep, chamfer_tool(90.0, 0.0)).program).unwrap();
+        assert!((z + 2.0).abs() < 1e-9, "tip rides 0.5 mm deeper, got {z}");
+    }
+
+    #[test]
+    fn depth_below_the_tip_minimum_falls_back_to_the_tip() {
+        // depth under width/tanα can't cut the full bevel; clamp to the tip + warn.
+        let mut shallow = op(1.5);
+        shallow.depth = 0.5;
+        let r = run(shallow, chamfer_tool(90.0, 0.0));
+        assert!((cut_depth(&r.program).unwrap() + 1.5).abs() < 1e-9, "clamped to the tip");
+        assert!(!r.diagnostics.is_empty(), "warns about the under-set depth");
+    }
+
+    #[test]
+    fn stepping_cuts_one_loop_per_pass() {
+        // width 3, step 1, uniform ⇒ 3 passes (one plunge each); the last reaches −3.
+        let mut o = op(3.0);
+        o.step = 1.0;
+        let r = run(o, chamfer_tool(90.0, 0.0));
+        assert!(!r.has_errors(), "{:?}", r.diagnostics);
+        assert_eq!(plunge_count(&r), 3, "one plunge per pass");
+        // Passes go shallow→deep: first at −1, last at −3.
+        let plunge_zs: Vec<f64> = r
+            .program
+            .steps()
+            .iter()
+            .filter_map(|s| match s {
+                Step::Linear { to, tag, .. } if tag.kind == MoveKind::Plunge => Some(to.z),
+                _ => None,
+            })
+            .collect();
+        assert!((plunge_zs[0] + 1.0).abs() < 1e-9, "first pass shallow at −1");
+        assert!((plunge_zs[2] + 3.0).abs() < 1e-9, "final pass at the full depth −3");
+    }
+
+    #[test]
+    fn gradual_makes_more_but_gentler_passes() {
+        let mut o = op(3.0);
+        o.step = 1.0;
+        o.gradual = true;
+        let r = run(o, chamfer_tool(90.0, 0.0));
+        assert!(!r.has_errors(), "{:?}", r.diagnostics);
+        assert_eq!(plunge_count(&r), 9, "equal-area gradual ⇒ 9 passes for 3 mm @ step 1");
     }
 }

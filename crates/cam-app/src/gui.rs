@@ -631,6 +631,10 @@ enum Field {
     ThreadBottom,
     /// Chamfer width (mm).
     ChamferWidth,
+    /// Chamfer tip depth below the top edge (mm); selects the flank section.
+    ChamferDepth,
+    /// Chamfer width increment per pass (mm); 0 cuts in one pass.
+    ChamferStep,
     /// Lead-in size (length for Linear, radius for Arc).
     LeadInSize,
     /// Lead-out size.
@@ -684,6 +688,8 @@ impl Field {
             Field::ThreadTop => "Thread top (mm)",
             Field::ThreadBottom => "Thread bottom (mm)",
             Field::ChamferWidth => "Chamfer width (mm)",
+            Field::ChamferDepth => "Tip depth (mm, 0=tip)",
+            Field::ChamferStep => "Step (mm, 0=one pass)",
             Field::LeadInSize => "Lead-in size (mm)",
             Field::LeadOutSize => "Lead-out size (mm)",
             Field::LeadOverlap => "Lead overlap (mm)",
@@ -1077,6 +1083,8 @@ enum Message {
     PlungeKindChanged(PlungeKind),
     /// Change the selected face op's pass direction (committed immediately).
     FaceDirectionChanged(Axis),
+    /// Toggle the selected chamfer's gradual (equal-material) stepping.
+    ChamferGradualToggled(bool),
     /// Create a new default tool and select it.
     NewTool,
     /// Delete the selected tool.
@@ -1703,6 +1711,15 @@ impl App {
                 self.refresh_fields();
                 self.rerun();
             }
+            Message::ChamferGradualToggled(on) => {
+                self.controller.edit_selected_operation(|op| {
+                    if let Operation::Chamfer(c) = op {
+                        c.gradual = on;
+                    }
+                });
+                self.refresh_fields();
+                self.rerun();
+            }
             Message::SideChanged(side) => {
                 self.controller.edit_selected_operation(|op| match op {
                     Operation::Profile(p) => p.side = side,
@@ -2093,7 +2110,13 @@ impl App {
                 ],
                 Some(Operation::Drill(_)) => vec![Field::Depth, Field::Feed],
                 Some(Operation::Chamfer(c)) => {
-                    let mut fields = vec![Field::ChamferWidth, Field::Feed, Field::PlungeFeed];
+                    let mut fields = vec![
+                        Field::ChamferWidth,
+                        Field::ChamferDepth,
+                        Field::ChamferStep,
+                        Field::Feed,
+                        Field::PlungeFeed,
+                    ];
                     if c.lead_in != Lead::None {
                         fields.push(Field::LeadInSize);
                     }
@@ -3219,6 +3242,18 @@ impl App {
                         &LeadKind::ALL[..],
                         Message::LeadOutKindChanged,
                     ));
+                    // Gradual stepping (equal material per pass) — only meaningful
+                    // when the chamfer is cut in multiple passes.
+                    list = list.push(
+                        row![
+                            text("Gradual").width(Length::Fixed(150.0)).size(13),
+                            checkbox(c.gradual)
+                                .size(15)
+                                .on_toggle(Message::ChamferGradualToggled),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                    );
                 }
                 Some(Operation::Thread(t)) => {
                     list = list.push(profile_picker(
@@ -3719,6 +3754,8 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Drill(o), Field::Depth) => Some(o.depth),
         (Operation::Drill(o), Field::Feed) => Some(o.feed),
         (Operation::Chamfer(o), Field::ChamferWidth) => Some(o.width),
+        (Operation::Chamfer(o), Field::ChamferDepth) => Some(o.depth),
+        (Operation::Chamfer(o), Field::ChamferStep) => Some(o.step),
         (Operation::Chamfer(o), Field::Feed) => Some(o.feed),
         (Operation::Chamfer(o), Field::PlungeFeed) => Some(o.plunge_feed),
         (Operation::Chamfer(o), Field::LeadInSize) => Some(lead_size(o.lead_in)),
@@ -3825,6 +3862,12 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
         Operation::Chamfer(o) => {
             if let Some(v) = get(Field::ChamferWidth) {
                 o.width = v;
+            }
+            if let Some(v) = get(Field::ChamferDepth) {
+                o.depth = v.max(0.0);
+            }
+            if let Some(v) = get(Field::ChamferStep) {
+                o.step = v.max(0.0);
             }
             if let Some(v) = get(Field::Feed) {
                 o.feed = v;

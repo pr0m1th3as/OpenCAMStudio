@@ -791,6 +791,10 @@ impl AppController {
                 side: Side::Outside,
                 width: 1.0,
                 top: p.top_of_stock,
+                // 0 depth ⇒ use the tool tip at the bevel bottom; 0 step ⇒ one pass.
+                depth: 0.0,
+                step: 0.0,
+                gradual: false,
                 feed: p.feed,
                 plunge_feed: p.plunge_feed,
                 start,
