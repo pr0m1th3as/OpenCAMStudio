@@ -317,6 +317,65 @@ pub enum Axis {
 impl Axis {
     /// Both axes, in a stable order — for pickers.
     pub const ALL: [Axis; 2] = [Axis::X, Axis::Y];
+
+    /// Infer a facing pass direction from **the boundary edge the user clicked**:
+    /// the passes run parallel to the edge nearest `pick`, snapped to the nearer
+    /// principal axis. This is the intent when a boundary is picked by clicking one
+    /// of its edges — face along the side you pointed at. Degenerate input (fewer
+    /// than two vertices) falls back to `X`.
+    pub fn along_edge_at(pts: &[cam_geo::Point], pick: cam_geo::Point) -> Axis {
+        let n = pts.len();
+        if n < 2 {
+            return Axis::X;
+        }
+        let mut best_d2 = f64::MAX;
+        let mut axis = Axis::X;
+        for i in 0..n {
+            let (a, b) = (pts[i], pts[(i + 1) % n]);
+            let d2 = point_seg_dist_sq(pick, a, b);
+            if d2 < best_d2 {
+                best_d2 = d2;
+                let (dx, dy) = ((b.x - a.x).abs(), (b.y - a.y).abs());
+                axis = if dx >= dy { Axis::X } else { Axis::Y };
+            }
+        }
+        axis
+    }
+
+    /// Infer a facing pass direction from a boundary's **longest edge**, snapped to
+    /// the nearer principal axis — the fallback when no pick point is available.
+    /// Facing along the long side gives the fewest, longest passes. Degenerate input
+    /// falls back to `X`.
+    pub fn along_longest_edge(pts: &[cam_geo::Point]) -> Axis {
+        let n = pts.len();
+        if n < 2 {
+            return Axis::X;
+        }
+        let mut best = f64::MIN;
+        let mut axis = Axis::X;
+        for i in 0..n {
+            let a = pts[i];
+            let b = pts[(i + 1) % n];
+            let (dx, dy) = ((b.x - a.x).abs(), (b.y - a.y).abs());
+            let len2 = dx * dx + dy * dy;
+            if len2 > best {
+                best = len2;
+                axis = if dx >= dy { Axis::X } else { Axis::Y };
+            }
+        }
+        axis
+    }
+}
+
+/// Squared distance from `p` to the segment `a→b` (clamped to the endpoints).
+fn point_seg_dist_sq(p: cam_geo::Point, a: cam_geo::Point, b: cam_geo::Point) -> f64 {
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    let len2 = dx * dx + dy * dy;
+    if len2 <= f64::EPSILON {
+        return p.distance_sq(a);
+    }
+    let t = (((p.x - a.x) * dx + (p.y - a.y) * dy) / len2).clamp(0.0, 1.0);
+    p.distance_sq(cam_geo::Point::new(a.x + dx * t, a.y + dy * t))
 }
 
 impl std::fmt::Display for Axis {
@@ -613,6 +672,36 @@ mod tests {
             lead_overlap: 0.0,
             plunge: Plunge::Straight,
         })
+    }
+
+    #[test]
+    fn face_direction_follows_the_picked_edge() {
+        // 60×40 rectangle. Clicking a horizontal edge ⇒ pass along X; clicking a
+        // vertical edge ⇒ pass along Y — regardless of which is longer.
+        let rect = [
+            Point::new(0.0, 0.0),
+            Point::new(60.0, 0.0),
+            Point::new(60.0, 40.0),
+            Point::new(0.0, 40.0),
+        ];
+        // Pick near the bottom edge (horizontal) → X.
+        assert_eq!(Axis::along_edge_at(&rect, Point::new(30.0, 0.5)), Axis::X);
+        // Pick near the right edge (vertical) → Y, even though it is the short side.
+        assert_eq!(Axis::along_edge_at(&rect, Point::new(59.5, 20.0)), Axis::Y);
+        // Degenerate input falls back to X.
+        assert_eq!(Axis::along_edge_at(&[Point::new(1.0, 1.0)], Point::new(0.0, 0.0)), Axis::X);
+    }
+
+    #[test]
+    fn face_direction_longest_edge_fallback() {
+        // No pick: default to the longest edge. 40×60 ⇒ long side is Y.
+        let tall = [
+            Point::new(0.0, 0.0),
+            Point::new(40.0, 0.0),
+            Point::new(40.0, 60.0),
+            Point::new(0.0, 60.0),
+        ];
+        assert_eq!(Axis::along_longest_edge(&tall), Axis::Y);
     }
 
     #[test]

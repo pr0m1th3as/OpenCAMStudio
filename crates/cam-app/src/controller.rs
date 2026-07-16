@@ -799,21 +799,32 @@ impl AppController {
                 dwell: None,
                 feed: p.plunge_feed,
             }),
-            OpKind::Face => Operation::Face(FaceOp {
-                id: 0,
-                tool,
-                boundary: chain,
-                // Face at the reference plane by default; a shallow skim the user
-                // then tunes (start_offset raises it to level proud stock).
-                start_offset: 0.0,
-                depth: 1.0,
-                stepdown: p.stepdown,
-                overlap: 0.5,
-                overshoot: 2.0,
-                direction: Axis::X,
-                feed: p.feed,
-                plunge_feed: p.plunge_feed,
-            }),
+            OpKind::Face => {
+                // Face along the edge the user clicked to pick the boundary (the
+                // snapped pick point rides on it); with no pick, fall back to the
+                // longest edge. The inspector picker still overrides either way.
+                let direction = match start {
+                    Some([x, y]) => {
+                        Axis::along_edge_at(chain.points(), cam_geo::Point::new(x, y))
+                    }
+                    None => Axis::along_longest_edge(chain.points()),
+                };
+                Operation::Face(FaceOp {
+                    id: 0,
+                    tool,
+                    boundary: chain,
+                    // Face at the reference plane by default; a shallow skim the user
+                    // then tunes (start_offset raises it to level proud stock).
+                    start_offset: 0.0,
+                    depth: 1.0,
+                    stepdown: p.stepdown,
+                    overlap: 0.5,
+                    overshoot: 2.0,
+                    direction,
+                    feed: p.feed,
+                    plunge_feed: p.plunge_feed,
+                })
+            }
             OpKind::Chamfer => Operation::Chamfer(ChamferOp {
                 id: 0,
                 tool,
