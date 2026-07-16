@@ -81,8 +81,37 @@ impl Strategy for PocketStrategy {
             fail!("operation {}: overlap leaves no stepover", op.id);
         }
         let first = r + op.offset;
-        let mut rings = match crate::rings::concentric_rings(&region, first, spacing, cancel) {
-            Ok(rings) => rings,
+
+        // The cleared region the wall leads must stay inside: the region held back by
+        // the wall ring's own offset. A lead-in/out that would swing past this (a
+        // pocket narrower than the lead) is dropped to a plain wall pass.
+        let guard = offset(std::slice::from_ref(&region), -first, JoinStyle::Round).unwrap_or_default();
+
+        let levels = depth_levels(env.heights.top_of_stock, floor, op.stepdown);
+        let mut program = Program::new();
+        // Clear through the shared engine: engagement-spaced, climb-oriented,
+        // stay-down inside-out rings, with the finishing wall leads.
+        let job = crate::clearing::ClearJob {
+            id: op.id,
+            first,
+            spacing,
+            clearing: op.clearing,
+            plunge: op.plunge,
+            feed: op.feed,
+            plunge_feed: op.plunge_feed,
+            lead_overlap: op.lead_overlap,
+            lead_in: op.lead_in,
+            lead_out: op.lead_out,
+            start: op.start,
+            guard: &guard,
+        };
+        match crate::clearing::clear(&mut program, &region, &job, &env.heights, &levels, cancel) {
+            Ok(0) => fail!(
+                "operation {}: tool (⌀{}) is too large to enter the pocket",
+                op.id,
+                tool.diameter
+            ),
+            Ok(_) => {}
             Err(crate::rings::RingsError::Cancelled) => {
                 return StrategyResult {
                     diagnostics,
@@ -93,43 +122,7 @@ impl Strategy for PocketStrategy {
             Err(crate::rings::RingsError::Offset(e)) => {
                 fail!("operation {}: offset failed: {e}", op.id)
             }
-        };
-        if rings.is_empty() {
-            fail!(
-                "operation {}: tool (⌀{}) is too large to enter the pocket",
-                op.id,
-                tool.diameter
-            );
         }
-        // `concentric_rings` yields wall-most first; reverse to carve inside-out
-        // (innermost first, wall last).
-        rings.reverse();
-
-        // The cleared region the wall leads must stay inside: the region held back by
-        // the wall ring's own offset. A lead-in/out that would swing past this (a
-        // pocket narrower than the lead) is dropped to a plain wall pass.
-        let guard = offset(std::slice::from_ref(&region), -first, JoinStyle::Round).unwrap_or_default();
-
-        let levels = depth_levels(env.heights.top_of_stock, floor, op.stepdown);
-        let mut program = Program::new();
-        // Stay down within each level; only lift where the next ring is more than a
-        // ring-and-a-half away (an island loop or a pinched lobe) to cut across.
-        crate::rings::emit_stay_down(
-            &mut program,
-            &rings,
-            op.start,
-            op.id,
-            op.feed,
-            op.plunge_feed,
-            op.plunge,
-            op.lead_overlap,
-            op.lead_in,
-            op.lead_out,
-            &guard,
-            &env.heights,
-            &levels,
-            1.5 * spacing,
-        );
 
         StrategyResult {
             program,
@@ -144,7 +137,7 @@ mod tests {
     use super::*;
     use cam_cldata::{MoveKind, Step};
     use cam_geo::{Contour, Point};
-    use cam_model::{Heights, Lead, Plunge, Tool, ToolKind};
+    use cam_model::{Clearing, Heights, Lead, Plunge, Tool, ToolKind};
 
     fn square(side: f64) -> Contour {
         Contour::new(vec![
@@ -474,6 +467,105 @@ mod tests {
         plain.lead_out = Lead::None;
         let r2 = PocketStrategy::new(plain).compute(&env, &CancelToken::new());
         assert!(leadin_arcs(&r2).is_empty(), "no leads when unset");
+    }
+
+    /// Signed area of the ordered cutting-move endpoints (shoelace); its sign is the
+    /// overall travel winding, which flips between climb and conventional.
+    fn cutting_path_signed_area(result: &StrategyResult) -> f64 {
+        let pts: Vec<(f64, f64)> = result
+            .program
+            .steps()
+            .iter()
+            .filter_map(|s| match s {
+                Step::Linear { to, tag, .. } if tag.kind == MoveKind::Cutting => Some((to.x, to.y)),
+                Step::Arc { end, tag, .. } if tag.kind == MoveKind::Cutting => Some((end.x, end.y)),
+                _ => None,
+            })
+            .collect();
+        let n = pts.len();
+        (0..n)
+            .map(|i| {
+                let (ax, ay) = pts[i];
+                let (bx, by) = pts[(i + 1) % n];
+                ax * by - bx * ay
+            })
+            .sum()
+    }
+
+    #[test]
+    fn engagement_cap_tightens_the_spacing() {
+        // A 2 mm engagement cap on a ⌀8 tool forces 2 mm rings where 50% overlap
+        // alone would space them 4 mm — so more rings, more cutting moves.
+        let run = |engagement: f64| {
+            let mut op = leaded_op(vec![]);
+            op.lead_in = Lead::None;
+            op.lead_out = Lead::None;
+            op.clearing = Clearing { engagement, climb: true };
+            let ts = tools(8.0);
+            let env = JobEnv {
+                heights: Heights::new(5.0, 2.0, 0.0),
+                tools: &ts,
+                stock: None,
+            };
+            let r = PocketStrategy::new(op).compute(&env, &CancelToken::new());
+            assert!(!r.has_errors(), "{:?}", r.diagnostics);
+            cutting_moves(&r)
+        };
+        assert!(
+            run(2.0) > run(0.0),
+            "a tighter engagement cap ⇒ more rings ({} vs {})",
+            run(2.0),
+            run(0.0)
+        );
+    }
+
+    #[test]
+    fn conventional_milling_reverses_travel_but_keeps_leads_inside() {
+        let ts = tools(8.0);
+        let env = JobEnv {
+            heights: Heights::new(5.0, 2.0, 0.0),
+            tools: &ts,
+            stock: None,
+        };
+        // Same pocket, climb vs conventional: the overall travel winding flips sign.
+        let climb = {
+            let mut op = leaded_op(vec![]);
+            op.lead_in = Lead::None;
+            op.lead_out = Lead::None;
+            op.clearing = Clearing { engagement: 0.0, climb: true };
+            PocketStrategy::new(op).compute(&env, &CancelToken::new())
+        };
+        let conv = {
+            let mut op = leaded_op(vec![]);
+            op.lead_in = Lead::None;
+            op.lead_out = Lead::None;
+            op.clearing = Clearing { engagement: 0.0, climb: false };
+            PocketStrategy::new(op).compute(&env, &CancelToken::new())
+        };
+        let a_climb = cutting_path_signed_area(&climb);
+        let a_conv = cutting_path_signed_area(&conv);
+        assert!(
+            a_climb * a_conv < 0.0,
+            "conventional must reverse travel: signed areas {a_climb} vs {a_conv}"
+        );
+
+        // With conventional milling *and* wall leads, the lead must still ease in from
+        // the cleared interior (not swing onto the wall) — the reversal is threaded
+        // through to the lead's cleared-side normal.
+        let mut leaded = leaded_op(vec![]);
+        leaded.clearing = Clearing { engagement: 0.0, climb: false };
+        let r = PocketStrategy::new(leaded).compute(&env, &CancelToken::new());
+        assert!(!r.has_errors(), "{:?}", r.diagnostics);
+        let arcs = leadin_arcs(&r);
+        assert_eq!(arcs.len(), 2, "conventional still leads on/off the wall");
+        let d = |p: Point| (p.x - 20.0).hypot(p.y - 20.0);
+        let (entry, wall) = arcs[0];
+        assert!(
+            d(entry) < d(wall),
+            "conventional lead must still come from inside: entry {:?} wall {:?}",
+            (entry.x, entry.y),
+            (wall.x, wall.y)
+        );
     }
 
     #[test]

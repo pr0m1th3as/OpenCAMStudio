@@ -17,6 +17,7 @@
 //!   `cdylib` plugin ABI later is cheap.
 
 mod chamfer;
+mod clearing;
 mod drill;
 mod emit;
 mod face;

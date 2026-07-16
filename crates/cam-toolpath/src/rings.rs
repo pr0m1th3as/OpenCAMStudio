@@ -157,15 +157,18 @@ fn enter_straight(prog: &mut Program, p: Point, from_z: f64, z: f64, h: &Heights
 }
 
 /// The normal toward the **cleared** side of a wall loop — where the tool has been,
-/// and where a wall lead must sit. For a boundary loop (CCW) that is the loop's
-/// interior; for an island loop (CW) it is the exterior. Either way it points into
-/// the pocket, away from the finished wall.
-fn cleared_normal(t: (f64, f64), ccw: bool) -> (f64, f64) {
-    let o = crate::profile::outward_normal_at(t, ccw);
-    if ccw {
-        (-o.0, -o.1)
+/// and where a wall lead must sit (into the pocket, away from the finished wall).
+///
+/// The clearing rings are wound so the cleared/pocket side is on the **left** of
+/// travel (a boundary loop CCW, an island loop CW both satisfy this). Conventional
+/// milling reverses every loop's travel, moving the cleared side to the **right**;
+/// `reversed` (`climb == false`) selects that.
+fn cleared_normal(t: (f64, f64), reversed: bool) -> (f64, f64) {
+    let left = (-t.1, t.0);
+    if reversed {
+        (-left.0, -left.1)
     } else {
-        o
+        left
     }
 }
 
@@ -223,16 +226,16 @@ fn emit_wall_ring(
     lead_in: Lead,
     lead_out: Lead,
     guard: &[Polygon],
+    reversed: bool,
     h: &Heights,
     link_threshold: f64,
 ) -> Point {
     let ri = crate::profile::rotate_to_start(pts, Some([prev_end.x, prev_end.y]));
     let start = ri[0];
-    let ccw = crate::profile::is_ccw(&ri);
     let tan_in = crate::profile::start_tangent(&ri);
-    let cin = cleared_normal(tan_in, ccw);
+    let cin = cleared_normal(tan_in, reversed);
     let (loop_pts, exit_on, tan_out) = crate::emit::loop_with_overlap(&ri, lead_overlap);
-    let cout = cleared_normal(tan_out, ccw);
+    let cout = cleared_normal(tan_out, reversed);
 
     // Drop any lead that would swing past the far wall down to a plain pass.
     let eff_in = crate::leads::guard_lead(guard, start, tan_in, cin, lead_in, true);
@@ -262,6 +265,8 @@ fn emit_wall_ring(
 /// `link_threshold` is the hop above which a stay-down link would cut across uncut
 /// material, so we lift instead. `guard` is the cleared region (the area bounded by
 /// the wall rings); a wall lead that would overshoot it is dropped to a plain pass.
+/// `reversed` is `true` when the caller has flipped the loops for conventional
+/// milling, so the wall leads sit on the (now right-of-travel) cleared side.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_stay_down(
     prog: &mut Program,
@@ -275,6 +280,7 @@ pub(crate) fn emit_stay_down(
     lead_in: Lead,
     lead_out: Lead,
     guard: &[Polygon],
+    reversed: bool,
     h: &Heights,
     levels: &[f64],
     link_threshold: f64,
@@ -333,6 +339,7 @@ pub(crate) fn emit_stay_down(
                     lead_in,
                     lead_out,
                     guard,
+                    reversed,
                     h,
                     link_threshold,
                 );
