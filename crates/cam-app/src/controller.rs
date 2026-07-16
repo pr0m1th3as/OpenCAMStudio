@@ -754,7 +754,8 @@ impl AppController {
                     islands: island_contours,
                     depth: p.depth,
                     stepdown: p.stepdown,
-                    stepover: p.stepover,
+                    overlap: 0.5,
+                    offset: 0.0,
                     feed: p.feed,
                     plunge_feed: p.plunge_feed,
                     plunge: Plunge::Straight,
@@ -1457,7 +1458,8 @@ impl AppController {
                             islands: Vec::new(),
                             depth: p.depth,
                             stepdown: p.stepdown,
-                            stepover: p.stepover,
+                            overlap: 0.5,
+                            offset: 0.0,
                             feed: p.feed,
                             plunge_feed: p.plunge_feed,
                             plunge: Plunge::Straight,
@@ -1996,7 +1998,7 @@ mod tests {
         match app.selected_operation() {
             Some(Operation::Pocket(o)) => {
                 assert!(o.islands.is_empty(), "no islands by default");
-                assert!(o.stepover > 0.0);
+                assert!((0.0..1.0).contains(&o.overlap), "a sane default overlap");
             }
             other => panic!("expected pocket, got {other:?}"),
         }

@@ -647,7 +647,7 @@ enum Field {
     /// Face: top cutting plane above the drawing reference (mm).
     FaceStartOffset,
     /// Face: pass overlap as a percentage of the tool diameter.
-    FaceOverlap,
+    Overlap,
     /// Face: overshoot past the stock edge before the turnaround (mm).
     FaceOvershoot,
     /// Plunge parameter A: ramp/zig-zag angle, or helix radius.
@@ -697,7 +697,7 @@ impl Field {
             Field::LeadOutSize => "Lead-out size (mm)",
             Field::LeadOverlap => "Lead overlap (mm)",
             Field::FaceStartOffset => "Start offset (mm)",
-            Field::FaceOverlap => "Overlap (%)",
+            Field::Overlap => "Overlap (%)",
             Field::FaceOvershoot => "Overshoot (mm)",
             Field::PlungeA => "Plunge angle/radius",
             Field::PlungeB => "Plunge length/pitch",
@@ -2088,7 +2088,8 @@ impl App {
                     let mut fields = vec![
                         Field::Depth,
                         Field::Stepdown,
-                        Field::Stepover,
+                        Field::Overlap,
+                        Field::ProfileOffset,
                         Field::Feed,
                         Field::PlungeFeed,
                         Field::LeadOverlap,
@@ -2107,7 +2108,7 @@ impl App {
                     Field::FaceStartOffset,
                     Field::Depth,
                     Field::Stepdown,
-                    Field::FaceOverlap,
+                    Field::Overlap,
                     Field::FaceOvershoot,
                     Field::Feed,
                     Field::PlungeFeed,
@@ -3744,7 +3745,8 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Profile(o), Field::PlungeB) => Some(plunge_params(o.plunge).1),
         (Operation::Pocket(o), Field::Depth) => Some(o.depth),
         (Operation::Pocket(o), Field::Stepdown) => Some(o.stepdown),
-        (Operation::Pocket(o), Field::Stepover) => Some(o.stepover),
+        (Operation::Pocket(o), Field::Overlap) => Some(o.overlap * 100.0),
+        (Operation::Pocket(o), Field::ProfileOffset) => Some(o.offset),
         (Operation::Pocket(o), Field::Feed) => Some(o.feed),
         (Operation::Pocket(o), Field::PlungeFeed) => Some(o.plunge_feed),
         (Operation::Pocket(o), Field::LeadOverlap) => Some(o.lead_overlap),
@@ -3753,7 +3755,7 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Face(o), Field::FaceStartOffset) => Some(o.start_offset),
         (Operation::Face(o), Field::Depth) => Some(o.depth),
         (Operation::Face(o), Field::Stepdown) => Some(o.stepdown),
-        (Operation::Face(o), Field::FaceOverlap) => Some(o.overlap * 100.0),
+        (Operation::Face(o), Field::Overlap) => Some(o.overlap * 100.0),
         (Operation::Face(o), Field::FaceOvershoot) => Some(o.overshoot),
         (Operation::Face(o), Field::Feed) => Some(o.feed),
         (Operation::Face(o), Field::PlungeFeed) => Some(o.plunge_feed),
@@ -3821,8 +3823,11 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
             if let Some(v) = get(Field::Stepdown) {
                 o.stepdown = v;
             }
-            if let Some(v) = get(Field::Stepover) {
-                o.stepover = v;
+            if let Some(v) = get(Field::Overlap) {
+                o.overlap = (v / 100.0).clamp(0.0, 0.99);
+            }
+            if let Some(v) = get(Field::ProfileOffset) {
+                o.offset = v.max(0.0);
             }
             if let Some(v) = get(Field::Feed) {
                 o.feed = v;
@@ -3848,7 +3853,7 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
             if let Some(v) = get(Field::Stepdown) {
                 o.stepdown = v;
             }
-            if let Some(v) = get(Field::FaceOverlap) {
+            if let Some(v) = get(Field::Overlap) {
                 // Stored as a fraction; the field edits a percentage. Clamp below
                 // 100 % so the pass spacing stays positive.
                 o.overlap = (v / 100.0).clamp(0.0, 0.99);

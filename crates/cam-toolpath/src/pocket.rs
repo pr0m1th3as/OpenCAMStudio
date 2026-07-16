@@ -48,11 +48,11 @@ impl Strategy for PocketStrategy {
         if !op.boundary.is_valid() {
             fail!("operation {}: pocket boundary is not a closed area", op.id);
         }
-        if op.stepover <= 0.0 || op.stepdown <= 0.0 {
-            fail!(
-                "operation {}: stepover and stepdown must be positive",
-                op.id
-            );
+        if !(0.0..1.0).contains(&op.overlap) {
+            fail!("operation {}: overlap must be a fraction in [0, 1)", op.id);
+        }
+        if op.stepdown <= 0.0 {
+            fail!("operation {}: stepdown must be positive", op.id);
         }
         // `depth` is a positive magnitude below the reference; the floor sits at Z = -depth.
         let floor = -op.depth;
@@ -72,9 +72,16 @@ impl Strategy for PocketStrategy {
             Err(e) => fail!("operation {}: invalid pocket region: {e}", op.id),
         };
 
-        // Concentric rings, offsetting inward from the wall by the tool radius.
+        // Concentric rings, offsetting inward from the wall by the tool radius plus
+        // the finishing allowance (so the skin is left on the boundary and every
+        // island), then by the ring spacing set by the overlap.
         let r = tool.radius();
-        let rings = match crate::rings::concentric_rings(&region, r, op.stepover, cancel) {
+        let spacing = tool.diameter * (1.0 - op.overlap);
+        if spacing <= 1e-9 {
+            fail!("operation {}: overlap leaves no stepover", op.id);
+        }
+        let first = r + op.offset;
+        let mut rings = match crate::rings::concentric_rings(&region, first, spacing, cancel) {
             Ok(rings) => rings,
             Err(crate::rings::RingsError::Cancelled) => {
                 return StrategyResult {
@@ -94,34 +101,27 @@ impl Strategy for PocketStrategy {
                 tool.diameter
             );
         }
+        // `concentric_rings` yields wall-most first; reverse to carve inside-out
+        // (innermost first, wall last).
+        rings.reverse();
 
         let levels = depth_levels(env.heights.top_of_stock, floor, op.stepdown);
         let mut program = Program::new();
-        for &z in &levels {
-            if cancel.is_cancelled() {
-                return StrategyResult {
-                    program,
-                    diagnostics,
-                    cancelled: true,
-                };
-            }
-            for ring in &rings {
-                // Begin each ring near the operator's chosen lead-in point, so the
-                // plunge/entry witness marks line up there; `None` keeps the default.
-                let rotated = crate::profile::rotate_to_start(ring, op.start);
-                crate::rings::emit_ring(
-                    &mut program,
-                    &rotated,
-                    op.id,
-                    op.feed,
-                    op.plunge_feed,
-                    op.plunge,
-                    op.lead_overlap,
-                    &env.heights,
-                    z,
-                );
-            }
-        }
+        // Stay down within each level; only lift where the next ring is more than a
+        // ring-and-a-half away (an island loop or a pinched lobe) to cut across.
+        crate::rings::emit_stay_down(
+            &mut program,
+            &rings,
+            op.start,
+            op.id,
+            op.feed,
+            op.plunge_feed,
+            op.plunge,
+            op.lead_overlap,
+            &env.heights,
+            &levels,
+            1.5 * spacing,
+        );
 
         StrategyResult {
             program,
@@ -134,7 +134,7 @@ impl Strategy for PocketStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cam_cldata::{MoveKind, Point3, Step};
+    use cam_cldata::{MoveKind, Step};
     use cam_geo::{Contour, Point};
     use cam_model::{Heights, Plunge, Tool, ToolKind};
 
@@ -166,11 +166,29 @@ mod tests {
             .count()
     }
 
+    fn retracts(result: &StrategyResult) -> usize {
+        result
+            .program
+            .steps()
+            .iter()
+            .filter(|s| matches!(s, Step::Rapid { tag, .. } if tag.kind == MoveKind::Retract))
+            .count()
+    }
+
+    fn cutting_moves(result: &StrategyResult) -> usize {
+        result
+            .program
+            .steps()
+            .iter()
+            .filter(|s| matches!(s, Step::Linear { tag, .. } | Step::Arc { tag, .. } if tag.kind == MoveKind::Cutting))
+            .count()
+    }
+
     #[test]
-    fn clears_a_square_pocket_in_concentric_rings() {
-        // 40×40 pocket, ⌀8 tool, 4 mm stepover: rings at inward offsets 4/8/12/16
-        // (offset 20 closes it off) ⇒ 4 rings. Depth −3 at 1.5 stepdown ⇒ 2
-        // levels. One plunge per ring per level ⇒ 8.
+    fn clears_a_square_pocket_staying_down_per_level() {
+        // 40×40 pocket, ⌀8 tool, 50% overlap ⇒ 4 mm spacing, rings at 4/8/12/16.
+        // Depth 3 at 1.5 stepdown ⇒ 2 levels. Staying down means one plunge and one
+        // retract *per level*, not per ring — and the rings are still all cut.
         let op = PocketOp {
             id: 0,
             tool: 1,
@@ -178,7 +196,8 @@ mod tests {
             islands: vec![],
             depth: 3.0,
             stepdown: 1.5,
-            stepover: 4.0,
+            overlap: 0.5,
+            offset: 0.0,
             feed: 300.0,
             plunge_feed: 100.0,
             plunge: Plunge::Straight,
@@ -193,7 +212,12 @@ mod tests {
         };
         let result = PocketStrategy::new(op).compute(&env, &CancelToken::new());
         assert!(!result.has_errors(), "{:?}", result.diagnostics);
-        assert_eq!(plunges(&result), 8, "4 rings × 2 depth levels");
+        assert_eq!(plunges(&result), 2, "one entry plunge per level");
+        assert_eq!(retracts(&result), 2, "one retract per level");
+        assert!(
+            cutting_moves(&result) > 8,
+            "all rings are still cut at each level"
+        );
     }
 
     #[test]
@@ -205,7 +229,8 @@ mod tests {
             islands: vec![],
             depth: 3.0,
             stepdown: 1.5,
-            stepover: 4.0,
+            overlap: 0.5,
+            offset: 0.0,
             feed: 300.0,
             plunge_feed: 100.0,
             plunge: Plunge::Helix {
@@ -252,7 +277,8 @@ mod tests {
             islands: vec![],
             depth: 3.0,
             stepdown: 1.5,
-            stepover: 4.0,
+            overlap: 0.5,
+            offset: 0.0,
             feed: 300.0,
             plunge_feed: 100.0,
             plunge: Plunge::Straight,
@@ -272,77 +298,87 @@ mod tests {
 
     /// Each ring's straight plunge (at its start) and the retract that follows it,
     /// paired in emission order.
-    fn plunge_retract_pairs(result: &StrategyResult) -> Vec<(Point3, Point3)> {
-        let mut pairs = Vec::new();
-        let mut pending: Option<Point3> = None;
-        for s in result.program.steps() {
-            match s {
-                Step::Linear { to, tag, .. } if tag.kind == MoveKind::Plunge => pending = Some(*to),
-                Step::Rapid { to, tag } if tag.kind == MoveKind::Retract => {
-                    if let Some(p) = pending.take() {
-                        pairs.push((p, *to));
-                    }
-                }
-                _ => {}
-            }
-        }
-        pairs
-    }
-
-    fn pocket_op(lead_overlap: f64) -> PocketOp {
-        PocketOp {
-            id: 0,
-            tool: 1,
-            boundary: square(40.0),
-            islands: vec![],
-            depth: 1.5,
-            stepdown: 1.5,
-            stepover: 4.0,
-            feed: 300.0,
-            plunge_feed: 100.0,
-            plunge: Plunge::Straight,
-            start: None,
-            lead_overlap,
-        }
+    fn max_cutting_x(result: &StrategyResult) -> f64 {
+        result
+            .program
+            .steps()
+            .iter()
+            .filter_map(|s| match s {
+                Step::Linear { to, tag, .. } if tag.kind == MoveKind::Cutting => Some(to.x),
+                Step::Arc { end, tag, .. } if tag.kind == MoveKind::Cutting => Some(end.x),
+                _ => None,
+            })
+            .fold(f64::MIN, f64::max)
     }
 
     #[test]
-    fn zero_overlap_closes_each_ring_at_its_start() {
-        let env = JobEnv {
-            heights: Heights::new(5.0, 2.0, 0.0),
-            tools: &tools(8.0),
-            stock: None,
+    fn overlap_sets_the_ring_spacing() {
+        // Finer overlap ⇒ smaller spacing ⇒ more rings ⇒ more cutting moves.
+        let run = |overlap: f64| {
+            let mut op = PocketOp {
+                id: 0,
+                tool: 1,
+                boundary: square(40.0),
+                islands: vec![],
+                depth: 1.5,
+                stepdown: 1.5,
+                overlap,
+                offset: 0.0,
+                feed: 300.0,
+                plunge_feed: 100.0,
+                plunge: Plunge::Straight,
+                start: None,
+                lead_overlap: 0.0,
+            };
+            op.overlap = overlap;
+            let ts = tools(8.0);
+            let env = JobEnv {
+                heights: Heights::new(5.0, 2.0, 0.0),
+                tools: &ts,
+                stock: None,
+            };
+            let r = PocketStrategy::new(op).compute(&env, &CancelToken::new());
+            assert!(!r.has_errors(), "{:?}", r.diagnostics);
+            cutting_moves(&r)
         };
-        let result = PocketStrategy::new(pocket_op(0.0)).compute(&env, &CancelToken::new());
-        let pairs = plunge_retract_pairs(&result);
-        assert!(!pairs.is_empty());
-        for (plunge, retract) in pairs {
-            assert!(
-                (plunge.x - retract.x).abs() < 1e-9 && (plunge.y - retract.y).abs() < 1e-9,
-                "with no overlap the ring retracts exactly where it plunged"
-            );
-        }
+        assert!(run(0.75) > run(0.25), "more overlap ⇒ tighter spacing ⇒ more rings");
     }
 
     #[test]
-    fn overlap_retracts_each_ring_past_its_start() {
-        let overlap = 2.0;
-        let env = JobEnv {
-            heights: Heights::new(5.0, 2.0, 0.0),
-            tools: &tools(8.0),
-            stock: None,
+    fn offset_leaves_a_skin_on_the_wall() {
+        // A 2 mm finishing offset keeps the outermost (wall) ring 2 mm inside the
+        // boundary, so the deepest cut into the +X wall is 2 mm shallower.
+        let run = |offset: f64| {
+            let op = PocketOp {
+                id: 0,
+                tool: 1,
+                boundary: square(40.0),
+                islands: vec![],
+                depth: 1.5,
+                stepdown: 1.5,
+                overlap: 0.5,
+                offset,
+                feed: 300.0,
+                plunge_feed: 100.0,
+                plunge: Plunge::Straight,
+                start: None,
+                lead_overlap: 0.0,
+            };
+            let ts = tools(8.0);
+            let env = JobEnv {
+                heights: Heights::new(5.0, 2.0, 0.0),
+                tools: &ts,
+                stock: None,
+            };
+            let r = PocketStrategy::new(op).compute(&env, &CancelToken::new());
+            assert!(!r.has_errors(), "{:?}", r.diagnostics);
+            max_cutting_x(&r)
         };
-        let result = PocketStrategy::new(pocket_op(overlap)).compute(&env, &CancelToken::new());
-        let pairs = plunge_retract_pairs(&result);
-        assert!(!pairs.is_empty());
-        for (plunge, retract) in pairs {
-            let d = ((retract.x - plunge.x).powi(2) + (retract.y - plunge.y).powi(2)).sqrt();
-            // Moved off the start, by no more than the overlap arc-length (a chord
-            // on a rounded corner can be a touch shorter, never longer).
-            assert!(
-                d > 1e-6 && d <= overlap + 1e-6,
-                "ring should retract past its start by up to {overlap} mm, got {d}"
-            );
-        }
+        let base = run(0.0);
+        let skinned = run(2.0);
+        assert!(
+            (base - skinned - 2.0).abs() < 1e-6,
+            "a 2 mm offset holds the wall ring 2 mm back ({base} vs {skinned})"
+        );
     }
 }

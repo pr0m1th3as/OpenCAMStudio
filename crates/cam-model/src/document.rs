@@ -269,8 +269,15 @@ pub struct PocketOp {
     pub depth: f64,
     /// Maximum depth removed per pass (mm, > 0).
     pub stepdown: f64,
-    /// Radial stepover between concentric rings (mm, > 0).
-    pub stepover: f64,
+    /// Fraction of the tool diameter that adjacent concentric rings overlap (0..1),
+    /// as on the face op. The radial ring spacing is `diameter * (1 - overlap)`.
+    pub overlap: f64,
+    /// Finishing allowance left on every wall (mm): the rings stop this far short of
+    /// the boundary and each island, so a later profile finishes the walls to size.
+    /// `0.0` (the default) clears to the boundary/island edges. Applied on top of
+    /// the tool radius.
+    #[serde(default)]
+    pub offset: f64,
     /// Cutting feed, mm/min.
     pub feed: f64,
     /// Plunge feed, mm/min.
