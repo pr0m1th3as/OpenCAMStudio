@@ -4072,7 +4072,13 @@ struct Viewport {
     vertices: Arc<Vec<Vertex>>,
     mesh_vertices: Arc<Vec<MeshVertex>>,
     mesh_indices: Arc<Vec<u32>>,
+    /// Scene extent (backplot + overlays) — used to *size* markers to the view.
     bounds: Option<([f32; 3], [f32; 3])>,
+    /// The box the camera frames on: the **stock**, which is stable across
+    /// operation-parameter edits. Framing on this (rather than the toolpath) keeps
+    /// the part a constant on-screen size — tweaking an offset/stepover must not
+    /// appear to resize the design.
+    frame_bounds: Option<([f32; 3], [f32; 3])>,
     controls: ViewControls,
     show_gizmo: bool,
     /// On-screen cube size, logical px (fixed; independent of window size).
@@ -4174,11 +4180,24 @@ impl Viewport {
             ),
             _ => (Vec::new(), Vec::new()),
         };
+        // Frame on the stock (stable across parameter edits) so the part keeps a
+        // constant on-screen size; fall back to the scene extent before any
+        // geometry is loaded.
+        let frame_bounds = if controller.regions().is_empty() {
+            bounds
+        } else {
+            let (mn, mx) = controller.stock_box();
+            Some((
+                [mn[0] as f32, mn[1] as f32, mn[2] as f32],
+                [mx[0] as f32, mx[1] as f32, mx[2] as f32],
+            ))
+        };
         Self {
             vertices: Arc::new(scene.line_vertices()),
             mesh_vertices: Arc::new(mesh_vertices),
             mesh_indices: Arc::new(mesh_indices),
             bounds,
+            frame_bounds,
             controls,
             show_gizmo,
             gizmo_size,
@@ -4189,9 +4208,12 @@ impl Viewport {
         }
     }
 
-    /// The orbit camera framed on the current scene, with the current controls.
+    /// The orbit camera framed on the stable stock box, with the current controls.
     fn camera(&self) -> OrbitCamera {
-        let (min, max) = self.bounds.unwrap_or(([0.0, 0.0, 0.0], [1.0, 1.0, 0.0]));
+        let (min, max) = self
+            .frame_bounds
+            .or(self.bounds)
+            .unwrap_or(([0.0, 0.0, 0.0], [1.0, 1.0, 0.0]));
         let mut cam = OrbitCamera::framed(min, max);
         cam.orient = cam_render::orientation(self.controls.yaw, self.controls.pitch);
         cam.zoom = self.controls.zoom;
