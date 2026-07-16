@@ -62,9 +62,11 @@ impl Strategy for ProfileStrategy {
                 ..Default::default()
             };
         }
-        if op.depth >= env.heights.top_of_stock {
+        // `depth` is a positive magnitude below the reference; the floor sits at Z = -depth.
+        let floor = -op.depth;
+        if floor >= env.heights.top_of_stock {
             diagnostics.push(Diagnostic::warning(format!(
-                "operation {}: depth {} is at or above the stock top {}; nothing to cut",
+                "operation {}: depth {} does not reach below the stock top {}; nothing to cut",
                 op.id, op.depth, env.heights.top_of_stock
             )));
             return StrategyResult {
@@ -129,7 +131,7 @@ impl Strategy for ProfileStrategy {
             };
         }
 
-        let levels = depth_levels(env.heights.top_of_stock, op.depth, op.stepdown);
+        let levels = depth_levels(env.heights.top_of_stock, floor, op.stepdown);
         let mut program = Program::new();
         for poly in &loops {
             if cancel.is_cancelled() {

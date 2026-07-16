@@ -47,7 +47,7 @@ impl Default for JobParams {
     fn default() -> Self {
         Self {
             tool_diameter: 6.0,
-            depth: -4.0,
+            depth: 4.0,
             stepdown: 2.0,
             stepover: 3.0,
             feed: 300.0,
@@ -820,8 +820,10 @@ impl AppController {
                     hand: Hand::Right,
                     major_dia: if dia.is_finite() && dia > 0.0 { dia } else { 6.0 },
                     pitch: 1.0,
+                    // Thread span is absolute Z; `depth` is now a positive magnitude
+                    // below the top, so the bottom sits that far under it.
                     z_top: p.top_of_stock,
-                    z_bottom: p.depth,
+                    z_bottom: p.top_of_stock - p.depth,
                     climb: true,
                     feed: p.feed,
                     plunge_feed: p.plunge_feed,
@@ -1450,7 +1452,9 @@ impl AppController {
             x_offset: 0.0,
             y_offset: 0.0,
             top,
-            thickness: top - depth,
+            // `depth` is a positive magnitude below the reference; the stock hangs
+            // from `top` down to the deepest cut at Z = -depth.
+            thickness: top + depth,
         }
     }
 
@@ -1669,7 +1673,7 @@ fn empty_document(p: &JobParams) -> Document {
             x_offset: 0.0,
             y_offset: 0.0,
             top: p.top_of_stock,
-            thickness: p.top_of_stock - p.depth,
+            thickness: p.top_of_stock + p.depth,
         },
         tools: vec![Tool {
             number: 1,
@@ -1787,15 +1791,15 @@ mod tests {
         // Op 0 is selected after import.
         app.edit_selected_operation(|op| {
             if let Operation::Profile(o) = op {
-                o.depth = -8.0;
+                o.depth = 8.0;
             }
         });
-        assert_eq!(depth_of(app.operation(0).unwrap()), -8.0);
+        assert_eq!(depth_of(app.operation(0).unwrap()), 8.0);
         assert!(app.outcome().is_none(), "editing invalidates the stale run");
         assert!(app.can_undo());
 
         assert!(app.undo());
-        assert_eq!(depth_of(app.operation(0).unwrap()), -4.0, "undo restores");
+        assert_eq!(depth_of(app.operation(0).unwrap()), 4.0, "undo restores");
     }
 
     fn op_ids(app: &AppController) -> Vec<u32> {

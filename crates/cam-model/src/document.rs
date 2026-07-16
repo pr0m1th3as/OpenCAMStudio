@@ -190,7 +190,8 @@ pub struct ProfileOp {
     pub side: Side,
     /// How radius compensation is applied.
     pub comp: Comp,
-    /// Absolute Z of the final (deepest) pass.
+    /// Cut depth below the reference plane (Z=0), as a positive magnitude (mm).
+    /// The final (deepest) pass sits at absolute Z `-depth`.
     pub depth: f64,
     /// Maximum depth removed per pass (mm, > 0).
     pub stepdown: f64,
@@ -226,7 +227,8 @@ pub struct DrillOp {
     pub tool: u32,
     /// Hole positions in the part/WCS frame.
     pub points: Vec<[f64; 2]>,
-    /// Absolute Z of the hole bottom.
+    /// Hole depth below the reference plane (Z=0), as a positive magnitude (mm).
+    /// The hole bottom sits at absolute Z `-depth`.
     pub depth: f64,
     /// Peck increment (mm, > 0); `None` drills straight.
     pub peck: Option<f64>,
@@ -249,7 +251,8 @@ pub struct PocketOp {
     pub boundary: Contour,
     /// Closed islands to leave uncut (holes within the pocket).
     pub islands: Vec<Contour>,
-    /// Absolute Z of the pocket floor.
+    /// Pocket depth below the reference plane (Z=0), as a positive magnitude (mm).
+    /// The floor sits at absolute Z `-depth`.
     pub depth: f64,
     /// Maximum depth removed per pass (mm, > 0).
     pub stepdown: f64,
@@ -549,7 +552,7 @@ mod tests {
             ]),
             side: Side::Outside,
             comp: Comp::Computed,
-            depth: -4.0,
+            depth: 4.0,
             stepdown: 2.0,
             feed: 300.0,
             plunge_feed: 100.0,
@@ -598,7 +601,7 @@ mod tests {
             id: 0,
             tool: 1,
             points: vec![[0.0, 0.0]],
-            depth: -4.0,
+            depth: 4.0,
             peck: None,
             dwell: None,
             feed: 100.0,

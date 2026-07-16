@@ -57,9 +57,11 @@ impl Strategy for PocketStrategy {
                 op.id
             );
         }
-        if op.depth >= env.heights.top_of_stock {
+        // `depth` is a positive magnitude below the reference; the floor sits at Z = -depth.
+        let floor = -op.depth;
+        if floor >= env.heights.top_of_stock {
             diagnostics.push(Diagnostic::warning(format!(
-                "operation {}: depth is at or above the stock top; nothing to cut",
+                "operation {}: depth does not reach below the stock top; nothing to cut",
                 op.id
             )));
             return StrategyResult {
@@ -111,7 +113,7 @@ impl Strategy for PocketStrategy {
             );
         }
 
-        let levels = depth_levels(env.heights.top_of_stock, op.depth, op.stepdown);
+        let levels = depth_levels(env.heights.top_of_stock, floor, op.stepdown);
         let mut program = Program::new();
         for &z in &levels {
             if cancel.is_cancelled() {
@@ -230,7 +232,7 @@ mod tests {
             tool: 1,
             boundary: square(40.0),
             islands: vec![],
-            depth: -3.0,
+            depth: 3.0,
             stepdown: 1.5,
             stepover: 4.0,
             feed: 300.0,
@@ -256,7 +258,7 @@ mod tests {
             tool: 1,
             boundary: square(40.0),
             islands: vec![],
-            depth: -3.0,
+            depth: 3.0,
             stepdown: 1.5,
             stepover: 4.0,
             feed: 300.0,
@@ -302,7 +304,7 @@ mod tests {
             tool: 1,
             boundary: square(10.0),
             islands: vec![],
-            depth: -3.0,
+            depth: 3.0,
             stepdown: 1.5,
             stepover: 4.0,
             feed: 300.0,
@@ -346,7 +348,7 @@ mod tests {
             tool: 1,
             boundary: square(40.0),
             islands: vec![],
-            depth: -1.5,
+            depth: 1.5,
             stepdown: 1.5,
             stepover: 4.0,
             feed: 300.0,

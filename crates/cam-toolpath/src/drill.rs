@@ -49,9 +49,11 @@ impl Strategy for DrillStrategy {
                 ..Default::default()
             };
         }
-        if op.depth >= env.heights.top_of_stock {
+        // `depth` is a positive magnitude below the reference; the bottom is Z = -depth.
+        let bottom = -op.depth;
+        if bottom >= env.heights.top_of_stock {
             diagnostics.push(Diagnostic::warning(format!(
-                "operation {}: depth {} is at or above the stock top {}; nothing to drill",
+                "operation {}: depth {} does not reach below the stock top {}; nothing to drill",
                 op.id, op.depth, env.heights.top_of_stock
             )));
             return StrategyResult {
@@ -74,7 +76,7 @@ impl Strategy for DrillStrategy {
         program.push(Step::Drill(DrillCycle {
             points: op.points.clone(),
             z_top: env.heights.top_of_stock,
-            depth: op.depth,
+            depth: bottom,
             retract: env.heights.retract,
             peck: op.peck,
             dwell: op.dwell,
