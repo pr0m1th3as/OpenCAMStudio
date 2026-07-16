@@ -477,7 +477,9 @@ fn inside_profile_ignores_stepover_and_warns_on_uncut_core() {
 #[test]
 fn stepover_roughs_outside_frame_to_the_stock() {
     // A 40×40 part in a 60×60 stock: outside roughing clears the 10 mm frame in
-    // concentric passes (part as an island in the stock), so several plunges.
+    // concentric passes (part as an island in the stock). Routed through the shared
+    // clearer it now stays *down* — the frame is cut in many ring segments but with
+    // far fewer plunges than moves (not a plunge-per-ring as before).
     let op = rough_op(Side::Outside, rect(10.0, 10.0, 50.0, 50.0), 4.0);
     let tools = end_mill_tools();
     let env = JobEnv {
@@ -487,11 +489,41 @@ fn stepover_roughs_outside_frame_to_the_stock() {
     };
     let r = ProfileStrategy::new(op).compute(&env, &CancelToken::new());
     assert!(!r.has_errors(), "{:?}", r.diagnostics);
+    let cuts = r
+        .program
+        .steps()
+        .iter()
+        .filter(|s| matches!(s, Step::Linear { tag, .. } | Step::Arc { tag, .. } if tag.kind == MoveKind::Cutting))
+        .count();
+    let plunges = plunge_count(&r.program);
+    assert!(cuts > 8, "the frame is cleared in several rings, got {cuts} cutting moves");
+    assert!(plunges >= 1, "at least one entry plunge");
     assert!(
-        plunge_count(&r.program) > 1,
-        "outside roughing clears the frame in rings, got {}",
-        plunge_count(&r.program)
+        plunges * 2 < cuts,
+        "stay-down: far fewer plunges than cutting moves ({plunges} vs {cuts})"
     );
+
+    // No gouge into the part: the tool centre stays a radius outside the 40×40 part
+    // [10,50]², so no cutting move — including the stay-down links between rings —
+    // may pass through the part interior. Check endpoints and segment midpoints.
+    let inside_part = |x: f64, y: f64| (10.5..49.5).contains(&x) && (10.5..49.5).contains(&y);
+    let mut prev: Option<(f64, f64)> = None;
+    for s in r.program.steps() {
+        let cutting = matches!(s, Step::Linear { tag, .. } | Step::Arc { tag, .. } if tag.kind == MoveKind::Cutting);
+        let (ex, ey) = match s {
+            Step::Linear { to, .. } | Step::Rapid { to, .. } => (to.x, to.y),
+            Step::Arc { end, .. } => (end.x, end.y),
+            _ => continue,
+        };
+        if cutting {
+            assert!(!inside_part(ex, ey), "cutting move ends inside the part at ({ex}, {ey})");
+            if let Some((px, py)) = prev {
+                let (mx, my) = (0.5 * (px + ex), 0.5 * (py + ey));
+                assert!(!inside_part(mx, my), "a cutting link chords through the part at ({mx}, {my})");
+            }
+        }
+        prev = Some((ex, ey));
+    }
 }
 
 #[test]

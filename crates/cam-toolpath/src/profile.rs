@@ -115,63 +115,62 @@ impl Strategy for ProfileStrategy {
         // (Leads apply to the single-pass finish, not the roughing rings.)
         if op.stepover > 0.0 && matches!(op.comp, Comp::Computed) && side_sign > 0.0 {
             if let Some(region) = roughing_region(op, env.stock) {
-                // The finishing allowance is baked into the island, so the wall ring
-                // sits at the tool radius.
-                let first = radius;
-                let rings =
-                    match crate::rings::concentric_rings(&region, first, op.stepover, cancel) {
-                        Ok(rings) => rings,
-                        Err(crate::rings::RingsError::Cancelled) => {
-                            return StrategyResult {
-                                diagnostics,
-                                cancelled: true,
-                                ..Default::default()
-                            };
-                        }
-                        Err(crate::rings::RingsError::Offset(e)) => {
-                            diagnostics.push(Diagnostic::error(format!(
-                                "operation {}: offset failed: {e}",
-                                op.id
-                            )));
-                            return StrategyResult {
-                                diagnostics,
-                                ..Default::default()
-                            };
-                        }
-                    };
-                if !rings.is_empty() {
-                    let levels = depth_levels(env.heights.top_of_stock, floor, op.stepdown);
-                    let mut program = Program::new();
-                    for &z in &levels {
-                        if cancel.is_cancelled() {
-                            return StrategyResult {
-                                program,
-                                diagnostics,
-                                cancelled: true,
-                            };
-                        }
-                        for ring in &rings {
-                            let rotated = rotate_to_start(&ring.pts, op.start);
-                            crate::rings::emit_ring(
-                                &mut program,
-                                &rotated,
-                                op.id,
-                                op.feed,
-                                op.plunge_feed,
-                                op.plunge,
-                                op.lead_overlap,
-                                &env.heights,
-                                z,
-                            );
+                let levels = depth_levels(env.heights.top_of_stock, floor, op.stepdown);
+                let mut program = Program::new();
+                // Clear the frame through the shared engine (stay-down inside-out,
+                // engagement-spaced, climb-oriented). No finishing leads — the
+                // single-pass finish that follows the roughing owns the walls. The
+                // finishing allowance is baked into the roughing island, so the wall
+                // ring sits at the tool radius.
+                let job = crate::clearing::ClearJob {
+                    id: op.id,
+                    first: radius,
+                    spacing: op.stepover,
+                    clearing: op.clearing,
+                    plunge: op.plunge,
+                    feed: op.feed,
+                    plunge_feed: op.plunge_feed,
+                    lead_overlap: op.lead_overlap,
+                    lead_in: Lead::None,
+                    lead_out: Lead::None,
+                    start: op.start,
+                    guard: &[],
+                };
+                match crate::clearing::clear(
+                    &mut program,
+                    &region,
+                    &job,
+                    &env.heights,
+                    &levels,
+                    cancel,
+                ) {
+                    // Degenerate frame (no rings) — fall through to a single pass.
+                    Ok(0) => {}
+                    Ok(_) => {
+                        return StrategyResult {
+                            program,
+                            diagnostics,
+                            cancelled: false,
                         }
                     }
-                    return StrategyResult {
-                        program,
-                        diagnostics,
-                        cancelled: false,
-                    };
+                    Err(crate::rings::RingsError::Cancelled) => {
+                        return StrategyResult {
+                            diagnostics,
+                            cancelled: true,
+                            ..Default::default()
+                        };
+                    }
+                    Err(crate::rings::RingsError::Offset(e)) => {
+                        diagnostics.push(Diagnostic::error(format!(
+                            "operation {}: offset failed: {e}",
+                            op.id
+                        )));
+                        return StrategyResult {
+                            diagnostics,
+                            ..Default::default()
+                        };
+                    }
                 }
-                // No rings (degenerate frame) — fall through to a single pass.
             }
         }
 
