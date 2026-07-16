@@ -2062,6 +2062,7 @@ impl App {
                     let mut fields = vec![
                         Field::Depth,
                         Field::Stepdown,
+                        Field::Stepover,
                         Field::ProfileOffset,
                         Field::Feed,
                         Field::PlungeFeed,
@@ -3732,6 +3733,7 @@ fn op_kind(op: &Operation) -> &'static str {
 fn op_field(op: &Operation, field: Field) -> Option<f64> {
     match (op, field) {
         (Operation::Profile(o), Field::Depth) => Some(o.depth),
+        (Operation::Profile(o), Field::Stepover) => Some(o.stepover),
         (Operation::Profile(o), Field::ProfileOffset) => Some(o.offset),
         (Operation::Profile(o), Field::Stepdown) => Some(o.stepdown),
         (Operation::Profile(o), Field::Feed) => Some(o.feed),
@@ -3786,6 +3788,9 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
             }
             if let Some(v) = get(Field::Stepdown) {
                 o.stepdown = v;
+            }
+            if let Some(v) = get(Field::Stepover) {
+                o.stepover = v.max(0.0);
             }
             if let Some(v) = get(Field::ProfileOffset) {
                 o.offset = v;

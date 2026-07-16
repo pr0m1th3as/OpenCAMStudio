@@ -391,6 +391,7 @@ mod tests {
         let env = JobEnv {
             heights: Heights::new(10.0, 2.0, 0.0),
             tools: &tools,
+            stock: None,
         };
         ThreadStrategy::new(op).compute(&env, &CancelToken::new())
     }

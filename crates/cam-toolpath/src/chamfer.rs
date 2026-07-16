@@ -373,6 +373,7 @@ mod tests {
         let env = JobEnv {
             heights: Heights::new(5.0, 2.0, 0.0),
             tools: &tools,
+            stock: None,
         };
         ChamferStrategy::new(op).compute(&env, &CancelToken::new())
     }

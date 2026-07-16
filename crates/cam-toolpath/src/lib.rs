@@ -22,6 +22,7 @@ mod emit;
 mod face;
 mod leads;
 mod plan;
+mod rings;
 mod pocket;
 mod profile;
 mod thread;
@@ -133,13 +134,19 @@ impl CancelToken {
 }
 
 /// Everything a strategy needs from the surrounding job that is not part of the
-/// operation itself: the setup's safety heights and its tool list.
+/// operation itself: the setup's safety heights, its tool list, and the resolved
+/// stock extent.
 #[derive(Clone, Copy, Debug)]
 pub struct JobEnv<'a> {
     /// The setup's safety planes.
     pub heights: Heights,
     /// The setup's tools.
     pub tools: &'a [Tool],
+    /// The resolved stock box in XY `(min, max)`, if known — needed by roughing
+    /// strategies (e.g. profile stepover) that clear the material out to the stock.
+    /// `None` when the caller has no stock bounds; such strategies then skip
+    /// roughing and cut a single pass.
+    pub stock: Option<([f64; 2], [f64; 2])>,
 }
 
 impl<'a> JobEnv<'a> {

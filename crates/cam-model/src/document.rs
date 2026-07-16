@@ -201,6 +201,13 @@ pub struct ProfileOp {
     pub depth: f64,
     /// Maximum depth removed per pass (mm, > 0).
     pub stepdown: f64,
+    /// Radial stepover for XY roughing passes (mm). `0` (the default) cuts a single
+    /// pass at the profile; `> 0` clears the material out to the raw stock in
+    /// concentric passes stepping in by this much (like `stepdown`, but in XY),
+    /// leaving the finishing `offset` on the wall. Needs the stock bounds; without
+    /// them it falls back to a single pass.
+    #[serde(default)]
+    pub stepover: f64,
     /// Cutting feed, mm/min.
     pub feed: f64,
     /// Plunge feed, mm/min.
@@ -581,6 +588,7 @@ mod tests {
             offset: 0.0,
             depth: 4.0,
             stepdown: 2.0,
+            stepover: 0.0,
             feed: 300.0,
             plunge_feed: 100.0,
             start: None,

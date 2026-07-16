@@ -48,7 +48,7 @@ fn setup(operations: Vec<Operation>) -> Document {
 }
 
 fn run(doc: &Document) -> cam_sim::SimResult {
-    let (program, diags) = build_job(doc, 1000.0, SpindleDir::Cw, &CancelToken::new());
+    let (program, diags) = build_job(doc, 1000.0, SpindleDir::Cw, None, &CancelToken::new());
     assert!(
         !diags
             .iter()
@@ -202,6 +202,7 @@ fn a_bad_setup_that_rapids_low_is_caught() {
             offset: 0.0,
             depth: 3.0,
             stepdown: 1.5,
+            stepover: 0.0,
             feed: 300.0,
             plunge_feed: 100.0,
             start: None,
@@ -213,7 +214,7 @@ fn a_bad_setup_that_rapids_low_is_caught() {
         origin: [0.0, 0.0, 0.0],
         start_offset: None,
     });
-    let (program, _) = build_job(&doc, 1000.0, SpindleDir::Cw, &CancelToken::new());
+    let (program, _) = build_job(&doc, 1000.0, SpindleDir::Cw, None, &CancelToken::new());
     let sim = simulate(
         &program,
         STOCK_MIN,

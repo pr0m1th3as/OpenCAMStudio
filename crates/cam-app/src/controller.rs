@@ -733,6 +733,7 @@ impl AppController {
                 offset: 0.0,
                 depth: p.depth,
                 stepdown: p.stepdown,
+                stepover: 0.0,
                 feed: p.feed,
                 plunge_feed: p.plunge_feed,
                 start,
@@ -1271,8 +1272,17 @@ impl AppController {
                 .retain(|o| !self.excluded.contains(&o.id()));
             Cow::Owned(d)
         };
-        let (program, diagnostics) =
-            build_job(&document, self.defaults.spindle_rpm, SpindleDir::Cw, cancel);
+        // The resolved stock box (XY) lets roughing strategies (profile stepover)
+        // clear out to the raw material.
+        let (smin, smax) = self.stock_box();
+        let stock = Some(([smin[0], smin[1]], [smax[0], smax[1]]));
+        let (program, diagnostics) = build_job(
+            &document,
+            self.defaults.spindle_rpm,
+            SpindleDir::Cw,
+            stock,
+            cancel,
+        );
 
         let mut scene = Scene::from_program(&program);
         for region in &self.regions {
@@ -1402,6 +1412,7 @@ impl AppController {
                     offset: 0.0,
                     depth: p.depth,
                     stepdown: p.stepdown,
+                    stepover: 0.0,
                     feed: p.feed,
                     plunge_feed: p.plunge_feed,
                     start: None,

@@ -2,7 +2,7 @@
 //! stepdown passes, down to depth.
 
 use cam_cldata::{ArcDir, CutterComp, MoveKind, Point3, Program, Step, Tag};
-use cam_geo::{offset, JoinStyle, Point, Polygon};
+use cam_geo::{offset, Contour, JoinStyle, Point, Polygon};
 use cam_model::{Comp, Heights, Lead, Plunge, ProfileOp, Side};
 
 use crate::{CancelToken, Diagnostic, JobEnv, Strategy, StrategyResult};
@@ -107,6 +107,79 @@ impl Strategy for ProfileStrategy {
         };
         let signed = side_sign * (radius + op.offset);
 
+        // Radial roughing (stepover): clear the material out to the raw stock in
+        // concentric passes, leaving the finishing `offset` on the wall — the
+        // roughing half of the rough-then-finish workflow. Only for computed comp
+        // with a real material side; an outside profile also needs the stock. Not
+        // applicable ⇒ fall through to the single finishing pass. (Leads apply to
+        // the single-pass finish, not the roughing rings.)
+        if op.stepover > 0.0 && matches!(op.comp, Comp::Computed) && side_sign != 0.0 {
+            if let Some(region) = roughing_region(op, side_sign, env.stock) {
+                // Inside offsets inward from the chain (finish = radius + allowance);
+                // outside bakes the allowance into the island, so the wall ring is at
+                // the tool radius.
+                let first = if side_sign > 0.0 {
+                    radius
+                } else {
+                    radius + op.offset
+                };
+                let rings =
+                    match crate::rings::concentric_rings(&region, first, op.stepover, cancel) {
+                        Ok(rings) => rings,
+                        Err(crate::rings::RingsError::Cancelled) => {
+                            return StrategyResult {
+                                diagnostics,
+                                cancelled: true,
+                                ..Default::default()
+                            };
+                        }
+                        Err(crate::rings::RingsError::Offset(e)) => {
+                            diagnostics.push(Diagnostic::error(format!(
+                                "operation {}: offset failed: {e}",
+                                op.id
+                            )));
+                            return StrategyResult {
+                                diagnostics,
+                                ..Default::default()
+                            };
+                        }
+                    };
+                if !rings.is_empty() {
+                    let levels = depth_levels(env.heights.top_of_stock, floor, op.stepdown);
+                    let mut program = Program::new();
+                    for &z in &levels {
+                        if cancel.is_cancelled() {
+                            return StrategyResult {
+                                program,
+                                diagnostics,
+                                cancelled: true,
+                            };
+                        }
+                        for ring in &rings {
+                            let rotated = rotate_to_start(ring, op.start);
+                            crate::rings::emit_ring(
+                                &mut program,
+                                &rotated,
+                                op.id,
+                                op.feed,
+                                op.plunge_feed,
+                                op.plunge,
+                                op.lead_overlap,
+                                &env.heights,
+                                z,
+                            );
+                        }
+                    }
+                    return StrategyResult {
+                        program,
+                        diagnostics,
+                        cancelled: false,
+                    };
+                }
+                // No rings (degenerate frame) — fall through to a single pass.
+            }
+        }
+
         let loops = if signed == 0.0 {
             vec![region]
         } else {
@@ -161,6 +234,56 @@ impl Strategy for ProfileStrategy {
             cancelled: false,
         }
     }
+}
+
+/// The region to clear when radial roughing (stepover). Inside profiling clears
+/// the enclosed area (rings inward from the chain); outside profiling clears the
+/// frame between the raw stock and the part, so the region is the stock with the
+/// part — dilated by the finishing allowance — as an island. Returns `None` when
+/// roughing does not apply (no stock for an outside profile, or the stock does not
+/// contain the part), so the caller falls back to a single pass.
+fn roughing_region(
+    op: &ProfileOp,
+    side_sign: f64,
+    stock: Option<([f64; 2], [f64; 2])>,
+) -> Option<Polygon> {
+    let chain_poly = Polygon::new(op.chain.clone()).ok()?;
+    if side_sign < 0.0 {
+        // Inside: rough the enclosed region itself.
+        return Some(chain_poly);
+    }
+
+    // Outside: the stock must strictly contain the part for there to be a frame.
+    let (smin, smax) = stock?;
+    let (mut xmin, mut ymin, mut xmax, mut ymax) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for p in op.chain.points() {
+        xmin = xmin.min(p.x);
+        ymin = ymin.min(p.y);
+        xmax = xmax.max(p.x);
+        ymax = ymax.max(p.y);
+    }
+    if !(smin[0] < xmin && smin[1] < ymin && smax[0] > xmax && smax[1] > ymax) {
+        return None;
+    }
+    // The part is an island, dilated by the finishing allowance so that much stock
+    // is left on the wall.
+    let island = if op.offset > 0.0 {
+        offset(&[chain_poly], op.offset, JoinStyle::Round)
+            .ok()?
+            .into_iter()
+            .next()?
+            .outer()
+            .clone()
+    } else {
+        op.chain.clone()
+    };
+    let stock_rect = Contour::new(vec![
+        Point::new(smin[0], smin[1]),
+        Point::new(smax[0], smin[1]),
+        Point::new(smax[0], smax[1]),
+        Point::new(smin[0], smax[1]),
+    ]);
+    Polygon::with_holes(stock_rect, vec![island]).ok()
 }
 
 /// Emit approach, stepdown passes, and retract for one closed tool-path loop.

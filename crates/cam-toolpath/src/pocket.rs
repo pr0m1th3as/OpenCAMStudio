@@ -6,15 +6,12 @@
 //! closed cutting loop; islands (holes in the region) are honoured by the offset
 //! and left standing.
 
-use cam_cldata::{MoveKind, Point3, Program, Step, Tag};
-use cam_geo::{offset, JoinStyle, Point, Polygon};
-use cam_model::{Heights, PocketOp};
+use cam_cldata::Program;
+use cam_geo::Polygon;
+use cam_model::PocketOp;
 
 use crate::profile::depth_levels;
 use crate::{CancelToken, Diagnostic, JobEnv, Strategy, StrategyResult};
-
-/// Safety cap on the number of concentric rings (guards the offset loop).
-const MAX_RINGS: usize = 100_000;
 
 /// Clears a pocket. Construct from a [`PocketOp`].
 #[derive(Clone, Debug)]
@@ -75,36 +72,21 @@ impl Strategy for PocketStrategy {
             Err(e) => fail!("operation {}: invalid pocket region: {e}", op.id),
         };
 
-        // Concentric rings, offsetting inward from the wall.
+        // Concentric rings, offsetting inward from the wall by the tool radius.
         let r = tool.radius();
-        let mut rings: Vec<Vec<Point>> = Vec::new();
-        let mut d = r;
-        loop {
-            if cancel.is_cancelled() {
+        let rings = match crate::rings::concentric_rings(&region, r, op.stepover, cancel) {
+            Ok(rings) => rings,
+            Err(crate::rings::RingsError::Cancelled) => {
                 return StrategyResult {
                     diagnostics,
                     cancelled: true,
                     ..Default::default()
                 };
             }
-            let offsets = match offset(std::slice::from_ref(&region), -d, JoinStyle::Round) {
-                Ok(v) => v,
-                Err(e) => fail!("operation {}: offset failed: {e}", op.id),
-            };
-            if offsets.is_empty() {
-                break;
+            Err(crate::rings::RingsError::Offset(e)) => {
+                fail!("operation {}: offset failed: {e}", op.id)
             }
-            for poly in &offsets {
-                rings.push(poly.outer().points().to_vec());
-                for hole in poly.holes() {
-                    rings.push(hole.points().to_vec());
-                }
-            }
-            d += op.stepover;
-            if rings.len() > MAX_RINGS {
-                break;
-            }
-        }
+        };
         if rings.is_empty() {
             fail!(
                 "operation {}: tool (⌀{}) is too large to enter the pocket",
@@ -127,7 +109,17 @@ impl Strategy for PocketStrategy {
                 // Begin each ring near the operator's chosen lead-in point, so the
                 // plunge/entry witness marks line up there; `None` keeps the default.
                 let rotated = crate::profile::rotate_to_start(ring, op.start);
-                emit_ring(&mut program, &rotated, op, &env.heights, z);
+                crate::rings::emit_ring(
+                    &mut program,
+                    &rotated,
+                    op.id,
+                    op.feed,
+                    op.plunge_feed,
+                    op.plunge,
+                    op.lead_overlap,
+                    &env.heights,
+                    z,
+                );
             }
         }
 
@@ -139,60 +131,12 @@ impl Strategy for PocketStrategy {
     }
 }
 
-/// Emit approach, plunge, one closed cutting loop, and retract for a ring at `z`.
-/// The entry uses the operation's plunge strategy (helix/ramp descend toward the
-/// pocket interior, staying clear of the wall).
-fn emit_ring(prog: &mut Program, pts: &[Point], op: &PocketOp, h: &Heights, z: f64) {
-    if pts.len() < 3 {
-        return;
-    }
-    let start = pts[0];
-    let link = Tag::new(op.id, MoveKind::Link);
-    let plunge = Tag::new(op.id, MoveKind::Plunge);
-    let cut = Tag::new(op.id, MoveKind::Cutting);
-    let retract = Tag::new(op.id, MoveKind::Retract);
-
-    prog.push(Step::Rapid {
-        to: Point3::new(start.x, start.y, h.clearance),
-        tag: link,
-    });
-    prog.push(Step::Rapid {
-        to: Point3::new(start.x, start.y, h.top_of_stock),
-        tag: link,
-    });
-    // Descend into the material per the plunge strategy. A helix/ramp is placed on
-    // the *inward* side of the ring so it stays within the pocket, not the wall.
-    let tan = crate::profile::start_tangent(pts);
-    let out = crate::profile::outward_normal(pts);
-    crate::profile::emit_plunge(
-        prog,
-        start,
-        tan,
-        (-out.0, -out.1),
-        h.top_of_stock,
-        z,
-        op.plunge,
-        op.plunge_feed,
-        op.feed,
-        plunge,
-    );
-    // Cut the ring, keeping on past the start by `lead_overlap` to re-machine the
-    // plunge/closure witness, then retract from wherever the overlap ended (the
-    // start itself when the overlap is zero — byte-identical to before).
-    let (loop_pts, exit_pt, _tan) = crate::emit::loop_with_overlap(pts, op.lead_overlap);
-    crate::emit::cut_polyline(prog, &loop_pts, op.feed, cut, z);
-    prog.push(Step::Rapid {
-        to: Point3::new(exit_pt.x, exit_pt.y, h.clearance),
-        tag: retract,
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cam_cldata::MoveKind;
-    use cam_geo::Contour;
-    use cam_model::{Plunge, Tool, ToolKind};
+    use cam_cldata::{MoveKind, Point3, Step};
+    use cam_geo::{Contour, Point};
+    use cam_model::{Heights, Plunge, Tool, ToolKind};
 
     fn square(side: f64) -> Contour {
         Contour::new(vec![
@@ -245,6 +189,7 @@ mod tests {
         let env = JobEnv {
             heights: Heights::new(5.0, 2.0, 0.0),
             tools: &ts,
+            stock: None,
         };
         let result = PocketStrategy::new(op).compute(&env, &CancelToken::new());
         assert!(!result.has_errors(), "{:?}", result.diagnostics);
@@ -274,6 +219,7 @@ mod tests {
         let env = JobEnv {
             heights: Heights::new(5.0, 2.0, 0.0),
             tools: &ts,
+            stock: None,
         };
         let result = PocketStrategy::new(op).compute(&env, &CancelToken::new());
         assert!(!result.has_errors(), "{:?}", result.diagnostics);
@@ -317,6 +263,7 @@ mod tests {
         let env = JobEnv {
             heights: Heights::new(5.0, 2.0, 0.0),
             tools: &ts,
+            stock: None,
         };
         let result = PocketStrategy::new(op).compute(&env, &CancelToken::new());
         assert!(result.has_errors());
@@ -364,6 +311,7 @@ mod tests {
         let env = JobEnv {
             heights: Heights::new(5.0, 2.0, 0.0),
             tools: &tools(8.0),
+            stock: None,
         };
         let result = PocketStrategy::new(pocket_op(0.0)).compute(&env, &CancelToken::new());
         let pairs = plunge_retract_pairs(&result);
@@ -382,6 +330,7 @@ mod tests {
         let env = JobEnv {
             heights: Heights::new(5.0, 2.0, 0.0),
             tools: &tools(8.0),
+            stock: None,
         };
         let result = PocketStrategy::new(pocket_op(overlap)).compute(&env, &CancelToken::new());
         let pairs = plunge_retract_pairs(&result);

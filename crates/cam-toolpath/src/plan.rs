@@ -27,12 +27,14 @@ pub fn build_job(
     doc: &Document,
     spindle_rpm: f64,
     dir: SpindleDir,
+    stock: Option<([f64; 2], [f64; 2])>,
     cancel: &CancelToken,
 ) -> (Program, Vec<Diagnostic>) {
     let setup = &doc.setup;
     let env = JobEnv {
         heights: setup.heights,
         tools: &setup.tools,
+        stock,
     };
 
     let mut program = Program::new();

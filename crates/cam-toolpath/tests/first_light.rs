@@ -57,6 +57,7 @@ fn document() -> Document {
         offset: 0.0,
         depth: 4.0,
         stepdown: 2.0,
+        stepover: 0.0,
         feed: 300.0,
         plunge_feed: 100.0,
         start: None,
@@ -74,6 +75,7 @@ fn document() -> Document {
         offset: 0.0,
         depth: 4.0,
         stepdown: 2.0,
+        stepover: 0.0,
         feed: 300.0,
         plunge_feed: 100.0,
         start: None,
@@ -100,7 +102,7 @@ fn document() -> Document {
 
 fn plan_and_post() -> (Program, String, Vec<cam_toolpath::Diagnostic>) {
     let doc = document();
-    let (program, diags) = build_job(&doc, 1000.0, SpindleDir::Cw, &CancelToken::new());
+    let (program, diags) = build_job(&doc, 1000.0, SpindleDir::Cw, None, &CancelToken::new());
     let opts = PostOptions {
         program_name: Some("first_light".into()),
         ..Default::default()
@@ -114,7 +116,7 @@ fn a_start_point_prepends_a_rapid_to_it() {
     let mut doc = document();
     doc.setup.origin = [1.0, 2.0, 0.0];
     doc.setup.start_offset = Some([0.0, 0.0, 30.0]); // origin + offset ⇒ (1,2,30)
-    let (program, _) = build_job(&doc, 1000.0, SpindleDir::Cw, &CancelToken::new());
+    let (program, _) = build_job(&doc, 1000.0, SpindleDir::Cw, None, &CancelToken::new());
     // The very first motion is a rapid to origin + offset.
     let first_rapid = program
         .steps()
@@ -197,6 +199,7 @@ fn tool_too_large_for_hole_reports_error() {
         offset: 0.0,
         depth: 4.0,
         stepdown: 2.0,
+        stepover: 0.0,
         feed: 300.0,
         plunge_feed: 100.0,
         start: None,
@@ -209,6 +212,7 @@ fn tool_too_large_for_hole_reports_error() {
     let env = JobEnv {
         heights: Heights::new(5.0, 2.0, 0.0),
         tools: &tools,
+        stock: None,
     };
     let result = ProfileStrategy::new(op).compute(&env, &CancelToken::new());
     assert!(result.has_errors(), "expected a tool-too-large error");
@@ -233,6 +237,7 @@ fn cancellation_stops_before_emitting() {
         offset: 0.0,
         depth: 4.0,
         stepdown: 2.0,
+        stepover: 0.0,
         feed: 300.0,
         plunge_feed: 100.0,
         start: None,
@@ -245,6 +250,7 @@ fn cancellation_stops_before_emitting() {
     let env = JobEnv {
         heights: Heights::new(5.0, 2.0, 0.0),
         tools: &tools,
+        stock: None,
     };
     let cancel = CancelToken::new();
     cancel.cancel();
@@ -277,6 +283,7 @@ fn lead_overlap_recuts_past_the_start() {
         offset: 0.0,
         depth: 2.0,
         stepdown: 2.0,
+        stepover: 0.0,
         feed: 300.0,
         plunge_feed: 100.0,
         start: None,
@@ -289,6 +296,7 @@ fn lead_overlap_recuts_past_the_start() {
     let env = JobEnv {
         heights: Heights::new(5.0, 2.0, 0.0),
         tools: &tools,
+        stock: None,
     };
     let result = ProfileStrategy::new(op).compute(&env, &CancelToken::new());
     assert!(!result.has_errors(), "{:?}", result.diagnostics);
@@ -350,6 +358,7 @@ fn offset_leaves_stock_on_the_wall() {
             offset,
             depth: 2.0,
             stepdown: 2.0,
+            stepover: 0.0,
             feed: 300.0,
             plunge_feed: 100.0,
             start: None,
@@ -368,6 +377,7 @@ fn offset_leaves_stock_on_the_wall() {
         let env = JobEnv {
             heights: Heights::new(5.0, 2.0, 0.0),
             tools: &tools,
+            stock: None,
         };
         let result = ProfileStrategy::new(op).compute(&env, &CancelToken::new());
         assert!(!result.has_errors(), "{:?}", result.diagnostics);
@@ -390,6 +400,100 @@ fn offset_leaves_stock_on_the_wall() {
         (left - base - 2.0).abs() < 1e-6,
         "a 2 mm offset leaves the wall 2 mm proud, got {left}"
     );
+}
+
+fn plunge_count(prog: &Program) -> usize {
+    prog.steps()
+        .iter()
+        .filter(|s| matches!(s, Step::Linear { tag, .. } if tag.kind == MoveKind::Plunge))
+        .count()
+}
+
+fn rough_op(side: Side, chain: Contour, stepover: f64) -> ProfileOp {
+    ProfileOp {
+        id: 0,
+        tool: 1,
+        chain,
+        side,
+        comp: Comp::Computed,
+        offset: 0.0,
+        depth: 2.0,
+        stepdown: 2.0, // one level
+        stepover,
+        feed: 300.0,
+        plunge_feed: 100.0,
+        start: None,
+        lead_in: Lead::None,
+        lead_out: Lead::None,
+        lead_overlap: 0.0,
+        plunge: Plunge::Straight,
+    }
+}
+
+fn end_mill_tools() -> [Tool; 1] {
+    [Tool {
+        number: 1,
+        diameter: 6.0,
+        length: 30.0,
+        flutes: 2,
+        kind: ToolKind::EndMill,
+    }]
+}
+
+#[test]
+fn stepover_roughs_inside_in_concentric_rings() {
+    // Inside profiling with a 4 mm stepover clears the enclosed 40×40 region in
+    // concentric rings (offset inward 3, 7, 11, …), so many plunges, not one.
+    let op = rough_op(Side::Inside, rect(0.0, 0.0, 40.0, 40.0), 4.0);
+    let tools = end_mill_tools();
+    let env = JobEnv {
+        heights: Heights::new(5.0, 2.0, 0.0),
+        tools: &tools,
+        stock: None, // inside needs no stock
+    };
+    let r = ProfileStrategy::new(op).compute(&env, &CancelToken::new());
+    assert!(!r.has_errors(), "{:?}", r.diagnostics);
+    assert!(
+        plunge_count(&r.program) > 1,
+        "inside roughing cuts several rings, got {}",
+        plunge_count(&r.program)
+    );
+}
+
+#[test]
+fn stepover_roughs_outside_frame_to_the_stock() {
+    // A 40×40 part in a 60×60 stock: outside roughing clears the 10 mm frame in
+    // concentric passes (part as an island in the stock), so several plunges.
+    let op = rough_op(Side::Outside, rect(10.0, 10.0, 50.0, 50.0), 4.0);
+    let tools = end_mill_tools();
+    let env = JobEnv {
+        heights: Heights::new(5.0, 2.0, 0.0),
+        tools: &tools,
+        stock: Some(([0.0, 0.0], [60.0, 60.0])),
+    };
+    let r = ProfileStrategy::new(op).compute(&env, &CancelToken::new());
+    assert!(!r.has_errors(), "{:?}", r.diagnostics);
+    assert!(
+        plunge_count(&r.program) > 1,
+        "outside roughing clears the frame in rings, got {}",
+        plunge_count(&r.program)
+    );
+}
+
+#[test]
+fn outside_stepover_without_stock_is_a_single_pass() {
+    // No stock ⇒ there is no frame to define, so roughing falls back to a single
+    // finishing pass: one plunge for the single depth level.
+    let op = rough_op(Side::Outside, rect(10.0, 10.0, 50.0, 50.0), 4.0);
+    let tools = end_mill_tools();
+    let env = JobEnv {
+        heights: Heights::new(5.0, 2.0, 0.0),
+        tools: &tools,
+        stock: None,
+    };
+    let r = ProfileStrategy::new(op).compute(&env, &CancelToken::new());
+    assert!(!r.has_errors(), "{:?}", r.diagnostics);
+    assert_eq!(plunge_count(&r.program), 1, "falls back to one finishing pass");
 }
 
 /// Parse grbl output (modal, absolute) and assert safety/correctness invariants:
@@ -545,6 +649,7 @@ fn arc_lead_and_helix_plunge_post_to_helical_gcode() {
         offset: 0.0,
         depth: 4.0,
         stepdown: 2.0,
+        stepover: 0.0,
         feed: 300.0,
         plunge_feed: 100.0,
         start: None,
@@ -578,7 +683,7 @@ fn arc_lead_and_helix_plunge_post_to_helical_gcode() {
         start_offset: None,
     });
 
-    let (program, diags) = build_job(&doc, 1000.0, SpindleDir::Cw, &CancelToken::new());
+    let (program, diags) = build_job(&doc, 1000.0, SpindleDir::Cw, None, &CancelToken::new());
     assert!(
         !diags
             .iter()

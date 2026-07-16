@@ -39,6 +39,7 @@ fn profile_op(id: u32, chain: cam_geo::Contour, side: Side) -> Operation {
         offset: 0.0,
         depth: 4.0,
         stepdown: 2.0,
+        stepover: 0.0,
         feed: 300.0,
         plunge_feed: 100.0,
         start: None,
@@ -82,7 +83,7 @@ fn import_and_plan() -> (String, Vec<cam_toolpath::Diagnostic>, usize, usize) {
         start_offset: None,
     });
 
-    let (program, diags) = build_job(&doc, 1000.0, SpindleDir::Cw, &CancelToken::new());
+    let (program, diags) = build_job(&doc, 1000.0, SpindleDir::Cw, None, &CancelToken::new());
     let opts = PostOptions {
         program_name: Some("part".into()),
         ..Default::default()
