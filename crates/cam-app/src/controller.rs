@@ -15,8 +15,8 @@ use cam_import::{read_cad_file, read_dxf_str, ImportError, ImportOptions};
 
 use crate::project::Project;
 use cam_model::{
-    ChamferOp, Comp, Document, DrillOp, FaceOp, Hand, Heights, History, Lead, Machine, Operation,
-    Plunge, PocketOp, ProfileOp, Setup, Side, Stock, ThreadOp, Tool, ToolKind,
+    Axis, ChamferOp, Comp, Document, DrillOp, FaceOp, Hand, Heights, History, Lead, Machine,
+    Operation, Plunge, PocketOp, ProfileOp, Setup, Side, Stock, ThreadOp, Tool, ToolKind,
 };
 use cam_post::{GrblPost, Post, PostError, PostOptions};
 use cam_render::{mesh_vertices, MeshVertex, Scene, PART};
@@ -773,9 +773,14 @@ impl AppController {
                 id: 0,
                 tool,
                 boundary: chain,
-                depth: p.depth,
+                // Face at the reference plane by default; a shallow skim the user
+                // then tunes (start_offset raises it to level proud stock).
+                start_offset: 0.0,
+                depth: 1.0,
                 stepdown: p.stepdown,
-                stepover: p.stepover,
+                overlap: 0.5,
+                overshoot: 2.0,
+                direction: Axis::X,
                 feed: p.feed,
                 plunge_feed: p.plunge_feed,
             }),

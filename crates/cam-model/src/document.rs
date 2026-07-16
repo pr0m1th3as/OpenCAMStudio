@@ -272,8 +272,38 @@ pub struct PocketOp {
     pub lead_overlap: f64,
 }
 
+/// A principal axis in the XY plane — used to orient facing passes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Axis {
+    /// Parallel cutting lines run along X (stepping over in Y).
+    #[default]
+    X,
+    /// Parallel cutting lines run along Y (stepping over in X).
+    Y,
+}
+
+impl Axis {
+    /// Both axes, in a stable order — for pickers.
+    pub const ALL: [Axis; 2] = [Axis::X, Axis::Y];
+}
+
+impl std::fmt::Display for Axis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Axis::X => "X",
+            Axis::Y => "Y",
+        })
+    }
+}
+
 /// A facing operation: clear the top of the stock over a boundary with parallel
-/// passes, in stepdown passes, down to a depth.
+/// passes, in stepdown passes, down to a depth. The passes form a continuous
+/// serpentine (one plunge per level, arc turnarounds) rather than lifting between
+/// passes.
+///
+/// Z uses the magnitude convention: `start_offset` is the top cutting plane above
+/// the drawing reference (Z=0), `depth` is how far *down* to face as a positive
+/// number, so the final faced plane is `start_offset - depth`.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FaceOp {
     /// Operation id.
@@ -282,12 +312,28 @@ pub struct FaceOp {
     pub tool: u32,
     /// The area to face (usually the stock outline).
     pub boundary: Contour,
-    /// Absolute Z of the faced surface.
+    /// Z of the top cutting plane, above the drawing reference (mm, >= 0). Set
+    /// this to face stock that stands proud of Z=0 down toward it; `0` starts the
+    /// cut at the reference plane.
+    #[serde(default)]
+    pub start_offset: f64,
+    /// Depth removed *downward* from `start_offset`, as a positive magnitude (mm).
+    /// The final faced plane sits at `start_offset - depth`.
     pub depth: f64,
     /// Maximum depth removed per pass (mm, > 0).
     pub stepdown: f64,
-    /// Lateral stepover between parallel passes (mm, > 0).
-    pub stepover: f64,
+    /// Fraction of the tool diameter that adjacent passes overlap (0..1). The pass
+    /// spacing is `diameter * (1 - overlap)`, and the first pass is placed so it
+    /// cuts a strip of exactly that width along the stock edge.
+    #[serde(default)]
+    pub overlap: f64,
+    /// Distance the tool overshoots past each stock edge (mm, >= 0) before the
+    /// 180-degree turnaround arc, so the arc swings clear of the part.
+    #[serde(default)]
+    pub overshoot: f64,
+    /// Orientation of the parallel cutting lines.
+    #[serde(default)]
+    pub direction: Axis,
     /// Cutting feed, mm/min.
     pub feed: f64,
     /// Plunge feed, mm/min.

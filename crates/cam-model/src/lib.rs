@@ -18,8 +18,8 @@ mod history;
 
 pub use cam_cldata::Point3;
 pub use document::{
-    ChamferOp, Comp, Document, DrillOp, FaceOp, Hand, Heights, Lead, Operation, Plunge, PocketOp,
-    ProfileOp, Setup, Side, Stock, ThreadOp, SCHEMA_VERSION,
+    Axis, ChamferOp, Comp, Document, DrillOp, FaceOp, Hand, Heights, Lead, Operation, Plunge,
+    PocketOp, ProfileOp, Setup, Side, Stock, ThreadOp, SCHEMA_VERSION,
 };
 pub use history::History;
 

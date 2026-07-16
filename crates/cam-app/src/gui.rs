@@ -21,7 +21,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
-use cam_model::{Envelope, Hand, Lead, Machine, Operation, Plunge, Point3, Side, ToolKind};
+use cam_model::{Axis, Envelope, Hand, Lead, Machine, Operation, Plunge, Point3, Side, ToolKind};
 
 use crate::tool_library::ToolLibrary;
 
@@ -638,6 +638,12 @@ enum Field {
     /// Closure overlap: distance kept cutting past the start to erase the
     /// entry/exit witness (profile, pocket, chamfer).
     LeadOverlap,
+    /// Face: top cutting plane above the drawing reference (mm).
+    FaceStartOffset,
+    /// Face: pass overlap as a percentage of the tool diameter.
+    FaceOverlap,
+    /// Face: overshoot past the stock edge before the turnaround (mm).
+    FaceOvershoot,
     /// Plunge parameter A: ramp/zig-zag angle, or helix radius.
     PlungeA,
     /// Plunge parameter B: zig-zag length, or helix pitch.
@@ -681,6 +687,9 @@ impl Field {
             Field::LeadInSize => "Lead-in size (mm)",
             Field::LeadOutSize => "Lead-out size (mm)",
             Field::LeadOverlap => "Lead overlap (mm)",
+            Field::FaceStartOffset => "Start offset (mm)",
+            Field::FaceOverlap => "Overlap (%)",
+            Field::FaceOvershoot => "Overshoot (mm)",
             Field::PlungeA => "Plunge angle/radius",
             Field::PlungeB => "Plunge length/pitch",
         }
@@ -1066,6 +1075,8 @@ enum Message {
     LeadInKindChanged(LeadKind),
     LeadOutKindChanged(LeadKind),
     PlungeKindChanged(PlungeKind),
+    /// Change the selected face op's pass direction (committed immediately).
+    FaceDirectionChanged(Axis),
     /// Create a new default tool and select it.
     NewTool,
     /// Delete the selected tool.
@@ -1683,6 +1694,15 @@ impl App {
                 self.refresh_fields();
                 self.rerun();
             }
+            Message::FaceDirectionChanged(axis) => {
+                self.controller.edit_selected_operation(|op| {
+                    if let Operation::Face(f) = op {
+                        f.direction = axis;
+                    }
+                });
+                self.refresh_fields();
+                self.rerun();
+            }
             Message::SideChanged(side) => {
                 self.controller.edit_selected_operation(|op| match op {
                     Operation::Profile(p) => p.side = side,
@@ -2062,7 +2082,15 @@ impl App {
                     }
                     fields
                 }
-                Some(Operation::Face(_)) => vec![Field::Depth, Field::Stepdown, Field::Feed],
+                Some(Operation::Face(_)) => vec![
+                    Field::FaceStartOffset,
+                    Field::Depth,
+                    Field::Stepdown,
+                    Field::FaceOverlap,
+                    Field::FaceOvershoot,
+                    Field::Feed,
+                    Field::PlungeFeed,
+                ],
                 Some(Operation::Drill(_)) => vec![Field::Depth, Field::Feed],
                 Some(Operation::Chamfer(c)) => {
                     let mut fields = vec![Field::ChamferWidth, Field::Feed, Field::PlungeFeed];
@@ -3164,6 +3192,14 @@ impl App {
                         Message::PlungeKindChanged,
                     ));
                 }
+                Some(Operation::Face(f)) => {
+                    list = list.push(profile_picker(
+                        "Direction",
+                        f.direction,
+                        &Axis::ALL[..],
+                        Message::FaceDirectionChanged,
+                    ));
+                }
                 Some(Operation::Chamfer(c)) => {
                     list = list.push(profile_picker(
                         "Side",
@@ -3673,9 +3709,13 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Pocket(o), Field::LeadOverlap) => Some(o.lead_overlap),
         (Operation::Pocket(o), Field::PlungeA) => Some(plunge_params(o.plunge).0),
         (Operation::Pocket(o), Field::PlungeB) => Some(plunge_params(o.plunge).1),
+        (Operation::Face(o), Field::FaceStartOffset) => Some(o.start_offset),
         (Operation::Face(o), Field::Depth) => Some(o.depth),
         (Operation::Face(o), Field::Stepdown) => Some(o.stepdown),
+        (Operation::Face(o), Field::FaceOverlap) => Some(o.overlap * 100.0),
+        (Operation::Face(o), Field::FaceOvershoot) => Some(o.overshoot),
         (Operation::Face(o), Field::Feed) => Some(o.feed),
+        (Operation::Face(o), Field::PlungeFeed) => Some(o.plunge_feed),
         (Operation::Drill(o), Field::Depth) => Some(o.depth),
         (Operation::Drill(o), Field::Feed) => Some(o.feed),
         (Operation::Chamfer(o), Field::ChamferWidth) => Some(o.width),
@@ -3750,14 +3790,28 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
             o.plunge = set_plunge_params(o.plunge, a, b);
         }
         Operation::Face(o) => {
+            if let Some(v) = get(Field::FaceStartOffset) {
+                o.start_offset = v.max(0.0);
+            }
             if let Some(v) = get(Field::Depth) {
                 o.depth = v;
             }
             if let Some(v) = get(Field::Stepdown) {
                 o.stepdown = v;
             }
+            if let Some(v) = get(Field::FaceOverlap) {
+                // Stored as a fraction; the field edits a percentage. Clamp below
+                // 100 % so the pass spacing stays positive.
+                o.overlap = (v / 100.0).clamp(0.0, 0.99);
+            }
+            if let Some(v) = get(Field::FaceOvershoot) {
+                o.overshoot = v.max(0.0);
+            }
             if let Some(v) = get(Field::Feed) {
                 o.feed = v;
+            }
+            if let Some(v) = get(Field::PlungeFeed) {
+                o.plunge_feed = v;
             }
         }
         Operation::Drill(o) => {
