@@ -18,7 +18,7 @@ use cam_model::{
     Axis, ChamferOp, Comp, Document, DrillOp, FaceOp, Hand, Heights, History, Lead, Machine,
     Operation, Plunge, PocketOp, ProfileOp, Setup, Side, Stock, ThreadOp, Tool, ToolKind,
 };
-use cam_post::{GrblPost, Post, PostError, PostOptions};
+use cam_post::{PostError, PostKind, PostOptions};
 use cam_render::{mesh_vertices, MeshVertex, Scene, PART};
 use cam_sim::{simulate, Collision, CollisionKind, ProfileShape, SimOptions, SimTool, ToolProfile};
 
@@ -148,6 +148,8 @@ impl From<PostError> for ExportError {
 /// The application state and operations, GUI-agnostic.
 pub struct AppController {
     machine: Machine,
+    /// The selected post/controller dialect for export.
+    post_kind: PostKind,
     regions: Vec<Polygon>,
     document: History<Document>,
     defaults: JobParams,
@@ -286,6 +288,7 @@ impl AppController {
         let defaults = JobParams::default();
         Self {
             machine,
+            post_kind: PostKind::default(),
             regions: Vec::new(),
             document: History::new(empty_document(&defaults)),
             defaults,
@@ -302,6 +305,17 @@ impl AppController {
     /// The machine being driven.
     pub fn machine(&self) -> &Machine {
         &self.machine
+    }
+
+    /// The selected post/controller dialect for export.
+    pub fn post_kind(&self) -> PostKind {
+        self.post_kind
+    }
+
+    /// Choose the post dialect. Clears any cached `.nc` so the next export re-posts.
+    pub fn set_post_kind(&mut self, kind: PostKind) {
+        self.post_kind = kind;
+        self.nc = None;
     }
 
     /// Edit the machine (envelope/name/limits). No re-run needed: the backplot is
@@ -1342,7 +1356,7 @@ impl AppController {
         // matched by the operator's G54 touch-off. Design/sim stay in part space.
         let origin = self.document.current().setup.origin;
         let program = outcome.program.translated([-origin[0], -origin[1], -origin[2]]);
-        let nc = GrblPost.post(&program, &self.machine, &options)?;
+        let nc = self.post_kind.post(&program, &self.machine, &options)?;
         self.nc = Some(nc);
         Ok(self.nc.as_deref().unwrap())
     }

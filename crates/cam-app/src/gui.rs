@@ -22,6 +22,7 @@ use iced::widget::{
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
 use cam_model::{Axis, Envelope, Hand, Lead, Machine, Operation, Plunge, Point3, Side, ToolKind};
+use cam_post::PostKind;
 
 use crate::tool_library::ToolLibrary;
 
@@ -995,6 +996,8 @@ enum Message {
     FieldChanged(Field, String),
     /// Rename the machine.
     MachineNameChanged(String),
+    /// Choose the post/controller dialect for export.
+    PostKindChanged(PostKind),
     /// Commit the inspector fields (one undo step) and recompute the toolpath.
     Apply,
     Undo,
@@ -1281,6 +1284,10 @@ impl App {
             }
             Message::MachineNameChanged(name) => {
                 self.controller.edit_machine(|m| m.name = name);
+            }
+            Message::PostKindChanged(kind) => {
+                self.controller.set_post_kind(kind);
+                self.status = format!("Post: {kind}.");
             }
             Message::Apply => self.apply_inspector(),
             Message::NewProject => {
@@ -3205,6 +3212,18 @@ impl App {
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),
+            );
+            // The post/controller dialect used on export.
+            list = list.push(profile_picker(
+                "Post",
+                self.controller.post_kind(),
+                &PostKind::ALL[..],
+                Message::PostKindChanged,
+            ));
+            list = list.push(
+                text("Dry-run / air-cut generated code on your control before cutting.")
+                    .size(11)
+                    .color(palette::GROUP_LABEL),
             );
         }
 

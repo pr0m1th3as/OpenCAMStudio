@@ -12,6 +12,7 @@
 //! that has one, or **expanded to explicit `G0`/`G1` pecks** by one that does not
 //! (grbl). See [`grbl::GrblPost`].
 
+mod dialect;
 mod fanuc;
 mod grbl;
 mod words;
@@ -24,6 +25,64 @@ use core::fmt;
 
 use cam_cldata::{Point3, Program, Step};
 use cam_model::Machine;
+
+/// A selectable post/controller dialect, for the export picker. Each maps to a
+/// [`dialect::Dialect`] that drives emission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PostKind {
+    /// grbl (Arduino/ESP32 hobby control).
+    #[default]
+    Grbl,
+    /// FluidNC (grbl for ESP32).
+    FluidNc,
+    /// grblHAL (32-bit grbl with real tool-change).
+    GrblHal,
+    /// LinuxCNC (RS-274NGC).
+    LinuxCnc,
+    /// Fanuc (industrial standard).
+    Fanuc,
+    /// Haas (Fanuc-family job-shop control).
+    Haas,
+}
+
+impl PostKind {
+    /// Every post, in a stable order — for the picker.
+    pub const ALL: [PostKind; 6] = [
+        PostKind::Grbl,
+        PostKind::FluidNc,
+        PostKind::GrblHal,
+        PostKind::LinuxCnc,
+        PostKind::Fanuc,
+        PostKind::Haas,
+    ];
+
+    fn dialect(self) -> &'static dialect::Dialect {
+        match self {
+            PostKind::Grbl => &dialect::GRBL,
+            PostKind::FluidNc => &dialect::FLUIDNC,
+            PostKind::GrblHal => &dialect::GRBLHAL,
+            PostKind::LinuxCnc => &dialect::LINUXCNC,
+            PostKind::Fanuc => &dialect::FANUC,
+            PostKind::Haas => &dialect::HAAS,
+        }
+    }
+
+    /// Post `program` in this dialect.
+    pub fn post(
+        self,
+        program: &Program,
+        machine: &Machine,
+        options: &PostOptions,
+    ) -> Result<String, PostError> {
+        dialect::emit(program, machine, options, self.dialect())
+    }
+}
+
+impl fmt::Display for PostKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.dialect().name)
+    }
+}
 
 /// What a controller's dialect can express. A post lowers CL-data according to
 /// these flags; where a capability is missing, it must synthesise the behaviour
