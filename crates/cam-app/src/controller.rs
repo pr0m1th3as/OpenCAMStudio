@@ -1402,12 +1402,12 @@ impl AppController {
         let mut operations = Vec::new();
         if seed_ops {
             let mut id = 0u32;
-            let mut push = |chain, side, operations: &mut Vec<Operation>| {
-                operations.push(Operation::Profile(ProfileOp {
+            let outer_profile = |id, chain| {
+                Operation::Profile(ProfileOp {
                     id,
                     tool: 1,
                     chain,
-                    side,
+                    side: Side::Outside,
                     comp: Comp::Computed,
                     offset: 0.0,
                     depth: p.depth,
@@ -1420,13 +1420,52 @@ impl AppController {
                     lead_out: Lead::None,
                     lead_overlap: 0.0,
                     plunge: Plunge::Straight,
-                }));
-                id += 1;
+                })
             };
             for region in &self.regions {
-                push(region.outer().clone(), Side::Outside, &mut operations);
+                operations.push(outer_profile(id, region.outer().clone()));
+                id += 1;
                 for hole in region.holes() {
-                    push(hole.clone(), Side::Inside, &mut operations);
+                    // A hole that fits the tool is a drill; a larger one is a pocket.
+                    // (An inner profile would leave an uncut core — see the profile
+                    // strategy's warning — so we never seed one for a hole.)
+                    let pts = hole.points();
+                    let (mut xmin, mut ymin, mut xmax, mut ymax) =
+                        (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+                    for pt in pts {
+                        xmin = xmin.min(pt.x);
+                        ymin = ymin.min(pt.y);
+                        xmax = xmax.max(pt.x);
+                        ymax = ymax.max(pt.y);
+                    }
+                    let dia = (xmax - xmin).min(ymax - ymin);
+                    if dia <= p.tool_diameter + 1e-9 {
+                        operations.push(Operation::Drill(DrillOp {
+                            id,
+                            tool: 1,
+                            points: vec![centroid(hole)],
+                            depth: p.depth,
+                            peck: None,
+                            dwell: None,
+                            feed: p.plunge_feed,
+                        }));
+                    } else {
+                        operations.push(Operation::Pocket(PocketOp {
+                            id,
+                            tool: 1,
+                            boundary: hole.clone(),
+                            islands: Vec::new(),
+                            depth: p.depth,
+                            stepdown: p.stepdown,
+                            stepover: p.stepover,
+                            feed: p.feed,
+                            plunge_feed: p.plunge_feed,
+                            plunge: Plunge::Straight,
+                            start: None,
+                            lead_overlap: 0.0,
+                        }));
+                    }
+                    id += 1;
                 }
             }
         }
@@ -1749,7 +1788,8 @@ mod tests {
     fn open_generates_ops_and_selects_the_first() {
         let mut app = AppController::new(machine());
         assert_eq!(app.open_dxf(PART_DXF, "part.dxf").unwrap(), 1);
-        // Rectangle boundary (outside) + circular hole (inside) = 2 profiles.
+        // Outside profile for the boundary + a hole op (drill/pocket, never an
+        // inner profile) = 2 operations.
         assert_eq!(app.document().setup.operations.len(), 2);
         assert_eq!(app.selection(), Selection::Operation(0));
         assert!(app.selected_operation().is_some());

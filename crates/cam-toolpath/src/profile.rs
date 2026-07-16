@@ -107,22 +107,17 @@ impl Strategy for ProfileStrategy {
         };
         let signed = side_sign * (radius + op.offset);
 
-        // Radial roughing (stepover): clear the material out to the raw stock in
-        // concentric passes, leaving the finishing `offset` on the wall — the
-        // roughing half of the rough-then-finish workflow. Only for computed comp
-        // with a real material side; an outside profile also needs the stock. Not
-        // applicable ⇒ fall through to the single finishing pass. (Leads apply to
-        // the single-pass finish, not the roughing rings.)
-        if op.stepover > 0.0 && matches!(op.comp, Comp::Computed) && side_sign != 0.0 {
-            if let Some(region) = roughing_region(op, side_sign, env.stock) {
-                // Inside offsets inward from the chain (finish = radius + allowance);
-                // outside bakes the allowance into the island, so the wall ring is at
-                // the tool radius.
-                let first = if side_sign > 0.0 {
-                    radius
-                } else {
-                    radius + op.offset
-                };
+        // Radial roughing (stepover) is **outside-only**: clear the frame out to the
+        // raw stock in concentric passes, leaving the finishing `offset` on the wall
+        // — the roughing half of the rough-then-finish workflow. Inner clearing is a
+        // pocket's job (an inner profile is a single-pass wall finish), so stepover
+        // is ignored for Inside/On. Not applicable ⇒ fall through to a single pass.
+        // (Leads apply to the single-pass finish, not the roughing rings.)
+        if op.stepover > 0.0 && matches!(op.comp, Comp::Computed) && side_sign > 0.0 {
+            if let Some(region) = roughing_region(op, env.stock) {
+                // The finishing allowance is baked into the island, so the wall ring
+                // sits at the tool radius.
+                let first = radius;
                 let rings =
                     match crate::rings::concentric_rings(&region, first, op.stepover, cancel) {
                         Ok(rings) => rings,
@@ -177,6 +172,25 @@ impl Strategy for ProfileStrategy {
                     };
                 }
                 // No rings (degenerate frame) — fall through to a single pass.
+            }
+        }
+
+        // An inner profile is a single-pass wall finish. Warn (don't block) if it
+        // would leave an uncut core — material the finish loop can't reach: the
+        // chain offset inward past the swept band (a tool diameter beyond the wall).
+        // That's the signal to rough the pocket first; it's a local check, so it
+        // fires whether or not anything actually roughed it.
+        if side_sign < 0.0 && matches!(op.comp, Comp::Computed) {
+            let core = 2.0 * tool.radius() + op.offset;
+            let leaves_core = Polygon::new(op.chain.clone())
+                .ok()
+                .and_then(|p| offset(&[p], -core, JoinStyle::Round).ok())
+                .is_some_and(|v| !v.is_empty());
+            if leaves_core {
+                diagnostics.push(Diagnostic::warning(format!(
+                    "operation {}: inner profile leaves an uncut core — rough it with a pocket first",
+                    op.id
+                )));
             }
         }
 
@@ -236,24 +250,14 @@ impl Strategy for ProfileStrategy {
     }
 }
 
-/// The region to clear when radial roughing (stepover). Inside profiling clears
-/// the enclosed area (rings inward from the chain); outside profiling clears the
-/// frame between the raw stock and the part, so the region is the stock with the
-/// part — dilated by the finishing allowance — as an island. Returns `None` when
-/// roughing does not apply (no stock for an outside profile, or the stock does not
-/// contain the part), so the caller falls back to a single pass.
-fn roughing_region(
-    op: &ProfileOp,
-    side_sign: f64,
-    stock: Option<([f64; 2], [f64; 2])>,
-) -> Option<Polygon> {
+/// The region to clear when radial roughing an **outside** profile: the frame
+/// between the raw stock and the part, so the region is the stock with the part —
+/// dilated by the finishing allowance — as an island. Returns `None` when roughing
+/// does not apply (no stock, or the stock does not contain the part), so the caller
+/// falls back to a single pass.
+fn roughing_region(op: &ProfileOp, stock: Option<([f64; 2], [f64; 2])>) -> Option<Polygon> {
     let chain_poly = Polygon::new(op.chain.clone()).ok()?;
-    if side_sign < 0.0 {
-        // Inside: rough the enclosed region itself.
-        return Some(chain_poly);
-    }
-
-    // Outside: the stock must strictly contain the part for there to be a frame.
+    // The stock must strictly contain the part for there to be a frame.
     let (smin, smax) = stock?;
     let (mut xmin, mut ymin, mut xmax, mut ymax) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
     for p in op.chain.points() {

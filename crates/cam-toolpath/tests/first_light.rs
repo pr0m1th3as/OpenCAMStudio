@@ -441,22 +441,29 @@ fn end_mill_tools() -> [Tool; 1] {
 }
 
 #[test]
-fn stepover_roughs_inside_in_concentric_rings() {
-    // Inside profiling with a 4 mm stepover clears the enclosed 40×40 region in
-    // concentric rings (offset inward 3, 7, 11, …), so many plunges, not one.
+fn inside_profile_ignores_stepover_and_warns_on_uncut_core() {
+    // Radial stepover is outside-only: an inner profile is a single-pass wall
+    // finish, so a set stepover is ignored (one plunge). A hole far larger than
+    // the tool would leave an uncut core, so it warns (rough it with a pocket).
     let op = rough_op(Side::Inside, rect(0.0, 0.0, 40.0, 40.0), 4.0);
     let tools = end_mill_tools();
     let env = JobEnv {
         heights: Heights::new(5.0, 2.0, 0.0),
         tools: &tools,
-        stock: None, // inside needs no stock
+        stock: None,
     };
     let r = ProfileStrategy::new(op).compute(&env, &CancelToken::new());
     assert!(!r.has_errors(), "{:?}", r.diagnostics);
+    assert_eq!(
+        plunge_count(&r.program),
+        1,
+        "an inner profile is a single finishing pass, not radial roughing"
+    );
     assert!(
-        plunge_count(&r.program) > 1,
-        "inside roughing cuts several rings, got {}",
-        plunge_count(&r.program)
+        r.diagnostics
+            .iter()
+            .any(|d| d.severity == cam_toolpath::Severity::Warning),
+        "warns that the inner profile leaves an uncut core"
     );
 }
 

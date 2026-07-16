@@ -2059,14 +2059,13 @@ impl App {
             ],
             Selection::Operation(id) => match self.controller.operation(id) {
                 Some(Operation::Profile(p)) => {
-                    let mut fields = vec![
-                        Field::Depth,
-                        Field::Stepdown,
-                        Field::Stepover,
-                        Field::ProfileOffset,
-                        Field::Feed,
-                        Field::PlungeFeed,
-                    ];
+                    let mut fields = vec![Field::Depth, Field::Stepdown];
+                    // Radial roughing (stepover) is outside-only; an inner profile is
+                    // a single-pass wall finish (rough the pocket first).
+                    if p.side == Side::Outside {
+                        fields.push(Field::Stepover);
+                    }
+                    fields.extend([Field::ProfileOffset, Field::Feed, Field::PlungeFeed]);
                     // Lead/plunge sizes appear only when the kind uses them.
                     if p.lead_in != Lead::None {
                         fields.push(Field::LeadInSize);
