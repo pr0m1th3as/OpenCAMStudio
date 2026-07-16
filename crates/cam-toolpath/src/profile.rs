@@ -151,7 +151,7 @@ impl Strategy for ProfileStrategy {
                             };
                         }
                         for ring in &rings {
-                            let rotated = rotate_to_start(ring, op.start);
+                            let rotated = rotate_to_start(&ring.pts, op.start);
                             crate::rings::emit_ring(
                                 &mut program,
                                 &rotated,

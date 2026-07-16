@@ -293,6 +293,15 @@ pub struct PocketOp {
     /// no witness dent. `0.0` (the default) closes exactly at the start, as before.
     #[serde(default)]
     pub lead_overlap: f64,
+    /// Lead-in onto the finished walls (boundary and islands), eased in from the
+    /// cleared interior so a one-pass wall finish leaves no witness. `None` (the
+    /// default) plunges/links straight onto the wall, as before.
+    #[serde(default)]
+    pub lead_in: Lead,
+    /// Lead-out off the walls after the finishing pass. `None` (the default) leaves
+    /// in place.
+    #[serde(default)]
+    pub lead_out: Lead,
 }
 
 /// A principal axis in the XY plane — used to orient facing passes.

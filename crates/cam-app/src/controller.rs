@@ -761,6 +761,8 @@ impl AppController {
                     plunge: Plunge::Straight,
                     start,
                     lead_overlap: 0.0,
+                    lead_in: Lead::None,
+                    lead_out: Lead::None,
                 })
             }
             OpKind::Drill => Operation::Drill(DrillOp {
@@ -1465,6 +1467,8 @@ impl AppController {
                             plunge: Plunge::Straight,
                             start: None,
                             lead_overlap: 0.0,
+                            lead_in: Lead::None,
+                            lead_out: Lead::None,
                         }));
                     }
                     id += 1;

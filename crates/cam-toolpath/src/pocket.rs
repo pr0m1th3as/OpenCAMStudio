@@ -118,6 +118,8 @@ impl Strategy for PocketStrategy {
             op.plunge_feed,
             op.plunge,
             op.lead_overlap,
+            op.lead_in,
+            op.lead_out,
             &env.heights,
             &levels,
             1.5 * spacing,
@@ -136,7 +138,7 @@ mod tests {
     use super::*;
     use cam_cldata::{MoveKind, Step};
     use cam_geo::{Contour, Point};
-    use cam_model::{Heights, Plunge, Tool, ToolKind};
+    use cam_model::{Heights, Lead, Plunge, Tool, ToolKind};
 
     fn square(side: f64) -> Contour {
         Contour::new(vec![
@@ -203,6 +205,8 @@ mod tests {
             plunge: Plunge::Straight,
             start: None,
             lead_overlap: 0.0,
+            lead_in: Lead::None,
+            lead_out: Lead::None,
         };
         let ts = tools(8.0);
         let env = JobEnv {
@@ -239,6 +243,8 @@ mod tests {
             },
             start: None,
             lead_overlap: 0.0,
+            lead_in: Lead::None,
+            lead_out: Lead::None,
         };
         let ts = tools(8.0);
         let env = JobEnv {
@@ -284,6 +290,8 @@ mod tests {
             plunge: Plunge::Straight,
             start: None,
             lead_overlap: 0.0,
+            lead_in: Lead::None,
+            lead_out: Lead::None,
         };
         let ts = tools(12.0); // radius 6 > half of 10 ⇒ cannot enter
         let env = JobEnv {
@@ -329,6 +337,8 @@ mod tests {
                 plunge: Plunge::Straight,
                 start: None,
                 lead_overlap: 0.0,
+                lead_in: Lead::None,
+                lead_out: Lead::None,
             };
             op.overlap = overlap;
             let ts = tools(8.0);
@@ -363,6 +373,8 @@ mod tests {
                 plunge: Plunge::Straight,
                 start: None,
                 lead_overlap: 0.0,
+                lead_in: Lead::None,
+                lead_out: Lead::None,
             };
             let ts = tools(8.0);
             let env = JobEnv {
@@ -380,5 +392,107 @@ mod tests {
             (base - skinned - 2.0).abs() < 1e-6,
             "a 2 mm offset holds the wall ring 2 mm back ({base} vs {skinned})"
         );
+    }
+
+    /// Every lead-in/out arc as `(start, end)` — start is the position before it.
+    fn leadin_arcs(result: &StrategyResult) -> Vec<(Point, Point)> {
+        let mut pos = Point::new(0.0, 0.0);
+        let mut arcs = Vec::new();
+        for s in result.program.steps() {
+            match s {
+                Step::Rapid { to, .. } | Step::Linear { to, .. } => pos = Point::new(to.x, to.y),
+                Step::Arc { end, tag, .. } => {
+                    if tag.kind == MoveKind::LeadIn {
+                        arcs.push((pos, Point::new(end.x, end.y)));
+                    }
+                    pos = Point::new(end.x, end.y);
+                }
+                _ => {}
+            }
+        }
+        arcs
+    }
+
+    fn leaded_op(islands: Vec<Contour>) -> PocketOp {
+        PocketOp {
+            id: 0,
+            tool: 1,
+            boundary: square(40.0),
+            islands,
+            depth: 1.5,
+            stepdown: 1.5,
+            overlap: 0.5,
+            offset: 0.0,
+            feed: 300.0,
+            plunge_feed: 100.0,
+            plunge: Plunge::Straight,
+            start: None,
+            lead_overlap: 0.0,
+            lead_in: Lead::Arc { radius: 2.0 },
+            lead_out: Lead::Arc { radius: 2.0 },
+        }
+    }
+
+    #[test]
+    fn wall_leads_ease_onto_the_boundary_from_inside() {
+        let ts = tools(8.0);
+        let env = JobEnv {
+            heights: Heights::new(5.0, 2.0, 0.0),
+            tools: &ts,
+            stock: None,
+        };
+        let result = PocketStrategy::new(leaded_op(vec![])).compute(&env, &CancelToken::new());
+        assert!(!result.has_errors(), "{:?}", result.diagnostics);
+        let arcs = leadin_arcs(&result);
+        assert_eq!(arcs.len(), 2, "one lead-in + one lead-out on the single boundary wall");
+        // The lead-in comes from the cleared interior: its entry is closer to the
+        // pocket centre (20,20) than the wall point it eases onto.
+        let (entry, wall) = arcs[0];
+        let d = |p: Point| (p.x - 20.0).hypot(p.y - 20.0);
+        assert!(
+            d(entry) < d(wall),
+            "lead-in must ease in from inside, entry {:?} wall {:?}",
+            (entry.x, entry.y),
+            (wall.x, wall.y)
+        );
+
+        // No leads emitted when unset.
+        let mut plain = leaded_op(vec![]);
+        plain.lead_in = Lead::None;
+        plain.lead_out = Lead::None;
+        let r2 = PocketStrategy::new(plain).compute(&env, &CancelToken::new());
+        assert!(leadin_arcs(&r2).is_empty(), "no leads when unset");
+    }
+
+    #[test]
+    fn wall_leads_reach_islands_without_gouging() {
+        // A centred 8×8 island: both the boundary and the island wall get leads,
+        // and no lead cuts into the island material [16,24] (verifies the lead sits
+        // on the pocket side of the island, i.e. the winding is read correctly).
+        let island = Contour::new(vec![
+            Point::new(16.0, 16.0),
+            Point::new(24.0, 16.0),
+            Point::new(24.0, 24.0),
+            Point::new(16.0, 24.0),
+        ]);
+        let ts = tools(6.0);
+        let env = JobEnv {
+            heights: Heights::new(5.0, 2.0, 0.0),
+            tools: &ts,
+            stock: None,
+        };
+        let result =
+            PocketStrategy::new(leaded_op(vec![island])).compute(&env, &CancelToken::new());
+        assert!(!result.has_errors(), "{:?}", result.diagnostics);
+        let arcs = leadin_arcs(&result);
+        assert_eq!(arcs.len(), 4, "leads on the boundary and the island (2 each)");
+        for (entry, _) in &arcs {
+            let into_island = entry.x > 16.0 && entry.x < 24.0 && entry.y > 16.0 && entry.y < 24.0;
+            assert!(
+                !into_island,
+                "a lead cut into the island, entry ({}, {})",
+                entry.x, entry.y
+            );
+        }
     }
 }
