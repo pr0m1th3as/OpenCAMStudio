@@ -655,6 +655,9 @@ enum Field {
     Overlap,
     /// Face: overshoot past the stock edge before the turnaround (mm).
     FaceOvershoot,
+    /// Clearing engagement cap: max radial width of cut (mm); 0 disables adaptive
+    /// clearing (pocket, profile outside-roughing).
+    Engagement,
     /// Plunge parameter A: ramp/zig-zag angle, or helix radius.
     PlungeA,
     /// Plunge parameter B: zig-zag length, or helix pitch.
@@ -707,6 +710,7 @@ impl Field {
             Field::FaceStartOffset => "Start offset (mm)",
             Field::Overlap => "Overlap (%)",
             Field::FaceOvershoot => "Overshoot (mm)",
+            Field::Engagement => "Engagement (mm, 0=off)",
             Field::PlungeA => "Plunge angle/radius",
             Field::PlungeB => "Plunge length/pitch",
         }
@@ -1098,6 +1102,9 @@ enum Message {
     PlungeKindChanged(PlungeKind),
     /// Change the selected face op's pass direction (committed immediately).
     FaceDirectionChanged(Axis),
+    /// Toggle climb (true) vs conventional (false) clearing on the selected
+    /// pocket / profile-roughing op.
+    ClearingClimbToggled(bool),
     /// Toggle the selected chamfer's gradual (equal-material) stepping.
     ChamferGradualToggled(bool),
     /// Create a new default tool and select it.
@@ -1744,6 +1751,15 @@ impl App {
                 self.refresh_fields();
                 self.rerun();
             }
+            Message::ClearingClimbToggled(on) => {
+                self.controller.edit_selected_operation(|op| match op {
+                    Operation::Pocket(p) => p.clearing.climb = on,
+                    Operation::Profile(p) => p.clearing.climb = on,
+                    _ => {}
+                });
+                self.refresh_fields();
+                self.rerun();
+            }
             Message::SideChanged(side) => {
                 self.controller.edit_selected_operation(|op| match op {
                     Operation::Profile(p) => p.side = side,
@@ -2090,6 +2106,7 @@ impl App {
                     // a single-pass wall finish (rough the pocket first).
                     if p.side == Side::Outside {
                         fields.push(Field::Stepover);
+                        fields.push(Field::Engagement);
                     }
                     fields.extend([Field::ProfileOffset, Field::Feed, Field::PlungeFeed]);
                     // Lead/plunge sizes appear only when the kind uses them.
@@ -2115,6 +2132,7 @@ impl App {
                         Field::Depth,
                         Field::Stepdown,
                         Field::Overlap,
+                        Field::Engagement,
                         Field::ProfileOffset,
                         Field::Feed,
                         Field::PlungeFeed,
@@ -3303,6 +3321,19 @@ impl App {
                         &PlungeKind::ALL[..],
                         Message::PlungeKindChanged,
                     ));
+                    // Climb/conventional applies to outside-roughing clearing only.
+                    if p.side == Side::Outside {
+                        list = list.push(
+                            row![
+                                text("Climb").width(Length::Fixed(135.0)).size(13),
+                                checkbox(p.clearing.climb)
+                                    .size(15)
+                                    .on_toggle(Message::ClearingClimbToggled),
+                            ]
+                            .spacing(8)
+                            .align_y(Alignment::Center),
+                        );
+                    }
                 }
                 Some(Operation::Pocket(p)) => {
                     list = list.push(profile_picker(
@@ -3311,6 +3342,16 @@ impl App {
                         &PlungeKind::ALL[..],
                         Message::PlungeKindChanged,
                     ));
+                    list = list.push(
+                        row![
+                            text("Climb").width(Length::Fixed(135.0)).size(13),
+                            checkbox(p.clearing.climb)
+                                .size(15)
+                                .on_toggle(Message::ClearingClimbToggled),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                    );
                     list = list.push(profile_picker(
                         "Wall lead-in",
                         LeadKind::of(p.lead_in),
@@ -3845,6 +3886,7 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Profile(o), Field::LeadInSize) => Some(lead_size(o.lead_in)),
         (Operation::Profile(o), Field::LeadOutSize) => Some(lead_size(o.lead_out)),
         (Operation::Profile(o), Field::LeadOverlap) => Some(o.lead_overlap),
+        (Operation::Profile(o), Field::Engagement) => Some(o.clearing.engagement),
         (Operation::Profile(o), Field::PlungeA) => Some(plunge_params(o.plunge).0),
         (Operation::Profile(o), Field::PlungeB) => Some(plunge_params(o.plunge).1),
         (Operation::Pocket(o), Field::Depth) => Some(o.depth),
@@ -3856,6 +3898,7 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Pocket(o), Field::Feed) => Some(o.feed),
         (Operation::Pocket(o), Field::PlungeFeed) => Some(o.plunge_feed),
         (Operation::Pocket(o), Field::LeadOverlap) => Some(o.lead_overlap),
+        (Operation::Pocket(o), Field::Engagement) => Some(o.clearing.engagement),
         (Operation::Pocket(o), Field::PlungeA) => Some(plunge_params(o.plunge).0),
         (Operation::Pocket(o), Field::PlungeB) => Some(plunge_params(o.plunge).1),
         (Operation::Face(o), Field::FaceStartOffset) => Some(o.start_offset),
@@ -3899,6 +3942,9 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
             if let Some(v) = get(Field::Stepover) {
                 o.stepover = v.max(0.0);
             }
+            if let Some(v) = get(Field::Engagement) {
+                o.clearing.engagement = v.max(0.0);
+            }
             if let Some(v) = get(Field::ProfileOffset) {
                 o.offset = v;
             }
@@ -3931,6 +3977,9 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
             }
             if let Some(v) = get(Field::Overlap) {
                 o.overlap = (v / 100.0).clamp(0.0, 0.99);
+            }
+            if let Some(v) = get(Field::Engagement) {
+                o.clearing.engagement = v.max(0.0);
             }
             if let Some(v) = get(Field::ProfileOffset) {
                 o.offset = v.max(0.0);
