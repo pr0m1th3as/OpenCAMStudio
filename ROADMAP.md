@@ -17,6 +17,10 @@ narrow slice exercises **every architectural seam** with the least geometry pain
 
 ## Build order (each phase independently demoable)
 
+**Status:** the 2.5-D slice is complete — **P0–P7 done** (headless pipeline, GUI,
+full 2.5-D operations, grbl + Fanuc posts, material simulation). **P8** (plugin
+ABI) is next. Live per-crate state lives in `WORKSTATE.md` / `STATUS.md`.
+
 | Phase | Goal | Crates | Done when |
 |-------|------|--------|-----------|
 | **P0** | Skeleton + CI | workspace, `.github/` | `cam-*` workspace compiles; release + Pages workflows produce a stub artifact; a dep-license check enforces GPLv3-compat |

@@ -56,6 +56,7 @@ correctness checks like "no rapid passes through stock".
 | Crate | Responsibility | Depends on kernel? |
 |-------|----------------|--------------------|
 | `cam-geo` | 2D toolpath geometry: polygons, **robust offset**, boolean, Z-slicing. On `geo`/`i_overlay`. The CAM heart. | **No** |
+| `cam-import` | DXF/DWG read (via `acadrust`) → contour chaining + hole nesting → `cam-geo` regions. | No |
 | `cam-kernel` | `Kernel` trait + a `truck`-backed impl. Import (STEP/mesh), B-rep hold, booleans for stock. Swappable → OCCT (C++ FFI) later. | is the kernel |
 | `cam-model` | Document model: `Project → Setup → Stock → Operation → Tool`. Serde. The save-file format. | No (holds refs) |
 | `cam-toolpath` | `Strategy` trait + 2.5D strategies. Consumes `cam-geo`, emits CL-data. | No |
@@ -83,16 +84,19 @@ implements its own toolpath geometry. So:
 ## Data model (2.5D scope)
 
 ```
-Project { schema_version, machines: [Machine] }
- └─ Setup            { WCS/G54, part-geometry ref, stock, heights }
-     ├─ Stock        { box | from-model + offsets }
+Document { schema_version, Setup }   (Machine is app state, not saved)
+ └─ Setup            { heights, stock, tools, operations, origin, start_offset }
+     ├─ Origin       { part XY/Z datum → G-code (0,0,0); post applies −origin }
+     ├─ Stock        { part bbox + per-axis XY offsets, top + thickness }
      ├─ Heights      { clearance, retract, top-of-stock, Z0 convention }
-     ├─ ToolLibrary  [ Tool { dia, flutes, type, feeds/speeds } ]
-     └─ Operation[]  (ordered; may override depth + heights)
+     ├─ ToolLibrary  [ Tool { dia, flutes, kind + per-kind geometry } ]
+     └─ Operation[]  (ordered; each carries its own depth + feeds)
          ├─ FaceOp    { tool, stepdown, stepover, boundary }
-         ├─ PocketOp  { tool, boundary loops, depth, stepover, ramp }
-         ├─ ProfileOp { tool, chain, side, comp: computed|G41/G42, tabs }
-         └─ DrillOp   { tool, points, cycle: drill|peck, depth }
+         ├─ PocketOp  { tool, boundary loops, islands, depth, stepover, plunge }
+         ├─ ProfileOp { tool, chain, side, comp: computed|G41/G42, leads, plunge }
+         ├─ DrillOp   { tool, points, depth, peck?, dwell? }
+         ├─ ChamferOp { tool (V/chamfer mill), chain, side, width }
+         └─ ThreadOp  { tool (thread mill), points, major_dia, pitch, hand }
 
 Machine (distinct from Post): { rapid rate, max spindle, feed limits,
                                 work envelope, tool-change pos, safe-Z rule }

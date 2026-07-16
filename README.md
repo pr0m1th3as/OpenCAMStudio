@@ -2,26 +2,38 @@
 
 A CAM application for CNC toolpath generation, built in Rust.
 
-> **Status: early development (P0 skeleton).** Not yet usable. The first milestone
-> is a 2.5-D milling slice — geometry → toolpath → simulation → G-code for
-> grbl/FluidNC and Fanuc/Haas controllers.
+> **Status: the 2.5-D milling slice works end-to-end** — DXF/DWG in, toolpaths
+> and material simulation in a live viewport, real G-code out. Everything beyond
+> 2.5-D (3-axis surfacing, turning, plugins) is roadmap.
 
-## Vision
+## What works
 
-Industrial-grade CAM (an EdgeCAM-class north star), reached incrementally on a
-small, stable core. Cutting **strategies** and **post-processors** are the primary
-extension points; machines and tools are data. See
-[ARCHITECTURE.md](ARCHITECTURE.md) for the design and [ROADMAP.md](ROADMAP.md) for
-the phased plan.
+- **Operations** — profile, pocket, drill, face, chamfer, thread-mill; leads and
+  ramp/helix plunges.
+- **Geometry in** — DXF/DWG import with contour chaining and hole nesting;
+  AutoCAD-style object snaps (end / mid / quadrant / nearest) when picking.
+- **Setup** — workpiece origin (datum) + program start point; part-relative
+  stock; first-class clearance/retract heights.
+- **Verify** — heightfield material-removal simulation with gouge and
+  rapid-through-stock detection.
+- **G-code out** — grbl and Fanuc posts from one controller-neutral IR (canned
+  cycles where supported, expanded where not).
+- **Shell** — a `wgpu` viewport (backplot, solid stock, orientation cube) in an
+  `iced` desktop GUI.
 
-## Build
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and [ROADMAP.md](ROADMAP.md)
+for the phased plan toward an EdgeCAM-class north star.
+
+## Build & run
 
 ```bash
-cargo build --workspace
-cargo run --bin opencamstudio
+cargo build --workspace                # headless: geometry, toolpaths, posts, sim
+cargo test  --workspace                # the full test suite
+cargo run -p cam-app --features gui    # the desktop GUI
 ```
 
-A stable Rust toolchain is used (pinned in `rust-toolchain.toml`).
+Stable Rust, pinned in `rust-toolchain.toml`. GUI prerequisites and platform
+notes: [RUNNING.md](RUNNING.md).
 
 ## License
 
