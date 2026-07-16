@@ -2706,13 +2706,13 @@ impl App {
                 Message::SetGizmoSize,
             )
             .step(1.0_f32)
-            .width(Length::Fixed(120.0))
+            .width(Length::Fixed(140.0))
             .into()
         } else {
             // Keep the footprint stable when the cube is off: an inert placeholder.
             container(
                 Space::new()
-                    .width(Length::Fixed(120.0))
+                    .width(Length::Fixed(140.0))
                     .height(Length::Fixed(16.0)),
             )
             .into()
@@ -3147,12 +3147,12 @@ impl App {
         }
         if let Some(t) = self.library.tools.get(self.lib_sel) {
             list = list.push(row![
-                text("Type").width(Length::Fixed(150.0)).size(13),
+                text("Type").width(Length::Fixed(135.0)).size(13),
                 pick_list(&ToolKindPick::ALL[..], Some(ToolKindPick::of(t.kind)), |p| {
                     Message::ToolKindChanged(p.to_kind())
                 })
                 .text_size(13)
-                .width(Length::Fixed(140.0)),
+                .width(Length::Fixed(120.0)),
             ]);
             list = list.push(button("Apply").on_press(Message::Apply));
         }
@@ -3205,10 +3205,10 @@ impl App {
             // change so multiple machines can be told apart later.
             list = list.push(
                 row![
-                    text("Name").width(Length::Fixed(150.0)).size(13),
+                    text("Name").width(Length::Fixed(135.0)).size(13),
                     text_input("machine", &self.controller.machine().name)
                         .on_input(Message::MachineNameChanged)
-                        .width(Length::Fixed(160.0)),
+                        .width(Length::Fixed(120.0)),
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),
@@ -3239,7 +3239,7 @@ impl App {
             let value = self.fields.get(&field).cloned().unwrap_or_default();
             list = list.push(
                 row![
-                    text(field.label()).width(Length::Fixed(150.0)).size(13),
+                    text(field.label()).width(Length::Fixed(135.0)).size(13),
                     text_input("", &value)
                         .on_input(move |v| Message::FieldChanged(field, v))
                         .on_submit(Message::Apply)
@@ -3259,14 +3259,14 @@ impl App {
             if let Some(tool) = self.controller.document().setup.tools.get(i) {
                 list = list.push(
                     row![
-                        text("Type").width(Length::Fixed(150.0)).size(13),
+                        text("Type").width(Length::Fixed(135.0)).size(13),
                         pick_list(
                             &ToolKindPick::ALL[..],
                             Some(ToolKindPick::of(tool.kind)),
                             |p| Message::ToolKindChanged(p.to_kind())
                         )
                         .text_size(13)
-                        .width(Length::Fixed(140.0)),
+                        .width(Length::Fixed(120.0)),
                     ]
                     .spacing(8)
                     .align_y(Alignment::Center),
@@ -3355,7 +3355,7 @@ impl App {
                     // when the chamfer is cut in multiple passes.
                     list = list.push(
                         row![
-                            text("Gradual").width(Length::Fixed(150.0)).size(13),
+                            text("Gradual").width(Length::Fixed(135.0)).size(13),
                             checkbox(c.gradual)
                                 .size(15)
                                 .on_toggle(Message::ChamferGradualToggled),
@@ -4080,7 +4080,7 @@ fn tree_note<'a>(label: &str) -> Element<'a, Message> {
 /// An inspector field row: a label and a numeric text input bound to `field`.
 fn field_row<'a>(field: Field, value: &str) -> Element<'a, Message> {
     row![
-        text(field.label()).width(Length::Fixed(150.0)).size(13),
+        text(field.label()).width(Length::Fixed(135.0)).size(13),
         text_input("", value)
             .on_input(move |v| Message::FieldChanged(field, v))
             .on_submit(Message::Apply)
@@ -4102,10 +4102,10 @@ where
     T: ToString + PartialEq + Clone + 'static,
 {
     row![
-        text(label.to_string()).width(Length::Fixed(150.0)).size(13),
+        text(label.to_string()).width(Length::Fixed(135.0)).size(13),
         pick_list(options, Some(selected), on_select)
             .text_size(13)
-            .width(Length::Fixed(140.0)),
+            .width(Length::Fixed(120.0)),
     ]
     .spacing(8)
     .align_y(Alignment::Center)
