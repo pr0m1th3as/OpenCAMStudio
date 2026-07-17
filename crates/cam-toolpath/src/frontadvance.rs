@@ -111,11 +111,16 @@ const RELIEF_PITCH: f64 = 0.35;
 /// The cost is `uncut`: 1.0 mm² on a 1600 mm² pocket (0.06%) of reachable material. It is
 /// real, it is charged to `certify`, and it is the price of the standoff.
 ///
-/// Do not raise it further hoping for more. The standoff is **not monotonic** — measured
-/// with the alternative clip-to-opened-`tc` formulation, 3·r read 4.85 and 4·r read 5.82,
-/// *worse* than no standoff at all, because [`corner_relief`]'s reach is fixed while the
-/// wedge grows as ρ², so the relief starts over-engaging on a wedge it can no longer
-/// finish. A bigger standoff needs a bigger relief, together or not at all.
+/// **Do not raise it: 2·r is a hard ceiling set by an unsolved problem elsewhere.** Above
+/// it the *opened* pass region breaks into pieces, the frontier `split`s, and
+/// [`connect_seam_spiral`] is skipped for the nearest-point links, which slot. Measured on
+/// square 40 at `ENTRY_TARGET`=1.0: 2.5·r and 3·r both read **6.00 — the full diameter, on
+/// the body as well as the corner**, which is the fallback links, not a corner effect.
+/// Raising [`RELIEF_REACH`] alongside does not rescue it (1.78 … 6.00 at 2.5·r), because
+/// the relief was never what was failing.
+///
+/// So the corner's last residual (2.58 against a 2.30 gate) is **blocked on split-frontier
+/// connection** — the same piece islands need. Solve that once and both unlock.
 const STANDOFF_RADII: f64 = 2.0;
 
 /// Area difference (mm²) below which two consecutive frontier passes count as the same
@@ -480,6 +485,12 @@ fn connect_seam_spiral(
             // when the state they need exists: everything but the corners is cleared, so
             // each relief dips into its wedge and retreats through cut stock, and the
             // links reaching them cross cleared ground rather than virgin stock.
+            //
+            // **Staging them before the lap was measured and is much worse — do not.** The
+            // standoff protects the corner *wedge*, but not the *wall band*, which is still
+            // uncut until this lap cuts it. A relief's loops reach the wall by construction,
+            // so run early they drive into virgin stock: measured on square 40, relief
+            // 0.84 → 3.93 and the corner 2.58 → 4.93.
             path.extend_from_slice(&cur[1..]);
             path.push(cur[0]);
             for rel in reliefs {
@@ -667,6 +678,13 @@ struct Tuning {
     /// Engagement the radius-aware advance and core spiral aim at, in mm. See
     /// [`ENTRY_TARGET`].
     entry_target: f64,
+    /// How far out the corner reliefs start. See [`RELIEF_REACH`].
+    ///
+    /// **Measured: this does not move the corner.** Swept at standoff 2·r on square 40,
+    /// reach 0.75 / 1.00 / 1.30 all leave the corner at **2.58**; it only quiets the
+    /// relief's own reading (0.84 → 0.57) and costs travel (1402 → 1834 mm). The corner's
+    /// residual is not relief-limited, so do not reach for this knob to chase it.
+    relief_reach: f64,
 }
 
 impl Tuning {
@@ -676,6 +694,7 @@ impl Tuning {
             seam_arc: SEAM_ARC,
             standoff: STANDOFF_RADII * r,
             entry_target: ENTRY_TARGET * e,
+            relief_reach: RELIEF_REACH,
         }
     }
 }
@@ -689,7 +708,7 @@ fn front_advance_tuned(
     start: Option<[f64; 2]>,
     t: Tuning,
 ) -> Option<Vec<Point>> {
-    let Tuning { seam_arc, standoff, entry_target } = t;
+    let Tuning { seam_arc, standoff, entry_target, relief_reach } = t;
     if !(e > 0.0 && e < 2.0 * r) {
         return None;
     }
@@ -812,7 +831,11 @@ fn front_advance_tuned(
     // Trochoidal relief for each sharp corner of the tool-centre region. Every loop is a
     // maximal inscribed circle, so these cannot gouge however they are sequenced.
     let reliefs: Vec<Vec<Point>> =
-        sharp_corners(&tc).into_iter().map(|c| corner_relief(c, r, e)).filter(|p| p.len() > 2).collect();
+        sharp_corners(&tc)
+        .into_iter()
+        .map(|c| corner_relief_tuned(c, r, e, relief_reach, RELIEF_PITCH))
+        .filter(|p| p.len() > 2)
+        .collect();
     let path = match (!split).then(|| connect_seam_spiral(entry, &loops, e, seam_arc, &reliefs, r, entry_target)).flatten() {
         Some(p) => p,
         None => {
@@ -1281,4 +1304,6 @@ mod tests {
             );
         }
     }
+
+
 }
