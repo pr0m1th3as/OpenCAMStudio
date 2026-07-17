@@ -1229,4 +1229,56 @@ mod tests {
 
 
 
+
+
+    /// **The raster gate never under-reads the exact oracle.** This is the safety property
+    /// the whole certified-or-fallback contract rests on: the raster is what a gate can
+    /// afford to run (~220× faster than the polygon oracle), so it must err *high*.
+    ///
+    /// It is pinned here, across a battery of real generated paths plus a deliberate slot,
+    /// because the alternative is not hypothetical — the raster shipped **full-diameter
+    /// slots** while reading 0.80, and the comment on it claimed it was "biased high, the
+    /// safe direction". Nobody checked. This test is that check.
+    ///
+    /// The bound comes from [`CELL_MAX`]: the probe sits at `r − px`, so cells coarser than
+    /// ~0.10 push it inside the tool and it starts missing the thin band at the perimeter.
+    #[test]
+    fn the_raster_never_under_reads_the_exact_oracle() {
+        let (r, e) = (R, E);
+        let mut cases: Vec<(String, Polygon, Vec<Point>)> = Vec::new();
+        for (name, region, ctr) in [
+            ("circle r30", circle(30.0, 96), [0.0, 0.0]),
+            ("circle r12", circle(12.0, 64), [0.0, 0.0]),
+            ("square 40", square(40.0), [20.0, 20.0]),
+            ("square 24", square(24.0), [12.0, 12.0]),
+        ] {
+            let path = front_advance_path(&region, r, 0.0, e, Some(ctr))
+                .unwrap_or_else(|| panic!("{name}: front-advance produces a path"));
+            cases.push((name.to_string(), region, path));
+        }
+        // The case the old formula was structurally blind to: driving into virgin stock.
+        cases.push((
+            "deliberate slot".to_string(),
+            square(40.0),
+            (0..=30).map(|i| Point::new(5.0 + i as f64, 20.0)).collect(),
+        ));
+
+        for (name, region, path) in &cases {
+            let exact = crate::clearsim::certify(path, r, region).max_engagement;
+            let ras = crate::raster::certify(path, r, region, e)
+                .unwrap_or_else(|| panic!("{name}: raster builds"))
+                .max_engagement;
+            assert!(
+                ras >= exact - 1e-6,
+                "{name}: the raster UNDER-read the truth — a gate that does this ships \
+                 slots. raster {ras:.2} vs exact {exact:.2}"
+            );
+            // And it must stay tight enough to be useful, or it rejects everything.
+            assert!(
+                ras <= exact + 0.5,
+                "{name}: the raster over-reads too far to be a usable gate, \
+                 raster {ras:.2} vs exact {exact:.2}"
+            );
+        }
+    }
 }

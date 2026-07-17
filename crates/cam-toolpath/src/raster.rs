@@ -15,6 +15,32 @@ use cam_geo::{Point, Polygon};
 use crate::clearsim::Verdict;
 
 /// A grid occupancy model for a tool of radius `r`.
+/// Smallest cell size (mm). Below this the grid buys nothing — the residual error is
+/// angular, not spatial (see [`CELL_MAX`]) — and costs memory quadratically.
+const CELL_MIN: f64 = 0.05;
+
+/// **Largest cell size (mm), and this is a safety bound, not a performance knob.**
+///
+/// The engagement probe sits at `r − px`, so a coarse cell pushes it deep inside the tool
+/// where it misses the thin uncut band at the perimeter and the raster **under-reads** —
+/// the unsafe direction for a gate. Calibrated against the exact oracle
+/// ([`crate::clearsim`]) over five paths (front-advance on circle r30 / r12 / square 40 /
+/// square 24, plus a deliberate slot), worst error at each cell size:
+///
+/// ```text
+///   px 0.35 → under-reads by 0.31   ← unsafe
+///   px 0.20 → under-reads by 0.21   ← unsafe (this used to be the default)
+///   px 0.10 → never under-reads; over-reads ≤ 0.21
+///   px 0.05 → never under-reads; over-reads ≤ 0.21
+/// ```
+///
+/// At or below 0.10 the sign flips and stays flipped: the raster only ever over-reads, so
+/// a pass is trustworthy and the cost is a false rejection (fall back to concentric, which
+/// is proven). The residual 0.21 is **not** spatial — it is ~2 samples of the `NA = 180`
+/// angular sweep (`da_e = r·sinΦ·dΦ` ≈ 0.10 per step), which is why 0.05 is no better than
+/// 0.10. Raise `NA` if that 0.21 ever needs tightening; shrinking cells will not do it.
+const CELL_MAX: f64 = 0.10;
+
 pub(crate) struct Raster {
     r: f64,
     px: f64,
@@ -87,7 +113,11 @@ impl Raster {
     /// Build a grid over `to_clear` (plus a tool-radius margin) for a tool of radius
     /// `r`, resolved fine enough to measure engagement against `cap`.
     pub(crate) fn new(to_clear: &Polygon, r: f64, cap: f64) -> Option<Self> {
-        let px = (cap.min(r) / 10.0).clamp(0.05, 0.35);
+        Self::with_px(to_clear, r, (cap.min(r) / 10.0).clamp(CELL_MIN, CELL_MAX))
+    }
+
+    /// [`Raster::new`] with the cell size given, so calibration can sweep it.
+    pub(crate) fn with_px(to_clear: &Polygon, r: f64, px: f64) -> Option<Self> {
         let pts = to_clear.outer().points();
         let (mut xmin, mut ymin) = (f64::MAX, f64::MAX);
         let (mut xmax, mut ymax) = (f64::MIN, f64::MIN);
@@ -140,17 +170,6 @@ impl Raster {
     /// cleared). Out-of-grid points read as not-material.
     #[inline]
     /// Whether the cell containing `p` is uncut target material.
-    ///
-    /// **Not yet calibrated as a safety gate.** Measured against the exact oracle
-    /// ([`crate::clearsim`]) on real front-advance paths, this reads +0.00 / +0.00 / −0.21
-    /// — i.e. it can under-read by ~0.2, the unsafe direction, because a grid probe reads
-    /// only the cell a sample falls in and a thin uncut band between sample centres
-    /// vanishes. Dilating the uncut set by one cell fixes the direction but is far too
-    /// blunt: it over-reads by +0.5 to +0.8 (measured), because `a_e = r(1−cos Φ)` is steep
-    /// near Φ = 90°, so it would reject good paths instead. Neither is right yet; the gate
-    /// needs a calibrated error bound (sweep `px`, bound the probe error, carry it as a
-    /// margin). Until then this is a fast *measurement*, not a gate — `clearing::clear`
-    /// dispatches nothing to it.
     fn is_uncut(&self, p: Point) -> bool {
         let i = ((p.x - self.ox) / self.px).floor();
         let j = ((p.y - self.oy) / self.px).floor();
