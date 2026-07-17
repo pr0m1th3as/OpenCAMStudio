@@ -26,6 +26,8 @@ use crate::clearsim::{certify, reachable};
 
 /// Chord tolerance for flattening the entry disc (mm).
 const FLAT_TOL: f64 = 0.05;
+/// Angular samples per revolution when morphing loops into a spiral.
+const ANGULAR_SAMPLES: usize = 32;
 /// Cap on peel iterations (guards the front-advance loop).
 const MAX_PASSES: usize = 400;
 /// Cap on the generated path length. Certifying peak engagement is sequential
@@ -103,15 +105,15 @@ pub(crate) fn adaptive_path(
     }
     let cover_tol = 0.02 * area(&reach) + 1.0;
 
-    // Seed the cleared region with the entry disc; the path starts at the entry.
+    // Seed the cleared region with the entry disc, then collect the successive
+    // tool-centre loops (each cuts a band of ≈ e beyond the current front).
     let mut cleared: Vec<Polygon> = vec![disc(entry, r)?];
-    let mut path = vec![entry];
-    let mut prev = entry;
+    let mut loops: Vec<Vec<Point>> = Vec::new();
     let mut last_uncut = f64::INFINITY;
 
     for _ in 0..MAX_PASSES {
         // Bail to the concentric fallback before the sequential certify gets costly.
-        if path.len() > MAX_PATH {
+        if loops.len() * ANGULAR_SAMPLES > MAX_PATH {
             return None;
         }
         let remaining = area(&difference(&reach, &cleared).ok()?);
@@ -134,17 +136,11 @@ pub(crate) fn adaptive_path(
         if pts.len() < 3 {
             return None;
         }
-        // Begin the loop nearest where we are, cut it, and close it.
-        let ordered = crate::profile::rotate_to_start(pts, Some([prev.x, prev.y]));
-        for &p in &ordered {
-            path.push(p);
-        }
-        path.push(ordered[0]);
-        prev = ordered[0];
+        loops.push(pts.to_vec());
 
         // Grow the cleared region by this loop's sweep.
-        let mut loop_path = ordered.clone();
-        loop_path.push(ordered[0]);
+        let mut loop_path = pts.to_vec();
+        loop_path.push(pts[0]);
         let swept = stroke_path(&Polyline::new(loop_path), r, CapStyle::Round, JoinStyle::Round).ok()?;
         if swept.is_empty() {
             return None;
@@ -152,9 +148,83 @@ pub(crate) fn adaptive_path(
         cleared = union(&cleared, &swept).ok()?;
     }
 
+    // Join the concentric loops into a continuous spiral so the radius grows a band
+    // per revolution rather than jumping radially between loops — the radial links
+    // were what spiked the engagement between passes.
+    let path = spiral(&loops, entry)?;
+
     // The whole path must certify: engagement ≤ cap, reachable target covered, no gouge.
     let verdict = certify(&path, r, &to_clear);
     verdict.certified(e, cover_tol).then_some(path)
+}
+
+/// The farthest positive-`s` intersection of the ray `c + s·d` (unit `d`) with the
+/// closed loop `pts`, as a point. `None` if the ray misses (a non-star-convex loop
+/// seen from `c`, which is not spiral-morphable — the caller falls back).
+fn ray_hit(c: Point, d: (f64, f64), pts: &[Point]) -> Option<Point> {
+    let n = pts.len();
+    let mut best_s = -1.0;
+    let mut best = None;
+    for i in 0..n {
+        let a = pts[i];
+        let b = pts[(i + 1) % n];
+        let (ex, ey) = (b.x - a.x, b.y - a.y);
+        let det = ex * d.1 - ey * d.0;
+        if det.abs() < 1e-12 {
+            continue;
+        }
+        let (rx, ry) = (a.x - c.x, a.y - c.y);
+        let s = (ex * ry - ey * rx) / det;
+        let u = (d.0 * ry - d.1 * rx) / det;
+        if (0.0..=1.0).contains(&u) && s > 1e-9 && s > best_s {
+            best_s = s;
+            best = Some(Point::new(c.x + d.0 * s, c.y + d.1 * s));
+        }
+    }
+    best
+}
+
+/// Resample a closed loop to `n` points at even angles about `center` (ray-cast).
+fn resample_by_angle(pts: &[Point], center: Point, n: usize) -> Option<Vec<Point>> {
+    (0..n)
+        .map(|i| {
+            let a = std::f64::consts::TAU * (i as f64) / (n as f64);
+            ray_hit(center, (a.cos(), a.sin()), pts)
+        })
+        .collect()
+}
+
+/// Morph the concentric `loops` (inner-first) into one continuous spiral about
+/// `center`: within each revolution the point blends from loop `k` to loop `k+1`,
+/// so the radius grows a band per turn with no radial jump. Ends with a full lap of
+/// the outermost loop to finish the wall. Returns `None` if any loop is not
+/// star-convex from `center` (not spiral-morphable).
+fn spiral(loops: &[Vec<Point>], center: Point) -> Option<Vec<Point>> {
+    if loops.is_empty() {
+        return None;
+    }
+    let n = ANGULAR_SAMPLES;
+    let rings: Vec<Vec<Point>> = loops
+        .iter()
+        .map(|l| resample_by_angle(l, center, n))
+        .collect::<Option<_>>()?;
+
+    let mut path = vec![center];
+    for pair in rings.windows(2) {
+        let (inner, outer) = (&pair[0], &pair[1]);
+        for i in 0..n {
+            let t = i as f64 / n as f64;
+            let (a, b) = (inner[i], outer[i]);
+            path.push(Point::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t));
+        }
+    }
+    // A closing lap of the outermost ring so the wall band is fully cut.
+    let last = rings.last()?;
+    for &p in last {
+        path.push(p);
+    }
+    path.push(last[0]);
+    Some(path)
 }
 
 #[cfg(test)]
@@ -174,24 +244,41 @@ mod tests {
     }
 
     #[test]
-    fn the_generator_never_returns_an_uncertified_path() {
-        // The core contract: whatever the generator returns is either `None` (the
-        // caller falls back to the proven concentric clearer) or a path the oracle
-        // independently confirms — engagement at the cap, no gouge. It never ships a
-        // path it cannot certify. (Round pockets fall back today because the radial
-        // link between passes spikes engagement; the spiral connection that lets them
-        // certify is the next step — this invariant holds throughout.)
-        let region = circle(9.0, 32);
+    fn adaptive_clears_a_round_pocket_as_a_bounded_engagement_spiral() {
+        // A round pocket now certifies: the loops are joined into a spiral, so the
+        // radius grows a band per revolution with no radial link spike. The oracle
+        // independently confirms engagement at the cap, coverage, and no gouge.
+        let region = circle(9.0, 40);
         let r = 3.0;
         let e = 2.0;
-        if let Some(path) = adaptive_path(&region, r, 0.0, e, Some([0.0, 0.0])) {
-            let v = certify(&path, r, &region);
-            assert!(
-                v.max_engagement <= e * 1.05 + 1e-6,
-                "a returned path must hold the cap, got {}",
-                v.max_engagement
-            );
-            assert!(v.gouge_area < 1.0, "a returned path must not gouge, got {}", v.gouge_area);
+        let path = adaptive_path(&region, r, 0.0, e, Some([0.0, 0.0]))
+            .expect("a round pocket should certify as a spiral");
+        assert!(path.len() > 8, "expected a multi-turn spiral, got {}", path.len());
+        let v = certify(&path, r, &region);
+        assert!(
+            v.max_engagement <= e * 1.05 + 1e-6,
+            "peak engagement {} exceeds the cap {e}",
+            v.max_engagement
+        );
+        assert!(v.uncut_area < 3.0, "the pocket is covered, uncut {}", v.uncut_area);
+        assert!(v.gouge_area < 1.0, "no gouge, got {}", v.gouge_area);
+    }
+
+    #[test]
+    fn the_generator_never_returns_an_uncertified_path() {
+        // The core contract regardless of shape: a returned path always certifies.
+        for (rad, e) in [(7.0, 3.0), (9.0, 4.0)] {
+            let region = circle(rad, 28);
+            let r = 3.0;
+            if let Some(path) = adaptive_path(&region, r, 0.0, e, Some([0.0, 0.0])) {
+                let v = certify(&path, r, &region);
+                assert!(
+                    v.max_engagement <= e * 1.05 + 1e-6,
+                    "returned path must hold the cap, got {}",
+                    v.max_engagement
+                );
+                assert!(v.gouge_area < 1.0, "returned path must not gouge, got {}", v.gouge_area);
+            }
         }
     }
 

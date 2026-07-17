@@ -13,11 +13,31 @@
 // consumes it at runtime lands in the next phase.
 #![allow(dead_code)]
 
-use cam_geo::{difference, offset, stroke_path, union, CapStyle, JoinStyle, Point, Polygon, Polyline};
+use cam_geo::{
+    difference, offset, stroke_path, union, Arc, CapStyle, Contour, JoinStyle, Point, Polygon,
+    Polyline,
+};
 
 /// Total (net, holes subtracted) area of a set of polygons.
 fn total_area(polys: &[Polygon]) -> f64 {
     polys.iter().map(Polygon::area).sum()
+}
+
+/// Perimeter of a closed point ring (sum of edge lengths).
+fn ring_perimeter(pts: &[Point]) -> f64 {
+    let n = pts.len();
+    (0..n).map(|i| pts[i].distance(pts[(i + 1) % n])).sum()
+}
+
+/// Total boundary length of a set of polygons (outer contours and holes).
+fn total_perimeter(polys: &[Polygon]) -> f64 {
+    polys
+        .iter()
+        .map(|p| {
+            ring_perimeter(p.outer().points())
+                + p.holes().iter().map(|h| ring_perimeter(h.points())).sum::<f64>()
+        })
+        .sum()
 }
 
 /// The region a tool of radius `r` sweeps as its centre travels along `path`
@@ -54,16 +74,30 @@ impl ClearedModel {
         }
     }
 
-    /// The radial width of **new** (previously-uncut) material the move `from`→`to`
-    /// cuts: the freshly-swept area divided by the move length. On a short segment
-    /// this approximates the instantaneous engagement — a full-width slotting cut
-    /// approaches the tool diameter, a light peel alongside cleared stock approaches
-    /// the stepover. (The leading round cap slightly inflates the figure on very
-    /// short isolated moves; it cancels out along a continuous path, where each
-    /// move's trailing cap sits in already-cleared stock.)
+    /// Seed the cleared region with the disc a plunge/helix opens at `c` — the entry
+    /// hole, so the first cutting moves are not charged for stock the plunge removed.
+    pub(crate) fn seed_disc(&mut self, c: Point) {
+        let pts = Arc::circle(c, self.r).flatten(0.05);
+        if let Ok(d) = Polygon::new(Contour::new(pts)) {
+            self.cleared = if self.cleared.is_empty() {
+                vec![d]
+            } else {
+                union(&self.cleared, std::slice::from_ref(&d)).unwrap_or_else(|_| vec![d])
+            };
+        }
+    }
+
+    /// The radial width of cut (`a_e`) of the move `from`→`to`: how deep into
+    /// previously-uncut material the tool bites.
+    ///
+    /// Measured as `2·area / perimeter` of the freshly-cut region. A cut of width
+    /// `w` and length `L` has area ≈ `w·L` and perimeter ≈ `2·L`, so this returns
+    /// `w` — **independent of how the path curves**, which the naïve
+    /// `area / feed_length` is not (a curving tool sweeps more at its outer edge than
+    /// its centre travels, over-reporting engagement on every arc). A full-width
+    /// slotting cut returns ≈ the diameter, a light peel returns ≈ the stepover.
     pub(crate) fn engagement(&self, from: Point, to: Point) -> f64 {
-        let len = from.distance(to);
-        if len < 1e-9 {
+        if from.distance(to) < 1e-9 {
             return 0.0;
         }
         let sweep = swept(&[from, to], self.r);
@@ -72,7 +106,12 @@ impl ClearedModel {
         } else {
             difference(&sweep, &self.cleared).unwrap_or_default()
         };
-        total_area(&fresh) / len
+        let perim = total_perimeter(&fresh);
+        if perim < 1e-9 {
+            0.0
+        } else {
+            2.0 * total_area(&fresh) / perim
+        }
     }
 
     /// Add the move `from`→`to` to the cleared region.
@@ -135,7 +174,11 @@ pub(crate) fn certify(path: &[Point], r: f64, to_clear: &Polygon) -> Verdict {
 
     // Peak engagement is inherently sequential: walk the path against the running
     // cleared region. This is the costly part, so it is measured, not the coverage.
+    // Seed the entry disc the plunge opens, so the first moves are not charged for it.
     let mut model = ClearedModel::new(r);
+    if let Some(first) = path.first() {
+        model.seed_disc(*first);
+    }
     let mut max_e = 0.0_f64;
     for w in path.windows(2) {
         max_e = max_e.max(model.engagement(w[0], w[1]));
@@ -164,14 +207,17 @@ mod tests {
     }
 
     #[test]
-    fn slotting_into_solid_engages_the_full_diameter() {
-        // A straight cut into virgin stock is a full slot: engagement ≈ the diameter
-        // (2r = 6), plus a little for the round end-caps over the finite length.
+    fn slotting_into_solid_engages_near_the_full_diameter() {
+        // A straight cut into virgin stock is a full slot: engagement approaches the
+        // diameter (2r = 6). The round end-caps add perimeter, so a finite-length slot
+        // reads a little under 6 (→ 6 as the slot lengthens) — accurate for the thin
+        // peels adaptive actually produces, and still far above any real cap, so a
+        // slot is always rejected.
         let model = ClearedModel::new(3.0);
         let e = model.engagement(Point::new(0.0, 0.0), Point::new(40.0, 0.0));
         assert!(
-            (6.0..7.5).contains(&e),
-            "slotting engagement should be ~diameter 6 (+caps), got {e}"
+            (5.0..6.1).contains(&e),
+            "slotting engagement should approach the diameter 6, got {e}"
         );
     }
 
