@@ -81,14 +81,23 @@ pub(crate) fn clear(
     // oracle and returns None whenever it cannot — so we simply fall through to the
     // proven concentric path below, and every emitted toolpath is verified correct.
     if job.clearing.engagement > 0.0 {
-        if let Some(tc) = crate::adaptive::adaptive_path(
-            region,
-            job.radius,
-            job.finish,
-            job.clearing.engagement,
-            job.start,
-        ) {
-            emit_adaptive(prog, &tc, job, heights, levels);
+        if region.holes().is_empty() {
+            if let Some(tc) = crate::adaptive::adaptive_path(
+                region,
+                job.radius,
+                job.finish,
+                job.clearing.engagement,
+                job.start,
+            ) {
+                emit_adaptive(prog, &tc, job, heights, levels);
+                return Ok(1);
+            }
+        } else if let Some(moves) =
+            crate::adaptive::adaptive_frame(region, job.radius, job.finish, job.clearing.engagement)
+        {
+            // A frame/annulus around an island: certified constant-engagement moves
+            // with a lift between the outer spiral and the island loops.
+            emit_adaptive_moves(prog, &moves, job, heights, levels);
             return Ok(1);
         }
     }
@@ -182,5 +191,168 @@ fn emit_adaptive(prog: &mut Program, tc: &[Point], job: &ClearJob, h: &Heights, 
             tag: retract,
         });
         from_z = z;
+    }
+}
+
+/// Emit a certified adaptive **move** path — `(point, is_cut)` pairs, as a frame needs
+/// where the tool lifts between the outer spiral and the island loops. Like
+/// [`emit_adaptive`] but honouring the cut flag: a `false` (rapid) move retracts to
+/// clearance, repositions, and re-plunges, so a lift becomes a real lift-and-replunge.
+/// The first move is the entry plunge. Between levels the entry re-plunges into stock
+/// cleared above.
+fn emit_adaptive_moves(
+    prog: &mut Program,
+    moves: &[(Point, bool)],
+    job: &ClearJob,
+    h: &Heights,
+    levels: &[f64],
+) {
+    if moves.len() < 2 {
+        return;
+    }
+    let link = Tag::new(job.id, MoveKind::Link);
+    let cut = Tag::new(job.id, MoveKind::Cutting);
+    let retract = Tag::new(job.id, MoveKind::Retract);
+    let plunge_tag = Tag::new(job.id, MoveKind::Plunge);
+
+    // Plunge tangent at move `i`: direction toward the next point that actually moves.
+    let tan_at = |i: usize| -> (f64, f64) {
+        let a = moves[i].0;
+        for &(b, _) in &moves[i + 1..] {
+            let d = crate::profile::unit(b.x - a.x, b.y - a.y);
+            if d != (0.0, 0.0) {
+                return d;
+            }
+        }
+        (1.0, 0.0)
+    };
+
+    let mut from_z = h.top_of_stock;
+    for &z in levels {
+        let start = moves[0].0;
+        let tan = tan_at(0);
+        let out = (-tan.1, tan.0);
+        prog.push(Step::Rapid {
+            to: Point3::new(start.x, start.y, h.clearance),
+            tag: link,
+        });
+        prog.push(Step::Rapid {
+            to: Point3::new(start.x, start.y, from_z),
+            tag: link,
+        });
+        crate::profile::emit_plunge(
+            prog, start, tan, out, from_z, z, job.plunge, job.plunge_feed, job.feed, plunge_tag,
+        );
+
+        for i in 1..moves.len() {
+            let (p, is_cut) = moves[i];
+            if is_cut {
+                prog.push(Step::Linear {
+                    to: Point3::new(p.x, p.y, z),
+                    feed: job.feed,
+                    tag: cut,
+                });
+            } else {
+                // A lift between families: retract where we stopped, rapid over, and
+                // re-plunge into fresh material at the next family's start.
+                let from = moves[i - 1].0;
+                prog.push(Step::Rapid {
+                    to: Point3::new(from.x, from.y, h.clearance),
+                    tag: retract,
+                });
+                prog.push(Step::Rapid {
+                    to: Point3::new(p.x, p.y, h.clearance),
+                    tag: link,
+                });
+                prog.push(Step::Rapid {
+                    to: Point3::new(p.x, p.y, from_z),
+                    tag: link,
+                });
+                let t2 = tan_at(i);
+                let o2 = (-t2.1, t2.0);
+                crate::profile::emit_plunge(
+                    prog, p, t2, o2, from_z, z, job.plunge, job.plunge_feed, job.feed, plunge_tag,
+                );
+            }
+        }
+        let last = moves[moves.len() - 1].0;
+        prog.push(Step::Rapid {
+            to: Point3::new(last.x, last.y, h.clearance),
+            tag: retract,
+        });
+        from_z = z;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cam_geo::Contour;
+
+    fn frame_job() -> Clearing {
+        Clearing { engagement: 2.0, climb: true }
+    }
+
+    fn count(prog: &Program, pred: impl Fn(&Step) -> bool) -> usize {
+        prog.steps().iter().filter(|s| pred(s)).count()
+    }
+
+    #[test]
+    fn a_holed_region_routes_through_the_certified_frame_clearer() {
+        // A pocket with an island (60×60 with a 20×20 island) + an engagement cap must
+        // route through the adaptive frame path — cutting motion, and a lift/replunge
+        // between the outer spiral and the island loops — replicated per depth level.
+        let outer = Contour::new(vec![
+            Point::new(0.0, 0.0),
+            Point::new(60.0, 0.0),
+            Point::new(60.0, 60.0),
+            Point::new(0.0, 60.0),
+        ]);
+        let island = Contour::new(vec![
+            Point::new(20.0, 20.0),
+            Point::new(40.0, 20.0),
+            Point::new(40.0, 40.0),
+            Point::new(20.0, 40.0),
+        ]);
+        let region = Polygon::with_holes(outer, vec![island]).unwrap();
+        let job = ClearJob {
+            id: 7,
+            radius: 3.0,
+            finish: 0.0,
+            first: 3.0,
+            spacing: 4.0,
+            clearing: frame_job(),
+            plunge: Plunge::Straight,
+            feed: 300.0,
+            plunge_feed: 100.0,
+            lead_overlap: 0.0,
+            lead_in: Lead::None,
+            lead_out: Lead::None,
+            start: None,
+            guard: &[],
+        };
+        let heights = Heights::new(5.0, 2.0, 0.0);
+        let levels = [-1.0, -2.0]; // two depth passes
+
+        let mut prog = Program::new();
+        let Ok(n) = clear(&mut prog, &region, &job, &heights, &levels, &CancelToken::new()) else {
+            panic!("clearing a frame should succeed");
+        };
+        assert_eq!(n, 1, "the adaptive frame path is a single certified path");
+
+        let cuts = count(&prog, |s| matches!(s, Step::Linear { tag, .. } if tag.kind == MoveKind::Cutting));
+        let plunges = count(&prog, |s| matches!(s, Step::Linear { tag, .. } if tag.kind == MoveKind::Plunge));
+        assert!(cuts > 50, "the frame has substantial cutting motion, got {cuts}");
+        // Per level: one entry plunge + at least one inter-family replunge ⇒ ≥ 2 each,
+        // over two levels ⇒ ≥ 4 plunges total.
+        assert!(plunges >= 4, "entry + inter-family replunge per level, got {plunges}");
+        // Every cutting move stays at a level depth (never above the stock top).
+        for s in prog.steps() {
+            if let Step::Linear { to, tag, .. } = s {
+                if tag.kind == MoveKind::Cutting {
+                    assert!(to.z <= heights.top_of_stock + 1e-9, "a cut rose above stock: z={}", to.z);
+                }
+            }
+        }
     }
 }

@@ -210,16 +210,34 @@ fn trochoidal_channel(guide: &[Point], e: f64, radius: f64) -> Vec<Point> {
 /// doesn't slot into solid), then the remaining loops peel off it, each adjacent to
 /// cleared stock. Returns `(point, is_cut)` moves (a frame lifts between loop
 /// families). `None` if there is nothing to clear.
-/// Append a closed loop to a move path: reach its nearest point (a cut link if close
-/// to cleared stock, else a rapid lift), then cut around and close it.
-fn append_loop(path: &mut Vec<(Point, bool)>, loop_pts: &[Point], prev: &mut Option<Point>, threshold: f64) {
+/// Append a cut segment (a bare tool-centre polyline) to a move path. The move onto
+/// its start is a **cut link** if the previous point is within `threshold` of it
+/// (adjacent to cleared stock), else a **rapid** reposition — which the oracle and
+/// emitter read as a lift-and-replunge at the start. The rest of the segment is cut.
+fn append_segment(path: &mut Vec<(Point, bool)>, seg: &[Point], prev: &mut Option<Point>, threshold: f64) {
+    let Some((&start, rest)) = seg.split_first() else {
+        return;
+    };
+    let link_cut = prev.is_some_and(|pp| pp.distance(start) <= threshold);
+    path.push((start, link_cut));
+    path.extend(rest.iter().map(|&p| (p, true)));
+    *prev = seg.last().copied();
+}
+
+/// Append a single closed loop, cut exactly (not morphed): reach its nearest point
+/// (a cut link if adjacent to cleared stock, else a rapid), cut around, and close it.
+/// Used for the **island family**, whose corners are convex — the tool unwraps there,
+/// so engagement drops rather than spikes and there is nothing to morph away; cutting
+/// the exact offset loop keeps the tool off the rounded island corners (morphing
+/// across radius-scaled corner arcs would chord inside them and nick the island).
+fn append_plain_loop(path: &mut Vec<(Point, bool)>, loop_pts: &[Point], prev: &mut Option<Point>, threshold: f64) {
     if loop_pts.len() < 3 {
         return;
     }
     let ri = crate::profile::rotate_to_start(loop_pts, prev.map(|p| [p.x, p.y]));
     let start = ri[0];
-    let link = prev.is_some_and(|pp| pp.distance(start) <= threshold);
-    path.push((start, link));
+    let link_cut = prev.is_some_and(|pp| pp.distance(start) <= threshold);
+    path.push((start, link_cut));
     path.extend(ri[1..].iter().map(|&p| (p, true)));
     path.push((start, true));
     *prev = Some(start);
@@ -232,13 +250,14 @@ fn append_loop(path: &mut Vec<(Point, bool)>, loop_pts: &[Point], prev: &mut Opt
 /// trochoidal channel opening the medial so its first cut doesn't slot. Returns
 /// `(point, is_cut)` moves (a frame lifts between families).
 ///
-/// This covers frames with no gouge and keeps engagement well below a slot, but not
-/// yet to the cap: the loops are cut directly, so the tool still over-engages a
-/// bounded amount pivoting the sharp corners (same spike the pocket spiral solved
-/// with arc-length morphing — the annular families need the equivalent, which is the
-/// remaining piece). So this is not yet wired into `adaptive_path`.
-#[allow(dead_code)]
+/// The outer family (concave frame-wall corners, the pocket-style engagement spike)
+/// is arc-length-morphed into a spiral so its sharp corners hold the cap; the island
+/// family (convex corners that under-engage) is cut as exact concentric loops, which
+/// also keeps the tool off the island's rounded corners. This certifies frames at the
+/// cap; [`adaptive_frame`] is the certified entry the clearing engine calls.
 fn frame_path(region: &Polygon, r: f64, finish: f64, e: f64) -> Option<Vec<(Point, bool)>> {
+    let center = centroid(region);
+
     // Separate the two loop families the concentric offsets produce, wall/island-most
     // first.
     let mut outer_family: Vec<Vec<Point>> = Vec::new();
@@ -265,7 +284,7 @@ fn frame_path(region: &Polygon, r: f64, finish: f64, e: f64) -> Option<Vec<(Poin
     let mut path: Vec<(Point, bool)> = Vec::new();
 
     // Open a trochoidal channel around the medial (innermost) outer loop so the first
-    // cut opens without slotting; both families then peel off it.
+    // cut opens without slotting; both spirals then peel off it.
     let medial = outer_family.last()?;
     let mut guide = medial.clone();
     guide.push(medial[0]);
@@ -277,14 +296,57 @@ fn frame_path(region: &Polygon, r: f64, finish: f64, e: f64) -> Option<Vec<(Poin
     path.extend(ch[1..].iter().map(|&p| (p, true)));
     let mut prev = ch.last().copied();
 
-    // Peel each family contiguously (medial→wall, then medial→island); lift between.
-    for loop_pts in outer_family.iter().rev().skip(1) {
-        append_loop(&mut path, loop_pts, &mut prev, threshold);
-    }
+    // The outer family has the frame's *concave* wall corners — the same engagement
+    // spike a pocket has — so arc-length-morph it into a spiral (medial→wall); the
+    // sharp corners stay a stepover apart, flattening the spike. Sample fine enough to
+    // trace the walls faithfully.
+    let step = (0.15 * r).clamp(0.05, e);
+    let outer_loops: Vec<Vec<Point>> = outer_family.iter().rev().cloned().collect();
+    let outer_sp = family_spiral(&outer_loops, center, step)?;
+    append_segment(&mut path, &outer_sp, &mut prev, threshold);
+
+    // The island family goes *around* a convex obstacle: engagement drops at those
+    // corners rather than spiking, so there is nothing to morph — and morphing would
+    // chord inside the radius-scaled rounded corner arcs and nick the island. Cut the
+    // exact offset loops instead, peeling medial→island so each is adjacent to cleared
+    // stock.
     for loop_pts in island_family.iter().rev() {
-        append_loop(&mut path, loop_pts, &mut prev, threshold);
+        append_plain_loop(&mut path, loop_pts, &mut prev, threshold);
     }
+
     (path.len() > 4).then_some(path)
+}
+
+/// Certified entry for clearing a frame/annulus (a region with island holes) at
+/// constant engagement. Builds the [`frame_path`] and returns it **only if** it
+/// certifies against the raster oracle — engagement at the cap, the reachable target
+/// covered, no gouge — mirroring [`adaptive_path`]'s certified-or-fallback contract.
+/// Returns `None` (⇒ fall back to plain concentric, which honours islands correctly)
+/// whenever it cannot certify. The moves carry a cut/rapid flag: the frame lifts
+/// between the outer spiral and the island loops.
+pub(crate) fn adaptive_frame(
+    region: &Polygon,
+    r: f64,
+    finish: f64,
+    e: f64,
+) -> Option<Vec<(Point, bool)>> {
+    if !(e > 0.0 && e < 2.0 * r) || region.holes().is_empty() {
+        return None;
+    }
+    // Certify against the material actually removed (skin left on the walls).
+    let to_clear = largest(offset(std::slice::from_ref(region), -finish, JoinStyle::Round).ok()?)?;
+    let moves = frame_path(region, r, finish, e)?;
+
+    let reach = reachable(&to_clear, r);
+    if reach.is_empty() {
+        return None;
+    }
+    let cover_tol = 0.02 * area(&reach) + 2.0;
+    let verdict = crate::raster::certify_moves(&moves, r, &to_clear, e)?;
+    let ok = verdict.max_engagement <= e * 1.2
+        && verdict.uncut_area <= cover_tol
+        && verdict.gouge_area <= cover_tol;
+    ok.then_some(moves)
 }
 
 /// Resample a closed loop to `n` points at even **arc-length** intervals, starting at
@@ -332,6 +394,63 @@ fn resample_by_arclength(pts: &[Point], center: Point, n: usize) -> Option<Vec<P
     }
     out.truncate(n);
     Some(out)
+}
+
+/// Morph a family of nested concentric `loops` (innermost first, **all wound the same
+/// way**) into one continuous arc-length spiral about `center`. Unlike [`spiral`] it
+/// seeds **no centre point**: the innermost element is a full loop (the medial ring of
+/// a frame, or the tight loop around an island), not the region's centre — so the
+/// family peels from its innermost loop outward, each turn a stepover from the last,
+/// with the corners bounded by arc-length morphing (the same medicine that flattened
+/// the pocket-spiral corner spike). Ends with a closing lap of the outermost loop to
+/// finish that wall.
+///
+/// The two loop families of a frame wind oppositely (CCW outer contours, CW hole
+/// contours — [`cam_geo`]'s convention), so each is morphed as its **own** spiral and
+/// the caller links them at depth; blending across the winding seam would cross the
+/// turns and gouge.
+fn family_spiral(loops: &[Vec<Point>], center: Point, step: f64) -> Option<Vec<Point>> {
+    match loops.len() {
+        0 => return None,
+        // A lone loop can't morph — emit it closed (its own wall lap).
+        1 => {
+            let mut v = loops[0].clone();
+            v.push(*loops[0].first()?);
+            return Some(v);
+        }
+        _ => {}
+    }
+    // Sample all loops at a common arc-length `step` fine enough to trace the tightest
+    // rounded corner faithfully: a hole offset outward rounds its corners to radius ≈
+    // the offset distance, and chording across such an arc dips the tool inside it —
+    // gouging the island. `step` is set by the caller from the tool radius (not the
+    // stepover) so the corner sagitta stays negligible. Radial spacing between turns
+    // is the offset stepover regardless; this only sharpens along-loop fidelity.
+    let max_perim = loops
+        .iter()
+        .map(|l| (0..l.len()).map(|k| l[k].distance(l[(k + 1) % l.len()])).sum::<f64>())
+        .fold(0.0_f64, f64::max);
+    let n = ((max_perim / step.max(1e-6)).ceil() as usize).clamp(ANGULAR_SAMPLES, 4096);
+
+    let rings: Vec<Vec<Point>> = loops
+        .iter()
+        .map(|l| resample_by_arclength(l, center, n))
+        .collect::<Option<_>>()?;
+
+    let mut path = Vec::with_capacity(n * rings.len() + n);
+    for pair in rings.windows(2) {
+        let (inner, outer) = (&pair[0], &pair[1]);
+        for i in 0..n {
+            let t = i as f64 / n as f64;
+            let (a, b) = (inner[i], outer[i]);
+            path.push(Point::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t));
+        }
+    }
+    // A closing lap of the outermost ring so its wall band is fully cut.
+    let last = rings.last()?;
+    path.extend_from_slice(last);
+    path.push(last[0]);
+    Some(path)
 }
 
 /// Morph the concentric `loops` (inner-first) into one continuous spiral about
@@ -515,11 +634,12 @@ mod tests {
     #[test]
     fn a_frame_around_an_island_clears_without_slotting_or_gouging() {
         // 60×60 pocket with a 20×20 island (a roughing frame is the same shape). The
-        // trochoidal medial channel avoids slotting and the contiguous family peel
-        // covers the frame with no gouge; engagement stays well below a full slot
-        // (diameter 6). Reaching the cap exactly still needs the annular-family morph
-        // that bounds the sharp corners — the remaining piece — so this is not yet
-        // wired into `adaptive_path`.
+        // trochoidal medial channel avoids slotting; the outer family is arc-length-
+        // morphed into a spiral so its concave wall corners hold the cap (the same
+        // medicine as the pocket spiral), and the island family is cut as exact
+        // concentric loops (its convex corners under-engage — nothing to morph, and
+        // morphing across their radius-scaled corner arcs would nick the island). The
+        // frame now clears covered, no gouge, engagement at the cap.
         let outer = Contour::new(vec![
             Point::new(0.0, 0.0),
             Point::new(60.0, 0.0),
@@ -538,8 +658,8 @@ mod tests {
         let v = crate::raster::certify_moves(&moves, r, &region, e).expect("raster builds");
         let reach: f64 = crate::clearsim::reachable(&region, r).iter().map(|p| p.area()).sum();
         assert!(
-            v.max_engagement <= 1.6 * e,
-            "engagement well below a slot (no full-width cut), got {}",
+            v.max_engagement <= 1.2 * e,
+            "engagement held at the cap by the morph (was ~1.5x before), got {}",
             v.max_engagement
         );
         assert!(v.gouge_area < 1.0, "no gouge, got {}", v.gouge_area);
@@ -549,6 +669,41 @@ mod tests {
             v.uncut_area,
             reach
         );
+    }
+
+    #[test]
+    fn adaptive_frame_certifies_and_falls_back_when_it_cannot() {
+        // The certified entry the clearing engine calls: a real frame yields a
+        // certified move path (engagement at the cap, covered, no gouge); a solid
+        // pocket (no island) is not this entry's job and returns None so the caller
+        // routes it through `adaptive_path` instead.
+        let outer = Contour::new(vec![
+            Point::new(0.0, 0.0),
+            Point::new(60.0, 0.0),
+            Point::new(60.0, 60.0),
+            Point::new(0.0, 60.0),
+        ]);
+        let island = Contour::new(vec![
+            Point::new(25.0, 25.0),
+            Point::new(35.0, 25.0),
+            Point::new(35.0, 35.0),
+            Point::new(25.0, 35.0),
+        ]);
+        let region = Polygon::with_holes(outer, vec![island]).unwrap();
+        let (r, e) = (3.0, 2.0);
+        let moves = adaptive_frame(&region, r, 0.0, e).expect("a frame certifies");
+        assert!(moves.iter().any(|&(_, cut)| cut), "the frame has cutting moves");
+        assert!(
+            moves.iter().any(|&(_, cut)| !cut),
+            "the frame lifts at least once (entry, and between families)"
+        );
+        // Re-certify independently: the wrapper's contract is that what it returns holds.
+        let v = crate::raster::certify_moves(&moves, r, &region, e).expect("raster builds");
+        assert!(v.max_engagement <= e * 1.2, "engagement at the cap, got {}", v.max_engagement);
+        assert!(v.gouge_area < 1.0, "no gouge, got {}", v.gouge_area);
+
+        // A solid pocket is not a frame — this entry declines it.
+        assert!(adaptive_frame(&circle(9.0, 40), r, 0.0, e).is_none());
     }
 
     #[test]
