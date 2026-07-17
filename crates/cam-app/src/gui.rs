@@ -92,6 +92,7 @@ enum Icon {
     ShowCube,
     SetOrigin,
     Info,
+    Machine,
 }
 
 impl Icon {
@@ -119,6 +120,7 @@ impl Icon {
             Icon::ShowCube => include_bytes!("../assets/icons/viewcube.svg"),
             Icon::SetOrigin => include_bytes!("../assets/icons/origin.svg"),
             Icon::Info => include_bytes!("../assets/icons/info.svg"),
+            Icon::Machine => include_bytes!("../assets/icons/machine.svg"),
         }
     }
 
@@ -149,6 +151,10 @@ impl Icon {
             Icon::ShowCube => "Show or hide the orientation cube.",
             Icon::SetOrigin => "Show or hide the workpiece-origin datum marker.",
             Icon::Info => "Show or hide hover tooltips on inspector fields and ribbon icons.",
+            Icon::Machine => {
+                "Set up the machine — working travel and the post-processor (G-code dialect, \
+                 e.g. grbl / FluidNC / Fanuc) the exported NC is written for."
+            }
         }
     }
 
@@ -3057,7 +3063,7 @@ impl App {
                 GroupSpec {
                     title: "Machine",
                     commands: vec![cmd(
-                        Icon::ShowStock,
+                        Icon::Machine,
                         "Machine",
                         Some(Message::Select(Selection::Machine)),
                     )],

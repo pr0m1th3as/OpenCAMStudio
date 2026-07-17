@@ -39,5 +39,6 @@ glance and stay visually distinct from each other:
 The remaining originals are in the flat 24×24 style:
 
 - `endmill.svg` — New tool
+- `machine.svg` — Machine / post-processor setup (a settings gear)
 - `undo.svg`, `redo.svg`, `run.svg` — edit / run actions
 - `new.svg`, `open.svg`, `save.svg` — project file actions
