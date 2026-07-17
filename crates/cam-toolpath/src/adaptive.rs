@@ -204,6 +204,89 @@ fn trochoidal_channel(guide: &[Point], e: f64, radius: f64) -> Vec<Point> {
     path
 }
 
+/// Clear a region whose offsets stay nested loops but do **not** reduce to a spiral
+/// centre — a frame/annulus around an island. Concentric loops honour the island; the
+/// innermost (medial) loop is opened with a **trochoidal channel** (so its first cut
+/// doesn't slot into solid), then the remaining loops peel off it, each adjacent to
+/// cleared stock. Returns `(point, is_cut)` moves (a frame lifts between loop
+/// families). `None` if there is nothing to clear.
+/// Append a closed loop to a move path: reach its nearest point (a cut link if close
+/// to cleared stock, else a rapid lift), then cut around and close it.
+fn append_loop(path: &mut Vec<(Point, bool)>, loop_pts: &[Point], prev: &mut Option<Point>, threshold: f64) {
+    if loop_pts.len() < 3 {
+        return;
+    }
+    let ri = crate::profile::rotate_to_start(loop_pts, prev.map(|p| [p.x, p.y]));
+    let start = ri[0];
+    let link = prev.is_some_and(|pp| pp.distance(start) <= threshold);
+    path.push((start, link));
+    path.extend(ri[1..].iter().map(|&p| (p, true)));
+    path.push((start, true));
+    *prev = Some(start);
+}
+
+/// Clear a frame/annulus (a region around an island) at bounded engagement. The two
+/// concentric loop families (outer contours offset in from the wall, hole contours
+/// offset out from the island) are cut **contiguously** — medial→wall, then
+/// medial→island — so each loop is adjacent to already-cleared stock, with a
+/// trochoidal channel opening the medial so its first cut doesn't slot. Returns
+/// `(point, is_cut)` moves (a frame lifts between families).
+///
+/// This covers frames with no gouge and keeps engagement well below a slot, but not
+/// yet to the cap: the loops are cut directly, so the tool still over-engages a
+/// bounded amount pivoting the sharp corners (same spike the pocket spiral solved
+/// with arc-length morphing — the annular families need the equivalent, which is the
+/// remaining piece). So this is not yet wired into `adaptive_path`.
+#[allow(dead_code)]
+fn frame_path(region: &Polygon, r: f64, finish: f64, e: f64) -> Option<Vec<(Point, bool)>> {
+    // Separate the two loop families the concentric offsets produce, wall/island-most
+    // first.
+    let mut outer_family: Vec<Vec<Point>> = Vec::new();
+    let mut island_family: Vec<Vec<Point>> = Vec::new();
+    let mut d = r + finish;
+    for _ in 0..MAX_LOOPS {
+        let offs = offset(std::slice::from_ref(region), -d, JoinStyle::Round).ok()?;
+        // A frame stays one annular polygon; splitting into lobes is a harder topology.
+        if offs.len() != 1 {
+            break;
+        }
+        let poly = offs.into_iter().next()?;
+        outer_family.push(poly.outer().points().to_vec());
+        for h in poly.holes() {
+            island_family.push(h.points().to_vec());
+        }
+        d += e;
+    }
+    if outer_family.len() < 2 || island_family.is_empty() {
+        return None;
+    }
+
+    let threshold = 1.5 * e;
+    let mut path: Vec<(Point, bool)> = Vec::new();
+
+    // Open a trochoidal channel around the medial (innermost) outer loop so the first
+    // cut opens without slotting; both families then peel off it.
+    let medial = outer_family.last()?;
+    let mut guide = medial.clone();
+    guide.push(medial[0]);
+    let ch = trochoidal_channel(&guide, e, 1.5 * e);
+    if ch.len() < 2 {
+        return None;
+    }
+    path.push((ch[0], false)); // rapid to the channel start = the plunge
+    path.extend(ch[1..].iter().map(|&p| (p, true)));
+    let mut prev = ch.last().copied();
+
+    // Peel each family contiguously (medial→wall, then medial→island); lift between.
+    for loop_pts in outer_family.iter().rev().skip(1) {
+        append_loop(&mut path, loop_pts, &mut prev, threshold);
+    }
+    for loop_pts in island_family.iter().rev() {
+        append_loop(&mut path, loop_pts, &mut prev, threshold);
+    }
+    (path.len() > 4).then_some(path)
+}
+
 /// Resample a closed loop to `n` points at even **arc-length** intervals, starting at
 /// the vertex whose direction from `center` is nearest +X (a phase alignment so the
 /// same parameter on successive loops lands at roughly the same place around them).
@@ -426,6 +509,45 @@ mod tests {
             v.max_engagement <= e * 1.3,
             "trochoidal channel engagement should stay near the cap, got {}",
             v.max_engagement
+        );
+    }
+
+    #[test]
+    fn a_frame_around_an_island_clears_without_slotting_or_gouging() {
+        // 60×60 pocket with a 20×20 island (a roughing frame is the same shape). The
+        // trochoidal medial channel avoids slotting and the contiguous family peel
+        // covers the frame with no gouge; engagement stays well below a full slot
+        // (diameter 6). Reaching the cap exactly still needs the annular-family morph
+        // that bounds the sharp corners — the remaining piece — so this is not yet
+        // wired into `adaptive_path`.
+        let outer = Contour::new(vec![
+            Point::new(0.0, 0.0),
+            Point::new(60.0, 0.0),
+            Point::new(60.0, 60.0),
+            Point::new(0.0, 60.0),
+        ]);
+        let island = Contour::new(vec![
+            Point::new(20.0, 20.0),
+            Point::new(40.0, 20.0),
+            Point::new(40.0, 40.0),
+            Point::new(20.0, 40.0),
+        ]);
+        let region = Polygon::with_holes(outer, vec![island]).unwrap();
+        let (r, e) = (3.0, 2.0);
+        let moves = frame_path(&region, r, 0.0, e).expect("a frame yields a path");
+        let v = crate::raster::certify_moves(&moves, r, &region, e).expect("raster builds");
+        let reach: f64 = crate::clearsim::reachable(&region, r).iter().map(|p| p.area()).sum();
+        assert!(
+            v.max_engagement <= 1.6 * e,
+            "engagement well below a slot (no full-width cut), got {}",
+            v.max_engagement
+        );
+        assert!(v.gouge_area < 1.0, "no gouge, got {}", v.gouge_area);
+        assert!(
+            v.uncut_area < 0.05 * reach + 2.0,
+            "frame covered, uncut {} of {}",
+            v.uncut_area,
+            reach
         );
     }
 

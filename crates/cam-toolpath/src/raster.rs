@@ -242,6 +242,40 @@ pub(crate) fn certify(path: &[Point], r: f64, to_clear: &Polygon, cap: f64) -> O
     })
 }
 
+/// Certify a path of `(point, is_cut)` moves — as an island/frame path needs, where
+/// the tool lifts (rapid) between loop families. A rapid does not cut (no stamp, no
+/// engagement); each cut that follows a rapid is a plunge, so the entry disc is
+/// seeded there. Returns `None` if the grid could not be built.
+pub(crate) fn certify_moves(
+    moves: &[(Point, bool)],
+    r: f64,
+    to_clear: &Polygon,
+    cap: f64,
+) -> Option<Verdict> {
+    let mut ras = Raster::new(to_clear, r, cap)?;
+    let mut prev: Option<Point> = None;
+    let mut prev_cut = false;
+    let mut max_e = 0.0_f64;
+    for &(p, cut) in moves {
+        if let Some(pp) = prev {
+            if cut {
+                if !prev_cut {
+                    ras.seed_disc(pp); // a cut after a rapid = a plunge at pp
+                }
+                max_e = max_e.max(ras.engagement(pp, p));
+                ras.stamp(pp, p);
+            }
+        }
+        prev = Some(p);
+        prev_cut = cut;
+    }
+    Some(Verdict {
+        max_engagement: max_e,
+        uncut_area: ras.uncut_area(),
+        gouge_area: ras.gouge_area(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
