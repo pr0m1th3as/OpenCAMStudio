@@ -144,6 +144,66 @@ pub(crate) fn adaptive_path(
     ok.then_some(path)
 }
 
+/// Point, unit tangent, and unit left-normal at arc-length `u` along the polyline
+/// `pts` (treated as open: last vertex ends it).
+#[allow(dead_code)] // used by the frame trochoidal entry (in progress) + tests
+fn frame_at(pts: &[Point], u: f64) -> (Point, (f64, f64), (f64, f64)) {
+    let mut acc = 0.0;
+    let last = pts.len().saturating_sub(1);
+    for k in 0..last {
+        let seg = pts[k].distance(pts[k + 1]);
+        if u <= acc + seg || k == last - 1 {
+            let t = if seg > 1e-9 { ((u - acc) / seg).clamp(0.0, 1.0) } else { 0.0 };
+            let p = Point::new(
+                pts[k].x + (pts[k + 1].x - pts[k].x) * t,
+                pts[k].y + (pts[k + 1].y - pts[k].y) * t,
+            );
+            let tan = {
+                let (dx, dy) = (pts[k + 1].x - pts[k].x, pts[k + 1].y - pts[k].y);
+                let l = dx.hypot(dy).max(1e-12);
+                (dx / l, dy / l)
+            };
+            return (p, tan, (-tan.1, tan.0));
+        }
+        acc += seg;
+    }
+    (pts[0], (1.0, 0.0), (0.0, 1.0))
+}
+
+/// Open a cut along `guide` with a **trochoidal** path — small loops advancing along
+/// the guide — so the tool bites only a stepover of fresh material at a time even
+/// though the channel it opens is much wider than a peel. This is the entry that lets
+/// a region with no spiral centre (a frame/annulus around an island) start clearing
+/// without slotting its first loop.
+///
+/// One loop is completed per `e` of forward advance (the forward bite ⇒ engagement ≈
+/// `e`); the loop radius `radius` sets the channel half-width and must exceed the
+/// pitch so successive loops overlap into already-cut stock rather than re-slot.
+#[allow(dead_code)] // the frame trochoidal entry (in progress) + tests
+fn trochoidal_channel(guide: &[Point], e: f64, radius: f64) -> Vec<Point> {
+    if guide.len() < 2 {
+        return Vec::new();
+    }
+    let total: f64 = (0..guide.len() - 1).map(|k| guide[k].distance(guide[k + 1])).sum();
+    if total < 1e-6 {
+        return Vec::new();
+    }
+    let pitch = e; // forward advance per loop ⇒ ~e engagement
+    let ds = (pitch / 10.0).clamp(0.05, 0.5);
+    let steps = (total / ds).ceil() as usize;
+    let mut path = Vec::with_capacity(steps + 1);
+    for i in 0..=steps {
+        let u = (i as f64 * ds).min(total);
+        let (g, tg, ng) = frame_at(guide, u);
+        let phi = std::f64::consts::TAU * u / pitch;
+        let (c, s) = (phi.cos(), phi.sin());
+        // Loop about the guide point: behind (−T) → inward (N) → ahead (T) → out (−N).
+        let dir = (-tg.0 * c + ng.0 * s, -tg.1 * c + ng.1 * s);
+        path.push(Point::new(g.x + radius * dir.0, g.y + radius * dir.1));
+    }
+    path
+}
+
 /// Resample a closed loop to `n` points at even **arc-length** intervals, starting at
 /// the vertex whose direction from `center` is nearest +X (a phase alignment so the
 /// same parameter on successive loops lands at roughly the same place around them).
@@ -341,6 +401,32 @@ mod tests {
             v.max_engagement
         );
         assert!(v.gouge_area < 2.0, "no gouge, got {}", v.gouge_area);
+    }
+
+    #[test]
+    fn trochoidal_channel_opens_at_bounded_engagement() {
+        // Open a channel along a straight guide in virgin stock: the trochoidal loops
+        // bite only a stepover at a time, so the peak engagement stays near the cap
+        // even though the channel is far wider than a peel. This is the entry that
+        // lets a frame start clearing without slotting.
+        let guide: Vec<Point> = (0..=40).map(|i| Point::new(i as f64, 0.0)).collect();
+        let (r, e) = (3.0, 2.0);
+        let path = trochoidal_channel(&guide, e, 2.0 * e);
+        assert!(path.len() > 20, "a trochoidal channel is many small loops");
+        // Big region so walls/coverage aren't a factor — we only assert engagement.
+        let region = Polygon::new(Contour::new(vec![
+            Point::new(-15.0, -15.0),
+            Point::new(55.0, -15.0),
+            Point::new(55.0, 15.0),
+            Point::new(-15.0, 15.0),
+        ]))
+        .unwrap();
+        let v = certify(&path, r, &region);
+        assert!(
+            v.max_engagement <= e * 1.3,
+            "trochoidal channel engagement should stay near the cap, got {}",
+            v.max_engagement
+        );
     }
 
     #[test]
