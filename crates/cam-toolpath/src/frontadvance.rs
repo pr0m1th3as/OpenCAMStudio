@@ -306,6 +306,18 @@ const ENTRY_TARGET: f64 = 1.4;
 /// centre (`cap·ρ/r`), which would stall the spiral at ρ=0 and never leave. The innermost
 /// band is not where the defect is anyway — measured, ρ<1.5 already reads 2.79.
 const MIN_CORE_PITCH: f64 = 0.25;
+
+/// Engagement allowance the certifier grants over the nominal stepover `e`, as a multiple
+/// of `e`. **This is the geometric floor, not slack for a sloppy path.** The engagement
+/// parameter is the *straight-wall* stepover; at a tool-centre radius ρ the band the tool
+/// removes sits at `2π(ρ+r)` while the centre travels `2πρ`, so the material-per-advance
+/// floor `a_e(ρ) = e(ρ+r)/ρ − e²/(2ρ)` exceeds `e` at every finite radius and reaches
+/// ~1.4·e on the tight loops a Ø6 tool cuts near a pocket centre — unreachable by *any*
+/// spiral clearer, concentric included (which simply is never certified). A full-diameter
+/// slot is 3·e, so 1.5·e cleanly separates "held to the floor" from "slotting": front-
+/// advance's measured whole-path peak is 2.69–2.90 on r=3/e=2 (1.35–1.45·e), which passes;
+/// the retired spiral-morph and the raster-gated links read 6.00, which does not.
+const CERT_ENGAGEMENT_SLACK: f64 = 1.5;
 /// Samples across a loop-to-loop seam transition.
 const SEAM_SAMPLES: usize = 24;
 
@@ -666,6 +678,46 @@ pub(crate) fn front_advance_path(
     front_advance_tuned(region, r, finish, e, start, Tuning::new(r, e))
 }
 
+/// [`front_advance_path`], certified against the **exact** oracle ([`crate::clearsim`]).
+///
+/// This is the entry [`crate::clearing::clear`] dispatches: it returns the tool-centre
+/// path only if that path holds engagement at the geometric-floor bound
+/// ([`CERT_ENGAGEMENT_SLACK`]·`e`), covers the reachable target, and never gouges —
+/// otherwise `None`, meaning *fall back to concentric*, mirroring
+/// [`crate::adaptive::adaptive_path`]'s contract. The bare [`front_advance_path`] is left
+/// uncertified for the module's measurement tests, which need the raw path to instrument.
+///
+/// **The gate is the exact oracle, never the raster** — the raster is blind to slots (it
+/// read 0.80 against a true 6.00 on square 24), which is precisely why the previous,
+/// raster-gated adaptive dispatch shipped full-diameter cuts and was retired. The exact
+/// oracle is O(path × rays) but runs once per op (the path is reused across depth levels),
+/// so the trade is a second against a broken cutter.
+pub(crate) fn front_advance_certified(
+    region: &Polygon,
+    r: f64,
+    finish: f64,
+    e: f64,
+    start: Option<[f64; 2]>,
+) -> Option<Vec<Point>> {
+    let path = front_advance_path(region, r, finish, e, start)?;
+    // The material to remove (skin left on the walls) — the same region the generator
+    // clears, recomputed here so the certifier scores against the true target.
+    let to_clear = largest(offset(std::slice::from_ref(region), -finish, JoinStyle::Round).ok()?)?;
+    let reach = crate::clearsim::reachable(&to_clear, r);
+    if reach.is_empty() {
+        return None;
+    }
+    // Coverage tolerance: the standoff leaves ~1 mm² of reachable corner material uncut by
+    // construction (charged here, deliberately — see [`STANDOFF_RADII`]), plus a small
+    // area-proportional term for tessellation slivers.
+    let cover_tol = 0.02 * total_area(&reach) + 1.0;
+    let verdict = crate::clearsim::certify(&path, r, &to_clear);
+    let ok = verdict.max_engagement <= e * CERT_ENGAGEMENT_SLACK
+        && verdict.uncut_area <= cover_tol
+        && verdict.gouge_area <= cover_tol;
+    ok.then_some(path)
+}
+
 /// The generator's tuning, bundled so it can be swept as a unit. Defaults come from the
 /// constants above; every field is an oracle-swept number, not a preference — see each
 /// constant's doc for the measurements behind it.
@@ -966,7 +1018,15 @@ mod tests {
             let path = front_advance_path(&region, r, 0.0, e, Some(ctr))
                 .unwrap_or_else(|| panic!("{name}: should produce a path"));
             let gen = t.elapsed().as_secs_f64();
-            assert!(gen < 3.0, "{name}: generation should be quick, took {gen:.2}s");
+            // The wall-clock ceiling is deliberately generous: it guards against the
+            // *catastrophic* regression this milestone retired — the 120 s pre-decimation
+            // grind and the 37-minute split-front `MAX_PASSES` loop — not against micro-
+            // timing. A tight bound is meaningless here: this is a debug build, and the
+            // suite now runs the exact oracle in several tests concurrently (front-advance
+            // is wired into `clearing::clear`), so wall-clock under a saturated runner
+            // reflects contention, not the generator. The **point count** below is the
+            // contention-independent guard that the frontier decimation is working.
+            assert!(gen < 20.0, "{name}: generation regressed to a grind, took {gen:.2}s");
             assert!(path.len() < 4000, "{name}: sane point count, got {}", path.len());
         }
     }

@@ -138,7 +138,7 @@ impl Strategy for PocketStrategy {
 mod tests {
     use super::*;
     use cam_cldata::{MoveKind, Step};
-    use cam_geo::{Contour, Point};
+    use cam_geo::{Contour, Point, Polygon};
     use cam_model::{Clearing, Heights, Lead, Plunge, Tool, ToolKind};
 
     fn square(side: f64) -> Contour {
@@ -518,6 +518,87 @@ mod tests {
             "a tighter engagement cap ⇒ more rings ({} vs {})",
             run(2.0),
             run(0.0)
+        );
+    }
+
+    #[test]
+    fn an_engagement_capped_climb_pocket_ships_the_certified_front_advance_path() {
+        // The end-to-end proof that wiring front-advance into `clearing::clear` emits a
+        // *bounded* toolpath — not just that the generator does. A 40×40 pocket, ⌀6 tool
+        // (r=3), engagement 2.0, climb, no leads, one depth level: this satisfies every
+        // dispatch guard, so `clear` routes through `front_advance_certified` and
+        // `emit_adaptive`. We rebuild the tool-centre polyline from the *emitted* moves
+        // (the plunge landing = path start, then the cutting moves) and re-certify it
+        // against the exact oracle. Concentric would slot this pocket at ~6.0 (the full
+        // ⌀6 diameter) at the entry and the pass-to-pass links; front-advance holds it at
+        // the geometric floor. The gate is 1.5·e = 3.0 — see
+        // `frontadvance::CERT_ENGAGEMENT_SLACK`.
+        let op = PocketOp {
+            clearing: Clearing { engagement: 2.0, climb: true },
+            id: 0,
+            tool: 1,
+            boundary: square(40.0),
+            islands: vec![],
+            depth: 2.0,
+            stepdown: 2.0, // one depth level
+            overlap: 0.5,
+            offset: 0.0,
+            feed: 300.0,
+            plunge_feed: 100.0,
+            plunge: Plunge::Straight,
+            start: None,
+            lead_overlap: 0.0,
+            lead_in: Lead::None,
+            lead_out: Lead::None,
+        };
+        let ts = tools(6.0);
+        let env = JobEnv {
+            heights: Heights::new(5.0, 2.0, 0.0),
+            tools: &ts,
+            stock: None,
+        };
+        let result = PocketStrategy::new(op).compute(&env, &CancelToken::new());
+        assert!(!result.has_errors(), "{:?}", result.diagnostics);
+
+        // Reconstruct the first level's tool-centre path: the plunge lands at the path
+        // start, then every cutting move is a path vertex. Stop at the first retract.
+        let mut path: Vec<Point> = Vec::new();
+        for s in result.program.steps() {
+            match s {
+                Step::Linear { to, tag, .. } if tag.kind == MoveKind::Plunge => {
+                    if path.is_empty() {
+                        path.push(Point::new(to.x, to.y));
+                    }
+                }
+                Step::Linear { to, tag, .. } if tag.kind == MoveKind::Cutting => {
+                    path.push(Point::new(to.x, to.y));
+                }
+                Step::Rapid { tag, .. } if tag.kind == MoveKind::Retract => break,
+                _ => {}
+            }
+        }
+        assert!(
+            path.len() > 50,
+            "a front-advance spiral is many small moves, got {}",
+            path.len()
+        );
+
+        // Certify the *shipped* path against the exact oracle. finish=0 ⇒ the material to
+        // clear is the boundary itself.
+        let region = Polygon::new(square(40.0)).expect("square is a valid polygon");
+        let verdict = crate::clearsim::certify(&path, 3.0, &region);
+        assert!(
+            verdict.max_engagement <= 2.0 * 1.5 + 1e-6,
+            "the emitted path must hold engagement at the certified bound (1.5·e = 3.0), \
+             got {:.2}",
+            verdict.max_engagement
+        );
+        // And it is unmistakably the front-advance path, not a slotting fallback: a
+        // concentric clear of this pocket slots at ~6.0 (the full diameter) at entry.
+        assert!(
+            verdict.max_engagement < 4.0,
+            "engagement {:.2} is nowhere near a slot (~6.0) — the front-advance path shipped",
+            verdict.max_engagement
         );
     }
 

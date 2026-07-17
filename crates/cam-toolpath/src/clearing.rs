@@ -21,7 +21,6 @@ use crate::rings::{concentric_rings, emit_stay_down, RingsError};
 use crate::CancelToken;
 
 /// Everything the clearing pass needs beyond the region geometry itself.
-#[allow(dead_code)] // `radius`/`finish` are read once the front-advance is dispatched again
 pub(crate) struct ClearJob<'a> {
     /// Operation id, stamped onto emitted tags.
     pub id: u32,
@@ -78,41 +77,70 @@ pub(crate) fn clear(
     levels: &[f64],
     cancel: &CancelToken,
 ) -> Result<usize, RingsError> {
-    // **The adaptive branch is deliberately not dispatched here — see below. Do not
-    // re-enable [`crate::adaptive`] without reading this.**
+    // **Adaptive dispatch: the front-advance clearer, behind the exact oracle.**
     //
-    // Until 2026-07-17 this tried `adaptive::adaptive_path` / `adaptive_frame` first,
-    // "self-certifying against the oracle" and falling through on `None`. The gate was
-    // `raster.rs`, and the raster is **blind to slots**. Measured — raster verdict vs the
-    // exact oracle ([`crate::clearsim`]) on the same *emitted* path, r=3, engagement 2.0:
+    // When an engagement cap is set and the cut is climb, try [`crate::frontadvance`]: it
+    // advances the cleared frontier one stepover per pass, so the tool-centre path holds
+    // engagement at the geometric floor (2.69–2.90 on r=3/e=2 — no slots) where the
+    // concentric path slots at the entry, the pass-to-pass links, and the concave corner.
+    // The path self-certifies against the **exact** oracle ([`crate::clearsim`]) and
+    // returns `None` — meaning fall through to concentric — whenever it cannot.
+    //
+    // Three gates before we even try, all by construction:
+    //
+    // - **Climb only.** Adaptive clearing inherits the offset winding = climb; there is no
+    //   radial-order-preserving rotation flip, and conventional defeats constant-engagement
+    //   HSM anyway. Conventional falls through to concentric, which honours it.
+    // - **Simply connected only.** A region with islands has no single seam; the frontier
+    //   flowing around holes is a later increment. `front_advance_certified` returns `None`
+    //   for a holed region regardless, but gating here keeps the intent legible.
+    // - **No finishing leads.** Front-advance is a *roughing* engine: it emits its frontier
+    //   spiral with no wall lead-on, because a lead onto a spiral loop has no clean
+    //   wall-hugging ring to ease onto. If the operator asked for a finishing lead
+    //   (`lead_in`/`lead_out`), the concentric path lays it on the wall ring and we must not
+    //   silently drop it — so a leaded pocket keeps the proven concentric clear. (Profile
+    //   roughing always passes `Lead::None`, so it is never held back by this.) A proper
+    //   front-advance-rough + separate leaded finish-wall pass is a later increment.
+    //
+    // **The gate is the exact oracle, never the raster.** Until 2026-07-17 an earlier
+    // adaptive dispatch (the spiral-morph) gated on `raster.rs`, which is blind to slots —
+    // measured, raster verdict vs the exact oracle on the same *emitted* path, r=3,
+    // engagement 2.0:
     //
     // ```text
     //   square 40 : raster 2.20 → shipped   exact 6.00   ← the full diameter
     //   square 24 : raster 0.80 → shipped   exact 6.00   ← the full diameter
-    //   circle r30: raster 2.20 → shipped   exact 4.76
-    //   circle r12: raster 0.40 → shipped   exact 4.85
     // ```
     //
-    // Every plain pocket shipped, every one blew the cap by 2.4–3×, and two took the tool
-    // to a full-width cut mid-pocket — at whatever axial depth the level set, on a
-    // strategy whose whole premise is that you may cut deep. The raster read 0.80 against
-    // a true 6.00: a 7.5× under-read in the unsafe direction, not the "biased high, the
-    // safe direction" its comment claimed.
+    // It shipped full-diameter cuts at whatever axial depth the level set. The raster read
+    // 0.80 against a true 6.00 — a 7.5× under-read in the unsafe direction. It stays out of
+    // this path until it is re-anchored against the exact oracle.
     //
-    // Gating on the exact oracle instead was tried and rejected as the wrong fix: the
-    // spiral-morph slots at corners and transitions **by construction**, so it never
-    // certifies honestly — the gate would spend ~10 s per op proving that and then fall
-    // through to concentric anyway. Identical output, 10 s slower, two gates to keep
-    // honest for a generator already slated for retirement.
-    //
-    // So: concentric for everything, which is proven. The engagement parameter is **not**
-    // inert — [`ClearJob::effective_spacing`] caps the ring spacing at it, which genuinely
-    // bounds the radial width of cut on a straight wall. What is gone is the claim of
-    // constant engagement around corners and at entry, which was never true.
-    //
-    // Adaptive returns when [`crate::frontadvance`] is wired in here behind the **exact**
-    // oracle: it holds 2.69 end-to-end on circle and square alike (measured, and agreed by
-    // two independent metrics) where this one hit 6.00.
+    // The engagement value is the **straight-wall stepover**, not a hard ceiling: the
+    // geometric floor `a_e(ρ) = e(ρ+r)/ρ − e²/(2ρ)` exceeds `e` at every finite radius and
+    // reaches ~1.4·e on the tight loops near a pocket centre, unreachable by any spiral
+    // clearer. Front-advance kills the *slots* (the machine-and-tool hazard); the benign
+    // floor is a per-loop feedrate matter. See [`crate::frontadvance::CERT_ENGAGEMENT_SLACK`].
+    if job.clearing.engagement > 0.0
+        && job.clearing.climb
+        && region.holes().is_empty()
+        && job.lead_in == Lead::None
+        && job.lead_out == Lead::None
+    {
+        if let Some(tc) = crate::frontadvance::front_advance_certified(
+            region,
+            job.radius,
+            job.finish,
+            job.clearing.engagement,
+            job.start,
+        ) {
+            emit_adaptive(prog, &tc, job, heights, levels);
+            // One continuous certified path (not a ring count); `Ok(_)` ⇒ emitted.
+            return Ok(1);
+        }
+        // Uncertified — fall through to the proven concentric path below.
+    }
+
     let spacing = job.effective_spacing();
     let mut rings = concentric_rings(region, job.first, spacing, cancel)?;
     if rings.is_empty() {
@@ -155,7 +183,6 @@ pub(crate) fn clear(
 /// approach and enter at the path start (per the plunge strategy), cut the whole
 /// path at depth, and retract. Between levels the entry re-plunges into stock
 /// cleared above.
-#[allow(dead_code)] // the emitter the front-advance will use once it is wired in
 fn emit_adaptive(prog: &mut Program, tc: &[Point], job: &ClearJob, h: &Heights, levels: &[f64]) {
     if tc.len() < 2 {
         return;
