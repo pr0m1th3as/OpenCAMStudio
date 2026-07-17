@@ -121,6 +121,12 @@ impl ClearedModel {
         let d = (dx / len, dy / len);
         // Angular resolution around the tool, and how densely to sample the move.
         const NA: usize = 180;
+        // Sample the perimeter a hair *inside* r. The cleared region is a flattened
+        // (inscribed) polygon, so probing at exactly r lets perimeter points graze just
+        // outside a tangent cleared boundary and read as uncut — a false slot when the
+        // tool sits in its own entry disc. The inset (> the flatten sagitta) removes
+        // that while costing a negligible under-read of a_e.
+        let rp = (self.r - 0.1).max(self.r * 0.9);
         let pos_steps = ((len / (0.5 * self.r).max(1e-3)).ceil() as usize).max(1);
         let mut max_ae = 0.0_f64;
         for s in 0..=pos_steps {
@@ -134,7 +140,7 @@ impl ClearedModel {
                 if ca * d.0 + sa * d.1 <= 0.0 {
                     continue; // trailing half — not the cutting edge
                 }
-                if self.is_uncut(Point::new(c.x + self.r * ca, c.y + self.r * sa)) {
+                if self.is_uncut(Point::new(c.x + rp * ca, c.y + rp * sa)) {
                     engaged += 1;
                 }
             }

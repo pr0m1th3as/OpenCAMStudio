@@ -128,8 +128,9 @@ pub(crate) fn adaptive_path(
 
     // Join the concentric loops into a continuous spiral so the radius grows a band
     // per revolution rather than jumping radially between loops — the radial links
-    // were what spiked the engagement between passes.
-    let path = spiral(&loops, entry)?;
+    // were what spiked the engagement between passes. The spiral opens with a bounded
+    // Archimedean core (pitch = the stepover) so the entry does not slot.
+    let path = spiral(&loops, entry, e)?;
 
     // The whole path must certify against the (fast, linear) raster oracle:
     // engagement ≤ cap, reachable target covered, no gouge. Cross-checked against the
@@ -453,11 +454,36 @@ fn family_spiral(loops: &[Vec<Point>], center: Point, step: f64) -> Option<Vec<P
     Some(path)
 }
 
+/// An Archimedean spiral from `center` growing at `pitch` per revolution out to
+/// `radius` — the **entry** that opens the core without slotting. The plunge disc
+/// (radius ≥ the tool radius) bounds the first turn, and each turn thereafter bites
+/// only `pitch` of fresh material, so the tool eases out instead of the old radial
+/// jump from the plunge point to the innermost ring (which cut virgin stock full
+/// width). Returned centre-first; empty for a degenerate radius.
+fn core_spiral(center: Point, radius: f64, pitch: f64) -> Vec<Point> {
+    if radius <= 1e-6 || pitch <= 1e-6 {
+        return vec![center];
+    }
+    let theta_max = std::f64::consts::TAU * radius / pitch;
+    // Same angular resolution as the ring blend.
+    let steps = ((theta_max / std::f64::consts::TAU) * ANGULAR_SAMPLES as f64).ceil() as usize;
+    let steps = steps.max(1);
+    let mut pts = Vec::with_capacity(steps + 1);
+    for k in 0..=steps {
+        let theta = theta_max * (k as f64) / (steps as f64);
+        let rr = pitch * theta / std::f64::consts::TAU;
+        pts.push(Point::new(center.x + rr * theta.cos(), center.y + rr * theta.sin()));
+    }
+    pts
+}
+
 /// Morph the concentric `loops` (inner-first) into one continuous spiral about
 /// `center`: within each revolution the point blends from loop `k` to loop `k+1`,
-/// so the radius grows a band per turn with no radial jump. Ends with a full lap of
-/// the outermost loop to finish the wall.
-fn spiral(loops: &[Vec<Point>], center: Point) -> Option<Vec<Point>> {
+/// so the radius grows a band per turn with no radial jump. Opens with an Archimedean
+/// [`core_spiral`] (pitch `pitch`) from the plunge point out to the innermost ring, so
+/// the entry does not slot. Ends with a full lap of the outermost loop to finish the
+/// wall.
+fn spiral(loops: &[Vec<Point>], center: Point, pitch: f64) -> Option<Vec<Point>> {
     if loops.is_empty() {
         return None;
     }
@@ -467,7 +493,10 @@ fn spiral(loops: &[Vec<Point>], center: Point) -> Option<Vec<Point>> {
         .map(|l| resample_by_arclength(l, center, n))
         .collect::<Option<_>>()?;
 
-    let mut path = vec![center];
+    // Open the core with a bounded Archimedean spiral out to the innermost ring's mean
+    // radius, then hand off to the ring blend.
+    let inner_r = rings[0].iter().map(|p| p.distance(center)).sum::<f64>() / rings[0].len() as f64;
+    let mut path = core_spiral(center, inner_r, pitch);
     for pair in rings.windows(2) {
         let (inner, outer) = (&pair[0], &pair[1]);
         for i in 0..n {
@@ -522,29 +551,40 @@ mod tests {
         let v = certify(&path, r, &region);
         assert!(v.uncut_area < 3.0, "the pocket is covered, uncut {}", v.uncut_area);
         assert!(v.gouge_area < 1.0, "no gouge, got {}", v.gouge_area);
+        // The Archimedean core-spiral entry bounds a round pocket's entry to a modest
+        // transient (~1.5x cap) instead of the full-diameter slot the old radial
+        // connector cut. (Squares/large pockets still slot elsewhere — a radial link at
+        // a corner, a handoff transition — pending front-advance generation.)
         assert!(
-            v.max_engagement <= 2.0 * r + 0.1,
-            "engagement never exceeds the diameter, got {}",
+            v.max_engagement <= 1.6 * e,
+            "round-pocket entry held below ~1.5x cap by the core spiral, got {}",
             v.max_engagement
         );
     }
 
     #[test]
-    fn the_runtime_raster_gate_misses_the_entry_slot_the_exact_oracle_catches() {
+    fn the_runtime_raster_gate_misses_a_slot_the_exact_oracle_catches() {
         // A load-bearing finding for step 2: the fast raster gate is NOT a faithful
-        // stand-in for the exact oracle. On the very same round-pocket spiral, the
-        // exact engagement-angle oracle sees the entry slot (a_e ≈ the diameter) while
-        // the raster reads it as a light cut — so the runtime gate currently lets a
-        // slotting entry through. Recalibrating (or replacing) the raster against the
-        // exact oracle is part of the generation rework.
-        let region = circle(9.0, 40);
+        // stand-in for the exact oracle. A square-pocket spiral still slots (a radial
+        // link at a corner, a_e ≈ the diameter) — the exact engagement-angle oracle
+        // sees it, but the raster reads it as a light cut, so the runtime gate lets it
+        // through. Recalibrating (or replacing) the raster against the exact oracle,
+        // and generating engagement-bounded paths in the first place (front-advance),
+        // is the generation rework.
+        let region = Polygon::new(Contour::new(vec![
+            Point::new(0.0, 0.0),
+            Point::new(40.0, 0.0),
+            Point::new(40.0, 40.0),
+            Point::new(0.0, 40.0),
+        ]))
+        .unwrap();
         let (r, e) = (3.0, 2.0);
-        let path = adaptive_path(&region, r, 0.0, e, Some([0.0, 0.0]))
-            .expect("round pocket certifies");
+        let path = adaptive_path(&region, r, 0.0, e, Some([20.0, 20.0]))
+            .expect("square pocket certifies (through the raster gate)");
         let poly = certify(&path, r, &region);
         let ras = crate::raster::certify(&path, r, &region, e).expect("raster builds");
-        assert!(poly.max_engagement > 2.0 * r - 0.5, "exact oracle sees the entry slot, got {}", poly.max_engagement);
-        assert!(ras.max_engagement < e * 1.2, "raster misses it, reads a light cut, got {}", ras.max_engagement);
+        assert!(poly.max_engagement > 2.0 * r - 0.5, "exact oracle sees the slot, got {}", poly.max_engagement);
+        assert!(ras.max_engagement < poly.max_engagement - 1.0, "raster under-reads it, got {}", ras.max_engagement);
     }
 
     #[test]
