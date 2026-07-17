@@ -24,6 +24,28 @@ fn square(x0: f64, y0: f64, x1: f64, y1: f64) -> Contour {
     ])
 }
 
+fn profile_square(id: u32, chain: Contour) -> ProfileOp {
+    ProfileOp {
+        clearing: cam_model::Clearing::default(),
+        id,
+        tool: 1,
+        chain,
+        side: Side::Outside,
+        comp: Comp::Computed,
+        offset: 0.0,
+        depth: 3.0,
+        stepdown: 1.5,
+        stepover: 0.0,
+        feed: 300.0,
+        plunge_feed: 100.0,
+        start: None,
+        lead_in: Lead::None,
+        lead_out: Lead::None,
+        lead_overlap: 0.0,
+        plunge: Plunge::Straight,
+    }
+}
+
 fn setup(operations: Vec<Operation>) -> Document {
     Document::new(Setup {
         name: "verify".into(),
@@ -183,8 +205,12 @@ fn a_pocket_deeper_than_intended_is_caught_as_a_gouge() {
 
 #[test]
 fn a_bad_setup_that_rapids_low_is_caught() {
-    // A profile whose clearance/retract sit *below* the stock top forces lateral
-    // rapids through the stock — the sim must catch what a backplot would hide.
+    // A clearance/retract plane set *below* the stock top is the classic unsafe setup.
+    // Two separate profiles force a **lateral** rapid between them at that low plane (from
+    // the first op's retract to the second's approach) — the tool plows sideways through
+    // the uncut stock between them, which the sim must catch even though a backplot would
+    // hide it. (A single-loop op only *lifts* vertically at the low plane, which is safe:
+    // the tool retreats up through the column it cut — so the hazard is the lateral move.)
     let doc = Document::new(Setup {
         name: "unsafe".into(),
         heights: Heights::new(-1.0, -1.0, 0.0), // clearance below stock top!
@@ -201,25 +227,13 @@ fn a_bad_setup_that_rapids_low_is_caught() {
             flutes: 2,
             kind: ToolKind::EndMill,
         }],
-        operations: vec![Operation::Profile(ProfileOp {
-            clearing: cam_model::Clearing::default(),
-            id: 0,
-            tool: 1,
-            chain: square(10.0, 10.0, 30.0, 30.0),
-            side: Side::Outside,
-            comp: Comp::Computed,
-            offset: 0.0,
-            depth: 3.0,
-            stepdown: 1.5,
-            stepover: 0.0,
-            feed: 300.0,
-            plunge_feed: 100.0,
-            start: None,
-            lead_in: Lead::None,
-            lead_out: Lead::None,
-            lead_overlap: 0.0,
-            plunge: Plunge::Straight,
-        })],
+        // Two separate profiles: linking from the first's retract to the second's
+        // approach forces a *lateral* rapid across the (too-low) clearance plane, over
+        // the uncut stock between them.
+        operations: vec![
+            Operation::Profile(profile_square(0, square(5.0, 5.0, 15.0, 15.0))),
+            Operation::Profile(profile_square(1, square(25.0, 25.0, 35.0, 35.0))),
+        ],
         origin: [0.0, 0.0, 0.0],
         start_offset: None,
     });

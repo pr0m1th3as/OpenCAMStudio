@@ -196,17 +196,29 @@ pub fn simulate(
             }
             Step::Rapid { to, .. } => {
                 if let Some(a) = cur {
-                    let clearance = a.z.min(to.z) as f32;
-                    let stock = field.max_height_along([a.x, a.y], [to.x, to.y], tool.radius);
-                    if stock > clearance + CLEARANCE_EPS {
-                        collisions.push(Collision {
-                            kind: CollisionKind::RapidThroughStock,
-                            at: [to.x, to.y, to.z],
-                            message: format!(
-                                "rapid at Z {:.3} passes through stock standing at Z {:.3}",
-                                to.z, stock
-                            ),
-                        });
+                    // A vertical lift (no XY travel, moving up) is always safe: the tool
+                    // retreats straight up through the column it just cut, so it cannot
+                    // plow through stock. The tool-radius disc below would otherwise catch
+                    // a neighbouring ridge — e.g. the scallops a V/chamfer tool leaves
+                    // between face passes — and false-flag the retract. (A *downward*
+                    // in-place move is still checked: strategies plunge with a feed, not a
+                    // rapid, so a descending rapid into stock is a real fault.) A lateral
+                    // rapid sweeps the tool horizontally and is always checked.
+                    let lateral = (a.x - to.x).hypot(a.y - to.y) > 1e-9;
+                    let vertical_lift = !lateral && to.z >= a.z;
+                    if !vertical_lift {
+                        let clearance = a.z.min(to.z) as f32;
+                        let stock = field.max_height_along([a.x, a.y], [to.x, to.y], tool.radius);
+                        if stock > clearance + CLEARANCE_EPS {
+                            collisions.push(Collision {
+                                kind: CollisionKind::RapidThroughStock,
+                                at: [to.x, to.y, to.z],
+                                message: format!(
+                                    "rapid at Z {:.3} passes through stock standing at Z {:.3}",
+                                    to.z, stock
+                                ),
+                            });
+                        }
                     }
                 }
                 cur = Some(*to);
@@ -327,6 +339,68 @@ mod tests {
             .build();
         let sim = simulate(&prog, STOCK_MIN, STOCK_MAX, &opts(), &[]);
         assert!(!sim.is_clean(), "should flag the rapid");
+        assert_eq!(sim.collisions[0].kind, CollisionKind::RapidThroughStock);
+    }
+
+    #[test]
+    fn a_vertical_lift_beside_a_proud_ridge_is_not_flagged() {
+        // A V/chamfer tool plunges a cone (narrow at depth, wide at the max radius),
+        // leaving uncut stock proud of the cut within the tool's footprint — the scallop
+        // a chamfer tool leaves when (mis)used to face. Lifting straight up out of that
+        // cone must NOT be flagged: the tool retreats through the column it just cut and
+        // cannot plow through the ridge beside it. Regression for a false RapidThroughStock
+        // that blocked export of a face op run with a chamfer tool.
+        let vee = SimTool {
+            number: 1,
+            profile: ToolProfile {
+                radius: 2.0,
+                shape: ProfileShape::Cone {
+                    half_angle_rad: std::f64::consts::FRAC_PI_4,
+                    flat_radius: 0.0,
+                },
+            },
+        };
+        let prog = ProgramBuilder::new()
+            .op(0)
+            .tool_change(1)
+            .feed(300.0)
+            .rapid(Point3::new(20.0, 20.0, 5.0), MoveKind::Link)
+            .linear(Point3::new(20.0, 20.0, -1.0), MoveKind::Plunge)
+            .rapid(Point3::new(20.0, 20.0, 5.0), MoveKind::Retract)
+            .build();
+        let sim = simulate(&prog, STOCK_MIN, STOCK_MAX, &opts(), &[vee]);
+        assert!(
+            sim.is_clean(),
+            "a vertical lift out of a cone must not flag the ridge beside it: {:?}",
+            sim.collisions
+        );
+    }
+
+    #[test]
+    fn a_lateral_rapid_low_over_a_ridge_is_still_flagged() {
+        // The fix must not blunt the real check: with the same cone tool, a *lateral*
+        // rapid at the plunge depth, out across proud stock, is a genuine crash.
+        let vee = SimTool {
+            number: 1,
+            profile: ToolProfile {
+                radius: 2.0,
+                shape: ProfileShape::Cone {
+                    half_angle_rad: std::f64::consts::FRAC_PI_4,
+                    flat_radius: 0.0,
+                },
+            },
+        };
+        let prog = ProgramBuilder::new()
+            .op(0)
+            .tool_change(1)
+            .feed(300.0)
+            .rapid(Point3::new(20.0, 20.0, 5.0), MoveKind::Link)
+            .linear(Point3::new(20.0, 20.0, -1.0), MoveKind::Plunge)
+            // Straight sideways at depth across untouched stock — a real plow.
+            .rapid(Point3::new(35.0, 20.0, -1.0), MoveKind::Link)
+            .build();
+        let sim = simulate(&prog, STOCK_MIN, STOCK_MAX, &opts(), &[vee]);
+        assert!(!sim.is_clean(), "a lateral rapid at depth over stock must flag");
         assert_eq!(sim.collisions[0].kind, CollisionKind::RapidThroughStock);
     }
 
