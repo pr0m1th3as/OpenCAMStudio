@@ -14,8 +14,8 @@
 #![allow(dead_code)]
 
 use cam_geo::{
-    difference, offset, stroke_path, union, Arc, CapStyle, Contour, JoinStyle, Point, Polygon,
-    Polyline,
+    difference, intersection, offset, stroke_path, union, Arc, CapStyle, Contour, JoinStyle, Point,
+    Polygon, Polyline,
 };
 
 /// Total (net, holes subtracted) area of a set of polygons.
@@ -40,6 +40,11 @@ pub(crate) fn reachable(region: &Polygon, r: f64) -> Vec<Polygon> {
         return Vec::new();
     }
     offset(&eroded, r, JoinStyle::Round).unwrap_or_default()
+}
+
+/// A filled disc of radius `r` at `c`.
+fn disc(c: Point, r: f64) -> Option<Polygon> {
+    Polygon::new(Contour::new(Arc::circle(c, r).flatten(0.05))).ok()
 }
 
 /// A running model of the material cleared by a tool of radius `r`.
@@ -148,6 +153,54 @@ impl ClearedModel {
             max_ae = max_ae.max(self.r * (1.0 - phi.cos()));
         }
         max_ae
+    }
+
+    /// The **radial width of cut** (`a_e`) of the move `from`→`to`, measured from the
+    /// material the move actually removes per unit of advance:
+    ///
+    /// ```text
+    ///   a_e = area( swept(from→to) ∖ tool-at-`from` ∖ cleared ∩ material ) / |to − from|
+    /// ```
+    ///
+    /// Subtracting the tool's own starting disc is what makes this a *rate*: the tool
+    /// already occupies `from`, so only what the advance uncovers is cut. Without it a
+    /// short move would charge its whole starting disc (≈ `πr²`) against a tiny advance.
+    ///
+    /// This is the textbook meaning of radial width of cut, and unlike [`Self::engagement`]
+    /// it assumes **nothing about the shape of the uncut boundary**. That is the whole
+    /// point: `a_e = r(1 − cos Φ)` derives depth from the contact *arc* on the assumption
+    /// that the uncut region is a half-plane, so where material **wraps** the tool — a
+    /// concave corner — it reports a deep cut for a shallow one. Here a slot reads the
+    /// diameter and a peel reads the stepover because the geometry says so, not because
+    /// the shape was assumed.
+    ///
+    /// It is **not** the averaging trap that `2·area/perimeter` was: that averaged over a
+    /// whole loop and drowned a momentary slot. This averages over exactly one move, so
+    /// the caller controls the window — measure in short pieces and a short slot still
+    /// reads as a slot.
+    pub(crate) fn engagement_area(&self, from: Point, to: Point) -> f64 {
+        let len = from.distance(to);
+        if len < 1e-9 {
+            return 0.0;
+        }
+        let sweep = swept(&[from, to], self.r);
+        if sweep.is_empty() {
+            return 0.0;
+        }
+        let Some(start) = disc(from, self.r) else {
+            return 0.0;
+        };
+        let mut cut = match difference(&sweep, std::slice::from_ref(&start)) {
+            Ok(v) => v,
+            Err(_) => return 0.0,
+        };
+        if !self.cleared.is_empty() {
+            cut = difference(&cut, &self.cleared).unwrap_or_default();
+        }
+        if let Some(m) = &self.material {
+            cut = intersection(&cut, std::slice::from_ref(m)).unwrap_or_default();
+        }
+        total_area(&cut) / len
     }
 
     /// Add the move `from`→`to` to the cleared region.
@@ -297,6 +350,41 @@ mod tests {
         let v = certify(&path, r, &square(0.0, 20.0));
         assert!(v.uncut_area < 3.0, "reachable target should be covered, uncut {}", v.uncut_area);
         assert!(v.gouge_area < 1e-3, "centres held inside ⇒ no gouge, got {}", v.gouge_area);
+    }
+
+    /// **The oracle's independent cross-check.** [`ClearedModel::engagement`] derives `a_e`
+    /// from the contact *arc* via `r(1−cos Φ)`; [`ClearedModel::engagement_area`] derives it
+    /// from the material actually removed per unit of advance. They share no machinery —
+    /// one probes the perimeter, the other does booleans on the swept region — so agreement
+    /// is real evidence rather than one formula confirming itself.
+    ///
+    /// This matters because this subsystem's history is of instruments quietly lying: the
+    /// original `2·area/perimeter` metric averaged slots away, and `engagement` itself was
+    /// suspected (wrongly, as it turns out) of over-reporting concave corners. A second,
+    /// independent measure is the cheapest guard against the next such surprise.
+    ///
+    /// Note `engagement_area` is biased **high on short moves** — the `flatten(0.05)` disc
+    /// and `stroke_path`'s round cap are different polygons, so differencing them leaves
+    /// ~0.5 mm² of slivers, which divided by a small advance explodes. Hence long moves
+    /// here, and hence `engagement` remains the metric the runtime gate uses.
+    #[test]
+    fn the_two_independent_engagement_measures_agree() {
+        let r = 3.0;
+
+        // A full slot into virgin stock: both must read the diameter.
+        let m = ClearedModel::new(r);
+        let (a, b) = (Point::new(0.0, 0.0), Point::new(40.0, 0.0));
+        let (angle, area) = (m.engagement(a, b), m.engagement_area(a, b));
+        assert!((5.9..6.1).contains(&angle), "slot by arc should read 6, got {angle}");
+        assert!((5.9..6.1).contains(&area), "slot by area should read 6, got {area}");
+
+        // A 2 mm peel alongside a cleared swath: both must read the stepover.
+        let mut m = ClearedModel::new(r);
+        m.commit(Point::new(-10.0, 0.0), Point::new(50.0, 0.0));
+        let (a, b) = (Point::new(0.0, 2.0), Point::new(40.0, 2.0));
+        let (angle, area) = (m.engagement(a, b), m.engagement_area(a, b));
+        assert!((1.85..2.15).contains(&angle), "peel by arc should read 2, got {angle}");
+        assert!((1.85..2.15).contains(&area), "peel by area should read 2, got {area}");
     }
 
     #[test]
