@@ -28,6 +28,7 @@ mod plan;
 mod rings;
 mod pocket;
 mod profile;
+mod raster;
 mod thread;
 
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -1,40 +1,33 @@
 //! Constant-engagement adaptive clearing — the generator.
 //!
-//! Front-advance peeling driven by the cleared-region model: seed the entry disc,
-//! then repeatedly take the next tool-centre loop as the cleared region shrunk by
-//! `radius − engagement` (clamped to the tool-centre-accessible region), which cuts
-//! a fresh band of width ≈ `engagement` beyond the current front. The whole path is
-//! then **certified** against the oracle ([`crate::clearsim::certify`]); it is
-//! returned only if it holds engagement at the cap, covers the reachable target, and
-//! never gouges. The caller falls back to concentric clearing on `None`.
+//! For a simply-connected region: take the concentric tool-centre loops (the region
+//! offset in by the tool radius, then by a stepover of `engagement`), then **morph
+//! them into one continuous spiral** so the radius grows a band per revolution with
+//! no radial link between passes — the links were what spiked the engagement. The
+//! whole path is then **certified** against the fast raster oracle
+//! ([`crate::raster`], cross-checked against the polygon anchor [`crate::clearsim`]):
+//! it is returned only if it holds engagement at the cap, covers the reachable
+//! target, and never gouges. The caller falls back to concentric clearing on `None`.
 //!
-//! Scope today: a single simply-connected region with the entry inside it. Islands,
-//! multi-lobe regions, and sharp corners whose engagement spikes are not certified
-//! and fall back. Corner-loop insertion (to certify sharp corners) and islands are
-//! the next phases — the oracle already guarantees every emitted path is correct
-//! regardless, so this grows without ever shipping a bad toolpath.
-// Consumed by the clearing pipeline once it certifies paths (spiral connection is
-// the next step); the self-certification contract is exercised by tests now.
-#![allow(dead_code)]
+//! Scope today: a simply-connected region, star-convex from the entry (so its loops
+//! spiral cleanly). Regions that split, grow an island, or are not star-convex from
+//! the entry fall back — cleared-region-tracked generation (the union front-advance)
+//! and corner handling return for those in later phases. The oracle guarantees every
+//! emitted path is correct regardless, so this grows without ever shipping a bad one.
 
-use cam_geo::{
-    difference, intersection, offset, stroke_path, union, CapStyle, Contour, JoinStyle, Point,
-    Polygon, Polyline,
-};
+use cam_geo::{offset, JoinStyle, Point, Polygon};
 
-use crate::clearsim::{certify, reachable};
+use crate::clearsim::reachable;
 
-/// Chord tolerance for flattening the entry disc (mm).
-const FLAT_TOL: f64 = 0.05;
 /// Angular samples per revolution when morphing loops into a spiral.
-const ANGULAR_SAMPLES: usize = 32;
+const ANGULAR_SAMPLES: usize = 48;
 /// Cap on peel iterations (guards the front-advance loop).
 const MAX_PASSES: usize = 400;
-/// Cap on the generated path length. Certifying peak engagement is sequential
-/// (O(n²) in the naïve cleared-region model), so a path longer than this bails to
-/// the concentric fallback rather than spend the time. A raster engagement model
-/// (next phase) lifts this so large pockets can go adaptive too.
-const MAX_PATH: usize = 200;
+/// Safety cap on the number of concentric loops (the front-advance is bounded, but
+/// this guards a pathological region). The raster oracle certifies in linear time,
+/// so this is generous — the practical limit is the per-pass offset/boolean cost of
+/// generation, not certification.
+const MAX_LOOPS: usize = 400;
 
 /// Net area of a set of polygons.
 fn area(polys: &[Polygon]) -> f64 {
@@ -46,12 +39,6 @@ fn largest(polys: Vec<Polygon>) -> Option<Polygon> {
     polys
         .into_iter()
         .max_by(|a, b| a.area().partial_cmp(&b.area()).unwrap_or(std::cmp::Ordering::Equal))
-}
-
-/// A filled disc of radius `r` at `c`.
-fn disc(c: Point, r: f64) -> Option<Polygon> {
-    let pts = cam_geo::Arc::circle(c, r).flatten(FLAT_TOL);
-    Polygon::new(Contour::new(pts)).ok()
 }
 
 /// Centroid of a contour's vertices.
@@ -105,57 +92,56 @@ pub(crate) fn adaptive_path(
     }
     let cover_tol = 0.02 * area(&reach) + 1.0;
 
-    // Seed the cleared region with the entry disc, then collect the successive
-    // tool-centre loops (each cuts a band of ≈ e beyond the current front).
-    let mut cleared: Vec<Polygon> = vec![disc(entry, r)?];
+    // Collect the concentric tool-centre loops, wall-most first: offset the region
+    // in by (r + finish) for the wall loop, then by a stepover of `e` until it closes
+    // to the centre. For a simply-connected region these equal the front-advanced
+    // loops but are far cheaper (independent offsets, no accumulated-cleared union);
+    // cleared-region tracking returns for islands / concave regions. A loop that
+    // splits or grows a hole means a non-simple region — fall back for now.
     let mut loops: Vec<Vec<Point>> = Vec::new();
-    let mut last_uncut = f64::INFINITY;
-
+    let mut d = r + finish;
     for _ in 0..MAX_PASSES {
-        // Bail to the concentric fallback before the sequential certify gets costly.
-        if loops.len() * ANGULAR_SAMPLES > MAX_PATH {
+        if loops.len() > MAX_LOOPS {
             return None;
         }
-        let remaining = area(&difference(&reach, &cleared).ok()?);
-        if remaining <= cover_tol {
-            break;
+        let offs = offset(std::slice::from_ref(region), -d, JoinStyle::Round).ok()?;
+        if offs.len() > 1 {
+            return None; // the region split — not simply connected (later phase)
         }
-        // If a pass fails to make real progress, we are stuck (a pinch, a corner the
-        // peel can't reach) — bail so the caller falls back rather than spin.
-        if remaining >= last_uncut - 0.01 * area(&reach) {
-            return None;
+        let Some(poly) = offs.into_iter().next() else {
+            break; // closed off — innermost reached
+        };
+        if !poly.holes().is_empty() {
+            return None; // an island opened up (later phase)
         }
-        last_uncut = remaining;
-        // Next tool-centre loop: the cleared region pulled in by (r − e) cuts a fresh
-        // band of width ≈ e beyond the front; clamp to the tool-centre region so the
-        // tool never crosses the wall.
-        let front = offset(&cleared, -(r - e), JoinStyle::Round).ok()?;
-        let clamped = intersection(&front, std::slice::from_ref(&rc)).ok()?;
-        let loop_poly = largest(clamped)?;
-        let pts = loop_poly.outer().points();
-        if pts.len() < 3 {
-            return None;
+        if poly.area() < e * e {
+            break; // innermost sliver — the seed disc and first turns cover the core
         }
-        loops.push(pts.to_vec());
-
-        // Grow the cleared region by this loop's sweep.
-        let mut loop_path = pts.to_vec();
-        loop_path.push(pts[0]);
-        let swept = stroke_path(&Polyline::new(loop_path), r, CapStyle::Round, JoinStyle::Round).ok()?;
-        if swept.is_empty() {
-            return None;
-        }
-        cleared = union(&cleared, &swept).ok()?;
+        loops.push(poly.outer().points().to_vec());
+        d += e;
     }
+    if loops.len() < 2 {
+        return None; // too small to spiral
+    }
+    // Carve inside-out: innermost first.
+    loops.reverse();
 
     // Join the concentric loops into a continuous spiral so the radius grows a band
     // per revolution rather than jumping radially between loops — the radial links
     // were what spiked the engagement between passes.
     let path = spiral(&loops, entry)?;
 
-    // The whole path must certify: engagement ≤ cap, reachable target covered, no gouge.
-    let verdict = certify(&path, r, &to_clear);
-    verdict.certified(e, cover_tol).then_some(path)
+    // The whole path must certify against the (fast, linear) raster oracle:
+    // engagement ≤ cap, reachable target covered, no gouge. Cross-checked against the
+    // polygon trust anchor in tests.
+    let verdict = crate::raster::certify(&path, r, &to_clear, e)?;
+    // The raster reads a_e to within about one cell (px), biased high — the safe
+    // direction. Allow the cap that plus the usual engagement-cap slack (an advisory
+    // target, not a hard limit) so a spiral held near the cap is not falsely rejected.
+    let ok = verdict.max_engagement <= e * 1.15
+        && verdict.uncut_area <= cover_tol
+        && verdict.gouge_area <= cover_tol;
+    ok.then_some(path)
 }
 
 /// The farthest positive-`s` intersection of the ray `c + s·d` (unit `d`) with the
@@ -231,6 +217,8 @@ fn spiral(loops: &[Vec<Point>], center: Point) -> Option<Vec<Point>> {
 mod tests {
     use super::*;
     use crate::clearsim::certify;
+    use cam_geo::Contour;
+    use std::time::Instant;
 
     /// A regular n-gon of radius `rad` centred at the origin (a stand-in circle).
     fn circle(rad: f64, n: usize) -> Polygon {
@@ -265,6 +253,27 @@ mod tests {
     }
 
     #[test]
+    fn raster_and_polygon_oracles_agree_on_an_adaptive_path() {
+        // The raster oracle must be a faithful stand-in for the polygon trust anchor:
+        // on the same certified adaptive path, both report bounded engagement, full
+        // coverage, and no gouge, with peak engagement within a cell or two.
+        let region = circle(9.0, 40);
+        let (r, e) = (3.0, 2.0);
+        let path = adaptive_path(&region, r, 0.0, e, Some([0.0, 0.0]))
+            .expect("round pocket certifies");
+        let poly = certify(&path, r, &region);
+        let ras = crate::raster::certify(&path, r, &region, e).expect("raster builds");
+        assert!(
+            (poly.max_engagement - ras.max_engagement).abs() < 0.8,
+            "oracles disagree on peak engagement: poly {} vs raster {}",
+            poly.max_engagement,
+            ras.max_engagement
+        );
+        assert!(ras.max_engagement <= e * 1.2, "raster engagement bounded, got {}", ras.max_engagement);
+        assert!(ras.uncut_area < 7.0 && ras.gouge_area < 3.0, "raster: covered {}, gouge {}", ras.uncut_area, ras.gouge_area);
+    }
+
+    #[test]
     fn the_generator_never_returns_an_uncertified_path() {
         // The core contract regardless of shape: a returned path always certifies.
         for (rad, e) in [(7.0, 3.0), (9.0, 4.0)] {
@@ -280,6 +289,24 @@ mod tests {
                 assert!(v.gouge_area < 1.0, "returned path must not gouge, got {}", v.gouge_area);
             }
         }
+    }
+
+    #[test]
+    fn a_large_round_pocket_goes_adaptive_quickly() {
+        // The payoff of the raster oracle: a ⌀60 pocket (far past the old polygon-
+        // certify cap) now certifies as an adaptive spiral, in well under a second.
+        let region = circle(30.0, 96);
+        let (r, e) = (3.0, 2.0);
+        let t = Instant::now();
+        let path = adaptive_path(&region, r, 0.0, e, Some([0.0, 0.0]))
+            .expect("a large round pocket should certify");
+        let secs = t.elapsed().as_secs_f64();
+        assert!(path.len() > 100, "a large pocket is a long spiral, got {}", path.len());
+        assert!(secs < 3.0, "adaptive generation should be quick, took {secs:.2}s");
+        // Confirm on the polygon trust anchor too (this is a one-off in the test).
+        let v = certify(&path, r, &region);
+        assert!(v.max_engagement <= e * 1.2, "polygon oracle: bounded, got {}", v.max_engagement);
+        assert!(v.uncut_area < 60.0, "polygon oracle: covered, uncut {}", v.uncut_area);
     }
 
     #[test]
