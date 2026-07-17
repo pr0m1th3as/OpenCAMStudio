@@ -707,6 +707,22 @@ mod tests {
     }
 
     #[test]
+    fn the_adaptive_spiral_winds_ccw_the_climb_sense() {
+        // Adaptive clearing is climb-by-construction: the spiral inherits the inward-
+        // offset winding, which for a pocket is CCW — the same sense the concentric
+        // *climb* path cuts (it reverses to CW only for conventional). Confirm the
+        // spiral's net winding is CCW (positive signed area) so the climb-only gate in
+        // `clearing::clear` is cutting the direction it claims.
+        let region = circle(9.0, 40);
+        let path = adaptive_path(&region, 3.0, 0.0, 2.0, Some([0.0, 0.0])).expect("certifies");
+        let signed2: f64 = path
+            .windows(2)
+            .map(|w| w[0].x * w[1].y - w[1].x * w[0].y)
+            .sum();
+        assert!(signed2 > 0.0, "spiral should wind CCW (climb), signed area·2 = {signed2}");
+    }
+
+    #[test]
     fn tiny_pocket_that_cannot_fit_the_tool_falls_back() {
         // Tool too big to enter ⇒ no tool-centre region ⇒ fall back (None).
         let region = circle(2.0, 32);

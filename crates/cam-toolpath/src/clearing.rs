@@ -80,7 +80,14 @@ pub(crate) fn clear(
     // Try constant-engagement adaptive clearing first. It self-certifies against the
     // oracle and returns None whenever it cannot — so we simply fall through to the
     // proven concentric path below, and every emitted toolpath is verified correct.
-    if job.clearing.engagement > 0.0 {
+    //
+    // Adaptive clearing is **climb-only by construction**: the spiral and frame inherit
+    // the inward-offset winding (CCW outer, CW holes), which is exactly the climb sense
+    // (the concentric path reverses that winding for conventional via `reversed`). There
+    // is no radial-order-preserving way to flip a spiral's rotational sense, and
+    // conventional milling defeats the point of constant-engagement HSM anyway — so when
+    // conventional is asked for we fall through to the concentric path, which honours it.
+    if job.clearing.engagement > 0.0 && job.clearing.climb {
         if region.holes().is_empty() {
             if let Some(tc) = crate::adaptive::adaptive_path(
                 region,
@@ -297,11 +304,8 @@ mod tests {
         prog.steps().iter().filter(|s| pred(s)).count()
     }
 
-    #[test]
-    fn a_holed_region_routes_through_the_certified_frame_clearer() {
-        // A pocket with an island (60×60 with a 20×20 island) + an engagement cap must
-        // route through the adaptive frame path — cutting motion, and a lift/replunge
-        // between the outer spiral and the island loops — replicated per depth level.
+    /// A 60×60 pocket with a 20×20 island — the frame the adaptive clearer certifies.
+    fn frame_region() -> Polygon {
         let outer = Contour::new(vec![
             Point::new(0.0, 0.0),
             Point::new(60.0, 0.0),
@@ -314,14 +318,17 @@ mod tests {
             Point::new(40.0, 40.0),
             Point::new(20.0, 40.0),
         ]);
-        let region = Polygon::with_holes(outer, vec![island]).unwrap();
-        let job = ClearJob {
+        Polygon::with_holes(outer, vec![island]).unwrap()
+    }
+
+    fn frame_clearjob(clearing: Clearing) -> ClearJob<'static> {
+        ClearJob {
             id: 7,
             radius: 3.0,
             finish: 0.0,
             first: 3.0,
             spacing: 4.0,
-            clearing: frame_job(),
+            clearing,
             plunge: Plunge::Straight,
             feed: 300.0,
             plunge_feed: 100.0,
@@ -330,7 +337,16 @@ mod tests {
             lead_out: Lead::None,
             start: None,
             guard: &[],
-        };
+        }
+    }
+
+    #[test]
+    fn a_holed_region_routes_through_the_certified_frame_clearer() {
+        // A pocket with an island + an engagement cap (climb) must route through the
+        // adaptive frame path — cutting motion, and a lift/replunge between the outer
+        // spiral and the island loops — replicated per depth level.
+        let region = frame_region();
+        let job = frame_clearjob(frame_job());
         let heights = Heights::new(5.0, 2.0, 0.0);
         let levels = [-1.0, -2.0]; // two depth passes
 
@@ -354,5 +370,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn conventional_milling_bypasses_adaptive_for_the_concentric_path() {
+        // Adaptive clearing is climb-only by construction, so a conventional job
+        // (climb = false) must NOT take the adaptive branch even with an engagement cap
+        // — it falls through to the concentric path, which honours conventional by
+        // reversing the ring winding. The clean signal: adaptive returns a single
+        // certified path (Ok(1)); concentric returns its ring count (Ok(>1)).
+        let region = frame_region();
+        let heights = Heights::new(5.0, 2.0, 0.0);
+        let levels = [-1.0];
+
+        let mut climb_prog = Program::new();
+        let Ok(climb_n) = clear(
+            &mut climb_prog,
+            &region,
+            &frame_clearjob(Clearing { engagement: 2.0, climb: true }),
+            &heights,
+            &levels,
+            &CancelToken::new(),
+        ) else {
+            panic!("climb clear should succeed");
+        };
+        assert_eq!(climb_n, 1, "climb + engagement is the adaptive single path");
+
+        let mut conv_prog = Program::new();
+        let Ok(conv_n) = clear(
+            &mut conv_prog,
+            &region,
+            &frame_clearjob(Clearing { engagement: 2.0, climb: false }),
+            &heights,
+            &levels,
+            &CancelToken::new(),
+        ) else {
+            panic!("conventional clear should succeed");
+        };
+        assert!(conv_n > 1, "conventional falls through to concentric rings, got {conv_n}");
     }
 }
