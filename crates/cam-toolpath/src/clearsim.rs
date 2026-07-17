@@ -14,7 +14,7 @@
 #![allow(dead_code)]
 
 use cam_geo::{
-    difference, intersection, offset, stroke_path, union, Arc, CapStyle, Contour, JoinStyle, Point,
+    difference, intersection, offset, stroke_path, Arc, CapStyle, Contour, JoinStyle, Point,
     Polygon, Polyline,
 };
 
@@ -47,14 +47,93 @@ fn disc(c: Point, r: f64) -> Option<Polygon> {
     Polygon::new(Contour::new(Arc::circle(c, r).flatten(0.05))).ok()
 }
 
+/// Squared distance from `p` to the segment `a`→`b`.
+fn seg_dist_sq(p: Point, a: Point, b: Point) -> f64 {
+    let (vx, vy) = (b.x - a.x, b.y - a.y);
+    let (wx, wy) = (p.x - a.x, p.y - a.y);
+    let vv = vx * vx + vy * vy;
+    let t = if vv < 1e-18 { 0.0 } else { ((wx * vx + wy * vy) / vv).clamp(0.0, 1.0) };
+    let (cx, cy) = (a.x + t * vx, a.y + t * vy);
+    (p.x - cx).powi(2) + (p.y - cy).powi(2)
+}
+
+/// A fixed-resolution occupancy grid tracking which cells a tool of radius `r` has
+/// cleared. It replaces per-point polygon `contains` (O(cleared perimeter), and the
+/// cleared region grows without bound) with an O(1) cell lookup — the single change
+/// that takes the oracle's engagement scan from ~O(n²) to linear.
+///
+/// **Occupancy is conservative in the safe direction.** A cell counts as cleared only
+/// when its centre lies within `r` of a committed move; a cell the tool only grazed
+/// stays "uncut", so [`ClearedModel::is_uncut`] never reports cleared stock that is
+/// actually still there. Reading a boundary cell as uncut can only *raise* the measured
+/// engagement, never lower it — and a high reading fails certification (falls back to
+/// concentric), which is safe, where a low reading would ship an over-engaged path.
+struct OccGrid {
+    ox: f64,
+    oy: f64,
+    cell: f64,
+    nx: usize,
+    ny: usize,
+    occ: Vec<bool>,
+}
+
+impl OccGrid {
+    /// A grid covering `[min,max]` (already padded by the caller) at `cell` mm.
+    fn new(min: [f64; 2], max: [f64; 2], cell: f64) -> Self {
+        let nx = (((max[0] - min[0]) / cell).ceil() as usize + 1).max(1);
+        let ny = (((max[1] - min[1]) / cell).ceil() as usize + 1).max(1);
+        Self { ox: min[0], oy: min[1], cell, nx, ny, occ: vec![false; nx * ny] }
+    }
+
+    /// Whether the cell containing `q` is marked cleared (out-of-grid ⇒ not cleared).
+    fn is_cleared(&self, q: Point) -> bool {
+        let (fx, fy) = ((q.x - self.ox) / self.cell, (q.y - self.oy) / self.cell);
+        if fx < 0.0 || fy < 0.0 {
+            return false;
+        }
+        let (ix, iy) = (fx as usize, fy as usize);
+        if ix >= self.nx || iy >= self.ny {
+            return false;
+        }
+        self.occ[iy * self.nx + ix]
+    }
+
+    /// Mark every cell whose centre lies within `r` of the segment `a`→`b` as cleared.
+    fn stamp(&mut self, a: Point, b: Point, r: f64) {
+        let (minx, maxx) = (a.x.min(b.x) - r, a.x.max(b.x) + r);
+        let (miny, maxy) = (a.y.min(b.y) - r, a.y.max(b.y) + r);
+        let ix0 = (((minx - self.ox) / self.cell).floor().max(0.0)) as usize;
+        let iy0 = (((miny - self.oy) / self.cell).floor().max(0.0)) as usize;
+        let ix1 = ((((maxx - self.ox) / self.cell).ceil()) as usize).min(self.nx.saturating_sub(1));
+        let iy1 = ((((maxy - self.oy) / self.cell).ceil()) as usize).min(self.ny.saturating_sub(1));
+        let r2 = r * r;
+        for iy in iy0..=iy1 {
+            let cy = self.oy + (iy as f64 + 0.5) * self.cell;
+            for ix in ix0..=ix1 {
+                let cx = self.ox + (ix as f64 + 0.5) * self.cell;
+                if seg_dist_sq(Point::new(cx, cy), a, b) <= r2 {
+                    self.occ[iy * self.nx + ix] = true;
+                }
+            }
+        }
+    }
+}
+
 /// A running model of the material cleared by a tool of radius `r`.
 pub(crate) struct ClearedModel {
     r: f64,
+    /// The swept regions cleared so far, **not** unioned (appended per move). Kept for
+    /// [`Self::engagement_area`], the area-based cross-check; the hot [`Self::is_uncut`]
+    /// path uses `grid` instead when it is present.
     cleared: Vec<Polygon>,
     /// The stock region (target material). `None` ⇒ unbounded virgin stock (used by
     /// the primitive slot/peel unit tests); `Some` bounds where material actually is,
     /// so engagement is not charged for cutting air outside the part.
     material: Option<Polygon>,
+    /// Occupancy grid for O(1) cleared lookups. Built for every `bounded` model (all
+    /// runtime and front-advance use); `None` for the unbounded primitive tests, which
+    /// fall back to polygon `contains` (their paths are a move or two, so it is cheap).
+    grid: Option<OccGrid>,
 }
 
 impl ClearedModel {
@@ -64,16 +143,40 @@ impl ClearedModel {
             r,
             cleared: Vec::new(),
             material: None,
+            grid: None,
         }
     }
 
     /// An empty model bounded to the stock region `material` — outside it is air, not
     /// uncut stock, so the tool is not charged engagement for a cut that leaves the part.
     pub(crate) fn bounded(r: f64, material: Polygon) -> Self {
+        // Grid over the material's bbox, padded by `r` (a move's swept region reaches a
+        // tool radius past the wall). Cell fine enough that the boundary bias on `a_e`
+        // stays well under the certification tolerance.
+        let pts = material.outer().points();
+        let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
+        for p in pts {
+            lo[0] = lo[0].min(p.x);
+            lo[1] = lo[1].min(p.y);
+            hi[0] = hi[0].max(p.x);
+            hi[1] = hi[1].max(p.y);
+        }
+        let grid = if lo[0] <= hi[0] {
+            let cell = (r / 15.0).clamp(0.03, 0.1);
+            let pad = r + 2.0 * cell;
+            Some(OccGrid::new(
+                [lo[0] - pad, lo[1] - pad],
+                [hi[0] + pad, hi[1] + pad],
+                cell,
+            ))
+        } else {
+            None
+        };
         Self {
             r,
             cleared: Vec::new(),
             material: Some(material),
+            grid,
         }
     }
 
@@ -85,19 +188,21 @@ impl ClearedModel {
                 return false;
             }
         }
-        !self.cleared.iter().any(|p| p.contains(q))
+        match &self.grid {
+            Some(g) => !g.is_cleared(q),
+            None => !self.cleared.iter().any(|p| p.contains(q)),
+        }
     }
 
     /// Seed the cleared region with the disc a plunge/helix opens at `c` — the entry
     /// hole, so the first cutting moves are not charged for stock the plunge removed.
     pub(crate) fn seed_disc(&mut self, c: Point) {
+        if let Some(g) = &mut self.grid {
+            g.stamp(c, c, self.r);
+        }
         let pts = Arc::circle(c, self.r).flatten(0.05);
         if let Ok(d) = Polygon::new(Contour::new(pts)) {
-            self.cleared = if self.cleared.is_empty() {
-                vec![d]
-            } else {
-                union(&self.cleared, std::slice::from_ref(&d)).unwrap_or_else(|_| vec![d])
-            };
+            self.cleared.push(d);
         }
     }
 
@@ -205,15 +310,16 @@ impl ClearedModel {
 
     /// Add the move `from`→`to` to the cleared region.
     pub(crate) fn commit(&mut self, from: Point, to: Point) {
-        let sweep = swept(&[from, to], self.r);
-        if sweep.is_empty() {
-            return;
+        // The grid is the hot path: stamp the swept capsule (O(cells under it)), no union.
+        if let Some(g) = &mut self.grid {
+            g.stamp(from, to, self.r);
         }
-        self.cleared = if self.cleared.is_empty() {
-            sweep
-        } else {
-            union(&self.cleared, &sweep).unwrap_or_else(|_| std::mem::take(&mut self.cleared))
-        };
+        // Append the swept region for `engagement_area`. Not unioned — that was the other
+        // O(n²) cost (a union of a growing polygon per move); `difference` in
+        // `engagement_area` subtracts the whole list regardless, and this list is only
+        // read by the (small-path) cross-check test, never the runtime gate.
+        let sweep = swept(&[from, to], self.r);
+        self.cleared.extend(sweep);
     }
 
     /// The cleared region so far.
