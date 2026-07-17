@@ -20,6 +20,7 @@ mod chamfer;
 mod clearing;
 mod adaptive;
 mod clearsim;
+mod frontadvance;
 mod drill;
 mod emit;
 mod face;
