@@ -21,6 +21,7 @@ use crate::rings::{concentric_rings, emit_stay_down, RingsError};
 use crate::CancelToken;
 
 /// Everything the clearing pass needs beyond the region geometry itself.
+#[allow(dead_code)] // `radius`/`finish` are read once the front-advance is dispatched again
 pub(crate) struct ClearJob<'a> {
     /// Operation id, stamped onto emitted tags.
     pub id: u32,
@@ -77,38 +78,41 @@ pub(crate) fn clear(
     levels: &[f64],
     cancel: &CancelToken,
 ) -> Result<usize, RingsError> {
-    // Try constant-engagement adaptive clearing first. It self-certifies against the
-    // oracle and returns None whenever it cannot — so we simply fall through to the
-    // proven concentric path below, and every emitted toolpath is verified correct.
+    // **The adaptive branch is deliberately not dispatched here — see below. Do not
+    // re-enable [`crate::adaptive`] without reading this.**
     //
-    // Adaptive clearing is **climb-only by construction**: the spiral and frame inherit
-    // the inward-offset winding (CCW outer, CW holes), which is exactly the climb sense
-    // (the concentric path reverses that winding for conventional via `reversed`). There
-    // is no radial-order-preserving way to flip a spiral's rotational sense, and
-    // conventional milling defeats the point of constant-engagement HSM anyway — so when
-    // conventional is asked for we fall through to the concentric path, which honours it.
-    if job.clearing.engagement > 0.0 && job.clearing.climb {
-        if region.holes().is_empty() {
-            if let Some(tc) = crate::adaptive::adaptive_path(
-                region,
-                job.radius,
-                job.finish,
-                job.clearing.engagement,
-                job.start,
-            ) {
-                emit_adaptive(prog, &tc, job, heights, levels);
-                return Ok(1);
-            }
-        } else if let Some(moves) =
-            crate::adaptive::adaptive_frame(region, job.radius, job.finish, job.clearing.engagement)
-        {
-            // A frame/annulus around an island: certified constant-engagement moves
-            // with a lift between the outer spiral and the island loops.
-            emit_adaptive_moves(prog, &moves, job, heights, levels);
-            return Ok(1);
-        }
-    }
-
+    // Until 2026-07-17 this tried `adaptive::adaptive_path` / `adaptive_frame` first,
+    // "self-certifying against the oracle" and falling through on `None`. The gate was
+    // `raster.rs`, and the raster is **blind to slots**. Measured — raster verdict vs the
+    // exact oracle ([`crate::clearsim`]) on the same *emitted* path, r=3, engagement 2.0:
+    //
+    // ```text
+    //   square 40 : raster 2.20 → shipped   exact 6.00   ← the full diameter
+    //   square 24 : raster 0.80 → shipped   exact 6.00   ← the full diameter
+    //   circle r30: raster 2.20 → shipped   exact 4.76
+    //   circle r12: raster 0.40 → shipped   exact 4.85
+    // ```
+    //
+    // Every plain pocket shipped, every one blew the cap by 2.4–3×, and two took the tool
+    // to a full-width cut mid-pocket — at whatever axial depth the level set, on a
+    // strategy whose whole premise is that you may cut deep. The raster read 0.80 against
+    // a true 6.00: a 7.5× under-read in the unsafe direction, not the "biased high, the
+    // safe direction" its comment claimed.
+    //
+    // Gating on the exact oracle instead was tried and rejected as the wrong fix: the
+    // spiral-morph slots at corners and transitions **by construction**, so it never
+    // certifies honestly — the gate would spend ~10 s per op proving that and then fall
+    // through to concentric anyway. Identical output, 10 s slower, two gates to keep
+    // honest for a generator already slated for retirement.
+    //
+    // So: concentric for everything, which is proven. The engagement parameter is **not**
+    // inert — [`ClearJob::effective_spacing`] caps the ring spacing at it, which genuinely
+    // bounds the radial width of cut on a straight wall. What is gone is the claim of
+    // constant engagement around corners and at entry, which was never true.
+    //
+    // Adaptive returns when [`crate::frontadvance`] is wired in here behind the **exact**
+    // oracle: it holds 2.69 end-to-end on circle and square alike (measured, and agreed by
+    // two independent metrics) where this one hit 6.00.
     let spacing = job.effective_spacing();
     let mut rings = concentric_rings(region, job.first, spacing, cancel)?;
     if rings.is_empty() {
@@ -151,6 +155,7 @@ pub(crate) fn clear(
 /// approach and enter at the path start (per the plunge strategy), cut the whole
 /// path at depth, and retract. Between levels the entry re-plunges into stock
 /// cleared above.
+#[allow(dead_code)] // the emitter the front-advance will use once it is wired in
 fn emit_adaptive(prog: &mut Program, tc: &[Point], job: &ClearJob, h: &Heights, levels: &[f64]) {
     if tc.len() < 2 {
         return;
@@ -207,6 +212,7 @@ fn emit_adaptive(prog: &mut Program, tc: &[Point], job: &ClearJob, h: &Heights, 
 /// clearance, repositions, and re-plunges, so a lift becomes a real lift-and-replunge.
 /// The first move is the entry plunge. Between levels the entry re-plunges into stock
 /// cleared above.
+#[allow(dead_code)] // the emitter the front-advance will use once frames/islands land
 fn emit_adaptive_moves(
     prog: &mut Program,
     moves: &[(Point, bool)],
@@ -342,9 +348,11 @@ mod tests {
 
     #[test]
     fn a_holed_region_routes_through_the_certified_frame_clearer() {
-        // A pocket with an island + an engagement cap (climb) must route through the
-        // adaptive frame path — cutting motion, and a lift/replunge between the outer
-        // spiral and the island loops — replicated per depth level.
+        // A pocket with an island + an engagement cap clears **concentrically**, per
+        // depth level. It used to route through the adaptive frame path; that path was
+        // raster-gated and the raster is blind to slots (see `clear`), so the adaptive
+        // dispatch is gone and everything takes the proven concentric path until
+        // `frontadvance` is wired in behind the exact oracle.
         let region = frame_region();
         let job = frame_clearjob(frame_job());
         let heights = Heights::new(5.0, 2.0, 0.0);
@@ -354,14 +362,12 @@ mod tests {
         let Ok(n) = clear(&mut prog, &region, &job, &heights, &levels, &CancelToken::new()) else {
             panic!("clearing a frame should succeed");
         };
-        assert_eq!(n, 1, "the adaptive frame path is a single certified path");
+        assert!(n > 1, "a frame clears as concentric rings, got {n}");
 
         let cuts = count(&prog, |s| matches!(s, Step::Linear { tag, .. } if tag.kind == MoveKind::Cutting));
         let plunges = count(&prog, |s| matches!(s, Step::Linear { tag, .. } if tag.kind == MoveKind::Plunge));
         assert!(cuts > 50, "the frame has substantial cutting motion, got {cuts}");
-        // Per level: one entry plunge + at least one inter-family replunge ⇒ ≥ 2 each,
-        // over two levels ⇒ ≥ 4 plunges total.
-        assert!(plunges >= 4, "entry + inter-family replunge per level, got {plunges}");
+        assert!(plunges >= 2, "at least one entry plunge per level, got {plunges}");
         // Every cutting move stays at a level depth (never above the stock top).
         for s in prog.steps() {
             if let Step::Linear { to, tag, .. } = s {
@@ -373,40 +379,56 @@ mod tests {
     }
 
     #[test]
-    fn conventional_milling_bypasses_adaptive_for_the_concentric_path() {
-        // Adaptive clearing is climb-only by construction, so a conventional job
-        // (climb = false) must NOT take the adaptive branch even with an engagement cap
-        // — it falls through to the concentric path, which honours conventional by
-        // reversing the ring winding. The clean signal: adaptive returns a single
-        // certified path (Ok(1)); concentric returns its ring count (Ok(>1)).
+    fn the_engagement_cap_tightens_the_ring_spacing_and_climb_flips_the_winding() {
+        // The two controls the clearing engine still honours, now that the adaptive
+        // dispatch is gone (see `clear`):
+        //
+        // 1. **Engagement caps the ring spacing** (`effective_spacing`), which genuinely
+        //    bounds the radial width of cut on a straight wall — a tighter cap means more
+        //    rings. This is what the engagement parameter honestly buys today; what it
+        //    does *not* buy is a bound around corners or at entry.
+        // 2. **Conventional reverses every ring's winding.**
         let region = frame_region();
         let heights = Heights::new(5.0, 2.0, 0.0);
         let levels = [-1.0];
-
-        let mut climb_prog = Program::new();
-        let Ok(climb_n) = clear(
-            &mut climb_prog,
-            &region,
-            &frame_clearjob(Clearing { engagement: 2.0, climb: true }),
-            &heights,
-            &levels,
-            &CancelToken::new(),
-        ) else {
-            panic!("climb clear should succeed");
+        let run = |c: Clearing| {
+            let mut prog = Program::new();
+            let Ok(n) = clear(&mut prog, &region, &frame_clearjob(c), &heights, &levels,
+                &CancelToken::new()) else {
+                panic!("clear should succeed");
+            };
+            (n, prog)
         };
-        assert_eq!(climb_n, 1, "climb + engagement is the adaptive single path");
 
-        let mut conv_prog = Program::new();
-        let Ok(conv_n) = clear(
-            &mut conv_prog,
-            &region,
-            &frame_clearjob(Clearing { engagement: 2.0, climb: false }),
-            &heights,
-            &levels,
-            &CancelToken::new(),
-        ) else {
-            panic!("conventional clear should succeed");
+        // A tight cap must produce strictly more rings than a loose one.
+        let (tight, _) = run(Clearing { engagement: 1.0, climb: true });
+        let (loose, _) = run(Clearing { engagement: 4.0, climb: true });
+        assert!(
+            tight > loose,
+            "a tighter engagement cap must mean more rings: {tight} vs {loose}"
+        );
+
+        // Climb and conventional both clear concentrically; they differ in winding.
+        let (climb_n, climb_prog) = run(Clearing { engagement: 2.0, climb: true });
+        let (conv_n, conv_prog) = run(Clearing { engagement: 2.0, climb: false });
+        assert_eq!(climb_n, conv_n, "same rings either way; only the winding differs");
+
+        // Signed area of the cutting moves: opposite senses.
+        let signed = |prog: &Program| -> f64 {
+            let pts: Vec<Point3> = prog
+                .steps()
+                .iter()
+                .filter_map(|s| match s {
+                    Step::Linear { to, tag, .. } if tag.kind == MoveKind::Cutting => Some(*to),
+                    _ => None,
+                })
+                .collect();
+            pts.windows(2).map(|w| w[0].x * w[1].y - w[1].x * w[0].y).sum()
         };
-        assert!(conv_n > 1, "conventional falls through to concentric rings, got {conv_n}");
+        let (sc, sv) = (signed(&climb_prog), signed(&conv_prog));
+        assert!(
+            sc * sv < 0.0,
+            "climb and conventional must wind opposite ways, got {sc:.1} and {sv:.1}"
+        );
     }
 }

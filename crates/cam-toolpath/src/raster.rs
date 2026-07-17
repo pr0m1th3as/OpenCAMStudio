@@ -139,6 +139,18 @@ impl Raster {
     /// Whether the cell at `p` is currently uncut material (in the target, not yet
     /// cleared). Out-of-grid points read as not-material.
     #[inline]
+    /// Whether the cell containing `p` is uncut target material.
+    ///
+    /// **Not yet calibrated as a safety gate.** Measured against the exact oracle
+    /// ([`crate::clearsim`]) on real front-advance paths, this reads +0.00 / +0.00 / −0.21
+    /// — i.e. it can under-read by ~0.2, the unsafe direction, because a grid probe reads
+    /// only the cell a sample falls in and a thin uncut band between sample centres
+    /// vanishes. Dilating the uncut set by one cell fixes the direction but is far too
+    /// blunt: it over-reads by +0.5 to +0.8 (measured), because `a_e = r(1−cos Φ)` is steep
+    /// near Φ = 90°, so it would reject good paths instead. Neither is right yet; the gate
+    /// needs a calibrated error bound (sweep `px`, bound the probe error, carry it as a
+    /// margin). Until then this is a fast *measurement*, not a gate — `clearing::clear`
+    /// dispatches nothing to it.
     fn is_uncut(&self, p: Point) -> bool {
         let i = ((p.x - self.ox) / self.px).floor();
         let j = ((p.y - self.oy) / self.px).floor();
@@ -169,37 +181,58 @@ impl Raster {
         }
     }
 
-    /// The radial width of cut of the move `a→b`: the widest run of uncut material
-    /// the tool spans perpendicular to the feed, sampled along the move. A slot reads
-    /// ≈ the diameter, a peel ≈ the stepover — measured before the move is stamped.
+    /// The **radial width of cut** (`a_e`) of the move `a`→`b`, by the tool-engagement
+    /// angle — the same measure as [`crate::clearsim::ClearedModel::engagement`], but read
+    /// off this occupancy grid instead of point-in-polygon tests:
+    ///
+    /// ```text
+    ///   a_e = r · (1 − cos Φ)
+    /// ```
+    ///
+    /// where `Φ` is the angular span of the tool's **leading** perimeter lying in uncut
+    /// stock. A full slot reads the diameter; a peel reads the stepover.
+    ///
+    /// **This replaces a measure that was not engagement at all.** It used to take the
+    /// longest contiguous run of uncut cells *along the perpendicular through the tool
+    /// centre* — "how wide is the band beside me". That is structurally blind to material
+    /// **ahead** of the tool: a cutter driving into a wall with cleared stock either side
+    /// reads ≈0 while slotting at full width. It shipped full-diameter slots for exactly
+    /// that reason (measured: it read 0.80 where the truth was 6.00, a 7.5× under-read in
+    /// the unsafe direction, on a plain square pocket). No amount of resolution fixes a
+    /// wrong quantity, so the formula had to go, not the pixel size.
+    ///
+    /// The grid is what keeps this affordable: `is_uncut` is an O(1) lookup, where the
+    /// polygon oracle rescans an accumulating set of cleared polygons per query. Same
+    /// answer, without the quadratic blow-up.
     pub(crate) fn engagement(&self, a: Point, b: Point) -> f64 {
         let len = a.distance(b);
         if len < 1e-9 {
             return 0.0;
         }
         let d = ((b.x - a.x) / len, (b.y - a.y) / len);
-        let perp = (-d.1, d.0);
-        let steps = (len / self.px).ceil().max(1.0) as usize;
-        let scan = (self.r / self.px).ceil() as isize;
+        /// Angular resolution around the tool.
+        const NA: usize = 180;
+        // Probe a hair inside `r`: at exactly `r` the perimeter grazes the cell boundary
+        // of its own swept disc and reads a false slot.
+        let rp = (self.r - self.px).max(self.r * 0.9);
+        let pos_steps = ((len / (0.5 * self.r).max(1e-3)).ceil() as usize).max(1);
         let mut max_ae = 0.0_f64;
-        for si in 0..=steps {
-            let t = len * (si as f64) / (steps as f64);
-            let p = Point::new(a.x + d.0 * t, a.y + d.1 * t);
-            // Longest contiguous run of uncut cells along the perpendicular through p,
-            // within ±r — the cut width perpendicular to the feed.
-            let mut run = 0.0_f64;
-            let mut best = 0.0_f64;
-            for k in -scan..=scan {
-                let s = k as f64 * self.px;
-                let q = Point::new(p.x + perp.0 * s, p.y + perp.1 * s);
-                if self.is_uncut(q) {
-                    run += self.px;
-                    best = best.max(run);
-                } else {
-                    run = 0.0;
+        for si in 0..=pos_steps {
+            let t = len * (si as f64) / (pos_steps as f64);
+            let c = Point::new(a.x + d.0 * t, a.y + d.1 * t);
+            let mut engaged = 0usize;
+            for k in 0..NA {
+                let ang = std::f64::consts::TAU * (k as f64) / (NA as f64);
+                let (ca, sa) = (ang.cos(), ang.sin());
+                if ca * d.0 + sa * d.1 <= 0.0 {
+                    continue; // trailing half — not the cutting edge
+                }
+                if self.is_uncut(Point::new(c.x + rp * ca, c.y + rp * sa)) {
+                    engaged += 1;
                 }
             }
-            max_ae = max_ae.max(best);
+            let phi = std::f64::consts::TAU * (engaged as f64) / (NA as f64);
+            max_ae = max_ae.max(self.r * (1.0 - phi.cos()));
         }
         max_ae
     }
@@ -300,11 +333,20 @@ mod tests {
 
     #[test]
     fn raster_peel_reads_about_the_stepover() {
-        let mut ras = Raster::new(&square(-10.0, 50.0), 3.0, 2.0).unwrap();
-        ras.stamp(Point::new(0.0, 20.0), Point::new(40.0, 20.0));
-        // Next pass 2 mm over: cuts a ~2 mm strip.
+        // Mirrors `clearsim`'s ground case exactly, so the two oracles are held to the
+        // same standard: the peel must stay well **inside** the cleared swath's extent
+        // (swath −10…50, peel 0…40), or the tool meets virgin stock at the swath's end
+        // and the reading is an end transient rather than the peel.
+        //
+        // This test used to stamp 0…40 and peel 0…40 — starting *at* the swath's end —
+        // and accept anything in 1.0..3.2. It could afford that sloppiness because the old
+        // formula measured the uncut run on the perpendicular through the tool centre and
+        // was blind to the material ahead. With the engagement angle it reads the
+        // transient honestly (3.73), so the setup has to be correct now.
+        let mut ras = Raster::new(&square(-20.0, 60.0), 3.0, 2.0).unwrap();
+        ras.stamp(Point::new(-10.0, 20.0), Point::new(50.0, 20.0));
         let e = ras.engagement(Point::new(0.0, 22.0), Point::new(40.0, 22.0));
-        assert!((1.0..3.2).contains(&e), "peel ≈ stepover 2, got {e}");
+        assert!((1.7..2.3).contains(&e), "a 2 mm peel should read a_e ≈ 2, got {e}");
     }
 
     #[test]

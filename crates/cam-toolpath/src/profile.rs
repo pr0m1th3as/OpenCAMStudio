@@ -1081,15 +1081,16 @@ mod tests {
     }
 
     #[test]
-    fn outside_roughing_with_an_engagement_cap_goes_through_the_adaptive_frame() {
-        // Outside roughing frames the part with the stock as an annulus, so an
-        // engagement cap must route it through the certified adaptive frame path — the
-        // same one pockets-with-islands use.
+    fn outside_roughing_honours_the_engagement_cap_by_tightening_the_ring_spacing() {
+        // Outside roughing frames the part with the stock as an annulus. It used to route
+        // through the adaptive frame path; that path was raster-gated and the raster is
+        // blind to slots (see `clearing::clear`), so it now clears concentrically like
+        // everything else.
         //
-        // The rigorous signature: when the adaptive frame *cannot* certify, `clear`
-        // falls back to the plain concentric path — producing output byte-identical to
-        // the engagement-disabled run. So any observable difference from the concentric
-        // baseline proves the adaptive frame path was genuinely emitted (not fallen back).
+        // The engagement cap is **not** inert: `ClearJob::effective_spacing` caps the ring
+        // spacing at it, which bounds the radial width of cut on a straight wall. So an
+        // engagement-capped run must still differ observably from the uncapped baseline —
+        // it just differs by having more, tighter rings rather than by being adaptive.
         let concentric = run_outside_rough(outside_rough_op(0.0));
         assert!(!concentric.has_errors(), "{:?}", concentric.diagnostics);
         let adaptive = run_outside_rough(outside_rough_op(2.0));

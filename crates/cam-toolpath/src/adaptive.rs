@@ -1,4 +1,13 @@
-//! Constant-engagement adaptive clearing — the generator.
+//! Constant-engagement adaptive clearing — the spiral-morph generator.
+//!
+//! **NOT DISPATCHED. This generator is retired, pending replacement by
+//! [`crate::frontadvance`].** It does not hold an engagement cap: it slots at the entry,
+//! at sharp corners and at ring transitions, reading the **full diameter** under the exact
+//! oracle. It shipped for a while because its gate was [`crate::raster`], which under-reads
+//! slots by up to 7.5×. `clearing::clear` now goes straight to concentric; the reasoning
+//! and the measurements are recorded there. Kept for now because its frame/trochoidal
+//! pieces are the starting point for islands in the front-advance, and because its tests
+//! pin *why* it fails — delete it once front-advance covers frames.
 //!
 //! For a simply-connected region: take the concentric tool-centre loops (the region
 //! offset in by the tool radius, then by a stepover of `engagement`), then **morph
@@ -14,6 +23,8 @@
 //! or grow an island fall back — cleared-region-tracked generation (the union
 //! front-advance) returns for those in a later phase. The oracle guarantees every
 //! emitted path is correct regardless, so this grows without ever shipping a bad one.
+
+#![allow(dead_code)] // retired generator: kept for its frame/trochoidal pieces + tests
 
 use cam_geo::{offset, JoinStyle, Point, Polygon};
 
@@ -132,17 +143,69 @@ pub(crate) fn adaptive_path(
     // Archimedean core (pitch = the stepover) so the entry does not slot.
     let path = spiral(&loops, entry, e)?;
 
-    // The whole path must certify against the (fast, linear) raster oracle:
-    // engagement ≤ cap, reachable target covered, no gouge. Cross-checked against the
-    // polygon trust anchor in tests.
-    let verdict = crate::raster::certify(&path, r, &to_clear, e)?;
-    // The raster reads a_e to within about one cell (px), biased high — the safe
-    // direction. Allow the cap that plus the usual engagement-cap slack (an advisory
-    // target, not a hard limit) so a spiral held near the cap is not falsely rejected.
+    // The whole path must certify: engagement ≤ cap, reachable target covered, no gouge.
+    //
+    // **This gate is the exact oracle, not the raster, and that is not a preference.**
+    // The raster gate shipped full-diameter slots. Measured (r=3, e=2, engagement cap 2.0),
+    // raster verdict vs the exact oracle on the *same emitted path*:
+    //
+    // ```text
+    //   square 40 : raster 2.20 → passed   exact 6.00 at (15.01,12.07)   ← the diameter
+    //   square 24 : raster 0.80 → passed   exact 6.00 at (16.14, 7.16)   ← the diameter
+    //   circle r30: raster 2.20 → passed   exact 4.76
+    //   circle r12: raster 0.40 → passed   exact 4.85
+    // ```
+    //
+    // Every one of them shipped; every one blew the cap by 2.4–3×. The raster read 0.80
+    // where the truth was 6.00 — a 7.5× under-read, in the unsafe direction, on a plain
+    // rectangular pocket with an engagement value set. The old comment here claimed the
+    // raster was "biased high — the safe direction"; `raster.rs` is not trustworthy as a
+    // gate until it is re-anchored against [`crate::clearsim`], and the cost of being
+    // wrong is a Ø6 tool taking a full-width cut at full axial depth.
+    //
+    // The exact oracle is O(path × 180 rays) where the raster is linear, which is why the
+    // raster was reached for. This runs **once per op** (the path is reused across depth
+    // levels), so the trade is about a second against a broken cutter.
+    //
+    // Consequence, stated plainly: the spiral-morph does not pass this gate — it slots at
+    // corners and transitions by construction — so it now always falls back to concentric,
+    // which is proven. That is the correct outcome and it is why [`crate::frontadvance`]
+    // exists.
+    let verdict = crate::clearsim::certify(&path, r, &to_clear);
     let ok = verdict.max_engagement <= e * 1.15
         && verdict.uncut_area <= cover_tol
         && verdict.gouge_area <= cover_tol;
     ok.then_some(path)
+}
+
+/// Build the spiral-morph path without the certification gate, for tests that pin a
+/// property of the *generator* (its winding) rather than of what ships. `adaptive_path`
+/// no longer returns a spiral at an HSM cap — it slots, so the gate rejects it — but the
+/// winding still gates the climb-only branch in `clearing::clear`.
+#[cfg(test)]
+fn spiral_for_test(
+    region: &Polygon,
+    r: f64,
+    finish: f64,
+    e: f64,
+    start: [f64; 2],
+) -> Option<Vec<Point>> {
+    let mut loops: Vec<Vec<Point>> = Vec::new();
+    let mut d = r + finish;
+    for _ in 0..MAX_PASSES {
+        let offs = offset(std::slice::from_ref(region), -d, JoinStyle::Round).ok()?;
+        let Some(poly) = offs.into_iter().next() else { break };
+        if poly.area() < e * e {
+            break;
+        }
+        loops.push(poly.outer().points().to_vec());
+        d += e;
+    }
+    if loops.len() < 2 {
+        return None;
+    }
+    loops.reverse();
+    spiral(&loops, Point::new(start[0], start[1]), e)
 }
 
 /// Point, unit tangent, and unit left-normal at arc-length `u` along the polyline
@@ -519,9 +582,18 @@ mod tests {
     use super::*;
     use crate::clearsim::certify;
     use cam_geo::Contour;
-    use std::time::Instant;
 
     /// A regular n-gon of radius `rad` centred at the origin (a stand-in circle).
+    fn square40() -> Polygon {
+        Polygon::new(Contour::new(vec![
+            Point::new(0.0, 0.0),
+            Point::new(40.0, 0.0),
+            Point::new(40.0, 40.0),
+            Point::new(0.0, 40.0),
+        ]))
+        .unwrap()
+    }
+
     fn circle(rad: f64, n: usize) -> Polygon {
         let pts = (0..n)
             .map(|i| {
@@ -531,61 +603,66 @@ mod tests {
             .collect();
         Polygon::new(Contour::new(pts)).unwrap()
     }
-
+    /// **The spiral-morph does not hold an HSM engagement cap, and the gate now says so.**
+    /// At a real cap (r=3, e=2) it fails to certify on every shape and the caller falls
+    /// back to concentric, which is proven. This test replaces three that asserted the
+    /// opposite — they passed only because the runtime gate was the raster, which is blind
+    /// to exactly this.
+    ///
+    /// What the raster shipped, measured against the exact oracle on the *same* path:
+    ///
+    /// ```text
+    ///   square 40 : raster 2.20 → passed   exact 6.00   ← the full diameter
+    ///   square 24 : raster 0.80 → passed   exact 6.00   ← the full diameter
+    ///   circle r30: raster 2.20 → passed   exact 4.76
+    /// ```
     #[test]
-    fn adaptive_clears_a_round_pocket_covered_without_gouge() {
-        // A round pocket spirals out, fully covered and without gouging.
-        //
-        // NOTE (exact-oracle finding, 2026-07-17): the plunge-and-spiral **entry**
-        // transiently slots — the first turn is cut into virgin stock (nothing cleared
-        // to offload into), so peak a_e reaches the diameter there. The old
-        // 2·area/perimeter metric averaged this real spike away and this test used to
-        // (wrongly) claim engagement at the cap. Coverage and no-gouge are the honest
-        // guarantees today; true bounded engagement needs a trochoidal/helical entry
-        // (generation step 2). We pin the peak at ≤ the diameter so a fix is visible.
-        let region = circle(9.0, 40);
+    fn the_spiral_morph_does_not_certify_at_an_hsm_cap() {
         let (r, e) = (3.0, 2.0);
-        let path = adaptive_path(&region, r, 0.0, e, Some([0.0, 0.0]))
-            .expect("a round pocket should certify as a spiral");
-        assert!(path.len() > 8, "expected a multi-turn spiral, got {}", path.len());
-        let v = certify(&path, r, &region);
-        assert!(v.uncut_area < 3.0, "the pocket is covered, uncut {}", v.uncut_area);
-        assert!(v.gouge_area < 1.0, "no gouge, got {}", v.gouge_area);
-        // The Archimedean core-spiral entry bounds a round pocket's entry to a modest
-        // transient (~1.5x cap) instead of the full-diameter slot the old radial
-        // connector cut. (Squares/large pockets still slot elsewhere — a radial link at
-        // a corner, a handoff transition — pending front-advance generation.)
+        for (name, region, start) in [
+            ("circle r9", circle(9.0, 40), [0.0, 0.0]),
+            ("square 40", square40(), [20.0, 20.0]),
+        ] {
+            assert!(
+                adaptive_path(&region, r, 0.0, e, Some(start)).is_none(),
+                "{name}: the spiral-morph slots; it must not certify at an HSM cap"
+            );
+        }
+    }
+
+    /// The two oracles now **agree on a slot**, which they did not before.
+    ///
+    /// `raster.rs` used to measure the longest uncut run on the perpendicular through the
+    /// tool centre — "how wide is the band beside me" — which is structurally blind to
+    /// material *ahead*: a cutter driving into a wall with cleared stock either side read
+    /// ≈0 while slotting at full width. On a real emitted path it read **0.80 against a
+    /// true 6.00**. It now measures the same engagement angle as [`crate::clearsim`],
+    /// against its occupancy grid, and reads the slot.
+    ///
+    /// Kept as a cross-check between two independently-implemented oracles: agreement is
+    /// evidence, where a formula confirming itself is not.
+    #[test]
+    fn the_raster_and_the_exact_oracle_agree_on_a_slot() {
+        let (r, e) = (3.0, 2.0);
+        let region = square40();
+        // A deliberate slot: drive straight through virgin stock across the pocket.
+        let path: Vec<Point> = (0..=30).map(|i| Point::new(5.0 + i as f64, 20.0)).collect();
+        let poly = certify(&path, r, &region);
+        let ras = crate::raster::certify(&path, r, &region, e).expect("raster builds");
         assert!(
-            v.max_engagement <= 1.6 * e,
-            "round-pocket entry held below ~1.5x cap by the core spiral, got {}",
-            v.max_engagement
+            poly.max_engagement > 2.0 * r - 0.5,
+            "the exact oracle sees the slot, got {}",
+            poly.max_engagement
+        );
+        assert!(
+            (ras.max_engagement - poly.max_engagement).abs() < 0.5,
+            "the two oracles should agree on a slot, got raster {} vs exact {}",
+            ras.max_engagement,
+            poly.max_engagement
         );
     }
 
-    #[test]
-    fn the_runtime_raster_gate_misses_a_slot_the_exact_oracle_catches() {
-        // A load-bearing finding for step 2: the fast raster gate is NOT a faithful
-        // stand-in for the exact oracle. A square-pocket spiral still slots (a radial
-        // link at a corner, a_e ≈ the diameter) — the exact engagement-angle oracle
-        // sees it, but the raster reads it as a light cut, so the runtime gate lets it
-        // through. Recalibrating (or replacing) the raster against the exact oracle,
-        // and generating engagement-bounded paths in the first place (front-advance),
-        // is the generation rework.
-        let region = Polygon::new(Contour::new(vec![
-            Point::new(0.0, 0.0),
-            Point::new(40.0, 0.0),
-            Point::new(40.0, 40.0),
-            Point::new(0.0, 40.0),
-        ]))
-        .unwrap();
-        let (r, e) = (3.0, 2.0);
-        let path = adaptive_path(&region, r, 0.0, e, Some([20.0, 20.0]))
-            .expect("square pocket certifies (through the raster gate)");
-        let poly = certify(&path, r, &region);
-        let ras = crate::raster::certify(&path, r, &region, e).expect("raster builds");
-        assert!(poly.max_engagement > 2.0 * r - 0.5, "exact oracle sees the slot, got {}", poly.max_engagement);
-        assert!(ras.max_engagement < poly.max_engagement - 1.0, "raster under-reads it, got {}", ras.max_engagement);
-    }
+
 
     #[test]
     fn the_generator_never_returns_an_uncertified_path() {
@@ -603,48 +680,6 @@ mod tests {
                 assert!(v.gouge_area < 1.0, "returned path must not gouge, got {}", v.gouge_area);
             }
         }
-    }
-
-    #[test]
-    fn a_large_round_pocket_goes_adaptive_quickly() {
-        // The payoff of the raster oracle: a ⌀60 pocket (far past the old polygon-
-        // certify cap) now certifies as an adaptive spiral, in well under a second.
-        let region = circle(30.0, 96);
-        let (r, e) = (3.0, 2.0);
-        let t = Instant::now();
-        let path = adaptive_path(&region, r, 0.0, e, Some([0.0, 0.0]))
-            .expect("a large round pocket should certify");
-        let secs = t.elapsed().as_secs_f64();
-        assert!(path.len() > 100, "a large pocket is a long spiral, got {}", path.len());
-        assert!(secs < 3.0, "adaptive generation should be quick, took {secs:.2}s");
-        // Confirm coverage on the exact oracle (engagement carries the same entry-slot
-        // caveat as the round-pocket test — bounded steady-state, slotting entry).
-        let v = certify(&path, r, &region);
-        assert!(v.max_engagement <= 2.0 * r + 0.1, "engagement ≤ diameter, got {}", v.max_engagement);
-        assert!(v.uncut_area < 60.0, "polygon oracle: covered, uncut {}", v.uncut_area);
-    }
-
-    #[test]
-    fn a_square_pocket_goes_adaptive_with_bounded_corners() {
-        // Sharp corners: arc-length resampling keeps the spiral turns a stepover apart
-        // around the corners too (angle resampling would balloon to √2× and spike the
-        // engagement there). The square certifies, covered, engagement at the cap.
-        let region = Polygon::new(Contour::new(vec![
-            Point::new(0.0, 0.0),
-            Point::new(40.0, 0.0),
-            Point::new(40.0, 40.0),
-            Point::new(0.0, 40.0),
-        ]))
-        .unwrap();
-        let (r, e) = (3.0, 2.0);
-        let path = adaptive_path(&region, r, 0.0, e, Some([20.0, 20.0]))
-            .expect("a square pocket should certify");
-        let v = certify(&path, r, &region);
-        // Covered, no gouge, engagement ≤ diameter (same entry-slot caveat as the round
-        // pocket — the corners themselves are held by the arc-length morph; the peak is
-        // the entry, not a corner).
-        assert!(v.gouge_area < 2.0, "no gouge, got {}", v.gouge_area);
-        assert!(v.max_engagement <= 2.0 * r + 0.1, "engagement ≤ diameter, got {}", v.max_engagement);
     }
 
     #[test]
@@ -672,14 +707,18 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_around_an_island_clears_without_slotting_or_gouging() {
-        // 60×60 pocket with a 20×20 island (a roughing frame is the same shape). The
-        // trochoidal medial channel avoids slotting; the outer family is arc-length-
-        // morphed into a spiral so its concave wall corners hold the cap (the same
-        // medicine as the pocket spiral), and the island family is cut as exact
-        // concentric loops (its convex corners under-engage — nothing to morph, and
-        // morphing across their radius-scaled corner arcs would nick the island). The
-        // frame now clears covered, no gouge, engagement at the cap.
+    fn a_frame_around_an_island_covers_and_does_not_gouge_but_slots() {
+        // 60×60 pocket with a 20×20 island (a roughing frame is the same shape).
+        //
+        // **This test used to assert the frame held engagement at the cap. It did not —
+        // it slots at the full diameter.** It passed because it measured with the raster,
+        // which read ~2.2 where the truth is 6.00: the raster measured the uncut run on
+        // the perpendicular through the tool centre and was blind to material ahead. This
+        // is the second of the two shipping adaptive paths found to slot (the other being
+        // `adaptive_path`), and the reason `clearing::clear` now dispatches neither — it
+        // is also the path profile-roughing used.
+        //
+        // What is honestly true of the frame today: it covers and it does not gouge.
         let outer = Contour::new(vec![
             Point::new(0.0, 0.0),
             Point::new(60.0, 0.0),
@@ -698,8 +737,8 @@ mod tests {
         let v = crate::raster::certify_moves(&moves, r, &region, e).expect("raster builds");
         let reach: f64 = crate::clearsim::reachable(&region, r).iter().map(|p| p.area()).sum();
         assert!(
-            v.max_engagement <= 1.2 * e,
-            "engagement held at the cap by the morph (was ~1.5x before), got {}",
+            v.max_engagement > 1.9 * r,
+            "the frame slots — pinned so the claim cannot quietly return, got {}",
             v.max_engagement
         );
         assert!(v.gouge_area < 1.0, "no gouge, got {}", v.gouge_area);
@@ -710,13 +749,14 @@ mod tests {
             reach
         );
     }
-
+    /// `adaptive_frame` is the certified-or-`None` entry the clearing engine used to call.
+    /// It now **declines every frame**, and that is the gate working rather than failing:
+    /// the frame slots at the full diameter, so an honest oracle must reject it. It used to
+    /// certify only because its gate — `raster::certify_moves` — measured the uncut run on
+    /// the perpendicular through the tool centre and could not see material ahead. Fixing
+    /// the raster's *formula* repaired this gate without touching this call site.
     #[test]
-    fn adaptive_frame_certifies_and_falls_back_when_it_cannot() {
-        // The certified entry the clearing engine calls: a real frame yields a
-        // certified move path (engagement at the cap, covered, no gouge); a solid
-        // pocket (no island) is not this entry's job and returns None so the caller
-        // routes it through `adaptive_path` instead.
+    fn adaptive_frame_declines_a_frame_it_cannot_certify() {
         let outer = Contour::new(vec![
             Point::new(0.0, 0.0),
             Point::new(60.0, 0.0),
@@ -731,20 +771,15 @@ mod tests {
         ]);
         let region = Polygon::with_holes(outer, vec![island]).unwrap();
         let (r, e) = (3.0, 2.0);
-        let moves = adaptive_frame(&region, r, 0.0, e).expect("a frame certifies");
-        assert!(moves.iter().any(|&(_, cut)| cut), "the frame has cutting moves");
         assert!(
-            moves.iter().any(|&(_, cut)| !cut),
-            "the frame lifts at least once (entry, and between families)"
+            adaptive_frame(&region, r, 0.0, e).is_none(),
+            "the frame slots; the gate must decline it so the caller falls back to concentric"
         );
-        // Re-certify independently: the wrapper's contract is that what it returns holds.
-        let v = crate::raster::certify_moves(&moves, r, &region, e).expect("raster builds");
-        assert!(v.max_engagement <= e * 1.2, "engagement at the cap, got {}", v.max_engagement);
-        assert!(v.gouge_area < 1.0, "no gouge, got {}", v.gouge_area);
-
-        // A solid pocket is not a frame — this entry declines it.
+        // A solid pocket is not a frame either — this entry declines it for a different
+        // reason (wrong shape, not a failed certificate).
         assert!(adaptive_frame(&circle(9.0, 40), r, 0.0, e).is_none());
     }
+
 
     #[test]
     fn the_adaptive_spiral_winds_ccw_the_climb_sense() {
@@ -754,7 +789,9 @@ mod tests {
         // spiral's net winding is CCW (positive signed area) so the climb-only gate in
         // `clearing::clear` is cutting the direction it claims.
         let region = circle(9.0, 40);
-        let path = adaptive_path(&region, 3.0, 0.0, 2.0, Some([0.0, 0.0])).expect("certifies");
+        // Built from `spiral` directly: `adaptive_path` no longer certifies this shape, but
+        // the winding is a property of the generator and still gates `clearing::clear`.
+        let path = spiral_for_test(&region, 3.0, 0.0, 2.0, [0.0, 0.0]).expect("a spiral is built");
         let signed2: f64 = path
             .windows(2)
             .map(|w| w[0].x * w[1].y - w[1].x * w[0].y)
