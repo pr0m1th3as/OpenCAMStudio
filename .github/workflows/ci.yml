@@ -18,14 +18,20 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Format
-        run: cargo fmt --all --check
+      # Correctness gates first — these must pass.
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Build
         run: cargo build --workspace --all-targets
       - name: Test
         run: cargo test --workspace
+      # Formatting is advisory: it runs last and never fails the job, so a cosmetic
+      # nit can't mask a real clippy/build/test failure. The diff is still visible in
+      # the log if we ever choose to act on it (the codebase is hand-formatted, not
+      # rustfmt-shaped — deliberate; revisit adopting rustfmt if collaborators join).
+      - name: Format (advisory)
+        continue-on-error: true
+        run: cargo fmt --all --check
 
   gui-build:
     name: gui build (iced + wgpu)
