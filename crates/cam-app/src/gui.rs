@@ -1768,10 +1768,11 @@ impl App {
                 self.setting_origin_2pt = false;
                 self.origin_first = None;
                 self.controller.begin_operation(kind);
-                // Seed the op with the first library tool so it always has a valid
-                // tool; the user can change it in the wizard picker.
+                // Seed the op with a sensible default tool so it always has a valid
+                // one; the user can change it in the wizard picker. Face prefers the
+                // largest flat end/face mill (see `ToolLibrary::default_tool_for`).
                 if self.controller.pending_op().is_some() {
-                    if let Some(&tool) = self.library.tools.first() {
+                    if let Some(tool) = self.library.default_tool_for(kind) {
                         let number = self.controller.use_tool(tool);
                         self.controller.set_pending_tool(number);
                     }

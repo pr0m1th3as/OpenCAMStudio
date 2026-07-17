@@ -9,6 +9,8 @@ use std::path::PathBuf;
 
 use cam_model::{Tool, ToolKind};
 
+use crate::controller::OpKind;
+
 /// A reusable set of tool definitions, persisted to the config directory.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolLibrary {
@@ -59,6 +61,38 @@ impl ToolLibrary {
         }
     }
 
+    /// The library tool to seed a newly-created operation of `kind` with — a
+    /// sensible starting default the user can still override in the wizard picker.
+    ///
+    /// Every op has a **natural tool kind** and defaults to the first tool of that
+    /// kind: Profile/Pocket → `EndMill`, Drill → `Drill`, Thread → `ThreadMill`,
+    /// Chamfer → `ChamferMill`. **Face** is the one that also sorts by size: it
+    /// wants a flat-bottomed tool (a chamfer or ball tool would leave a scalloped
+    /// floor), and the *largest* such tool means the fewest passes, so facing
+    /// prefers the biggest `EndMill`/`FaceMill`.
+    ///
+    /// In every case this is only a **default** — we never *reject* a tool the user
+    /// picks; and if no tool of the preferred kind exists we fall back to the first
+    /// library tool (order = the user's own numbering). `None` only when the
+    /// library is empty.
+    pub fn default_tool_for(&self, kind: OpKind) -> Option<Tool> {
+        let first = |pred: fn(&ToolKind) -> bool| self.tools.iter().find(|t| pred(&t.kind));
+        let preferred = match kind {
+            // Facing wants the *largest* flat tool (fewest passes) — scallop-safe.
+            OpKind::Face => self
+                .tools
+                .iter()
+                .filter(|t| matches!(t.kind, ToolKind::EndMill | ToolKind::FaceMill))
+                .max_by(|a, b| a.diameter.total_cmp(&b.diameter)),
+            // The rest take the first tool of their kind (no size preference).
+            OpKind::Profile | OpKind::Pocket => first(|k| matches!(k, ToolKind::EndMill)),
+            OpKind::Drill => first(|k| matches!(k, ToolKind::Drill { .. })),
+            OpKind::Thread => first(|k| matches!(k, ToolKind::ThreadMill { .. })),
+            OpKind::Chamfer => first(|k| matches!(k, ToolKind::ChamferMill { .. })),
+        };
+        preferred.or_else(|| self.tools.first()).copied()
+    }
+
     /// Append a fresh default tool (numbered one past the highest) and return its
     /// index. The caller typically selects it and edits its fields.
     pub fn add_default(&mut self) -> usize {
@@ -106,6 +140,17 @@ fn config_dir() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    /// A bare tool of a given number/diameter/kind (length/flutes irrelevant here).
+    fn mk(number: u32, diameter: f64, kind: ToolKind) -> Tool {
+        Tool {
+            number,
+            diameter,
+            length: 30.0,
+            flutes: 2,
+            kind,
+        }
+    }
+
     #[test]
     fn defaults_are_nonempty_and_uniquely_numbered() {
         let lib = ToolLibrary::defaults();
@@ -126,6 +171,99 @@ mod tests {
         let json = serde_json::to_string(&lib).unwrap();
         let back: ToolLibrary = serde_json::from_str(&json).unwrap();
         assert_eq!(lib, back);
+    }
+
+    #[test]
+    fn face_defaults_to_the_largest_flat_tool() {
+        // Starter library is three end mills (⌀3/6/10) — Face should pick ⌀10.
+        let lib = ToolLibrary::defaults();
+        let t = lib.default_tool_for(OpKind::Face).unwrap();
+        assert_eq!(t.diameter, 10.0);
+        assert!(matches!(t.kind, ToolKind::EndMill));
+        // A non-Face op keeps the first library tool ( diameter order is the
+        // user's own numbering, not a size preference).
+        assert_eq!(
+            lib.default_tool_for(OpKind::Profile).unwrap().number,
+            lib.tools[0].number
+        );
+    }
+
+    #[test]
+    fn face_skips_non_flat_tools_but_falls_back_when_none_flat() {
+        // A big chamfer mill must not win facing over a smaller flat end mill.
+        let lib = ToolLibrary {
+            tools: vec![
+                mk(1, 20.0, ToolKind::ChamferMill {
+                    included_angle_deg: 90.0,
+                    tip_diameter: 0.5,
+                }),
+                mk(2, 8.0, ToolKind::EndMill),
+                mk(3, 16.0, ToolKind::FaceMill),
+            ],
+        };
+        let t = lib.default_tool_for(OpKind::Face).unwrap();
+        assert_eq!(t.number, 3, "the ⌀16 face mill is the largest flat tool");
+
+        // With only non-flat tools, fall back to the first (never leave Face
+        // without a tool — the machinist can still change it).
+        let only_chamfer = ToolLibrary {
+            tools: vec![mk(1, 20.0, ToolKind::ChamferMill {
+                included_angle_deg: 90.0,
+                tip_diameter: 0.5,
+            })],
+        };
+        assert_eq!(only_chamfer.default_tool_for(OpKind::Face).unwrap().number, 1);
+    }
+
+    #[test]
+    fn kinded_ops_default_to_the_first_matching_tool_by_kind() {
+        // Order deliberately shuffled: the *first match by kind* must win, not the
+        // first tool overall, and size must not matter (only Face sorts by size).
+        let lib = ToolLibrary {
+            tools: vec![
+                mk(1, 10.0, ToolKind::EndMill),
+                mk(2, 3.2, ToolKind::Drill { point_angle_deg: 118.0 }),
+                mk(3, 6.0, ToolKind::Drill { point_angle_deg: 135.0 }),
+                mk(4, 8.0, ToolKind::ChamferMill {
+                    included_angle_deg: 90.0,
+                    tip_diameter: 0.0,
+                }),
+                mk(5, 12.0, ToolKind::ThreadMill { pitch: None }),
+            ],
+        };
+        assert_eq!(lib.default_tool_for(OpKind::Drill).unwrap().number, 2, "first Drill");
+        assert_eq!(lib.default_tool_for(OpKind::Chamfer).unwrap().number, 4, "first ChamferMill");
+        assert_eq!(lib.default_tool_for(OpKind::Thread).unwrap().number, 5, "first ThreadMill");
+        // Profile/Pocket want the first end mill (tool 1 here).
+        assert_eq!(lib.default_tool_for(OpKind::Profile).unwrap().number, 1);
+        assert_eq!(lib.default_tool_for(OpKind::Pocket).unwrap().number, 1);
+    }
+
+    #[test]
+    fn profile_and_pocket_pick_the_first_end_mill_past_a_leading_drill() {
+        // A drill numbered first must not become the profile/pocket default.
+        let lib = ToolLibrary {
+            tools: vec![
+                mk(1, 6.0, ToolKind::Drill { point_angle_deg: 118.0 }),
+                mk(2, 8.0, ToolKind::EndMill),
+                mk(3, 4.0, ToolKind::EndMill),
+            ],
+        };
+        assert_eq!(lib.default_tool_for(OpKind::Profile).unwrap().number, 2);
+        assert_eq!(lib.default_tool_for(OpKind::Pocket).unwrap().number, 2);
+    }
+
+    #[test]
+    fn kinded_ops_fall_back_to_first_when_no_matching_kind() {
+        // A library of only end mills: every kinded op still gets a (valid) tool.
+        let lib = ToolLibrary::defaults();
+        for kind in [OpKind::Drill, OpKind::Thread, OpKind::Chamfer] {
+            assert_eq!(
+                lib.default_tool_for(kind).unwrap().number,
+                lib.tools[0].number,
+                "{kind:?} falls back to the first library tool"
+            );
+        }
     }
 
     #[test]
