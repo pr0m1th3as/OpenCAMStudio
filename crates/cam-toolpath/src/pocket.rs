@@ -93,6 +93,8 @@ impl Strategy for PocketStrategy {
         // stay-down inside-out rings, with the finishing wall leads.
         let job = crate::clearing::ClearJob {
             id: op.id,
+            radius: r,
+            finish: op.offset,
             first,
             spacing,
             clearing: op.clearing,

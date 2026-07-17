@@ -124,6 +124,10 @@ impl Strategy for ProfileStrategy {
                 // ring sits at the tool radius.
                 let job = crate::clearing::ClearJob {
                     id: op.id,
+                    radius,
+                    // The finishing allowance is baked into the roughing island, so
+                    // the tool-centre wall sits at the bare tool radius.
+                    finish: 0.0,
                     first: radius,
                     spacing: op.stepover,
                     clearing: op.clearing,

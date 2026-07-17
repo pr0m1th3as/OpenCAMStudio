@@ -18,6 +18,7 @@
 
 mod chamfer;
 mod clearing;
+mod adaptive;
 mod clearsim;
 mod drill;
 mod emit;

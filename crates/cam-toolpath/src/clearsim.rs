@@ -122,20 +122,25 @@ impl Verdict {
 /// against the target material region `to_clear` for a tool of radius `r`: peak
 /// engagement, uncut remainder (of the reachable target), and gouge.
 pub(crate) fn certify(path: &[Point], r: f64, to_clear: &Polygon) -> Verdict {
+    // Coverage and gouge come from the whole swept region in one boolean pass —
+    // exact and cheap (no per-segment accumulation).
+    let full = swept(path, r);
+    let reach = reachable(to_clear, r);
+    let uncut = if reach.is_empty() {
+        Vec::new()
+    } else {
+        difference(&reach, &full).unwrap_or_default()
+    };
+    let gouge = difference(&full, std::slice::from_ref(to_clear)).unwrap_or_default();
+
+    // Peak engagement is inherently sequential: walk the path against the running
+    // cleared region. This is the costly part, so it is measured, not the coverage.
     let mut model = ClearedModel::new(r);
     let mut max_e = 0.0_f64;
     for w in path.windows(2) {
         max_e = max_e.max(model.engagement(w[0], w[1]));
         model.commit(w[0], w[1]);
     }
-    let cleared = model.cleared();
-    let reach = reachable(to_clear, r);
-    let uncut = if reach.is_empty() {
-        Vec::new()
-    } else {
-        difference(&reach, cleared).unwrap_or_default()
-    };
-    let gouge = difference(cleared, std::slice::from_ref(to_clear)).unwrap_or_default();
     Verdict {
         max_engagement: max_e,
         uncut_area: total_area(&uncut),
