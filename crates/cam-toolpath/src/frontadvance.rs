@@ -5,11 +5,17 @@
 //! entry, at sharp corners, and at ring/handoff transitions — this advances the
 //! **actual cleared region** outward by one stepover per pass.
 //!
-//! Each pass's tool centres follow `offset(cleared ⊕ e, −r)`, so the tool reaches
-//! exactly `e` beyond what is already cleared and the *loops themselves* peel a stepover
-//! by construction. That is the frontier's guarantee, and it holds: measured by the exact
+//! Each pass's tool centres follow `offset(cleared ⊕ a, −r)`, so the tool reaches exactly
+//! `a` beyond what is already cleared and the *loops themselves* peel that much by
+//! construction. That is the frontier's guarantee, and it holds: measured by the exact
 //! oracle ([`crate::clearsim`]), the body of the path reads **1.4·e on a round pocket and
 //! a square pocket alike** — the sameness being the evidence that the tracking is sound.
+//!
+//! The advance `a` is **not** the stepover `e`. Engagement is not a function of the
+//! stepover alone: at tool-centre radius ρ the tool's outer edge sweeps `(ρ+r)/ρ` times as
+//! far as its centre travels, so the same advance bites harder the tighter the loop — the
+//! geometric floor `a_e = e(ρ+r)/ρ − e²/(2ρ)`. [`pitch_for_cap`] inverts it, so each pass
+//! advances what its radius can carry, relaxing to the full stepover by ρ≈5 (r=3, e=2).
 //!
 //! The guarantee is about the loops, though, and a path is not only loops. What the
 //! frontier does **not** hand you, and what is therefore built on top:
@@ -22,6 +28,9 @@
 //!   the hand-off to the +X seam.
 //! - **the entry** — a radial move off the plunge point slots identically;
 //!   [`core_spiral_to_seam`] eases out instead, landing on the first loop's seam.
+//!   **Answered** (3.52 → 2.69, the floor). The residual was never the spiral: it was the
+//!   **geometric floor on the innermost frontier loops**, which advanced a flat stepover
+//!   however tight they were. The advance is now radius-aware ([`pitch_for_cap`]).
 //! - **concave corners** — as the front closes on a sharp vertex the trapped corner
 //!   material *wraps* the tool, and engagement climbs the nearer it gets (4.41 at 2.2·e).
 //!   **Answered**, by two halves that only work together: the frontier **stands off** sharp
@@ -277,6 +286,21 @@ fn append_loop(path: &mut Vec<Point>, loop_pts: &[Point], prev: &mut Point) {
 
 /// Angular samples per revolution of the core spiral.
 const CORE_SAMPLES: usize = 48;
+
+/// Guard on the core spiral's turn count. The pitch shrinks toward the centre, so an
+/// unbounded march would crawl out of a tiny radius forever.
+const MAX_CORE_TURNS: usize = 200;
+
+/// What the core spiral aims its engagement at, in stepovers. Set to the body's own
+/// geometric floor (~1.4·e): the entry hands off to the frontier loops, and there is no
+/// value in it being quieter than the path it hands off to — nor any way for it to be, as
+/// the floor binds the loops too. Swept: see [`core_spiral_to_seam`].
+const ENTRY_TARGET: f64 = 1.4;
+
+/// Floor on the core spiral's pitch, in stepovers. [`pitch_for_cap`] tends to zero at the
+/// centre (`cap·ρ/r`), which would stall the spiral at ρ=0 and never leave. The innermost
+/// band is not where the defect is anyway — measured, ρ<1.5 already reads 2.79.
+const MIN_CORE_PITCH: f64 = 0.25;
 /// Samples across a loop-to-loop seam transition.
 const SEAM_SAMPLES: usize = 24;
 
@@ -339,26 +363,82 @@ fn at_len(pts: &[Point], cum: &[f64], u: f64) -> Point {
     Point::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
 }
 
-/// An Archimedean spiral from `center` out to `radius`, **ending on the +X seam** so it
-/// hands straight over to the first frontier loop at that loop's seam with no radial
-/// jump. Turn count is rounded up, so the realised pitch never exceeds `pitch` (each
-/// turn bites at most a stepover of fresh material). The plunge disc bounds the first
-/// turn. Without this the entry is a radial move from the plunge point into virgin
-/// stock — a full slot.
-fn core_spiral_to_seam(center: Point, radius: f64, pitch: f64) -> Vec<Point> {
-    if radius <= 1e-6 || pitch <= 1e-6 {
+/// The radial advance per turn that holds a spiral turn at `cap`, at tool-centre radius
+/// `rho`. This is the geometric floor `a_e = e(ρ+r)/ρ − e²/(2ρ)` **inverted** for `e`:
+///
+/// ```text
+///   e(ρ) = (ρ+r) − √((ρ+r)² − 2ρ·cap)
+/// ```
+///
+/// It tends to `cap` as ρ→∞ (a straight peel bites its stepover) and to `cap·ρ/r` as ρ→0
+/// (a tight turn must bite less, because the tool's outer edge sweeps `(ρ+r)/ρ` times as
+/// far as its centre travels). That ratio is the whole reason a fixed-pitch core spiral
+/// over-engages at the entry and nowhere else.
+fn pitch_for_cap(rho: f64, r: f64, cap: f64) -> f64 {
+    let a = rho + r;
+    let d = a * a - 2.0 * rho * cap;
+    if d <= 0.0 {
+        return cap; // cap unreachable at this radius; take the stepover and let the caller clamp
+    }
+    a - d.sqrt()
+}
+
+/// Integrate a variable-pitch spiral out from `center`, scaling every pitch by `lambda`.
+/// Returns the points and the angle at which `radius` was reached.
+fn spiral_march(center: Point, radius: f64, r: f64, cap: f64, e: f64, lambda: f64) -> (Vec<Point>, f64) {
+    let dth = std::f64::consts::TAU / CORE_SAMPLES as f64;
+    let mut rho = 0.0_f64;
+    let mut th = 0.0_f64;
+    let mut pts = vec![center];
+    // Bounded so a pathological pitch cannot spin forever.
+    for _ in 0..(CORE_SAMPLES * MAX_CORE_TURNS) {
+        if rho >= radius {
+            break;
+        }
+        let p = (lambda * pitch_for_cap(rho, r, cap)).clamp(MIN_CORE_PITCH * e, e);
+        rho = (rho + p * dth / std::f64::consts::TAU).min(radius);
+        th += dth;
+        pts.push(Point::new(center.x + rho * th.cos(), center.y + rho * th.sin()));
+    }
+    (pts, th)
+}
+
+/// A spiral from `center` out to `radius`, **ending on the +X seam** so it hands straight
+/// over to the first frontier loop at that loop's seam with no radial jump. Without this
+/// the entry is a radial move from the plunge point into virgin stock — a full slot.
+///
+/// The pitch is **not** constant, and that is the point. A fixed-pitch Archimedean spiral
+/// bites a stepover per turn everywhere, but engagement is not a function of the stepover
+/// alone: at tool-centre radius ρ the tool's outer edge sweeps `(ρ+r)/ρ` times as far as
+/// its centre travels, so the same pitch bites harder the tighter the turn. Measured on
+/// the old fixed-pitch entry (r=3, e=2, circle r30), bucketed by ρ: **3.52 at ρ≈2, 3.42 at
+/// ρ≈4, 3.00 at ρ≈5, then the body's 2.5** — the entry residual was the first two turns and
+/// nothing else. So each turn takes the pitch [`pitch_for_cap`] says it can afford, which
+/// is ~1.4 near the middle and relaxes to the full stepover by ρ≈5.
+///
+/// Landing on the seam still needs a whole number of turns, so the profile is scaled by a
+/// `lambda ≤ 1` found by bisection. Scaling **down** is what makes that safe: it only ever
+/// slows the spiral out, which lowers engagement — the turn count is rounded up, never
+/// down, so no turn is asked to bite more than it was sized for.
+fn core_spiral_to_seam(center: Point, radius: f64, e: f64, r: f64, cap: f64) -> Vec<Point> {
+    if radius <= 1e-6 || e <= 1e-6 {
         return vec![center];
     }
-    let turns = (radius / pitch).ceil().max(1.0);
-    let theta_max = std::f64::consts::TAU * turns;
-    let steps = (turns * CORE_SAMPLES as f64).ceil() as usize;
-    (0..=steps)
-        .map(|k| {
-            let th = theta_max * (k as f64) / (steps as f64);
-            let rr = radius * th / theta_max;
-            Point::new(center.x + rr * th.cos(), center.y + rr * th.sin())
-        })
-        .collect()
+    let (_, th_full) = spiral_march(center, radius, r, cap, e, 1.0);
+    let turns = (th_full / std::f64::consts::TAU).ceil().max(1.0);
+    let target = std::f64::consts::TAU * turns;
+    // Bisect the scale so the spiral reaches `radius` exactly as it crosses the seam.
+    let (mut lo, mut hi) = (1e-3_f64, 1.0_f64);
+    for _ in 0..40 {
+        let mid = 0.5 * (lo + hi);
+        let (_, th) = spiral_march(center, radius, r, cap, e, mid);
+        if th > target {
+            lo = mid; // too slow — it overshot the turn budget
+        } else {
+            hi = mid;
+        }
+    }
+    spiral_march(center, radius, r, cap, e, hi).0
 }
 
 /// Stitch the frontier `loops` (innermost first, all wound the same way) into one
@@ -381,13 +461,15 @@ fn connect_seam_spiral(
     e: f64,
     seam_arc: f64,
     reliefs: &[Vec<Point>],
+    r: f64,
+    cap: f64,
 ) -> Option<Vec<Point>> {
     let seamed: Vec<Vec<Point>> =
         loops.iter().map(|l| seam_rotate(l, entry)).collect::<Option<_>>()?;
     let cums: Vec<Vec<f64>> = seamed.iter().map(|l| cum_len(l)).collect();
 
     // Open the core out to the first loop's seam, landing on it.
-    let mut path = core_spiral_to_seam(entry, seamed[0][0].distance(entry), e);
+    let mut path = core_spiral_to_seam(entry, seamed[0][0].distance(entry), e, r, cap);
 
     for k in 0..seamed.len() {
         let (cur, ccur) = (&seamed[k], &cums[k]);
@@ -570,19 +652,44 @@ pub(crate) fn front_advance_path(
     e: f64,
     start: Option<[f64; 2]>,
 ) -> Option<Vec<Point>> {
-    front_advance_tuned(region, r, finish, e, start, SEAM_ARC, STANDOFF_RADII * r)
+    front_advance_tuned(region, r, finish, e, start, Tuning::new(r, e))
 }
 
-/// [`front_advance_path`] with the seam hand-off length exposed, so it can be swept.
+/// The generator's tuning, bundled so it can be swept as a unit. Defaults come from the
+/// constants above; every field is an oracle-swept number, not a preference — see each
+/// constant's doc for the measurements behind it.
+#[derive(Clone, Copy, Debug)]
+struct Tuning {
+    /// Loop-to-loop seam hand-off length, in mm. See [`SEAM_ARC`].
+    seam_arc: f64,
+    /// How far the frontier stands off a sharp corner, in mm. See [`STANDOFF_RADII`].
+    standoff: f64,
+    /// Engagement the radius-aware advance and core spiral aim at, in mm. See
+    /// [`ENTRY_TARGET`].
+    entry_target: f64,
+}
+
+impl Tuning {
+    /// The shipped tuning for a tool of radius `r` at stepover `e`.
+    fn new(r: f64, e: f64) -> Self {
+        Self {
+            seam_arc: SEAM_ARC,
+            standoff: STANDOFF_RADII * r,
+            entry_target: ENTRY_TARGET * e,
+        }
+    }
+}
+
+/// [`front_advance_path`] with the tuning exposed, so it can be swept.
 fn front_advance_tuned(
     region: &Polygon,
     r: f64,
     finish: f64,
     e: f64,
     start: Option<[f64; 2]>,
-    seam_arc: f64,
-    standoff: f64,
+    t: Tuning,
 ) -> Option<Vec<Point>> {
+    let Tuning { seam_arc, standoff, entry_target } = t;
     if !(e > 0.0 && e < 2.0 * r) {
         return None;
     }
@@ -616,8 +723,24 @@ fn front_advance_tuned(
     let mut prev_pass: Option<(f64, usize)> = None;
 
     for _ in 0..MAX_PASSES {
-        // Advance the frontier one stepover into fresh material, clipped to the stock.
-        let grown = intersection(&offset(&cleared, e, JoinStyle::Round).ok()?, clear_slice).ok()?;
+        // **Radius-aware advance.** The frontier cannot afford a full stepover near the
+        // entry. At tool-centre radius ρ the tool's outer edge sweeps `(ρ+r)/ρ` times as
+        // far as its centre travels, so the same advance bites harder the tighter the
+        // loop — the geometric floor `a_e = e(ρ+r)/ρ − e²/(2ρ)`, which blows up as ρ→0.
+        // [`pitch_for_cap`] inverts it for the advance this radius can carry.
+        //
+        // The innermost loops are what the "entry residual" always was. It was **not** the
+        // core spiral: measured on a circle r30, the spiral spans only ρ ∈ [0,2] (the first
+        // frontier loop's radius), while the 3.42 peak sits at ρ≈3.94 — the loop at ρ=4,
+        // where the floor predicts 3.0. Retuning the spiral's pitch moved it not at all,
+        // across targets from 1.4·e to 0.5·e.
+        //
+        // ρ is estimated from the cleared region's equivalent-disc radius, less the tool:
+        // near the entry the frontier really is a disc, which is exactly where this binds.
+        let rho = (total_area(&cleared) / std::f64::consts::PI).sqrt() - r;
+        let adv = pitch_for_cap(rho.max(0.0), r, entry_target).clamp(MIN_CORE_PITCH * e, e);
+        // Advance the frontier into fresh material, clipped to the stock.
+        let grown = intersection(&offset(&cleared, adv, JoinStyle::Round).ok()?, clear_slice).ok()?;
         if grown.is_empty() {
             break;
         }
@@ -690,7 +813,7 @@ fn front_advance_tuned(
     // maximal inscribed circle, so these cannot gouge however they are sequenced.
     let reliefs: Vec<Vec<Point>> =
         sharp_corners(&tc).into_iter().map(|c| corner_relief(c, r, e)).filter(|p| p.len() > 2).collect();
-    let path = match (!split).then(|| connect_seam_spiral(entry, &loops, e, seam_arc, &reliefs)).flatten() {
+    let path = match (!split).then(|| connect_seam_spiral(entry, &loops, e, seam_arc, &reliefs, r, entry_target)).flatten() {
         Some(p) => p,
         None => {
             let mut p = vec![entry];
@@ -909,8 +1032,15 @@ mod tests {
     #[test]
     fn the_standoff_is_what_lets_the_relief_reach_the_corner() {
         let region = square(40.0);
-        let bare =
-            front_advance_tuned(&region, R, 0.0, E, Some([20.0, 20.0]), SEAM_ARC, 0.0).unwrap();
+        let bare = front_advance_tuned(
+            &region,
+            R,
+            0.0,
+            E,
+            Some([20.0, 20.0]),
+            Tuning { standoff: 0.0, ..Tuning::new(R, E) },
+        )
+        .unwrap();
         let mut m = crate::clearsim::ClearedModel::bounded(R, region.clone());
         m.seed_disc(bare[0]);
         let mut worst = 0.0f64;
@@ -929,14 +1059,71 @@ mod tests {
         );
     }
 
-    /// The **entry** is opened by an Archimedean core spiral rather than a radial move
-    /// from the plunge point, which slotted at the full diameter. Each turn bites at most
-    /// a stepover, and it lands on the first frontier loop's seam so there is no jump onto
-    /// it. The residual 3.52 (1.76·e) is a tighter gap than the corner's, and next after it.
+    /// The **entry no longer over-engages**: 3.52 → 2.69, which is the geometric floor and
+    /// the same value the rest of the path holds. It is not the peak of anything any more.
+    ///
+    /// **What the entry residual actually was, after two wrong answers.** It was *not* the
+    /// core spiral. On a circle r30 the first frontier loop sits at ρ=2, so the spiral spans
+    /// only ρ ∈ [0,2] — while the 3.42 peak sat at ρ≈3.94, on the frontier **loop** at ρ=4.
+    /// Retuning the spiral's pitch moved it not at all, across targets from 1.4·e to 0.5·e
+    /// (measured: 3.42, every time). Nor was it an artifact of the arc formula, as the
+    /// wrapped-groove story would have it: the independent area oracle agrees at the same
+    /// move — **3.42 angle vs 3.53 area**.
+    ///
+    /// It was the **geometric floor on the innermost loops**: at tool-centre radius ρ the
+    /// tool's outer edge sweeps `(ρ+r)/ρ` times as far as its centre travels, so a full
+    /// stepover bites harder the tighter the loop — `floor(ρ=4)` = 3.0, `floor(ρ=2)` = 4.0.
+    /// The frontier advanced a flat `e` regardless. The fix is the **radius-aware advance**
+    /// in [`front_advance_tuned`]; see [`pitch_for_cap`].
     #[test]
-    fn the_core_spiral_entry_does_not_slot() {
-        let entry = peak(circle_readings(), |p| p.distance(Point::new(0.0, 0.0)) <= 3.0 * E);
-        assert!(entry <= 2.0 * E, "core-spiral entry should not slot, got {entry} (was 6.0)");
+    fn the_entry_holds_engagement_like_the_rest_of_the_path() {
+        for (name, rs, c) in [
+            ("circle r30", circle_readings(), Point::new(0.0, 0.0)),
+            ("square 40", square_readings(), Point::new(20.0, 20.0)),
+        ] {
+            let entry = peak(rs, |p| p.distance(c) <= 3.0 * E);
+            assert!(entry <= 1.5 * E, "{name}: entry should sit at the floor, got {entry} (was 3.52)");
+        }
+    }
+
+    /// The radius-aware advance is what fixed the entry, and it is **not** a free win — it
+    /// is bought with passes. Pinned as a pair: forcing the advance to a flat stepover (by
+    /// asking for a target the floor can always meet) puts the entry back over 3.4.
+    ///
+    /// Guards against "just lower the target": measured on a circle r30, target 1.4·e →
+    /// entry 2.69 at +2.5% travel, because `pitch_for_cap` only bites below ρ≈5 and clamps
+    /// to the full stepover beyond. 0.7·e → entry 2.07 but **+64% travel**, and 0.5·e →
+    /// +119% — that is not a fix, it is cutting the whole pocket finer.
+    #[test]
+    fn the_radius_aware_advance_is_what_holds_the_entry() {
+        let region = circle(30.0, 96);
+        // A target of 4·e is above the floor at every radius here, so `pitch_for_cap`
+        // never binds and the advance is a flat stepover — the old behaviour.
+        let flat = front_advance_tuned(
+            &region,
+            R,
+            0.0,
+            E,
+            Some([0.0, 0.0]),
+            Tuning { entry_target: 4.0 * E, ..Tuning::new(R, E) },
+        )
+        .unwrap();
+        let mut m = crate::clearsim::ClearedModel::bounded(R, region.clone());
+        m.seed_disc(flat[0]);
+        let mut worst = 0.0f64;
+        for w in flat.windows(2) {
+            for pc in densify(w, 1.0).windows(2) {
+                if pc[0].distance(Point::new(0.0, 0.0)) <= 3.0 * E {
+                    worst = worst.max(m.engagement(pc[0], pc[1]));
+                }
+            }
+            m.commit(w[0], w[1]);
+        }
+        let tuned = peak(circle_readings(), |p| p.distance(Point::new(0.0, 0.0)) <= 3.0 * E);
+        assert!(
+            worst > tuned + 0.3 * E,
+            "a flat advance should over-engage the entry: {worst} vs {tuned}"
+        );
     }
 
     /// The seam hand-off cannot be tuned into or out of trouble: the tool only ever bites
@@ -953,8 +1140,15 @@ mod tests {
             .iter()
             .map(|&sa| {
                 let raw =
-                    front_advance_tuned(&region, r, 0.0, e, Some([20.0, 20.0]), sa, STANDOFF_RADII * r)
-                        .unwrap();
+                    front_advance_tuned(
+                        &region,
+                        r,
+                        0.0,
+                        e,
+                        Some([20.0, 20.0]),
+                        Tuning { seam_arc: sa, ..Tuning::new(r, e) },
+                    )
+                    .unwrap();
                 let mut m = crate::clearsim::ClearedModel::bounded(r, region.clone());
                 m.seed_disc(raw[0]);
                 let mut pk = 0.0f64;
@@ -1030,6 +1224,9 @@ mod tests {
         let visits = path.iter().filter(|p| p.distance(Point::new(37.0, 37.0)) < 1e-6).count();
         assert!(visits <= 1, "the closing lap's corner should be visited once, got {visits}");
     }
+
+
+
 
 
 }
