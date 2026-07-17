@@ -17,7 +17,7 @@ use std::sync::Arc;
 use iced::widget::pane_grid::{self, PaneGrid};
 use iced::widget::{
     button, checkbox, column, container, mouse_area, pick_list, row, scrollable, shader, slider,
-    text, text_input, Space,
+    text, text_input, tooltip, Space,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
@@ -91,6 +91,7 @@ enum Icon {
     ResetView,
     ShowCube,
     SetOrigin,
+    Info,
 }
 
 impl Icon {
@@ -117,6 +118,37 @@ impl Icon {
             Icon::ResetView => include_bytes!("../assets/icons/zoom_ext.svg"),
             Icon::ShowCube => include_bytes!("../assets/icons/viewcube.svg"),
             Icon::SetOrigin => include_bytes!("../assets/icons/origin.svg"),
+            Icon::Info => include_bytes!("../assets/icons/info.svg"),
+        }
+    }
+
+    /// A one-line description of the command this icon stands for, shown as a hover
+    /// tooltip on its ribbon button (the label under the icon is terser, and vanishes
+    /// entirely at Compact density — the tooltip is where the icon explains itself).
+    fn help(self) -> &'static str {
+        match self {
+            Icon::New => "Start a new, empty project.",
+            Icon::Open => "Open a saved .ocam project from disk.",
+            Icon::Save => "Save the current project to disk.",
+            Icon::Import => "Import part geometry from a DXF or DWG drawing.",
+            Icon::Export => "Export the generated toolpaths as G-code (NC) for your machine.",
+            Icon::Undo => "Undo the last change.",
+            Icon::Redo => "Redo the change just undone.",
+            Icon::Run => "Generate toolpaths for every operation and simulate the result.",
+            Icon::Profile => "Add a Profile operation — cut along a chain, inside/outside/on the line.",
+            Icon::Pocket => "Add a Pocket operation — clear the area inside a closed boundary.",
+            Icon::Drill => "Add a Drill operation — peck/drill the selected hole circles.",
+            Icon::Thread => "Add a Thread-milling operation on a bore or boss.",
+            Icon::Chamfer => "Add a Chamfer operation — break an edge with a V/chamfer tool.",
+            Icon::Face => "Add a Face operation — skim the top of the stock flat.",
+            Icon::NewTool => "Add a new tool to the library.",
+            Icon::Duplicate => "Duplicate the selected operation.",
+            Icon::Delete => "Delete the selected item.",
+            Icon::ShowStock => "Show or hide the simulated stock surface in the viewport.",
+            Icon::ResetView => "Reset the camera to frame the whole part.",
+            Icon::ShowCube => "Show or hide the orientation cube.",
+            Icon::SetOrigin => "Show or hide the workpiece-origin datum marker.",
+            Icon::Info => "Show or hide hover tooltips on inspector fields and ribbon icons.",
         }
     }
 
@@ -715,6 +747,248 @@ impl Field {
             Field::PlungeB => "Plunge length/pitch",
         }
     }
+
+    /// A one- or two-sentence, new-user-friendly explanation of what the field does,
+    /// shown as a hover tooltip on its label in the inspector.
+    fn help(self) -> &'static str {
+        match self {
+            Field::Clearance => {
+                "Safe height for rapid (non-cutting) moves above the part. The tool \
+                 traverses at this Z between features so it never drags through stock."
+            }
+            Field::Retract => {
+                "Height the tool pulls back to between passes or plunges — lower than \
+                 Clearance for speed, but still above any uncut material."
+            }
+            Field::TopOfStock => {
+                "Absolute Z of the top surface of the raw material. Cutting depths are \
+                 measured downward from here."
+            }
+            Field::StockXOffset => {
+                "Extra material left on both +X and −X sides of the part's bounding box \
+                 — the raw block is this much wider than the part in X."
+            }
+            Field::StockYOffset => {
+                "Extra material left on both +Y and −Y sides of the part's bounding box \
+                 — the raw block is this much wider than the part in Y."
+            }
+            Field::StockTop => "Absolute Z of the stock's top surface (mm).",
+            Field::StockThickness => {
+                "Height of the raw block below its top: the bottom sits at (top − \
+                 thickness)."
+            }
+            Field::MachineTravelX => {
+                "Working-envelope size in X. Toolpaths that exceed it are flagged so a \
+                 program can't command the machine past its limits."
+            }
+            Field::MachineTravelY => "Working-envelope size in Y (see X travel).",
+            Field::MachineTravelZ => "Working-envelope size in Z (see X travel).",
+            Field::OriginX => {
+                "Part-space X of the workpiece datum — the (0,0,0) the G-code is written \
+                 about. Set it to the corner or feature you'll touch off on the machine."
+            }
+            Field::OriginY => "Part-space Y of the workpiece datum (see Origin X).",
+            Field::OriginZ => "Part-space Z of the workpiece datum (see Origin X).",
+            Field::StartOffX => {
+                "X offset of the program start point from the origin — where the tool \
+                 rapids to before the first cut (e.g. clear of clamps)."
+            }
+            Field::StartOffY => "Y offset of the program start point from the origin.",
+            Field::StartOffZ => "Z offset of the program start point from the origin.",
+            Field::ToolDiameter => "Cutting diameter of the tool (mm).",
+            Field::ToolLength => {
+                "Overall/usable length of the tool — used for reach checks and the \
+                 backplot; it does not change the cutting geometry."
+            }
+            Field::Flutes => {
+                "Number of cutting edges. Informational for now (feed-per-tooth math \
+                 comes later); does not change the path."
+            }
+            Field::CornerRadius => {
+                "Corner (bull-nose) radius of the end mill. 0 = a sharp square end; \
+                 equal to the tool radius = a ball nose."
+            }
+            Field::ChamferAngle => {
+                "Included point angle of the chamfer/V tool (e.g. 90° for a 45° \
+                 chamfer). Sets how depth maps to chamfer width."
+            }
+            Field::TipDiameter => {
+                "Flat diameter at the very tip of a chamfer/V tool. 0 = a true point."
+            }
+            Field::PointAngle => {
+                "Included angle of the drill point (e.g. 118° or 135°) — used to place \
+                 the tip so the full diameter reaches the intended depth."
+            }
+            Field::ToolThreadPitch => {
+                "Ground pitch of a fixed-pitch thread mill (mm). 0 = a single-form \
+                 cutter that can mill any pitch."
+            }
+            Field::Depth => {
+                "Total cut depth below the top of stock (a positive distance). The \
+                 feature's floor sits this far down."
+            }
+            Field::ProfileOffset => {
+                "Finishing allowance left on the wall (mm): the roughing pass stops this \
+                 far from the final profile so a finish pass can clean it up. 0 = cut to \
+                 size."
+            }
+            Field::Stepdown => {
+                "Maximum depth removed per Z level. The cut is split into passes no \
+                 deeper than this; smaller is gentler on the tool."
+            }
+            Field::Stepover => {
+                "Radial width of cut between adjacent passes (mm). For outside roughing \
+                 it sets the concentric-pass spacing."
+            }
+            Field::Feed => "Cutting feed rate — how fast the tool advances while cutting (mm/min).",
+            Field::PlungeFeed => {
+                "Feed rate for downward (Z) entry moves — usually slower than the \
+                 cutting feed, since end mills cut poorly straight down (mm/min)."
+            }
+            Field::MajorDia => {
+                "Major (nominal) diameter of the thread — the crest diameter for an \
+                 external thread, the bore's tapped size for internal (mm)."
+            }
+            Field::Pitch => {
+                "Thread pitch: the axial distance advanced per revolution (mm). One turn \
+                 of the helix climbs by this much."
+            }
+            Field::ThreadTop => "Absolute Z of the top of the threaded length (mm).",
+            Field::ThreadBottom => "Absolute Z of the bottom of the threaded length (mm).",
+            Field::ChamferWidth => {
+                "Width of the chamfer face measured along the slope (mm). With the tool \
+                 angle this sets how deep the tool drops."
+            }
+            Field::ChamferDepth => {
+                "How far below the top edge the tool tip rides (mm), which picks where \
+                 on the tool's flank the cut lands. 0 = cut at the tip."
+            }
+            Field::ChamferStep => {
+                "Chamfer width added per pass (mm) for a multi-pass chamfer. 0 = cut the \
+                 whole chamfer in a single pass."
+            }
+            Field::LeadInSize => {
+                "Size of the lead-in that eases the tool onto the wall — arc radius for \
+                 an arc lead, ramp length for a linear one (mm). Avoids a dwell mark."
+            }
+            Field::LeadOutSize => "Size of the lead-out that eases the tool off the wall (see lead-in).",
+            Field::LeadOverlap => {
+                "How far the tool keeps cutting past the start point before leaving, to \
+                 erase the entry/exit witness mark (mm)."
+            }
+            Field::FaceStartOffset => {
+                "Height of the first facing cut above the drawing reference (mm) — start \
+                 above the true top to skim scale, or at 0 to cut to size."
+            }
+            Field::Overlap => {
+                "How much each facing pass overlaps the previous, as a percent of tool \
+                 diameter. Higher = smoother floor, more passes."
+            }
+            Field::FaceOvershoot => {
+                "How far the tool runs past the stock edge before turning around (mm), \
+                 so the cutter fully clears the edge."
+            }
+            Field::Engagement => {
+                "Adaptive-clearing engagement cap: the largest radial width of cut the \
+                 tool takes at once (mm). Keeps tool load constant for high-speed \
+                 clearing. 0 = plain concentric clearing (off). Climb only."
+            }
+            Field::PlungeA => {
+                "First plunge parameter: the ramp/zig-zag angle in degrees, or the helix \
+                 radius in mm — depending on the plunge type chosen below."
+            }
+            Field::PlungeB => {
+                "Second plunge parameter: the zig-zag length, or the helix pitch (mm) — \
+                 depending on the plunge type. Unused for a straight plunge."
+            }
+        }
+    }
+}
+
+/// An inspector label wrapped in a hover tooltip carrying its help text — the shared
+/// way every parameter (field, picker, checkbox) explains itself to new users. Keeps
+/// the fixed 135-px label column so rows stay aligned.
+/// Wrap any element in a hover tooltip carrying `help` (appearing to its left, toward
+/// the viewport), when `show`. The shared primitive behind every inspector tooltip.
+fn help_wrap<'a>(
+    content: impl Into<Element<'a, Message>>,
+    help: &'static str,
+    show: bool,
+) -> Element<'a, Message> {
+    let content = content.into();
+    if !show {
+        return content;
+    }
+    tooltip(
+        content,
+        container(text(help).size(12))
+            .padding(8)
+            .max_width(300.0)
+            .style(container::rounded_box),
+        tooltip::Position::Left,
+    )
+    .into()
+}
+
+/// A fixed-width (135 px) inspector label wrapped in a hover tooltip carrying its help
+/// text when `show` — how every field/picker/checkbox row explains itself, keeping the
+/// label column aligned.
+fn label_help<'a>(
+    label: impl iced::widget::text::IntoFragment<'a>,
+    help: &'static str,
+    show: bool,
+) -> Element<'a, Message> {
+    help_wrap(text(label).width(Length::Fixed(135.0)).size(13), help, show)
+}
+
+/// Hover-help text for the inspector's non-numeric controls (pickers, checkboxes).
+/// Numeric fields carry their own via [`Field::help`].
+mod help {
+    pub const SIDE: &str =
+        "Which side of the selected chain the tool runs. Outside keeps the chain as the \
+         finished part (cut around it); Inside cuts a pocket/bore to the chain; On centres \
+         the tool on the line.";
+    pub const LEAD_IN: &str =
+        "How the tool eases onto the wall at the start of a pass instead of diving \
+         straight in — an arc or a straight ramp — to avoid a dwell/witness mark. None \
+         starts cutting directly.";
+    pub const LEAD_OUT: &str = "How the tool eases off the wall at the end of a pass (see lead-in).";
+    pub const PLUNGE: &str =
+        "How the tool enters downward at each level. Straight drops vertically (needs a \
+         centre-cutting tool or pre-drilled hole); Ramp and Zig-zag oscillate down; Helix \
+         spirals down — all gentler than a straight plunge.";
+    pub const CLIMB: &str =
+        "Milling direction. Climb (recommended) gives a cleaner finish and is required for \
+         adaptive clearing; unticking it is conventional milling, which reverses the pass \
+         direction.";
+    pub const FACE_DIRECTION: &str =
+        "The axis the facing passes sweep along. Defaults to the boundary edge you picked; \
+         otherwise the longest edge.";
+    pub const CHAMFER_GRADUAL: &str =
+        "Spread the chamfer over its passes so each removes an equal amount of material, \
+         rather than full-width passes stepping down. Only matters for a multi-pass chamfer.";
+    pub const BORE: &str =
+        "Whether the thread is cut into a hole (Internal) or onto a boss/stud (External). \
+         Sets which side of the pitch line the tool orbits.";
+    pub const HAND: &str =
+        "Thread hand: Right-hand advances when turned clockwise (the common case), \
+         Left-hand the opposite. Sets the helix direction.";
+    pub const THREAD_CUT: &str =
+        "Climb vs conventional milling for the threading orbit — climb usually finishes \
+         cleaner.";
+    pub const POST: &str =
+        "The machine controller/dialect the exported G-code is written for (grbl, Fanuc, \
+         …). Pick the one your control speaks.";
+    pub const TOOL_TYPE: &str =
+        "The cutter geometry class. Changing it reveals the geometry fields that class \
+         needs (corner radius, point angle, tip diameter, …) and how the toolpath treats \
+         the tip.";
+    pub const START_POINT: &str =
+        "Rapid to a chosen point before the first cut — e.g. clear of clamps or over a \
+         pre-drilled entry. When off, the program starts straight from the origin.";
+    pub const MACHINE_NAME: &str =
+        "A free-text label to tell your machines apart. It does not affect the toolpath \
+         or output.";
 }
 
 /// The size (length/radius) carried by a lead, or 0 for `None`.
@@ -806,6 +1080,9 @@ struct App {
     show_stock: bool,
     /// Whether the orientation-cube gizmo is shown (toggleable).
     show_gizmo: bool,
+    /// Whether hover tooltips (inspector parameters + ribbon icons) are shown. On by
+    /// default to help new users; toggled off from the View tab once they're fluent.
+    tooltips: bool,
     /// On-screen edge length of the orientation cube, in **logical pixels** —
     /// fixed (not scaled with the window), adjustable at runtime via the View tab.
     gizmo_size: f32,
@@ -1087,6 +1364,8 @@ enum Message {
     ResetView,
     /// Show or hide the orientation cube.
     ToggleGizmo,
+    /// Show or hide hover tooltips (inspector + ribbon icons).
+    ToggleTooltips,
     /// Set the orientation cube's on-screen size (logical px).
     SetGizmoSize(f32),
     PaneResized(pane_grid::ResizeEvent),
@@ -1201,6 +1480,7 @@ impl App {
             fields: BTreeMap::new(),
             show_stock: false,
             show_gizmo: true,
+            tooltips: true,
             gizmo_size: GIZMO_SIZE_DEFAULT,
             view: ViewControls::default(),
             cursor: None,
@@ -1669,6 +1949,14 @@ impl App {
             }
             Message::ResetView => self.view = ViewControls::default(),
             Message::ToggleGizmo => self.show_gizmo = !self.show_gizmo,
+            Message::ToggleTooltips => {
+                self.tooltips = !self.tooltips;
+                self.status = if self.tooltips {
+                    "Tooltips on.".to_string()
+                } else {
+                    "Tooltips off.".to_string()
+                };
+            }
             Message::SetGizmoSize(v) => {
                 self.gizmo_size = v.clamp(GIZMO_SIZE_MIN, GIZMO_SIZE_MAX)
             }
@@ -2681,6 +2969,12 @@ impl App {
                         self.show_origin,
                         Message::ToggleShowOrigin,
                     ),
+                    toggle_cmd(
+                        Icon::Info,
+                        "Tips",
+                        self.tooltips,
+                        Message::ToggleTooltips,
+                    ),
                 ],
             }],
             RibbonTab::Windows => return None,
@@ -2704,7 +2998,7 @@ impl App {
         let densities = self.ribbon_densities(&specs);
         let mut band = row![].spacing(GROUP_GAP).align_y(Alignment::Start);
         for (i, (spec, &density)) in specs.iter().zip(&densities).enumerate() {
-            band = band.push(render_group(spec, density, i));
+            band = band.push(render_group(spec, density, i, self.tooltips));
         }
         // The View tab gets a live orientation-cube size control (a slider has no
         // place in the icon-command band, so it is appended as its own group).
@@ -2785,7 +3079,7 @@ impl App {
 
         let mut commands = row![].spacing(CMD_GAP);
         for command in &spec.commands {
-            commands = commands.push(render_command(command, false));
+            commands = commands.push(render_command(command, false, self.tooltips));
         }
         let panel = container(commands)
             .padding(6)
@@ -3122,14 +3416,15 @@ impl App {
         col = col.push(
             row![
                 checkbox(on).size(15).on_toggle(Message::ToggleStartPoint),
-                text("Rapid to a start point").size(13),
+                help_wrap(text("Rapid to a start point").size(13), help::START_POINT, self.tooltips),
             ]
             .spacing(6)
             .align_y(Alignment::Center),
         );
         if on {
-            let field =
-                |f: Field| field_row(f, &self.fields.get(&f).cloned().unwrap_or_default());
+            let field = |f: Field| {
+                field_row(f, &self.fields.get(&f).cloned().unwrap_or_default(), self.tooltips)
+            };
             col = col.push(field(Field::StartOffX));
             col = col.push(field(Field::StartOffY));
             col = col.push(field(Field::StartOffZ));
@@ -3161,11 +3456,11 @@ impl App {
 
         for field in self.inspector_fields() {
             let value = self.fields.get(&field).cloned().unwrap_or_default();
-            list = list.push(field_row(field, &value));
+            list = list.push(field_row(field, &value, self.tooltips));
         }
         if let Some(t) = self.library.tools.get(self.lib_sel) {
             list = list.push(row![
-                text("Type").width(Length::Fixed(135.0)).size(13),
+                label_help("Type", help::TOOL_TYPE, self.tooltips),
                 pick_list(&ToolKindPick::ALL[..], Some(ToolKindPick::of(t.kind)), |p| {
                     Message::ToolKindChanged(p.to_kind())
                 })
@@ -3223,7 +3518,7 @@ impl App {
             // change so multiple machines can be told apart later.
             list = list.push(
                 row![
-                    text("Name").width(Length::Fixed(135.0)).size(13),
+                    label_help("Name", help::MACHINE_NAME, self.tooltips),
                     text_input("machine", &self.controller.machine().name)
                         .on_input(Message::MachineNameChanged)
                         .width(Length::Fixed(120.0)),
@@ -3234,6 +3529,8 @@ impl App {
             // The post/controller dialect used on export.
             list = list.push(profile_picker(
                 "Post",
+                help::POST,
+                self.tooltips,
                 self.controller.post_kind(),
                 &PostKind::ALL[..],
                 Message::PostKindChanged,
@@ -3255,17 +3552,7 @@ impl App {
                 continue;
             }
             let value = self.fields.get(&field).cloned().unwrap_or_default();
-            list = list.push(
-                row![
-                    text(field.label()).width(Length::Fixed(135.0)).size(13),
-                    text_input("", &value)
-                        .on_input(move |v| Message::FieldChanged(field, v))
-                        .on_submit(Message::Apply)
-                        .width(Length::Fixed(90.0)),
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center),
-            );
+            list = list.push(field_row(field, &value, self.tooltips));
         }
         // The program start-point editor lives on the Origin node (offset from it).
         if let Selection::Origin = self.controller.selection() {
@@ -3277,7 +3564,7 @@ impl App {
             if let Some(tool) = self.controller.document().setup.tools.get(i) {
                 list = list.push(
                     row![
-                        text("Type").width(Length::Fixed(135.0)).size(13),
+                        label_help("Type", help::TOOL_TYPE, self.tooltips),
                         pick_list(
                             &ToolKindPick::ALL[..],
                             Some(ToolKindPick::of(tool.kind)),
@@ -3299,24 +3586,32 @@ impl App {
                 Some(Operation::Profile(p)) => {
                     list = list.push(profile_picker(
                         "Side",
+                        help::SIDE,
+                        self.tooltips,
                         p.side,
                         &Side::ALL[..],
                         Message::SideChanged,
                     ));
                     list = list.push(profile_picker(
                         "Lead-in",
+                        help::LEAD_IN,
+                        self.tooltips,
                         LeadKind::of(p.lead_in),
                         &LeadKind::ALL[..],
                         Message::LeadInKindChanged,
                     ));
                     list = list.push(profile_picker(
                         "Lead-out",
+                        help::LEAD_OUT,
+                        self.tooltips,
                         LeadKind::of(p.lead_out),
                         &LeadKind::ALL[..],
                         Message::LeadOutKindChanged,
                     ));
                     list = list.push(profile_picker(
                         "Plunge",
+                        help::PLUNGE,
+                        self.tooltips,
                         PlungeKind::of(p.plunge),
                         &PlungeKind::ALL[..],
                         Message::PlungeKindChanged,
@@ -3325,7 +3620,7 @@ impl App {
                     if p.side == Side::Outside {
                         list = list.push(
                             row![
-                                text("Climb").width(Length::Fixed(135.0)).size(13),
+                                label_help("Climb", help::CLIMB, self.tooltips),
                                 checkbox(p.clearing.climb)
                                     .size(15)
                                     .on_toggle(Message::ClearingClimbToggled),
@@ -3338,13 +3633,15 @@ impl App {
                 Some(Operation::Pocket(p)) => {
                     list = list.push(profile_picker(
                         "Plunge",
+                        help::PLUNGE,
+                        self.tooltips,
                         PlungeKind::of(p.plunge),
                         &PlungeKind::ALL[..],
                         Message::PlungeKindChanged,
                     ));
                     list = list.push(
                         row![
-                            text("Climb").width(Length::Fixed(135.0)).size(13),
+                            label_help("Climb", help::CLIMB, self.tooltips),
                             checkbox(p.clearing.climb)
                                 .size(15)
                                 .on_toggle(Message::ClearingClimbToggled),
@@ -3354,12 +3651,16 @@ impl App {
                     );
                     list = list.push(profile_picker(
                         "Wall lead-in",
+                        help::LEAD_IN,
+                        self.tooltips,
                         LeadKind::of(p.lead_in),
                         &LeadKind::ALL[..],
                         Message::LeadInKindChanged,
                     ));
                     list = list.push(profile_picker(
                         "Wall lead-out",
+                        help::LEAD_OUT,
+                        self.tooltips,
                         LeadKind::of(p.lead_out),
                         &LeadKind::ALL[..],
                         Message::LeadOutKindChanged,
@@ -3368,6 +3669,8 @@ impl App {
                 Some(Operation::Face(f)) => {
                     list = list.push(profile_picker(
                         "Direction",
+                        help::FACE_DIRECTION,
+                        self.tooltips,
                         f.direction,
                         &Axis::ALL[..],
                         Message::FaceDirectionChanged,
@@ -3376,18 +3679,24 @@ impl App {
                 Some(Operation::Chamfer(c)) => {
                     list = list.push(profile_picker(
                         "Side",
+                        help::SIDE,
+                        self.tooltips,
                         c.side,
                         &Side::ALL[..],
                         Message::SideChanged,
                     ));
                     list = list.push(profile_picker(
                         "Lead-in",
+                        help::LEAD_IN,
+                        self.tooltips,
                         LeadKind::of(c.lead_in),
                         &LeadKind::ALL[..],
                         Message::LeadInKindChanged,
                     ));
                     list = list.push(profile_picker(
                         "Lead-out",
+                        help::LEAD_OUT,
+                        self.tooltips,
                         LeadKind::of(c.lead_out),
                         &LeadKind::ALL[..],
                         Message::LeadOutKindChanged,
@@ -3396,7 +3705,7 @@ impl App {
                     // when the chamfer is cut in multiple passes.
                     list = list.push(
                         row![
-                            text("Gradual").width(Length::Fixed(135.0)).size(13),
+                            label_help("Gradual", help::CHAMFER_GRADUAL, self.tooltips),
                             checkbox(c.gradual)
                                 .size(15)
                                 .on_toggle(Message::ChamferGradualToggled),
@@ -3408,18 +3717,24 @@ impl App {
                 Some(Operation::Thread(t)) => {
                     list = list.push(profile_picker(
                         "Bore",
+                        help::BORE,
+                        self.tooltips,
                         Bore::of(t.internal),
                         &Bore::ALL[..],
                         |b| Message::ThreadInternalChanged(b == Bore::Internal),
                     ));
                     list = list.push(profile_picker(
                         "Hand",
+                        help::HAND,
+                        self.tooltips,
                         t.hand,
                         &Hand::ALL[..],
                         Message::ThreadHandChanged,
                     ));
                     list = list.push(profile_picker(
                         "Cut",
+                        help::THREAD_CUT,
+                        self.tooltips,
                         CutStyle::of(t.climb),
                         &CutStyle::ALL[..],
                         |c| Message::ThreadClimbChanged(c == CutStyle::Climb),
@@ -3794,8 +4109,9 @@ fn toggle_cmd(icon: Icon, label: &'static str, on: bool, msg: Message) -> Comman
 }
 
 /// Render a single command at Full (`compact = false`, icon over label) or Compact
-/// (`compact = true`, icon only) density.
-fn render_command(command: &Command, compact: bool) -> Element<'static, Message> {
+/// (`compact = true`, icon only) density. When `show`, the button carries a hover
+/// tooltip describing the command — the icon's only self-explanation at Compact.
+fn render_command(command: &Command, compact: bool, show: bool) -> Element<'static, Message> {
     let (icon_px, width) = if compact {
         (22.0, COMPACT_W)
     } else {
@@ -3815,7 +4131,7 @@ fn render_command(command: &Command, compact: bool) -> Element<'static, Message>
     let base = button(content)
         .width(Length::Fixed(width))
         .padding(Padding::from([4.0, 2.0]));
-    match command.toggle {
+    let btn: Element<'static, Message> = match command.toggle {
         Some(on) => base
             .on_press_maybe(command.action.clone())
             .style(move |_theme, status| command_toggle_style(on, status))
@@ -3824,12 +4140,24 @@ fn render_command(command: &Command, compact: bool) -> Element<'static, Message>
             .on_press_maybe(command.action.clone())
             .style(|_theme, status| command_button_style(status))
             .into(),
+    };
+    if !show {
+        return btn;
     }
+    tooltip(
+        btn,
+        container(text(command.icon.help()).size(12))
+            .padding(8)
+            .max_width(300.0)
+            .style(container::rounded_box),
+        tooltip::Position::Bottom,
+    )
+    .into()
 }
 
 /// Render a whole group at its assigned density. Collapsed/Tight groups become a
 /// single button that toggles the group's popup (`index` in the active tab).
-fn render_group(spec: &GroupSpec, density: Density, index: usize) -> Element<'static, Message> {
+fn render_group(spec: &GroupSpec, density: Density, index: usize, show: bool) -> Element<'static, Message> {
     if density.is_popup() {
         let (icon_px, width) = if density == Density::Tight {
             (22.0, TIGHT_W)
@@ -3857,7 +4185,7 @@ fn render_group(spec: &GroupSpec, density: Density, index: usize) -> Element<'st
     let compact = density == Density::Compact;
     let mut commands = row![].spacing(CMD_GAP);
     for command in &spec.commands {
-        commands = commands.push(render_command(command, compact));
+        commands = commands.push(render_command(command, compact, show));
     }
     ribbon_group(spec.title, commands)
 }
@@ -4126,10 +4454,11 @@ fn tree_note<'a>(label: &str) -> Element<'a, Message> {
     .into()
 }
 
-/// An inspector field row: a label and a numeric text input bound to `field`.
-fn field_row<'a>(field: Field, value: &str) -> Element<'a, Message> {
+/// An inspector field row: a label (with a hover tooltip explaining it, when `show`)
+/// and a numeric text input bound to `field`.
+fn field_row<'a>(field: Field, value: &str, show: bool) -> Element<'a, Message> {
     row![
-        text(field.label()).width(Length::Fixed(135.0)).size(13),
+        label_help(field.label(), field.help(), show),
         text_input("", value)
             .on_input(move |v| Message::FieldChanged(field, v))
             .on_submit(Message::Apply)
@@ -4140,9 +4469,12 @@ fn field_row<'a>(field: Field, value: &str) -> Element<'a, Message> {
     .into()
 }
 
-/// A labelled strategy picker row (lead / plunge kind) for the profile inspector.
+/// A labelled strategy picker row (lead / plunge kind, side, …) for the inspector,
+/// with a hover tooltip (`help`) explaining the choice when `show`.
 fn profile_picker<T>(
     label: &str,
+    help: &'static str,
+    show: bool,
     selected: T,
     options: &'static [T],
     on_select: impl Fn(T) -> Message + 'static,
@@ -4151,7 +4483,7 @@ where
     T: ToString + PartialEq + Clone + 'static,
 {
     row![
-        text(label.to_string()).width(Length::Fixed(135.0)).size(13),
+        label_help(label.to_string(), help, show),
         pick_list(options, Some(selected), on_select)
             .text_size(13)
             .width(Length::Fixed(120.0)),
