@@ -9,10 +9,10 @@
 //! it is returned only if it holds engagement at the cap, covers the reachable
 //! target, and never gouges. The caller falls back to concentric clearing on `None`.
 //!
-//! Scope today: a simply-connected region, star-convex from the entry (so its loops
-//! spiral cleanly). Regions that split, grow an island, or are not star-convex from
-//! the entry fall back — cleared-region-tracked generation (the union front-advance)
-//! and corner handling return for those in later phases. The oracle guarantees every
+//! Scope today: a simply-connected region whose inward offsets stay a single loop
+//! (convex or gently concave, sharp corners included). Regions that split into lobes
+//! or grow an island fall back — cleared-region-tracked generation (the union
+//! front-advance) returns for those in a later phase. The oracle guarantees every
 //! emitted path is correct regardless, so this grows without ever shipping a bad one.
 
 use cam_geo::{offset, JoinStyle, Point, Polygon};
@@ -144,47 +144,57 @@ pub(crate) fn adaptive_path(
     ok.then_some(path)
 }
 
-/// The farthest positive-`s` intersection of the ray `c + s·d` (unit `d`) with the
-/// closed loop `pts`, as a point. `None` if the ray misses (a non-star-convex loop
-/// seen from `c`, which is not spiral-morphable — the caller falls back).
-fn ray_hit(c: Point, d: (f64, f64), pts: &[Point]) -> Option<Point> {
-    let n = pts.len();
-    let mut best_s = -1.0;
-    let mut best = None;
-    for i in 0..n {
-        let a = pts[i];
-        let b = pts[(i + 1) % n];
-        let (ex, ey) = (b.x - a.x, b.y - a.y);
-        let det = ex * d.1 - ey * d.0;
-        if det.abs() < 1e-12 {
-            continue;
-        }
-        let (rx, ry) = (a.x - c.x, a.y - c.y);
-        let s = (ex * ry - ey * rx) / det;
-        let u = (d.0 * ry - d.1 * rx) / det;
-        if (0.0..=1.0).contains(&u) && s > 1e-9 && s > best_s {
-            best_s = s;
-            best = Some(Point::new(c.x + d.0 * s, c.y + d.1 * s));
-        }
+/// Resample a closed loop to `n` points at even **arc-length** intervals, starting at
+/// the vertex whose direction from `center` is nearest +X (a phase alignment so the
+/// same parameter on successive loops lands at roughly the same place around them).
+///
+/// Arc length — not angle — is used because concentric offset loops are *equidistant*
+/// curves: the same arc-length fraction on adjacent loops stays ≈ a stepover apart
+/// perpendicular, on straights *and* around corners. Sampling by angle instead balloons
+/// the spacing at corners (a square corner is √2× farther out than its edge), which
+/// spikes the engagement there.
+fn resample_by_arclength(pts: &[Point], center: Point, n: usize) -> Option<Vec<Point>> {
+    let m = pts.len();
+    if m < 3 || n == 0 {
+        return None;
     }
-    best
-}
+    // Phase-align: start at the vertex whose direction from `center` is nearest +X.
+    let start = (0..m).min_by(|&a, &b| {
+        let angle = |k: usize| (pts[k].y - center.y).atan2(pts[k].x - center.x).abs();
+        angle(a).partial_cmp(&angle(b)).unwrap_or(std::cmp::Ordering::Equal)
+    })?;
+    let rot: Vec<Point> = (0..m).map(|k| pts[(start + k) % m]).collect();
 
-/// Resample a closed loop to `n` points at even angles about `center` (ray-cast).
-fn resample_by_angle(pts: &[Point], center: Point, n: usize) -> Option<Vec<Point>> {
-    (0..n)
-        .map(|i| {
-            let a = std::f64::consts::TAU * (i as f64) / (n as f64);
-            ray_hit(center, (a.cos(), a.sin()), pts)
-        })
-        .collect()
+    let perim: f64 = (0..m).map(|k| rot[k].distance(rot[(k + 1) % m])).sum();
+    if perim < 1e-9 {
+        return None;
+    }
+    let step = perim / n as f64;
+    let mut out = Vec::with_capacity(n);
+    out.push(rot[0]);
+    let mut dist_along = 0.0;
+    let mut next = step;
+    for k in 0..m {
+        let (a, b) = (rot[k], rot[(k + 1) % m]);
+        let seg = a.distance(b);
+        while out.len() < n && next <= dist_along + seg + 1e-9 {
+            let t = if seg > 1e-12 { ((next - dist_along) / seg).clamp(0.0, 1.0) } else { 0.0 };
+            out.push(Point::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t));
+            next += step;
+        }
+        dist_along += seg;
+    }
+    while out.len() < n {
+        out.push(rot[0]);
+    }
+    out.truncate(n);
+    Some(out)
 }
 
 /// Morph the concentric `loops` (inner-first) into one continuous spiral about
 /// `center`: within each revolution the point blends from loop `k` to loop `k+1`,
 /// so the radius grows a band per turn with no radial jump. Ends with a full lap of
-/// the outermost loop to finish the wall. Returns `None` if any loop is not
-/// star-convex from `center` (not spiral-morphable).
+/// the outermost loop to finish the wall.
 fn spiral(loops: &[Vec<Point>], center: Point) -> Option<Vec<Point>> {
     if loops.is_empty() {
         return None;
@@ -192,7 +202,7 @@ fn spiral(loops: &[Vec<Point>], center: Point) -> Option<Vec<Point>> {
     let n = ANGULAR_SAMPLES;
     let rings: Vec<Vec<Point>> = loops
         .iter()
-        .map(|l| resample_by_angle(l, center, n))
+        .map(|l| resample_by_arclength(l, center, n))
         .collect::<Option<_>>()?;
 
     let mut path = vec![center];
@@ -307,6 +317,30 @@ mod tests {
         let v = certify(&path, r, &region);
         assert!(v.max_engagement <= e * 1.2, "polygon oracle: bounded, got {}", v.max_engagement);
         assert!(v.uncut_area < 60.0, "polygon oracle: covered, uncut {}", v.uncut_area);
+    }
+
+    #[test]
+    fn a_square_pocket_goes_adaptive_with_bounded_corners() {
+        // Sharp corners: arc-length resampling keeps the spiral turns a stepover apart
+        // around the corners too (angle resampling would balloon to √2× and spike the
+        // engagement there). The square certifies, covered, engagement at the cap.
+        let region = Polygon::new(Contour::new(vec![
+            Point::new(0.0, 0.0),
+            Point::new(40.0, 0.0),
+            Point::new(40.0, 40.0),
+            Point::new(0.0, 40.0),
+        ]))
+        .unwrap();
+        let (r, e) = (3.0, 2.0);
+        let path = adaptive_path(&region, r, 0.0, e, Some([20.0, 20.0]))
+            .expect("a square pocket should certify");
+        let v = certify(&path, r, &region);
+        assert!(
+            v.max_engagement <= e * 1.2,
+            "corner engagement should be bounded, got {}",
+            v.max_engagement
+        );
+        assert!(v.gouge_area < 2.0, "no gouge, got {}", v.gouge_area);
     }
 
     #[test]
