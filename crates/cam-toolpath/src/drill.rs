@@ -49,12 +49,16 @@ impl Strategy for DrillStrategy {
                 ..Default::default()
             };
         }
-        // `depth` is a positive magnitude below the reference; the bottom is Z = -depth.
-        let bottom = -op.depth;
+        // Consistent with Face: `start_offset` raises the hole's top plane *above*
+        // the stock top (Z0 by convention) — positive starts it above the surface
+        // (a proud boss), negative below (a recessed/faced surface) — and `depth` is
+        // measured down from there, so the bottom is at `top + offset - depth`.
+        let hole_top = env.heights.top_of_stock + op.start_offset;
+        let bottom = hole_top - op.depth;
         if bottom >= env.heights.top_of_stock {
             diagnostics.push(Diagnostic::warning(format!(
-                "operation {}: depth {} does not reach below the stock top {}; nothing to drill",
-                op.id, op.depth, env.heights.top_of_stock
+                "operation {}: the hole bottom {bottom} does not reach below the stock top {}; nothing to drill",
+                op.id, env.heights.top_of_stock
             )));
             return StrategyResult {
                 diagnostics,
@@ -75,7 +79,7 @@ impl Strategy for DrillStrategy {
         let mut program = Program::new();
         program.push(Step::Drill(DrillCycle {
             points: op.points.clone(),
-            z_top: env.heights.top_of_stock,
+            z_top: hole_top,
             depth: bottom,
             retract: env.heights.retract,
             peck: op.peck,
@@ -89,5 +93,85 @@ impl Strategy for DrillStrategy {
             diagnostics,
             cancelled: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Severity;
+    use cam_cldata::Step;
+    use cam_model::{Heights, Tool, ToolKind};
+
+    fn tool() -> Tool {
+        Tool {
+            number: 1,
+            diameter: 5.0,
+            length: 40.0,
+            flutes: 2,
+            kind: ToolKind::Drill {
+                point_angle_deg: 118.0,
+            },
+        }
+    }
+
+    fn op(depth: f64, start_offset: f64) -> DrillOp {
+        DrillOp {
+            id: 7,
+            tool: 1,
+            points: vec![[10.0, 20.0]],
+            depth,
+            start_offset,
+            peck: None,
+            dwell: None,
+            feed: 100.0,
+        }
+    }
+
+    /// Extract `(z_top, bottom)` from the single emitted drill cycle.
+    fn cycle_planes(op: DrillOp) -> (f64, f64) {
+        let tools = [tool()];
+        let env = JobEnv {
+            heights: Heights::new(5.0, 2.0, 0.0),
+            tools: &tools,
+            stock: None,
+        };
+        let res = DrillStrategy::new(op).compute(&env, &CancelToken::new());
+        assert!(
+            !res.diagnostics.iter().any(|d| d.severity == Severity::Error),
+            "no errors"
+        );
+        match res.program.steps().iter().find_map(|s| match s {
+            Step::Drill(c) => Some(c),
+            _ => None,
+        }) {
+            Some(c) => (c.z_top, c.depth),
+            None => panic!("no drill cycle emitted"),
+        }
+    }
+
+    #[test]
+    fn no_offset_starts_at_the_stock_top_and_measures_depth_from_there() {
+        // top_of_stock = 0: the classic case, unchanged from before start_offset.
+        let (z_top, bottom) = cycle_planes(op(8.0, 0.0));
+        assert_eq!(z_top, 0.0);
+        assert_eq!(bottom, -8.0);
+    }
+
+    #[test]
+    fn a_positive_offset_starts_above_the_stock_top() {
+        // A proud boss 3 mm above the stock top (Face convention): the whole hole
+        // shifts up, and it is still `depth` deep from its start.
+        let (z_top, bottom) = cycle_planes(op(8.0, 3.0));
+        assert_eq!(z_top, 3.0, "starts 3 mm above the stock top");
+        assert_eq!(bottom, -5.0, "8 mm deep from the +3 start");
+    }
+
+    #[test]
+    fn a_negative_offset_starts_below_the_stock_top() {
+        // Drilling from a surface 2 mm below the stock top (recessed/faced).
+        let (z_top, bottom) = cycle_planes(op(8.0, -2.0));
+        assert_eq!(z_top, -2.0);
+        assert_eq!(bottom, -10.0);
     }
 }

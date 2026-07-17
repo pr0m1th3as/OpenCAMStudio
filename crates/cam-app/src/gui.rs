@@ -166,6 +166,7 @@ fn icon_svg(icon: Icon, size: f32) -> Element<'static, Message> {
         .height(Length::Fixed(size))
         .into()
 }
+use cam_cldata::{Program, Step};
 use cam_render::{MeshVertex, OrbitCamera, Scene, Vertex, PART};
 use cam_toolpath::{CancelToken, Severity};
 
@@ -654,6 +655,12 @@ enum Field {
     /// Thread mill's ground pitch (mm); 0 means single-form (any pitch).
     ToolThreadPitch,
     Depth,
+    /// Drill start plane, as a distance below the stock top (mm); 0 = at the top.
+    DrillStartOffset,
+    /// Drill peck increment (mm); 0 = drill straight to depth (no peck).
+    Peck,
+    /// Drill dwell at the hole bottom (seconds); 0 = no dwell.
+    Dwell,
     Stepdown,
     Stepover,
     /// Profile finishing allowance left on the wall (mm).
@@ -724,6 +731,9 @@ impl Field {
             Field::PointAngle => "Point angle (deg)",
             Field::ToolThreadPitch => "Tool pitch (mm, 0=any)",
             Field::Depth => "Depth (mm)",
+            Field::DrillStartOffset => "Start offset (mm)",
+            Field::Peck => "Peck (mm, 0=off)",
+            Field::Dwell => "Dwell (s, 0=off)",
             Field::ProfileOffset => "Offset / leave (mm)",
             Field::Stepdown => "Stepdown (mm)",
             Field::Stepover => "Stepover (mm)",
@@ -826,6 +836,22 @@ impl Field {
             Field::Depth => {
                 "Total cut depth below the top of stock (a positive distance). The \
                  feature's floor sits this far down."
+            }
+            Field::DrillStartOffset => {
+                "Where the hole begins, as a height above the stock top (mm) — the same \
+                 convention as the facing start offset. 0 starts at the stock top; a \
+                 positive value starts above it (a proud boss); negative starts below \
+                 (a recessed or faced surface). Depth is measured down from here."
+            }
+            Field::Peck => {
+                "Peck-drilling increment (mm): the drill cuts this deep, fully retracts \
+                 to clear chips, then returns and repeats until it reaches depth. \
+                 0 = drill straight to depth in one plunge (no pecking)."
+            }
+            Field::Dwell => {
+                "Dwell at the bottom of the hole (seconds): the tool pauses with the \
+                 spindle turning before retracting, cleaning up the hole bottom. \
+                 0 = no dwell."
             }
             Field::ProfileOffset => {
                 "Finishing allowance left on the wall (mm): the roughing pass stops this \
@@ -1247,6 +1273,101 @@ fn add_loop_highlight(scene: &mut Scene, c: &cam_geo::Contour, color: [f32; 4]) 
         strip.push(first); // close the loop
     }
     scene.add_strip(strip, color);
+}
+
+/// Colour of the drilling annotations — a light blue, distinct from the cyan snap
+/// and magenta origin markers and legible under red-green colour deficiency.
+const DRILL_MARK: [f32; 4] = [0.40, 0.72, 1.0, 1.0];
+/// Radius of a peck ring / half-length of a dwell bar, in **screen pixels** (so the
+/// mark never scales with the model — it is sized against `world_per_pixel` at draw).
+const DRILL_MARK_PX: f32 = 4.4;
+/// Facets in a peck ring (a billboarded circle drawn as a line loop).
+const DRILL_RING_SEGMENTS: usize = 16;
+/// Safety cap on rings per hole, so a pathologically tiny peck can't flood the buffer.
+const DRILL_MAX_RINGS: u32 = 200;
+
+/// A drilling annotation anchored in world space: a **ring** at a peck retract
+/// depth, or a horizontal **bar** at the hole bottom when it dwells. The pixel
+/// sizing/billboarding happens at draw time (see [`Viewport::draw`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DrillMark {
+    at: [f32; 3],
+    kind: DrillMarkKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DrillMarkKind {
+    /// A peck retract level (locates the pecking).
+    PeckRing,
+    /// The exact bottom where a dwelling drill stops.
+    DwellBar,
+}
+
+/// Collect the drilling annotation anchors from a backplot program: a ring at each
+/// **intermediate** peck retract (strictly between the hole top and bottom — the
+/// bottom is the plunge-line end, not a peck), and a bar at the bottom of every
+/// hole that dwells. Pure; the screen sizing is applied later, per frame.
+fn drill_marks_of(program: &Program) -> Vec<DrillMark> {
+    let mut marks = Vec::new();
+    for step in program.steps() {
+        let Step::Drill(c) = step else { continue };
+        for &[x, y] in &c.points {
+            let (x, y) = (x as f32, y as f32);
+            if let Some(peck) = c.peck.filter(|p| *p > 0.0) {
+                let mut k = 1u32;
+                loop {
+                    let z = c.z_top - peck * k as f64;
+                    if z <= c.depth + 1e-6 || k > DRILL_MAX_RINGS {
+                        break; // reached (or passed) the bottom — that's not a peck
+                    }
+                    marks.push(DrillMark {
+                        at: [x, y, z as f32],
+                        kind: DrillMarkKind::PeckRing,
+                    });
+                    k += 1;
+                }
+            }
+            if c.dwell.is_some() {
+                marks.push(DrillMark {
+                    at: [x, y, c.depth as f32],
+                    kind: DrillMarkKind::DwellBar,
+                });
+            }
+        }
+    }
+    marks
+}
+
+/// Append `mark`, sized to `px_world` (world mm for the desired pixel size) and
+/// billboarded into the camera's `right`/`up` plane, to a `LineList` vertex buffer.
+fn push_drill_mark(out: &mut Vec<Vertex>, mark: DrillMark, px_world: f32, right: [f32; 3], up: [f32; 3]) {
+    let at = mark.at;
+    let point = |du: f32, dv: f32| Vertex {
+        position: [
+            at[0] + du * right[0] + dv * up[0],
+            at[1] + du * right[1] + dv * up[1],
+            at[2] + du * right[2] + dv * up[2],
+        ],
+        color: DRILL_MARK,
+    };
+    match mark.kind {
+        DrillMarkKind::PeckRing => {
+            let r = px_world;
+            let n = DRILL_RING_SEGMENTS;
+            for i in 0..n {
+                let a0 = i as f32 / n as f32 * std::f32::consts::TAU;
+                let a1 = (i + 1) as f32 / n as f32 * std::f32::consts::TAU;
+                out.push(point(r * a0.cos(), r * a0.sin()));
+                out.push(point(r * a1.cos(), r * a1.sin()));
+            }
+        }
+        DrillMarkKind::DwellBar => {
+            // A little wider than a ring so the exact stop reads as a crisp line.
+            let h = px_world * 1.4;
+            out.push(point(-h, 0.0));
+            out.push(point(h, 0.0));
+        }
+    }
 }
 
 /// The `(yaw, pitch)` that views a cube face (given by its outward normal)
@@ -2452,7 +2573,13 @@ impl App {
                     Field::Feed,
                     Field::PlungeFeed,
                 ],
-                Some(Operation::Drill(_)) => vec![Field::Depth, Field::Feed],
+                Some(Operation::Drill(_)) => vec![
+                    Field::Depth,
+                    Field::DrillStartOffset,
+                    Field::Peck,
+                    Field::Dwell,
+                    Field::Feed,
+                ],
                 Some(Operation::Chamfer(c)) => {
                     let mut fields = vec![
                         Field::ChamferWidth,
@@ -4238,6 +4365,9 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Face(o), Field::Feed) => Some(o.feed),
         (Operation::Face(o), Field::PlungeFeed) => Some(o.plunge_feed),
         (Operation::Drill(o), Field::Depth) => Some(o.depth),
+        (Operation::Drill(o), Field::DrillStartOffset) => Some(o.start_offset),
+        (Operation::Drill(o), Field::Peck) => Some(o.peck.unwrap_or(0.0)),
+        (Operation::Drill(o), Field::Dwell) => Some(o.dwell.unwrap_or(0.0)),
         (Operation::Drill(o), Field::Feed) => Some(o.feed),
         (Operation::Chamfer(o), Field::ChamferWidth) => Some(o.width),
         (Operation::Chamfer(o), Field::ChamferDepth) => Some(o.depth),
@@ -4361,6 +4491,16 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
         Operation::Drill(o) => {
             if let Some(v) = get(Field::Depth) {
                 o.depth = v;
+            }
+            if let Some(v) = get(Field::DrillStartOffset) {
+                o.start_offset = v;
+            }
+            if let Some(v) = get(Field::Peck) {
+                // 0 (or negative) clears pecking; the toolpath requires peck > 0.
+                o.peck = (v > 0.0).then_some(v);
+            }
+            if let Some(v) = get(Field::Dwell) {
+                o.dwell = (v > 0.0).then_some(v);
             }
             if let Some(v) = get(Field::Feed) {
                 o.feed = v;
@@ -4590,6 +4730,9 @@ struct Viewport {
     snap_engaged: bool,
     /// The world Z of the plane clicks are projected onto (top of stock).
     pick_z: f32,
+    /// Drilling annotations (peck rings / dwell bars) anchored in world space;
+    /// sized to constant screen pixels and billboarded in [`Self::draw`].
+    drill_marks: Vec<DrillMark>,
 }
 
 impl Viewport {
@@ -4621,6 +4764,12 @@ impl Viewport {
                 scene
             }
         };
+        // Drilling annotations from the backplot (peck rings + dwell bars), once a
+        // run has produced a program. Anchors only — sized to the screen at draw.
+        let drill_marks = controller
+            .outcome()
+            .map(|o| drill_marks_of(&o.program))
+            .unwrap_or_default();
         // Frame the camera on the *stable* part/backplot only — capture bounds
         // before the transient pick overlays (hover highlight, snap marker), or
         // the whole view would re-fit and drift as the cursor moves.
@@ -4703,6 +4852,7 @@ impl Viewport {
             set_origin,
             snap_engaged: snap.is_some(),
             pick_z,
+            drill_marks,
         }
     }
 
@@ -4911,8 +5061,23 @@ impl shader::Program<Message> for Viewport {
         } else {
             1.0
         };
+        // Drilling annotations are sized here, where the viewport's pixel height is
+        // known, so they stay a constant screen size at any zoom (never scaling with
+        // the model) and billboard to face the camera at any orbit angle.
+        let vertices = if self.drill_marks.is_empty() {
+            self.vertices.clone()
+        } else {
+            let cam = self.camera();
+            let px_world = DRILL_MARK_PX * cam.world_per_pixel(bounds.height);
+            let (right, up) = (cam.right(), cam.up());
+            let mut v = (*self.vertices).clone();
+            for &mark in &self.drill_marks {
+                push_drill_mark(&mut v, mark, px_world, right, up);
+            }
+            Arc::new(v)
+        };
         ScenePrimitive {
-            vertices: self.vertices.clone(),
+            vertices,
             mesh_vertices: self.mesh_vertices.clone(),
             mesh_indices: self.mesh_indices.clone(),
             view_proj: self.camera().view_proj(aspect),
@@ -5152,6 +5317,135 @@ impl shader::Primitive for ScenePrimitive {
         gizmo_pass.set_viewport(gx as f32, gy as f32, size as f32, size as f32, 0.0, 1.0);
         gizmo_pass.set_scissor_rect(gx, gy, size, size);
         pipeline.gizmo.draw(&mut gizmo_pass);
+    }
+}
+
+#[cfg(test)]
+mod inspector_field_tests {
+    use super::*;
+    use cam_model::DrillOp;
+
+    fn drill(peck: Option<f64>, dwell: Option<f64>) -> Operation {
+        Operation::Drill(DrillOp {
+            id: 1,
+            tool: 1,
+            points: vec![[0.0, 0.0]],
+            depth: 10.0,
+            start_offset: 0.0,
+            peck,
+            dwell,
+            feed: 100.0,
+        })
+    }
+
+    #[test]
+    fn drill_exposes_peck_and_dwell_fields() {
+        let fields = match drill(None, None) {
+            Operation::Drill(_) => vec![Field::Depth, Field::Peck, Field::Dwell, Field::Feed],
+            _ => unreachable!(),
+        };
+        assert!(fields.contains(&Field::Peck));
+        assert!(fields.contains(&Field::Dwell));
+    }
+
+    #[test]
+    fn peck_and_dwell_round_trip_with_a_zero_off_sentinel() {
+        // Set: an on-value writes Some; then the same read shows it back.
+        let mut op = drill(None, None);
+        let mut parsed = BTreeMap::new();
+        parsed.insert(Field::Peck, 2.5);
+        parsed.insert(Field::Dwell, 0.75);
+        apply_op_fields(&mut op, &parsed);
+        assert_eq!(op_field(&op, Field::Peck), Some(2.5));
+        assert_eq!(op_field(&op, Field::Dwell), Some(0.75));
+        if let Operation::Drill(o) = &op {
+            assert_eq!(o.peck, Some(2.5));
+            assert_eq!(o.dwell, Some(0.75));
+        }
+
+        // 0 clears both back to None (off), and a disabled field reads as 0.
+        let mut off = BTreeMap::new();
+        off.insert(Field::Peck, 0.0);
+        off.insert(Field::Dwell, 0.0);
+        apply_op_fields(&mut op, &off);
+        assert_eq!(op_field(&op, Field::Peck), Some(0.0));
+        assert_eq!(op_field(&op, Field::Dwell), Some(0.0));
+        if let Operation::Drill(o) = &op {
+            assert_eq!(o.peck, None, "0 must clear peck to None (toolpath needs peck>0)");
+            assert_eq!(o.dwell, None);
+        }
+    }
+
+    fn drilled(peck: Option<f64>, dwell: Option<f64>) -> Program {
+        use cam_cldata::{DrillCycle, MoveKind, Tag};
+        let mut prog = Program::new();
+        prog.push(Step::Drill(DrillCycle {
+            points: vec![[0.0, 0.0], [5.0, 0.0]],
+            z_top: 0.0,
+            depth: -6.0,
+            retract: 2.0,
+            peck,
+            dwell,
+            feed: 100.0,
+            tag: Tag::new(1, MoveKind::Plunge),
+        }));
+        prog
+    }
+
+    #[test]
+    fn peck_rings_land_on_intermediate_depths_only_never_the_bottom() {
+        // depth 6, peck 2 ⇒ retracts at -2 and -4; the -6 bottom is not a peck.
+        let marks = drill_marks_of(&drilled(Some(2.0), None));
+        let rings: Vec<f32> = marks
+            .iter()
+            .filter(|m| m.kind == DrillMarkKind::PeckRing && m.at[0] == 0.0)
+            .map(|m| m.at[2])
+            .collect();
+        assert_eq!(rings, vec![-2.0, -4.0], "one ring per intermediate peck");
+        assert!(
+            !marks.iter().any(|m| m.at[2] <= -6.0),
+            "no mark sits at or below the bottom for a non-dwelling hole"
+        );
+        // Two holes ⇒ the rings are mirrored at the second point.
+        assert_eq!(
+            marks.iter().filter(|m| m.kind == DrillMarkKind::PeckRing).count(),
+            4
+        );
+    }
+
+    #[test]
+    fn a_dwelling_hole_gets_one_bar_at_the_exact_bottom_per_point() {
+        let marks = drill_marks_of(&drilled(None, Some(0.5)));
+        let bars: Vec<[f32; 3]> = marks
+            .iter()
+            .filter(|m| m.kind == DrillMarkKind::DwellBar)
+            .map(|m| m.at)
+            .collect();
+        assert_eq!(bars, vec![[0.0, 0.0, -6.0], [5.0, 0.0, -6.0]]);
+        assert!(!marks.iter().any(|m| m.kind == DrillMarkKind::PeckRing));
+    }
+
+    #[test]
+    fn a_plain_hole_has_no_annotations() {
+        assert!(drill_marks_of(&drilled(None, None)).is_empty());
+    }
+
+    #[test]
+    fn a_peck_bigger_than_the_hole_rings_nothing() {
+        // First peck already reaches the bottom ⇒ no intermediate retract to mark.
+        let marks = drill_marks_of(&drilled(Some(20.0), None));
+        assert!(marks.is_empty());
+    }
+
+    #[test]
+    fn a_negative_peck_is_treated_as_off_not_stored() {
+        let mut op = drill(Some(1.0), None);
+        let mut parsed = BTreeMap::new();
+        parsed.insert(Field::Peck, -3.0);
+        apply_op_fields(&mut op, &parsed);
+        if let Operation::Drill(o) = &op {
+            assert_eq!(o.peck, None, "a negative peck must not reach the toolpath");
+        }
     }
 }
 

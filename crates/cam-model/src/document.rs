@@ -245,9 +245,16 @@ pub struct DrillOp {
     pub tool: u32,
     /// Hole positions in the part/WCS frame.
     pub points: Vec<[f64; 2]>,
-    /// Hole depth below the reference plane (Z=0), as a positive magnitude (mm).
-    /// The hole bottom sits at absolute Z `-depth`.
+    /// Hole depth (mm, a positive magnitude) measured **down from where the hole
+    /// starts** — i.e. from `top_of_stock + start_offset`. The bottom sits at
+    /// absolute Z `top_of_stock + start_offset - depth`.
     pub depth: f64,
+    /// Where the hole begins, as a height **above the stock top** (mm), matching the
+    /// Face convention. `0` (the default) starts at the stock top; positive starts it
+    /// above the surface (a proud boss); negative below (a recessed/faced surface).
+    /// Depth is measured down from here.
+    #[serde(default)]
+    pub start_offset: f64,
     /// Peck increment (mm, > 0); `None` drills straight.
     pub peck: Option<f64>,
     /// Dwell at the bottom, seconds; `None` for no dwell.
@@ -783,6 +790,7 @@ mod tests {
             tool: 1,
             points: vec![[0.0, 0.0]],
             depth: 4.0,
+            start_offset: 0.0,
             peck: None,
             dwell: None,
             feed: 100.0,
