@@ -1016,4 +1016,91 @@ mod tests {
             }
         }
     }
+
+    /// An outside profile set up for radial roughing: a square part (the chain) that
+    /// the stock frames, with a stepover and (optionally) an engagement cap.
+    fn outside_rough_op(engagement: f64) -> ProfileOp {
+        ProfileOp {
+            clearing: cam_model::Clearing { engagement, climb: true },
+            id: 0,
+            tool: 1,
+            // A 20×20 part; the stock is a 60×60 block, so the frame around it is the
+            // same annulus the adaptive frame clearer certifies.
+            chain: Contour::new(vec![
+                Point::new(20.0, 20.0),
+                Point::new(40.0, 20.0),
+                Point::new(40.0, 40.0),
+                Point::new(20.0, 40.0),
+            ]),
+            side: Side::Outside,
+            comp: Comp::Computed,
+            depth: 2.0,
+            stepdown: 2.0, // one depth level
+            offset: 0.0,
+            stepover: 4.0,
+            feed: 300.0,
+            plunge_feed: 100.0,
+            plunge: Plunge::Straight,
+            start: None,
+            lead_in: Lead::None,
+            lead_out: Lead::None,
+            lead_overlap: 0.0,
+        }
+    }
+
+    fn run_outside_rough(op: ProfileOp) -> StrategyResult {
+        let ts = [Tool {
+            number: 1,
+            diameter: 6.0,
+            length: 30.0,
+            flutes: 2,
+            kind: ToolKind::EndMill,
+        }];
+        let env = crate::JobEnv {
+            heights: Heights::new(5.0, 2.0, 0.0),
+            tools: &ts,
+            stock: Some(([0.0, 0.0], [60.0, 60.0])),
+        };
+        ProfileStrategy::new(op).compute(&env, &crate::CancelToken::new())
+    }
+
+    fn plunge_count(r: &StrategyResult) -> usize {
+        r.program
+            .steps()
+            .iter()
+            .filter(|s| matches!(s, Step::Linear { tag, .. } if tag.kind == MoveKind::Plunge))
+            .count()
+    }
+
+    fn cut_count(r: &StrategyResult) -> usize {
+        r.program
+            .steps()
+            .iter()
+            .filter(|s| matches!(s, Step::Linear { tag, .. } if tag.kind == MoveKind::Cutting))
+            .count()
+    }
+
+    #[test]
+    fn outside_roughing_with_an_engagement_cap_goes_through_the_adaptive_frame() {
+        // Outside roughing frames the part with the stock as an annulus, so an
+        // engagement cap must route it through the certified adaptive frame path — the
+        // same one pockets-with-islands use.
+        //
+        // The rigorous signature: when the adaptive frame *cannot* certify, `clear`
+        // falls back to the plain concentric path — producing output byte-identical to
+        // the engagement-disabled run. So any observable difference from the concentric
+        // baseline proves the adaptive frame path was genuinely emitted (not fallen back).
+        let concentric = run_outside_rough(outside_rough_op(0.0));
+        assert!(!concentric.has_errors(), "{:?}", concentric.diagnostics);
+        let adaptive = run_outside_rough(outside_rough_op(2.0));
+        assert!(!adaptive.has_errors(), "{:?}", adaptive.diagnostics);
+
+        assert!(cut_count(&adaptive) > 50, "the frame cuts, got {}", cut_count(&adaptive));
+        assert_ne!(
+            (plunge_count(&adaptive), cut_count(&adaptive)),
+            (plunge_count(&concentric), cut_count(&concentric)),
+            "engagement>0 must change the path — identical output would mean it fell \
+             back to concentric instead of certifying the adaptive frame"
+        );
+    }
 }
