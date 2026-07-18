@@ -569,10 +569,11 @@ enum ToolKindPick {
     Drill,
     FaceMill,
     ThreadMill,
+    VBit,
 }
 
 impl ToolKindPick {
-    const ALL: [ToolKindPick; 7] = [
+    const ALL: [ToolKindPick; 8] = [
         ToolKindPick::EndMill,
         ToolKindPick::BallMill,
         ToolKindPick::BullNose,
@@ -580,6 +581,7 @@ impl ToolKindPick {
         ToolKindPick::Drill,
         ToolKindPick::FaceMill,
         ToolKindPick::ThreadMill,
+        ToolKindPick::VBit,
     ];
 
     fn of(kind: ToolKind) -> Self {
@@ -591,6 +593,7 @@ impl ToolKindPick {
             ToolKind::Drill { .. } => ToolKindPick::Drill,
             ToolKind::FaceMill => ToolKindPick::FaceMill,
             ToolKind::ThreadMill { .. } => ToolKindPick::ThreadMill,
+            ToolKind::VBit { .. } => ToolKindPick::VBit,
         }
     }
 
@@ -609,6 +612,10 @@ impl ToolKindPick {
             },
             ToolKindPick::FaceMill => ToolKind::FaceMill,
             ToolKindPick::ThreadMill => ToolKind::ThreadMill { pitch: None },
+            ToolKindPick::VBit => ToolKind::VBit {
+                included_angle_deg: 60.0,
+                tip_radius: 0.0,
+            },
         }
     }
 }
@@ -627,6 +634,7 @@ fn tool_kind_fields(kind: ToolKind) -> Vec<Field> {
         ToolKind::ChamferMill { .. } => vec![Field::ChamferAngle, Field::TipDiameter],
         ToolKind::Drill { .. } => vec![Field::PointAngle],
         ToolKind::ThreadMill { .. } => vec![Field::ToolThreadPitch],
+        ToolKind::VBit { .. } => vec![Field::PointAngle, Field::TipRadius],
         ToolKind::EndMill | ToolKind::BallMill | ToolKind::FaceMill => Vec::new(),
     }
 }
@@ -642,6 +650,8 @@ fn tool_kind_field(kind: ToolKind, field: Field) -> Option<f64> {
         (ToolKind::Drill { point_angle_deg }, Field::PointAngle) => Some(point_angle_deg),
         // Single-form (None) shows as 0 — "any pitch".
         (ToolKind::ThreadMill { pitch }, Field::ToolThreadPitch) => Some(pitch.unwrap_or(0.0)),
+        (ToolKind::VBit { included_angle_deg, .. }, Field::PointAngle) => Some(included_angle_deg),
+        (ToolKind::VBit { tip_radius, .. }, Field::TipRadius) => Some(tip_radius),
         _ => None,
     }
 }
@@ -718,6 +728,17 @@ fn apply_tool_kind_fields(kind: &mut ToolKind, parsed: &BTreeMap<Field, f64>) {
                 *pitch = (v > 0.0).then_some(v);
             }
         }
+        ToolKind::VBit {
+            included_angle_deg,
+            tip_radius,
+        } => {
+            if let Some(v) = get(Field::PointAngle) {
+                *included_angle_deg = v;
+            }
+            if let Some(v) = get(Field::TipRadius) {
+                *tip_radius = v.max(0.0);
+            }
+        }
         ToolKind::EndMill | ToolKind::BallMill | ToolKind::FaceMill => {}
     }
 }
@@ -768,6 +789,8 @@ enum Field {
     ChamferAngle,
     /// Chamfer/V mill flat-tip diameter (mm).
     TipDiameter,
+    /// V-bit rounded-tip radius (mm).
+    TipRadius,
     /// Drill point angle (deg).
     PointAngle,
     /// Thread mill's ground pitch (mm); 0 means single-form (any pitch).
@@ -851,6 +874,7 @@ impl Field {
             Field::CornerRadius => "Corner radius (mm)",
             Field::ChamferAngle => "Point angle (deg)",
             Field::TipDiameter => "Tip ⌀ (mm)",
+            Field::TipRadius => "Tip radius (mm)",
             Field::PointAngle => "Point angle (deg)",
             Field::ToolThreadPitch => "Tool pitch (mm, 0=any)",
             Field::Depth => "Depth (mm)",
@@ -968,6 +992,9 @@ impl Field {
             }
             Field::TipDiameter => {
                 "Flat diameter at the very tip of a chamfer/V tool. 0 = a true point."
+            }
+            Field::TipRadius => {
+                "Rounded-tip radius of a carving V-bit. 0 = a sharp point."
             }
             Field::PointAngle => {
                 "Included angle of the drill point (e.g. 118° or 135°) — used to place \
@@ -2895,8 +2922,21 @@ impl App {
                     (Some(cr), Some(d)) if cr > d * 0.5 + 1e-9)
             }
             Field::PointAngle => {
-                // Drill point angle is bounded to [90°, 135°].
-                !matches!(buf(Field::PointAngle), Some(a) if (90.0..=135.0).contains(&a))
+                let Some(a) = buf(Field::PointAngle) else {
+                    return true;
+                };
+                match self.inspected_tool_kind() {
+                    // Drill point angle is bounded to [90°, 135°].
+                    Some(ToolKind::Drill { .. }) => !(90.0..=135.0).contains(&a),
+                    // A V-bit's included angle just has to be a valid cone.
+                    Some(ToolKind::VBit { .. }) => !(0.0 < a && a < 180.0),
+                    _ => false,
+                }
+            }
+            Field::TipRadius => {
+                // A V-bit's tip radius cannot exceed the shaft radius (⌀/2).
+                matches!((buf(Field::TipRadius), buf(Field::ToolDiameter)),
+                    (Some(tr), Some(d)) if tr > d * 0.5 + 1e-9)
             }
             Field::FluteLength => {
                 let Some(fl) = buf(Field::FluteLength) else {
@@ -3004,6 +3044,14 @@ impl App {
                 Field::ShankLength,
                 Field::ToolLength,
                 Field::PointAngle,
+            ],
+            // V-bit: shaft ⌀, overall length, point angle, tip radius. No flute length /
+            // count (the cutting cone's length is derived).
+            Some(ToolKind::VBit { .. }) => vec![
+                Field::ToolDiameter,
+                Field::ToolLength,
+                Field::PointAngle,
+                Field::TipRadius,
             ],
             other => {
                 let mut f = vec![
@@ -5409,8 +5457,9 @@ fn kind_order(kind: ToolKind) -> u8 {
         ToolKind::BullNose { .. } => 2,
         ToolKind::FaceMill => 3,
         ToolKind::ChamferMill { .. } => 4,
-        ToolKind::Drill { .. } => 5,
-        ToolKind::ThreadMill { .. } => 6,
+        ToolKind::VBit { .. } => 5,
+        ToolKind::Drill { .. } => 6,
+        ToolKind::ThreadMill { .. } => 7,
     }
 }
 
@@ -6191,13 +6240,22 @@ struct ToolCanvas {
 
 impl ToolCanvas {
     fn new(tool: &cam_model::Tool) -> Self {
+        let profile = tool.profile();
+        // The flute helix spans the actual cutting region — the flute length for an end
+        // mill, the cone for a V-bit / drill — read off the profile's cutting segments.
+        let cutting_top = profile
+            .segs
+            .iter()
+            .filter(|s| s.cutting)
+            .map(|s| s.end.y)
+            .fold(0.0_f64, f64::max);
         Self {
-            profile: tool.profile(),
             diameter: tool.diameter,
             length: tool.length,
-            flute_length: tool.flute_len(),
+            flute_length: cutting_top,
             flutes: tool.flutes,
             cutting_direction: tool.cutting_direction,
+            profile,
         }
     }
 }

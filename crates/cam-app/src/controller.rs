@@ -1787,6 +1787,15 @@ fn sim_profile(tool: &Tool) -> ToolProfile {
             half_angle_rad: point_angle_deg.to_radians() / 2.0,
             flat_radius: 0.0,
         },
+        // A V-bit's removal is its cone; the rounded tip is approximated as a flat of
+        // the tip radius (a close-enough footprint for the height-field sim).
+        ToolKind::VBit {
+            included_angle_deg,
+            tip_radius,
+        } => ProfileShape::Cone {
+            half_angle_rad: included_angle_deg.to_radians() / 2.0,
+            flat_radius: tip_radius.clamp(0.0, radius),
+        },
         // A thread mill's material removal is approximated by its footprint.
         ToolKind::ThreadMill { .. } => ProfileShape::Flat,
     };

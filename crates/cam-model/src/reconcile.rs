@@ -43,6 +43,7 @@ enum ToolKindId {
     Drill { angle_mdeg: i64 },
     /// `pitch_um == 0` ⇒ single-form (`None`).
     ThreadMill { pitch_um: i64 },
+    VBit { angle_mdeg: i64, tip_um: i64 },
 }
 
 fn kind_id(k: &ToolKind) -> ToolKindId {
@@ -65,6 +66,13 @@ fn kind_id(k: &ToolKind) -> ToolKindId {
         },
         ToolKind::ThreadMill { pitch } => ToolKindId::ThreadMill {
             pitch_um: pitch.map_or(0, q),
+        },
+        ToolKind::VBit {
+            included_angle_deg,
+            tip_radius,
+        } => ToolKindId::VBit {
+            angle_mdeg: qa(included_angle_deg),
+            tip_um: q(tip_radius),
         },
     }
 }

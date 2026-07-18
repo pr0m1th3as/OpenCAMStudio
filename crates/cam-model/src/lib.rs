@@ -143,6 +143,15 @@ pub enum ToolKind {
         /// Full-profile pitch, mm; `None` for a single-form mill.
         pitch: Option<f64>,
     },
+    /// Carving **V-bit**: a cone rising at `included_angle_deg` (full V angle) from a
+    /// rounded tip of `tip_radius` mm (0 = a sharp point) up to the shaft diameter. The
+    /// cone is the cutting portion; there is no separate flute length.
+    VBit {
+        /// Full included V angle, degrees.
+        included_angle_deg: f64,
+        /// Rounded-tip radius, mm (0 for a sharp point).
+        tip_radius: f64,
+    },
 }
 
 impl std::fmt::Display for ToolKind {
@@ -155,6 +164,7 @@ impl std::fmt::Display for ToolKind {
             ToolKind::Drill { .. } => "Drill bit",
             ToolKind::FaceMill => "Face mill",
             ToolKind::ThreadMill { .. } => "Thread mill",
+            ToolKind::VBit { .. } => "V-bit",
         };
         f.write_str(s)
     }
@@ -292,6 +302,10 @@ impl Tool {
     /// the true tooth form is a later refinement; see the build log.)
     pub fn profile(&self) -> cam_geo::Profile2D {
         use cam_geo::BottomShape;
+        // A V-bit's cutting is the whole cone (no separate flute length); passing
+        // flute_length 0 clamps the flute top to the cone top, so the cone is cutting
+        // and the shaft above is non-cutting.
+        let mut flute_length = self.flute_len();
         let bottom = match self.kind {
             ToolKind::EndMill | ToolKind::FaceMill | ToolKind::ThreadMill { .. } => {
                 BottomShape::Flat
@@ -309,10 +323,20 @@ impl Tool {
                 half_angle_rad: (point_angle_deg * 0.5).to_radians(),
                 flat_radius: 0.0,
             },
+            ToolKind::VBit {
+                included_angle_deg,
+                tip_radius,
+            } => {
+                flute_length = 0.0;
+                BottomShape::VTip {
+                    half_angle_rad: (included_angle_deg * 0.5).to_radians(),
+                    tip_radius,
+                }
+            }
         };
         cam_geo::generatrix(&cam_geo::GeneratrixSpec {
             radius: self.radius(),
-            flute_length: self.flute_len(),
+            flute_length,
             shank_radius: self.shank_dia() * 0.5,
             length: self.length,
             neck_length: self.neck_length,

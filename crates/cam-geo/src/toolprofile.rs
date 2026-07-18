@@ -62,6 +62,14 @@ pub enum BottomShape {
         /// Flat-tip radius, mm.
         flat_radius: f64,
     },
+    /// Carving V-bit cone with a **rounded** tip: a `tip_radius` arc tangent to a cone
+    /// of half-angle `half_angle_rad` (from the axis). `tip_radius == 0` = a sharp cone.
+    VTip {
+        /// Half of the included V angle, from the axis (radians).
+        half_angle_rad: f64,
+        /// Rounded-tip radius, mm.
+        tip_radius: f64,
+    },
 }
 
 /// Neutral parameters for [`generatrix`] — no `cam-model` dependency. All lengths mm.
@@ -144,6 +152,28 @@ pub fn generatrix(spec: &GeneratrixSpec) -> Profile2D {
             };
             segs.push(line(Point::new(r, z_apex), true));
             z_apex
+        }
+        BottomShape::VTip {
+            half_angle_rad,
+            tip_radius,
+        } => {
+            let a = half_angle_rad;
+            let rt = tip_radius.clamp(0.0, r);
+            if rt <= EPS || a <= EPS {
+                // Sharp cone (no tip radius).
+                let z_apex = if a > EPS { r / a.tan() } else { 0.0 };
+                segs.push(line(Point::new(r, z_apex), true));
+                z_apex
+            } else {
+                // Rounded tip: an arc of radius rt (centre on the axis at (0, rt)) tangent
+                // to the cone, then the cone flank to the full radius.
+                let r_t = rt * a.cos();
+                let z_t = rt * (1.0 - a.sin());
+                segs.push(arc(Point::new(r_t, z_t), Point::new(0.0, rt), true, true));
+                let z_top = z_t + (r - r_t) / a.tan();
+                segs.push(line(Point::new(r, z_top), true));
+                z_top
+            }
         }
     };
 
@@ -368,6 +398,42 @@ mod tests {
         assert!(matches!(p.segs[1].shape, SegShape::Arc { .. }));
         assert_eq!(p.segs[1].end, Point::new(5.0, 1.5)); // (r, cr)
         assert!(p.segs[0].cutting && p.segs[1].cutting);
+    }
+
+    #[test]
+    fn vbit_cone_is_cutting_then_the_shaft_is_not() {
+        // A sharp 60° V-bit, shaft ⌀6 (r=3), overall 40. flute_length 0 ⇒ the cone is the
+        // cutting portion, the shaft above is non-cutting.
+        let spec = GeneratrixSpec {
+            radius: 3.0,
+            flute_length: 0.0,
+            shank_radius: 3.0,
+            length: 40.0,
+            neck_length: 0.0,
+            neck_radius: 3.0,
+            bottom: BottomShape::VTip {
+                half_angle_rad: 30.0_f64.to_radians(), // 60° full → 30° half
+                tip_radius: 0.0,
+            },
+        };
+        let p = generatrix(&spec);
+        // Cone flank cutting to (r, r/tan30) then non-cutting shaft.
+        let z_cone = 3.0 / 30.0_f64.to_radians().tan();
+        assert!(p.segs[0].cutting, "the cone cuts");
+        assert!((p.segs[0].end.x - 3.0).abs() < 1e-9 && (p.segs[0].end.y - z_cone).abs() < 1e-9);
+        assert!(
+            p.segs.iter().filter(|s| s.cutting).all(|s| s.end.y <= z_cone + 1e-9),
+            "nothing above the cone cuts"
+        );
+
+        // A rounded tip starts with a cutting arc.
+        let mut spec2 = spec;
+        spec2.bottom = BottomShape::VTip {
+            half_angle_rad: 30.0_f64.to_radians(),
+            tip_radius: 0.5,
+        };
+        let p2 = generatrix(&spec2);
+        assert!(matches!(p2.segs[0].shape, SegShape::Arc { .. }) && p2.segs[0].cutting);
     }
 
     #[test]
