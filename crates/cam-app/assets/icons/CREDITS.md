@@ -39,6 +39,7 @@ glance and stay visually distinct from each other:
 The remaining originals are in the flat 24×24 style:
 
 - `endmill.svg` — New tool
+- `renumber.svg` — bulk-renumber the tool library (a slanted `#` hash)
 - `import_library.svg`, `export_library.svg` — tool-library import/export (a
   machinist's tool chest with a down/up arrow; deliberately distinct from the
   project `open.svg`/`save.svg` and the CAD/G-code `cui_import.svg`/`cui_export.svg`)

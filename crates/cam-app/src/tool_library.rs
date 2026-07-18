@@ -136,6 +136,36 @@ impl ToolLibrary {
         (1..).find(|n| !used.contains(n)).expect("u32 space is never exhausted")
     }
 
+    /// Set the number of the tool at `index` to `new`, **swapping** with whatever tool
+    /// currently holds `new` so numbers stay unique. No-op if the index is out of range,
+    /// `new` is 0, or the number is unchanged.
+    pub fn set_number(&mut self, index: usize, new: u32) {
+        if new == 0 {
+            return;
+        }
+        let Some(old) = self.tools.get(index).map(|t| t.number) else {
+            return;
+        };
+        if old == new {
+            return;
+        }
+        if let Some(other) = self.tools.iter().position(|t| t.number == new) {
+            self.tools[other].number = old; // swap
+        }
+        self.tools[index].number = new;
+    }
+
+    /// Bulk-renumber the tools **sequentially 1..N** in the given order (`order[k]` is
+    /// the library index that becomes tool number `k+1`). Used by the guarded "Renumber"
+    /// action to normalise the numbering (e.g. by family).
+    pub fn set_numbers_in_order(&mut self, order: &[usize]) {
+        for (k, &idx) in order.iter().enumerate() {
+            if let Some(t) = self.tools.get_mut(idx) {
+                t.number = (k + 1) as u32;
+            }
+        }
+    }
+
     /// Promote `tool` into the shop library (the "Add to library" action, §6.3),
     /// **idempotent by geometry**: if a tool of the same [`identity`](Tool::identity)
     /// already exists, its number is returned and nothing is inserted; otherwise the
@@ -325,6 +355,21 @@ mod tests {
         // Now 1/2/3 again → next is 4.
         lib.add_default();
         assert_eq!(lib.tools.last().unwrap().number, 4);
+    }
+
+    #[test]
+    fn set_number_swaps_on_collision() {
+        let mut lib = ToolLibrary::defaults(); // #1, #2, #3
+        // Move #3 (index 2) onto #1 → the two swap.
+        lib.set_number(2, 1);
+        assert_eq!(lib.tools[2].number, 1, "target adopted");
+        assert_eq!(lib.tools[0].number, 3, "the tool that held #1 took #3");
+        // Numbers stay a unique set {1,2,3}.
+        let nums: std::collections::BTreeSet<u32> = lib.tools.iter().map(|t| t.number).collect();
+        assert_eq!(nums.len(), lib.tools.len());
+        // Moving to a free number just takes it, no swap.
+        lib.set_number(0, 9); // index 0 currently #3
+        assert_eq!(lib.tools[0].number, 9);
     }
 
     #[test]

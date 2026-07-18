@@ -91,6 +91,7 @@ enum Icon {
     Chamfer,
     Face,
     NewTool,
+    Renumber,
     ImportLibrary,
     ExportLibrary,
     Duplicate,
@@ -121,6 +122,7 @@ impl Icon {
             Icon::Chamfer => include_bytes!("../assets/icons/chamfer.svg"),
             Icon::Face => include_bytes!("../assets/icons/face.svg"),
             Icon::NewTool => include_bytes!("../assets/icons/endmill.svg"),
+            Icon::Renumber => include_bytes!("../assets/icons/renumber.svg"),
             Icon::ImportLibrary => include_bytes!("../assets/icons/import_library.svg"),
             Icon::ExportLibrary => include_bytes!("../assets/icons/export_library.svg"),
             Icon::Duplicate => include_bytes!("../assets/icons/copy.svg"),
@@ -154,6 +156,10 @@ impl Icon {
             Icon::Chamfer => "Add a Chamfer operation — break an edge with a V/chamfer tool.",
             Icon::Face => "Add a Face operation — skim the top of the stock flat.",
             Icon::NewTool => "Add a new tool to the library.",
+            Icon::Renumber => {
+                "Renumber the whole library sequentially in the current tab order \
+                 (asks for confirmation — it rewrites every tool number)."
+            }
             Icon::ImportLibrary => {
                 "Import a tool library from a .ocam file, replacing the working library."
             }
@@ -275,6 +281,18 @@ async fn confirm_export_duplicates(detail: String) -> bool {
         == rfd::MessageDialogResult::Yes
 }
 
+/// Native Yes/No warning gating the **bulk renumber** (it rewrites every tool's number).
+async fn confirm_renumber(detail: String) -> bool {
+    rfd::AsyncMessageDialog::new()
+        .set_level(rfd::MessageLevel::Warning)
+        .set_title("Renumber tools")
+        .set_description(detail)
+        .set_buttons(rfd::MessageButtons::YesNo)
+        .show()
+        .await
+        == rfd::MessageDialogResult::Yes
+}
+
 /// The docked panes. Any of them can be shown or hidden from the Windows ribbon
 /// tab (except the Viewport, which is always present as the main view).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -331,6 +349,14 @@ const ALL_PANES: [Pane; 5] = [
     Pane::Inspector,
     Pane::Output,
 ];
+
+/// The Library-pane right-click menu state. Starts as a "Set number…" item; clicking it
+/// morphs the same popup into a number input (`input = Some(buffer)`).
+#[derive(Clone, Debug)]
+struct LibMenu {
+    index: usize,
+    input: Option<String>,
+}
 
 /// How the Tool Library pane lists its tools — the pane's two internal tabs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1251,6 +1277,10 @@ struct App {
     /// and where to anchor it. `None` unless a menu is open.
     open_tool_menu: Option<u32>,
     tool_menu_pos: iced::Point,
+    /// The Library-pane right-click menu: which library index, whether it has morphed
+    /// into the "set number" input (and its buffer), and where to anchor it.
+    lib_menu: Option<LibMenu>,
+    lib_menu_pos: iced::Point,
     /// Last known cursor position in **window-absolute** coords (from a global
     /// event subscription). Overlays are placed from the window origin, so this —
     /// not a widget-local position — is what anchors the op context menu exactly
@@ -1647,6 +1677,20 @@ enum Message {
     DeleteTool,
     /// Switch the Tool Library pane's internal tab (Serial / Family).
     SetLibraryView(LibraryView),
+    /// Open the Library-pane right-click menu for the library tool at this index.
+    LibToolMenu(usize),
+    /// Morph the Library menu into the "set number" input.
+    LibMenuSetNumber,
+    /// Update the "set number" input buffer.
+    LibNumberInput(String),
+    /// Commit the "set number" input (swaps on collision).
+    LibNumberCommit,
+    /// Dismiss the Library-pane menu / number input.
+    CloseLibMenu,
+    /// Bulk-renumber the library (opens a confirm dialog first).
+    RenumberLibrary,
+    /// The confirm-dialog result for the bulk renumber.
+    RenumberConfirmed(bool),
     /// Open the project-tree right-click menu for the tool numbered `u32` (only wired
     /// for tools not in the library).
     ToolMenu(u32),
@@ -1755,6 +1799,8 @@ impl App {
             op_menu_pos: iced::Point::ORIGIN,
             open_tool_menu: None,
             tool_menu_pos: iced::Point::ORIGIN,
+            lib_menu: None,
+            lib_menu_pos: iced::Point::ORIGIN,
             window_cursor: iced::Point::ORIGIN,
             focus_ops: BTreeSet::new(),
             modifiers: iced::keyboard::Modifiers::default(),
@@ -2496,6 +2542,60 @@ impl App {
                 self.refresh_fields();
             }
             Message::SetLibraryView(view) => self.library_view = view,
+            Message::LibToolMenu(i) => {
+                self.lib_sel = i;
+                self.refresh_fields();
+                self.lib_menu = Some(LibMenu { index: i, input: None });
+                self.lib_menu_pos = self.window_cursor;
+            }
+            Message::LibMenuSetNumber => {
+                if let Some(menu) = &mut self.lib_menu {
+                    let cur = self
+                        .library
+                        .tools
+                        .get(menu.index)
+                        .map(|t| t.number.to_string())
+                        .unwrap_or_default();
+                    menu.input = Some(cur);
+                }
+            }
+            Message::LibNumberInput(s) => {
+                if let Some(menu) = &mut self.lib_menu {
+                    menu.input = Some(s);
+                }
+            }
+            Message::LibNumberCommit => {
+                if let Some(menu) = &self.lib_menu {
+                    if let Some(n) = menu.input.as_ref().and_then(|s| s.trim().parse::<u32>().ok()) {
+                        self.library.set_number(menu.index, n);
+                        self.library.save();
+                        self.refresh_fields();
+                    }
+                }
+                self.lib_menu = None;
+            }
+            Message::CloseLibMenu => self.lib_menu = None,
+            Message::RenumberLibrary => {
+                let n = self.library.tools.len();
+                let by = match self.library_view {
+                    LibraryView::Ordered => "current order (compacting any gaps)",
+                    LibraryView::Grouped => "family, then diameter",
+                };
+                let detail = format!(
+                    "Renumber all {n} library tools sequentially (T1…T{n}) by {by}?\n\n\
+                     This changes every tool's number and cannot be undone. Open projects \
+                     re-align to the new numbering when next opened.",
+                );
+                return iced::Task::perform(confirm_renumber(detail), Message::RenumberConfirmed);
+            }
+            Message::RenumberConfirmed(true) => {
+                let order = self.renumber_order();
+                self.library.set_numbers_in_order(&order);
+                self.library.save();
+                self.refresh_fields();
+                self.status = "Renumbered the tool library.".to_string();
+            }
+            Message::RenumberConfirmed(false) => {}
             Message::OpMenu(id) => {
                 self.controller.select(Selection::Operation(id));
                 self.focus_ops.clear();
@@ -2752,6 +2852,24 @@ impl App {
     /// ribbon tab, independent of the project selection).
     fn library_mode(&self) -> bool {
         self.active_tab == RibbonTab::Tooling
+    }
+
+    /// The library indices in the order the bulk renumber will assign 1..N — the same
+    /// order the current Library-pane tab displays (Ordered by number, Grouped by
+    /// family then diameter).
+    fn renumber_order(&self) -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..self.library.tools.len()).collect();
+        match self.library_view {
+            LibraryView::Ordered => idx.sort_by_key(|&i| self.library.tools[i].number),
+            LibraryView::Grouped => idx.sort_by(|&a, &b| {
+                let (ta, tb) = (&self.library.tools[a], &self.library.tools[b]);
+                kind_order(ta.kind)
+                    .cmp(&kind_order(tb.kind))
+                    .then(ta.diameter.total_cmp(&tb.diameter))
+                    .then(ta.number.cmp(&tb.number))
+            }),
+        }
+        idx
     }
 
     /// The kind of the tool the inspector is editing (library entry or project tool).
@@ -3269,6 +3387,11 @@ impl App {
                 .on_press(Message::CloseToolMenu);
             layers = layers.push(catcher).push(menu);
         }
+        if let Some(menu) = self.lib_menu_overlay() {
+            let catcher = mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
+                .on_press(Message::CloseLibMenu);
+            layers = layers.push(catcher).push(menu);
+        }
         if let Some(pickbox) = self.pickbox_overlay() {
             layers = layers.push(pickbox);
         }
@@ -3360,6 +3483,51 @@ impl App {
             .padding(Padding {
                 top: self.tool_menu_pos.y,
                 left: self.tool_menu_pos.x,
+                right: 0.0,
+                bottom: 0.0,
+            });
+        Some(positioned.into())
+    }
+
+    /// The Library-pane right-click menu, anchored under the cursor. Shows a "Set number…"
+    /// item that morphs into a small number input (Enter or Set commits; swaps on clash).
+    fn lib_menu_overlay(&self) -> Option<Element<'_, Message>> {
+        let menu = self.lib_menu.as_ref()?;
+        let content: Element<'_, Message> = match &menu.input {
+            None => button(text("Set number…").size(13))
+                .width(Length::Fixed(140.0))
+                .padding(Padding::from([4.0, 8.0]))
+                .on_press(Message::LibMenuSetNumber)
+                .style(|_theme, status| command_button_style(status))
+                .into(),
+            Some(buf) => row![
+                text_input("T#", buf)
+                    .on_input(Message::LibNumberInput)
+                    .on_submit(Message::LibNumberCommit)
+                    .width(Length::Fixed(64.0)),
+                button(text("Set").size(13)).on_press(Message::LibNumberCommit),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center)
+            .into(),
+        };
+        let popup = container(content).padding(4).style(|_theme| container::Style {
+            background: Some(Background::Color(palette::RIBBON_BG)),
+            border: Border {
+                color: palette::BORDER_DARK,
+                width: 1.0,
+                radius: 3.0.into(),
+            },
+            ..container::Style::default()
+        });
+        let positioned = container(popup)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Left)
+            .align_y(iced::alignment::Vertical::Top)
+            .padding(Padding {
+                top: self.lib_menu_pos.y,
+                left: self.lib_menu_pos.x,
                 right: 0.0,
                 bottom: 0.0,
             });
@@ -3525,6 +3693,8 @@ impl App {
                         // Keep at least one tool in the library.
                         (self.library.tools.len() > 1).then_some(Message::DeleteTool),
                     ),
+                    // Bulk renumber (guarded by a confirm dialog).
+                    cmd(Icon::Renumber, "Renumber", Some(Message::RenumberLibrary)),
                     // ("Add to library" lives on the project-tree tool right-click menu,
                     // shown only for a project tool that isn't already in the library.)
                 ],
@@ -4092,17 +4262,20 @@ impl App {
                 // here) — the reverse of the Project pane, e.g. "T1: ⌀6 End mill (2 flutes)".
                 items.sort_by_key(|(_, t)| t.number);
                 for (i, t) in items {
-                    list = list.push(select_row(
-                        format!(
-                            "T{}: ⌀{} {} ({})",
-                            t.number,
-                            fmt_num(t.diameter),
-                            t.kind,
-                            flute_count(t.flutes)
-                        ),
-                        i == self.lib_sel,
-                        Message::SelectLibraryTool(i),
-                    ));
+                    list = list.push(
+                        mouse_area(select_row(
+                            format!(
+                                "T{}: ⌀{} {} ({})",
+                                t.number,
+                                fmt_num(t.diameter),
+                                t.kind,
+                                flute_count(t.flutes)
+                            ),
+                            i == self.lib_sel,
+                            Message::SelectLibraryTool(i),
+                        ))
+                        .on_right_press(Message::LibToolMenu(i)),
+                    );
                 }
             }
             LibraryView::Grouped => {
@@ -4121,16 +4294,19 @@ impl App {
                         current = Some(fam);
                     }
                     // Kind is the group header, so the row omits it: "T2: ⌀6 (4 flutes)".
-                    list = list.push(select_row(
-                        format!(
-                            "T{}: ⌀{} ({})",
-                            t.number,
-                            fmt_num(t.diameter),
-                            flute_count(t.flutes)
-                        ),
-                        i == self.lib_sel,
-                        Message::SelectLibraryTool(i),
-                    ));
+                    list = list.push(
+                        mouse_area(select_row(
+                            format!(
+                                "T{}: ⌀{} ({})",
+                                t.number,
+                                fmt_num(t.diameter),
+                                flute_count(t.flutes)
+                            ),
+                            i == self.lib_sel,
+                            Message::SelectLibraryTool(i),
+                        ))
+                        .on_right_press(Message::LibToolMenu(i)),
+                    );
                 }
             }
         }
