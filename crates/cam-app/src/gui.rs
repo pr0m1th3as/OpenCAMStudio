@@ -4342,10 +4342,9 @@ impl App {
                 items.sort_by_key(|(_, t)| t.number);
                 for (i, t) in items {
                     let base = format!("T{}: ⌀{} {}", t.number, fmt_num(t.diameter), t.kind);
-                    let label = if shows_flute_count(t.kind) {
-                        format!("{base} ({})", flute_count(t.flutes))
-                    } else {
-                        base
+                    let label = match library_extra(t) {
+                        Some(extra) => format!("{base} ({extra})"),
+                        None => base,
                     };
                     list = list.push(
                         mouse_area(select_row(label, i == self.lib_sel, Message::SelectLibraryTool(i)))
@@ -4370,10 +4369,9 @@ impl App {
                     }
                     // Kind is the group header, so the row omits it: "T2: ⌀6 (4 flutes)".
                     let base = format!("T{}: ⌀{}", t.number, fmt_num(t.diameter));
-                    let label = if shows_flute_count(t.kind) {
-                        format!("{base} ({})", flute_count(t.flutes))
-                    } else {
-                        base
+                    let label = match library_extra(t) {
+                        Some(extra) => format!("{base} ({extra})"),
+                        None => base,
                     };
                     list = list.push(
                         mouse_area(select_row(label, i == self.lib_sel, Message::SelectLibraryTool(i)))
@@ -5454,10 +5452,41 @@ fn flute_count(flutes: u32) -> String {
     format!("{flutes} flute{}", if flutes == 1 { "" } else { "s" })
 }
 
-/// Whether to show the `(N flutes)` suffix in the Library pane — omitted for kinds where
-/// the flute count isn't a meaningful characterisation (drill bits, V-bits).
-fn shows_flute_count(kind: ToolKind) -> bool {
-    !matches!(kind, ToolKind::Drill { .. } | ToolKind::VBit { .. })
+/// The **Tool Library** parenthetical — the extra, kind-specific descriptor shown only
+/// in the Library pane (never the Project pane, which carries just number + compact
+/// form). Radii use a shared `r…` form (`r0.5`, `r0`) for consistency across kinds, and
+/// cutting direction a single letter (D/U/S). `None` = no parenthetical for this kind.
+///
+/// - End mills (square / ball): `(2 flutes, D)`
+/// - Rounded-edge end mills: `(2 flutes, D, r1)` — trailing corner radius
+/// - V-bits: `(60°, r0.25)` — point angle + tip radius
+/// - Face / chamfer / thread mills: `(2 flutes)`
+/// - Drill bits: none
+fn library_extra(t: &cam_model::Tool) -> Option<String> {
+    let dir = |d: CutDir| match d {
+        CutDir::Down => "D",
+        CutDir::Up => "U",
+        CutDir::Straight => "S",
+    };
+    match t.kind {
+        ToolKind::EndMill | ToolKind::BallMill => {
+            Some(format!("{}, {}", flute_count(t.flutes), dir(t.cutting_direction)))
+        }
+        ToolKind::BullNose { corner_radius } => Some(format!(
+            "{}, {}, r{}",
+            flute_count(t.flutes),
+            dir(t.cutting_direction),
+            fmt_num(corner_radius)
+        )),
+        ToolKind::VBit {
+            included_angle_deg,
+            tip_radius,
+        } => Some(format!("{}°, r{}", fmt_num(included_angle_deg), fmt_num(tip_radius))),
+        ToolKind::FaceMill | ToolKind::ChamferMill { .. } | ToolKind::ThreadMill { .. } => {
+            Some(flute_count(t.flutes))
+        }
+        ToolKind::Drill { .. } => None,
+    }
 }
 
 /// A stable family sort/order key for the Tool Library pane's Family view.
