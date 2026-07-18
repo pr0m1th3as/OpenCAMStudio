@@ -330,10 +330,10 @@ const ALL_PANES: [Pane; 5] = [
 /// How the Tool Library pane lists its tools — the pane's two internal tabs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LibraryView {
-    /// Serial order by tool number (T1, T2, …).
-    Serial,
+    /// Ordered by tool number (T1, T2, …).
+    Ordered,
     /// Grouped by tool family (all end mills, then drills, …), sorted by diameter.
-    Family,
+    Grouped,
 }
 
 /// A tab in the top-bar ribbon. Each tab shows a band of grouped commands.
@@ -1693,7 +1693,7 @@ impl App {
             cursor: None,
             library: ToolLibrary::load(),
             lib_sel: 0,
-            library_view: LibraryView::Serial,
+            library_view: LibraryView::Ordered,
             open_op_menu: None,
             op_menu_pos: iced::Point::ORIGIN,
             open_tool_menu: None,
@@ -3897,8 +3897,8 @@ impl App {
                 .style(move |_theme, status| snap_toggle_style(active, status))
         };
         let mut list = column![row![
-            tab("Serial", LibraryView::Serial),
-            tab("Family", LibraryView::Family),
+            tab("Ordered", LibraryView::Ordered),
+            tab("Grouped", LibraryView::Grouped),
         ]
         .spacing(6)]
         .spacing(4)
@@ -3913,7 +3913,7 @@ impl App {
         let mut items: Vec<(usize, &cam_model::Tool)> =
             self.library.tools.iter().enumerate().collect();
         match self.library_view {
-            LibraryView::Serial => {
+            LibraryView::Ordered => {
                 // Number **first** in the library (the number is the tool's identity
                 // here) — the reverse of the Project pane, e.g. "T1: ⌀6 End mill (2 flutes)".
                 items.sort_by_key(|(_, t)| t.number);
@@ -3931,7 +3931,7 @@ impl App {
                     ));
                 }
             }
-            LibraryView::Family => {
+            LibraryView::Grouped => {
                 items.sort_by(|(_, a), (_, b)| {
                     kind_order(a.kind)
                         .cmp(&kind_order(b.kind))
