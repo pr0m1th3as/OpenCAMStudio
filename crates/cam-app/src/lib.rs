@@ -11,14 +11,17 @@
 
 mod controller;
 mod project;
-#[cfg(feature = "gui")]
+// Not GUI-gated: the library type and the `.ocam` file union are plain serializable
+// data + config-dir I/O (only their *use* is GUI). Phase 3 (`TOOLING_PLAN.md`) lets
+// the ungated `project` module reference `ToolLibrary` for the `OcamFile` union.
 mod tool_library;
 
 pub use controller::{
     op_selects_circles, AppController, ExportError, ExportToError, JobParams, LoopPart, LoopRef,
     OpKind, PendingOp, PickResult, ProjectError, RunOutcome, Selection, SnapHit, SnapKind,
 };
-pub use project::Project;
+pub use project::{OcamFile, Project};
+pub use tool_library::ToolLibrary;
 
 #[cfg(feature = "gui")]
 pub mod gui;

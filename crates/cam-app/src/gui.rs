@@ -24,6 +24,7 @@ use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 use cam_model::{Axis, Envelope, Hand, Lead, Machine, Operation, Plunge, Point3, Side, ToolKind};
 use cam_post::PostKind;
 
+use crate::project::OcamFile;
 use crate::tool_library::ToolLibrary;
 
 /// Ribbon palette and metrics, adopted from **OpenCADStudio**'s ribbon
@@ -1451,6 +1452,14 @@ enum Message {
     SaveProjectAs,
     /// The chosen path to save to (`None` = cancelled).
     ProjectToSave(Option<PathBuf>),
+    /// Prompt for a `.ocam` to export the current tool library to.
+    SaveLibrary,
+    /// The chosen path to write the library to (`None` = cancelled).
+    LibraryToSave(Option<PathBuf>),
+    /// Prompt for a `.ocam` tool library to load (replaces the working library).
+    LoadLibrary,
+    /// The chosen library file to load (`None` = cancelled).
+    LibraryToLoad(Option<PathBuf>),
     /// Prompt for and import a `.dxf`/`.dwg` file.
     ImportCad,
     /// The chosen CAD file to import (`None` = cancelled).
@@ -1779,6 +1788,47 @@ impl App {
                 );
             }
             Message::ProjectToSave(Some(path)) => self.save_to(&path),
+            Message::SaveLibrary => {
+                return iced::Task::perform(
+                    pick_save("OpenCAMStudio tool library", "tools.ocam", &["ocam"]),
+                    Message::LibraryToSave,
+                );
+            }
+            Message::LibraryToSave(Some(path)) => {
+                let file = OcamFile::Library(self.library.clone());
+                self.status = match file.to_json() {
+                    Ok(json) => match std::fs::write(&path, json) {
+                        Ok(()) => format!("Saved tool library to {}.", path.display()),
+                        Err(e) => format!("Library save failed: {e}"),
+                    },
+                    Err(e) => format!("Library save failed: {e}"),
+                };
+            }
+            Message::LoadLibrary => {
+                return iced::Task::perform(
+                    pick_open("OpenCAMStudio tool library", &["ocam"]),
+                    Message::LibraryToLoad,
+                );
+            }
+            Message::LibraryToLoad(Some(path)) => {
+                self.status = match std::fs::read_to_string(&path) {
+                    Ok(text) => match OcamFile::from_json(&text) {
+                        Ok(OcamFile::Library(lib)) => {
+                            let n = lib.tools.len();
+                            self.library = lib;
+                            self.library.save(); // becomes the working (config-dir) library
+                            self.lib_sel = 0;
+                            self.refresh_fields();
+                            format!("Loaded {n} tool(s) from {}.", path.display())
+                        }
+                        Ok(OcamFile::Project(_)) => {
+                            "That .ocam is a project, not a tool library.".to_string()
+                        }
+                        Err(e) => format!("Library load failed: {e}"),
+                    },
+                    Err(e) => format!("Library load failed: {e}"),
+                };
+            }
             Message::ImportCad => {
                 return iced::Task::perform(
                     pick_open("CAD drawing", &["dxf", "dwg"]),
@@ -1831,6 +1881,8 @@ impl App {
             // Cancelled dialogs — nothing to do.
             Message::ProjectToOpen(None)
             | Message::ProjectToSave(None)
+            | Message::LibraryToSave(None)
+            | Message::LibraryToLoad(None)
             | Message::CadToImport(None)
             | Message::NcToExport(None) => {}
             Message::Undo => {
@@ -3175,6 +3227,13 @@ impl App {
                         matches!(self.controller.selection(), Selection::Tool(_))
                             .then_some(Message::AddToLibrary),
                     ),
+                ],
+            },
+            GroupSpec {
+                title: "File",
+                commands: vec![
+                    cmd(Icon::Save, "Save", Some(Message::SaveLibrary)),
+                    cmd(Icon::Open, "Load", Some(Message::LoadLibrary)),
                 ],
             }],
             RibbonTab::View => vec![GroupSpec {

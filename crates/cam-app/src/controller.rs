@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use cam_geo::{Contour, Point, Polygon};
 use cam_import::{read_cad_file, read_dxf_str, ImportError, ImportOptions};
 
-use crate::project::Project;
+use crate::project::{OcamFile, Project};
 use cam_model::{
     reconcile_tool_numbers, Axis, ChamferOp, Comp, Document, DrillOp, FaceOp, Hand, Heights,
     History, Lead, Machine, Operation, Plunge, PocketOp, ProfileOp, ReconcileReport, Setup, Side,
@@ -249,6 +249,8 @@ pub enum ProjectError {
     Io(String),
     /// The project JSON could not be produced or parsed.
     Json(String),
+    /// The `.ocam` opened as a project is actually a **tool library**.
+    NotAProject,
 }
 
 impl std::fmt::Display for ProjectError {
@@ -256,6 +258,9 @@ impl std::fmt::Display for ProjectError {
         match self {
             ProjectError::Io(e) => write!(f, "file error: {e}"),
             ProjectError::Json(e) => write!(f, "project format error: {e}"),
+            ProjectError::NotAProject => {
+                write!(f, "this .ocam file is a tool library, not a project")
+            }
         }
     }
 }
@@ -467,7 +472,8 @@ impl AppController {
             defaults: self.defaults,
             source_name: self.source_name.clone(),
         };
-        let json = project
+        // Written through the tagged `.ocam` union (§3.1) so the file self-describes.
+        let json = OcamFile::Project(project)
             .to_json()
             .map_err(|e| ProjectError::Json(e.to_string()))?;
         let path = path.as_ref();
@@ -480,7 +486,12 @@ impl AppController {
     pub fn open_project(&mut self, path: impl AsRef<Path>) -> Result<(), ProjectError> {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path).map_err(|e| ProjectError::Io(e.to_string()))?;
-        let project = Project::from_json(&text).map_err(|e| ProjectError::Json(e.to_string()))?;
+        // Route through the tagged union; a legacy untagged project still parses (§3.1).
+        let project = match OcamFile::from_json(&text).map_err(|e| ProjectError::Json(e.to_string()))?
+        {
+            OcamFile::Project(p) => p,
+            OcamFile::Library(_) => return Err(ProjectError::NotAProject),
+        };
         self.regions = project.regions;
         self.defaults = project.defaults;
         self.source_name = project.source_name;
@@ -2316,6 +2327,41 @@ mod tests {
         assert_eq!(app.document(), &doc_before);
         assert_eq!(app.regions(), regions_before.as_slice());
         assert_eq!(app.current_path(), Some(path.as_path()));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn legacy_untagged_project_still_opens() {
+        // A `.ocam` written before the `OcamFile` tag existed is a bare Project object.
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        let project = Project {
+            schema_version: cam_model::SCHEMA_VERSION,
+            document: app.document().clone(),
+            regions: app.regions().to_vec(),
+            defaults: *app.defaults(),
+            source_name: app.source_name().to_string(),
+        };
+        let path = temp_path("legacy.ocam");
+        std::fs::write(&path, project.to_json().unwrap()).unwrap(); // untagged, on purpose
+
+        app.new_project();
+        app.open_project(&path).expect("legacy untagged project must load");
+        assert!(!app.regions().is_empty(), "geometry came back");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn opening_a_tool_library_as_a_project_is_rejected() {
+        use crate::tool_library::ToolLibrary;
+        let mut app = AppController::new(machine());
+        let path = temp_path("lib.ocam");
+        let file = crate::project::OcamFile::Library(ToolLibrary::defaults());
+        std::fs::write(&path, file.to_json().unwrap()).unwrap();
+        assert!(matches!(
+            app.open_project(&path),
+            Err(ProjectError::NotAProject)
+        ));
         std::fs::remove_file(&path).ok();
     }
 
