@@ -1170,6 +1170,10 @@ struct App {
     /// (window-absolute coords, captured from `window_cursor` at right-click time).
     open_op_menu: Option<u32>,
     op_menu_pos: iced::Point,
+    /// The project tool (by number) whose right-click "Add to library" menu is open,
+    /// and where to anchor it. `None` unless a menu is open.
+    open_tool_menu: Option<u32>,
+    tool_menu_pos: iced::Point,
     /// Last known cursor position in **window-absolute** coords (from a global
     /// event subscription). Overlays are placed from the window origin, so this —
     /// not a widget-local position — is what anchors the op context menu exactly
@@ -1562,8 +1566,13 @@ enum Message {
     NewTool,
     /// Delete the selected tool.
     DeleteTool,
-    /// Promote the selected project tool into the shop library (§6.3).
-    AddToLibrary,
+    /// Open the project-tree right-click menu for the tool numbered `u32` (only wired
+    /// for tools not in the library).
+    ToolMenu(u32),
+    /// Dismiss the tool context menu.
+    CloseToolMenu,
+    /// Promote the project tool numbered `u32` into the shop library (§6.3).
+    AddToolToLibrary(u32),
     /// Switch the active ribbon tab.
     SelectRibbonTab(RibbonTab),
     /// Open/close the collapse-popup for a collapsed group (index in the active tab).
@@ -1662,6 +1671,8 @@ impl App {
             lib_sel: 0,
             open_op_menu: None,
             op_menu_pos: iced::Point::ORIGIN,
+            open_tool_menu: None,
+            tool_menu_pos: iced::Point::ORIGIN,
             window_cursor: iced::Point::ORIGIN,
             focus_ops: BTreeSet::new(),
             modifiers: iced::keyboard::Modifiers::default(),
@@ -2325,20 +2336,32 @@ impl App {
                     self.refresh_fields();
                 }
             }
-            Message::AddToLibrary => {
-                // Promote the selected project-local tool into the shop library, then
+            Message::ToolMenu(number) => {
+                self.open_tool_menu = Some(number);
+                self.tool_menu_pos = self.window_cursor;
+            }
+            Message::CloseToolMenu => self.open_tool_menu = None,
+            Message::AddToolToLibrary(number) => {
+                // Promote the project tool numbered `number` into the shop library, then
                 // reconcile so it adopts the shop number (§6.3). Idempotent by geometry.
-                if let Selection::Tool(i) = self.controller.selection() {
-                    if let Some(&tool) = self.controller.document().setup.tools.get(i) {
-                        self.library.add_tool(tool);
-                        self.library.save();
-                        let report = self.controller.reconcile_tools(&self.library.tools);
-                        self.refresh_fields();
-                        self.status = match report.summary() {
-                            Some(s) => format!("Added tool to library. {s}."),
-                            None => "Added tool to library.".to_string(),
-                        };
-                    }
+                self.open_tool_menu = None;
+                let tool = self
+                    .controller
+                    .document()
+                    .setup
+                    .tools
+                    .iter()
+                    .find(|t| t.number == number)
+                    .copied();
+                if let Some(tool) = tool {
+                    self.library.add_tool(tool);
+                    self.library.save();
+                    let report = self.controller.reconcile_tools(&self.library.tools);
+                    self.refresh_fields();
+                    self.status = match report.summary() {
+                        Some(s) => format!("Added tool to library. {s}."),
+                        None => "Added tool to library.".to_string(),
+                    };
                 }
             }
             Message::SelectLibraryTool(i) => {
@@ -3027,6 +3050,11 @@ impl App {
                 .on_press(Message::CloseOpMenu);
             layers = layers.push(catcher).push(menu);
         }
+        if let Some(menu) = self.tool_menu_overlay() {
+            let catcher = mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
+                .on_press(Message::CloseToolMenu);
+            layers = layers.push(catcher).push(menu);
+        }
         if let Some(pickbox) = self.pickbox_overlay() {
             layers = layers.push(pickbox);
         }
@@ -3075,6 +3103,49 @@ impl App {
             .padding(Padding {
                 top: self.op_menu_pos.y,
                 left: self.op_menu_pos.x,
+                right: 0.0,
+                bottom: 0.0,
+            });
+        Some(positioned.into())
+    }
+
+    /// The project-tree tool right-click menu — a single "Add to library" action,
+    /// anchored under the cursor. Only opens for a project tool not already in the
+    /// library (the un-numbered rows), so the action is always applicable.
+    fn tool_menu_overlay(&self) -> Option<Element<'_, Message>> {
+        let number = self.open_tool_menu?;
+        let menu = container(
+            button(
+                row![
+                    icon_svg(Icon::ImportLibrary, 14.0),
+                    text("Add to library").size(13)
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .width(Length::Fixed(150.0))
+            .padding(Padding::from([4.0, 8.0]))
+            .on_press(Message::AddToolToLibrary(number))
+            .style(|_theme, status| command_button_style(status)),
+        )
+        .padding(4)
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(palette::RIBBON_BG)),
+            border: Border {
+                color: palette::BORDER_DARK,
+                width: 1.0,
+                radius: 3.0.into(),
+            },
+            ..container::Style::default()
+        });
+        let positioned = container(menu)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Left)
+            .align_y(iced::alignment::Vertical::Top)
+            .padding(Padding {
+                top: self.tool_menu_pos.y,
+                left: self.tool_menu_pos.x,
                 right: 0.0,
                 bottom: 0.0,
             });
@@ -3240,14 +3311,8 @@ impl App {
                         // Keep at least one tool in the library.
                         (self.library.tools.len() > 1).then_some(Message::DeleteTool),
                     ),
-                    // Promote the selected *project* tool into the shop library (§6.3);
-                    // enabled only when a project tool is the current selection.
-                    cmd(
-                        Icon::Duplicate,
-                        "To library",
-                        matches!(self.controller.selection(), Selection::Tool(_))
-                            .then_some(Message::AddToLibrary),
-                    ),
+                    // ("Add to library" lives on the project-tree tool right-click menu,
+                    // shown only for a project tool that isn't already in the library.)
                 ],
             },
             GroupSpec {
@@ -3499,21 +3564,42 @@ impl App {
         ]
         .spacing(2);
 
-        // Tools in use — read-only; tools are chosen from the library during op setup.
+        // Tools in use. A tool that matches the shop library shows its **shop number**
+        // (`T4 …`); one that isn't in the library shows **no number** — the simple,
+        // clear signal that it's project-local. Right-clicking an un-numbered tool
+        // offers "Add to library" (which registers it and gives it a number).
         list = list.push(tree_header("Tools (in use)"));
         let used = self.controller.used_tools();
         if used.is_empty() {
             list = list.push(tree_note("none yet — set up an operation"));
         }
         for t in used {
-            list = list.push(
-                container(
-                    text(format!("T{} ⌀{} {}", t.number, fmt_num(t.diameter), t.kind))
-                        .size(13)
-                        .color(palette::LABEL_COLOR),
-                )
-                .padding(Padding::from([3.0, 6.0])),
-            );
+            let in_library = self
+                .library
+                .tools
+                .iter()
+                .any(|lt| lt.identity() == t.identity());
+            // Numbered ⇒ in the library; un-numbered ⇒ project-local. The presence of
+            // the number *is* the distinction (kept deliberately simple).
+            let label = if in_library {
+                format!("T{} — ⌀{} {}", t.number, fmt_num(t.diameter), t.kind)
+            } else {
+                format!("⌀{} {}", fmt_num(t.diameter), t.kind)
+            };
+            let row = container(
+                text(label).size(13).color(if in_library {
+                    palette::LABEL_COLOR
+                } else {
+                    palette::GROUP_LABEL
+                }),
+            )
+            .padding(Padding::from([3.0, 6.0]));
+            if in_library {
+                list = list.push(row);
+            } else {
+                // Only un-numbered (not-in-library) tools carry the right-click menu.
+                list = list.push(mouse_area(row).on_right_press(Message::ToolMenu(t.number)));
+            }
         }
 
         // Exact-duplicate operations (identical bar their id, both included),
