@@ -4329,19 +4329,15 @@ impl App {
                 // here) — the reverse of the Project pane, e.g. "T1: ⌀6 End mill (2 flutes)".
                 items.sort_by_key(|(_, t)| t.number);
                 for (i, t) in items {
+                    let base = format!("T{}: ⌀{} {}", t.number, fmt_num(t.diameter), t.kind);
+                    let label = if shows_flute_count(t.kind) {
+                        format!("{base} ({})", flute_count(t.flutes))
+                    } else {
+                        base
+                    };
                     list = list.push(
-                        mouse_area(select_row(
-                            format!(
-                                "T{}: ⌀{} {} ({})",
-                                t.number,
-                                fmt_num(t.diameter),
-                                t.kind,
-                                flute_count(t.flutes)
-                            ),
-                            i == self.lib_sel,
-                            Message::SelectLibraryTool(i),
-                        ))
-                        .on_right_press(Message::LibToolMenu(i)),
+                        mouse_area(select_row(label, i == self.lib_sel, Message::SelectLibraryTool(i)))
+                            .on_right_press(Message::LibToolMenu(i)),
                     );
                 }
             }
@@ -4361,18 +4357,15 @@ impl App {
                         current = Some(fam);
                     }
                     // Kind is the group header, so the row omits it: "T2: ⌀6 (4 flutes)".
+                    let base = format!("T{}: ⌀{}", t.number, fmt_num(t.diameter));
+                    let label = if shows_flute_count(t.kind) {
+                        format!("{base} ({})", flute_count(t.flutes))
+                    } else {
+                        base
+                    };
                     list = list.push(
-                        mouse_area(select_row(
-                            format!(
-                                "T{}: ⌀{} ({})",
-                                t.number,
-                                fmt_num(t.diameter),
-                                flute_count(t.flutes)
-                            ),
-                            i == self.lib_sel,
-                            Message::SelectLibraryTool(i),
-                        ))
-                        .on_right_press(Message::LibToolMenu(i)),
+                        mouse_area(select_row(label, i == self.lib_sel, Message::SelectLibraryTool(i)))
+                            .on_right_press(Message::LibToolMenu(i)),
                     );
                 }
             }
@@ -5449,6 +5442,12 @@ fn flute_count(flutes: u32) -> String {
     format!("{flutes} flute{}", if flutes == 1 { "" } else { "s" })
 }
 
+/// Whether to show the `(N flutes)` suffix in the Library pane — omitted for kinds where
+/// the flute count isn't a meaningful characterisation (drill bits, V-bits).
+fn shows_flute_count(kind: ToolKind) -> bool {
+    !matches!(kind, ToolKind::Drill { .. } | ToolKind::VBit { .. })
+}
+
 /// A stable family sort/order key for the Tool Library pane's Family view.
 fn kind_order(kind: ToolKind) -> u8 {
     match kind {
@@ -6236,6 +6235,11 @@ struct ToolCanvas {
     flute_length: f64,
     flutes: u32,
     cutting_direction: CutDir,
+    /// Whether to draw the flute helix at all (off for V-bits).
+    draw_flutes: bool,
+    /// Axial advance per helix turn (drill bits ≈ 3·⌀ for a realistic pitch; other
+    /// kinds do one turn over the cutting region).
+    flute_pitch: f64,
 }
 
 impl ToolCanvas {
@@ -6249,12 +6253,19 @@ impl ToolCanvas {
             .filter(|s| s.cutting)
             .map(|s| s.end.y)
             .fold(0.0_f64, f64::max);
+        let cutting_top = cutting_top.max(1e-3);
         Self {
             diameter: tool.diameter,
             length: tool.length,
             flute_length: cutting_top,
             flutes: tool.flutes,
             cutting_direction: tool.cutting_direction,
+            // V-bits show no flutes; a drill bit's helix revolves every ~3·⌀.
+            draw_flutes: !matches!(tool.kind, ToolKind::VBit { .. }),
+            flute_pitch: match tool.kind {
+                ToolKind::Drill { .. } => (3.0 * tool.diameter).max(1e-3),
+                _ => cutting_top,
+            },
             profile,
         }
     }
@@ -6352,60 +6363,65 @@ impl canvas::Program<Message> for ToolCanvas {
             }
             best
         };
-        let n = self.flutes.max(1);
-        let flute_len = self.flute_length.max(1e-3);
-        let flute_col = Color { a: 0.75, ..fg };
-        let steps = 48;
+        if self.draw_flutes {
+            let n = self.flutes.max(1);
+            let flute_len = self.flute_length.max(1e-3);
+            let pitch = self.flute_pitch.max(1e-3);
+            let flute_col = Color { a: 0.75, ..fg };
+            // More samples when the helix wraps more times (keeps a tight drill smooth).
+            let turns = (flute_len / pitch).max(1.0);
+            let steps = ((48.0 * turns).ceil() as usize).clamp(48, 240);
 
-        let mut flute_paths: Vec<Vec<P>> = Vec::new();
-        match self.cutting_direction {
-            CutDir::Straight => {
-                // ~N/2 visible front flutes, spread across the width, each tapering to the tip.
-                let front = n.div_ceil(2).max(1);
-                for j in 0..front {
-                    let theta = ((j as f64 + 0.5) / front as f64) * PI - PI / 2.0;
-                    let pts = (0..=steps)
-                        .map(|i| {
-                            let z = flute_len * (i as f64) / (steps as f64);
-                            map(radius_at(z) * theta.sin(), z, 1.0)
-                        })
-                        .collect();
-                    flute_paths.push(pts);
+            let mut flute_paths: Vec<Vec<P>> = Vec::new();
+            match self.cutting_direction {
+                CutDir::Straight => {
+                    // ~N/2 visible front flutes, spread across the width, tapering to the tip.
+                    let front = n.div_ceil(2).max(1);
+                    for j in 0..front {
+                        let theta = ((j as f64 + 0.5) / front as f64) * PI - PI / 2.0;
+                        let pts = (0..=steps)
+                            .map(|i| {
+                                let z = flute_len * (i as f64) / (steps as f64);
+                                map(radius_at(z) * theta.sin(), z, 1.0)
+                            })
+                            .collect();
+                        flute_paths.push(pts);
+                    }
                 }
-            }
-            dir => {
-                let s = if dir == CutDir::Up { 1.0_f64 } else { -1.0 };
-                for k in 0..n {
-                    let psi0 = (k as f64) * TAU / (n as f64);
-                    let mut seg: Vec<P> = Vec::new();
-                    for i in 0..=steps {
-                        let z = flute_len * (i as f64) / (steps as f64);
-                        let psi = psi0 + s * TAU * (z / flute_len);
-                        if psi.cos() > 0.0 {
-                            seg.push(map(radius_at(z) * psi.sin(), z, 1.0));
-                        } else if seg.len() >= 2 {
-                            flute_paths.push(std::mem::take(&mut seg));
-                        } else {
-                            seg.clear();
+                dir => {
+                    let s = if dir == CutDir::Up { 1.0_f64 } else { -1.0 };
+                    for k in 0..n {
+                        let psi0 = (k as f64) * TAU / (n as f64);
+                        let mut seg: Vec<P> = Vec::new();
+                        for i in 0..=steps {
+                            let z = flute_len * (i as f64) / (steps as f64);
+                            let psi = psi0 + s * TAU * (z / pitch);
+                            if psi.cos() > 0.0 {
+                                seg.push(map(radius_at(z) * psi.sin(), z, 1.0));
+                            } else if seg.len() >= 2 {
+                                flute_paths.push(std::mem::take(&mut seg));
+                            } else {
+                                seg.clear();
+                            }
+                        }
+                        if seg.len() >= 2 {
+                            flute_paths.push(seg);
                         }
                     }
-                    if seg.len() >= 2 {
-                        flute_paths.push(seg);
+                }
+            }
+            for pts in flute_paths {
+                if pts.len() < 2 {
+                    continue;
+                }
+                let path = canvas::Path::new(|b| {
+                    b.move_to(pts[0]);
+                    for p in &pts[1..] {
+                        b.line_to(*p);
                     }
-                }
+                });
+                frame.stroke(&path, canvas::Stroke::default().with_color(flute_col).with_width(1.0));
             }
-        }
-        for pts in flute_paths {
-            if pts.len() < 2 {
-                continue;
-            }
-            let path = canvas::Path::new(|b| {
-                b.move_to(pts[0]);
-                for p in &pts[1..] {
-                    b.line_to(*p);
-                }
-            });
-            frame.stroke(&path, canvas::Stroke::default().with_color(flute_col).with_width(1.0));
         }
 
         // Dimension annotations (text only — no scale bars, kept minimal).
@@ -6420,12 +6436,19 @@ impl canvas::Program<Message> for ToolCanvas {
         };
         label(&mut frame, format!("⌀ {:.3} mm", self.diameter), 6.0);
         label(&mut frame, format!("length {:.1} mm", self.length), 22.0);
-        label(&mut frame, format!("flute {:.1} mm", self.flute_length), 38.0);
-        label(
-            &mut frame,
-            format!("{} flute{}, {}", self.flutes, if self.flutes == 1 { "" } else { "s" }, self.cutting_direction),
-            54.0,
-        );
+        if self.draw_flutes {
+            label(&mut frame, format!("flute {:.1} mm", self.flute_length), 38.0);
+            label(
+                &mut frame,
+                format!(
+                    "{} flute{}, {}",
+                    self.flutes,
+                    if self.flutes == 1 { "" } else { "s" },
+                    self.cutting_direction
+                ),
+                54.0,
+            );
+        }
 
         vec![frame.into_geometry()]
     }
