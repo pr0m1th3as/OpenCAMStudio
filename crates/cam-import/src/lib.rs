@@ -99,6 +99,24 @@ pub fn read_dxf_file(
     read_dxf_str(&text, options)
 }
 
+/// Read a CAD file's **raw entity inventory** — the typed entities plus the names of any
+/// unsupported/skipped ones — *without* assembling regions. This is the tool-import
+/// **vet** path (`TOOLING_PLAN.md` §5): the vet must reject a drawing containing anything
+/// other than LINE/ARC, which needs to see every entity, not the chained geometry that
+/// [`read_cad_file`] returns. DXF (ASCII or binary) or DWG, chosen by extension.
+pub fn read_cad_entities(
+    path: impl AsRef<Path>,
+) -> Result<(Vec<dxf::Entity>, Vec<String>), ImportError> {
+    let doc = read_cad_document(path.as_ref())?;
+    Ok(map_acad_entities(&doc))
+}
+
+/// The entity inventory of an in-memory ASCII-DXF string (the in-crate reader) — the
+/// string-level companion to [`read_cad_entities`], for the bundled sample and tests.
+pub fn read_dxf_entities(text: &str) -> (Vec<dxf::Entity>, Vec<String>) {
+    dxf::read_entities(text)
+}
+
 /// Import geometry from a CAD file (`.dxf` — ASCII or binary — or `.dwg`) via
 /// **acadrust**. This is the user-facing import path; the supported entities
 /// (LINE / CIRCLE / ARC / LWPOLYLINE) are mapped into the same chaining +
@@ -203,4 +221,43 @@ fn assemble_import(
         open_chains,
         warnings,
     })
+}
+
+#[cfg(test)]
+mod entity_inventory_tests {
+    use super::*;
+
+    // A tiny ASCII-DXF ENTITIES section with a LINE, an ARC, and an LWPOLYLINE.
+    const MIXED: &str = "0\nSECTION\n2\nENTITIES\n\
+        0\nLINE\n10\n0.0\n20\n0.0\n11\n10.0\n21\n0.0\n\
+        0\nARC\n10\n5.0\n20\n0.0\n40\n5.0\n50\n0.0\n51\n90.0\n\
+        0\nLWPOLYLINE\n90\n2\n10\n0.0\n20\n0.0\n10\n1.0\n20\n1.0\n\
+        0\nENDSEC\n0\nEOF\n";
+
+    #[test]
+    fn read_dxf_entities_surfaces_every_entity_type_for_the_vet() {
+        let (entities, _skipped) = read_dxf_entities(MIXED);
+        // The tool-import vet needs to *see* the LWPOLYLINE (to reject it), not have it
+        // silently chained away.
+        assert!(entities.iter().any(|e| matches!(e, dxf::Entity::Line { .. })));
+        assert!(entities.iter().any(|e| matches!(e, dxf::Entity::Arc { .. })));
+        assert!(
+            entities.iter().any(|e| matches!(e, dxf::Entity::LwPolyline { .. })),
+            "the polyline is visible to the vet, which will reject the whole drawing"
+        );
+    }
+
+    #[test]
+    fn a_line_and_arc_only_drawing_has_nothing_the_vet_rejects() {
+        let clean = "0\nSECTION\n2\nENTITIES\n\
+            0\nLINE\n10\n0.0\n20\n0.0\n11\n6.0\n21\n0.0\n\
+            0\nARC\n10\n6.0\n20\n0.0\n40\n2.0\n50\n0.0\n51\n90.0\n\
+            0\nENDSEC\n0\nEOF\n";
+        let (entities, skipped) = read_dxf_entities(clean);
+        assert_eq!(entities.len(), 2);
+        assert!(entities
+            .iter()
+            .all(|e| matches!(e, dxf::Entity::Line { .. } | dxf::Entity::Arc { .. })));
+        assert!(skipped.is_empty(), "no unsupported entities skipped");
+    }
 }
