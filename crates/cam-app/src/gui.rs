@@ -2341,9 +2341,17 @@ impl App {
                 self.rerun();
             }
             Message::NewTool => {
-                // Add a tool to the library and select it for editing. If an op
-                // wizard is active, also embed it and pick it for the pending op.
-                self.lib_sel = self.library.add_default();
+                // Add a tool to the library and select it for editing. Its **type**
+                // seeds from the currently-selected tool (a chamfer mill begets a
+                // chamfer mill), defaulting to an end mill when nothing is selected. If
+                // an op wizard is active, also embed it and pick it for the pending op.
+                let seed_kind = self
+                    .library
+                    .tools
+                    .get(self.lib_sel)
+                    .map(|t| t.kind)
+                    .unwrap_or(ToolKind::EndMill);
+                self.lib_sel = self.library.add_of_kind(seed_kind);
                 self.library.save();
                 if self.controller.pending_op().is_some() {
                     if let Some(&tool) = self.library.tools.get(self.lib_sel) {

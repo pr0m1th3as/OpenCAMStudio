@@ -97,12 +97,19 @@ impl ToolLibrary {
     /// Append a fresh default tool (numbered one past the highest) and return its
     /// index. The caller typically selects it and edits its fields.
     pub fn add_default(&mut self) -> usize {
+        self.add_of_kind(ToolKind::EndMill)
+    }
+
+    /// Append a fresh default tool of a **given kind** (its kind-specific parameters
+    /// carried through) and return its index — so "New" can seed the type from whatever
+    /// tool is currently selected (a chamfer mill begets a chamfer mill, etc.).
+    pub fn add_of_kind(&mut self, kind: ToolKind) -> usize {
         self.tools.push(Tool {
             number: self.next_number(),
             diameter: 6.0,
             length: 30.0,
             flutes: 2,
-            kind: ToolKind::EndMill,
+            kind,
             ..Default::default()
         });
         self.tools.len() - 1
