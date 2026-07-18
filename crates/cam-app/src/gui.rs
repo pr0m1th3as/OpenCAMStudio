@@ -3914,10 +3914,18 @@ impl App {
             self.library.tools.iter().enumerate().collect();
         match self.library_view {
             LibraryView::Serial => {
+                // Number **first** in the library (the number is the tool's identity
+                // here) — the reverse of the Project pane, e.g. "T1: ⌀6 End mill (2 flutes)".
                 items.sort_by_key(|(_, t)| t.number);
                 for (i, t) in items {
                     list = list.push(select_row(
-                        format!("⌀{} {} (T{})", fmt_num(t.diameter), t.kind, t.number),
+                        format!(
+                            "T{}: ⌀{} {} ({})",
+                            t.number,
+                            fmt_num(t.diameter),
+                            t.kind,
+                            flute_count(t.flutes)
+                        ),
                         i == self.lib_sel,
                         Message::SelectLibraryTool(i),
                     ));
@@ -3937,8 +3945,14 @@ impl App {
                         list = list.push(tree_header(&fam));
                         current = Some(fam);
                     }
+                    // Kind is the group header, so the row omits it: "T2: ⌀6 (4 flutes)".
                     list = list.push(select_row(
-                        format!("⌀{} (T{})", fmt_num(t.diameter), t.number),
+                        format!(
+                            "T{}: ⌀{} ({})",
+                            t.number,
+                            fmt_num(t.diameter),
+                            flute_count(t.flutes)
+                        ),
                         i == self.lib_sel,
                         Message::SelectLibraryTool(i),
                     ));
@@ -4960,6 +4974,11 @@ fn select_row<'a>(label: String, active: bool, on_press: Message) -> Element<'a,
 }
 
 /// A section header row in the project tree.
+/// A tool's flute count as a short label, e.g. `"2 flutes"` / `"1 flute"`.
+fn flute_count(flutes: u32) -> String {
+    format!("{flutes} flute{}", if flutes == 1 { "" } else { "s" })
+}
+
 /// A stable family sort/order key for the Tool Library pane's Family view.
 fn kind_order(kind: ToolKind) -> u8 {
     match kind {
