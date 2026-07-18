@@ -27,6 +27,7 @@ impl ToolLibrary {
                 number,
                 diameter,
                 flute_length: flute,
+                shank_diameter: diameter,
                 length: flute + 2.5 * flute,
                 flutes: 2,
                 kind: ToolKind::EndMill,
@@ -119,6 +120,7 @@ impl ToolLibrary {
             number: self.next_number(),
             diameter,
             flute_length: flute,
+            shank_diameter: diameter, // explicit shank ⌀ (= flute ⌀ by default)
             length: flute + shank,
             flutes: 2,
             kind,

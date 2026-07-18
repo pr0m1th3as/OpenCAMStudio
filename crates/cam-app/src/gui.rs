@@ -811,10 +811,10 @@ impl Field {
             Field::StartOffX => "Offset X (mm)",
             Field::StartOffY => "Offset Y (mm)",
             Field::StartOffZ => "Offset Z (mm)",
-            Field::ToolDiameter => "Flute ⌀ (mm)",
+            Field::ToolDiameter => "Flute diameter (mm)",
             Field::ToolLength => "Overall length (mm)",
             Field::FluteLength => "Flute length (mm)",
-            Field::ShankDiameter => "Shank ⌀ (mm, 0=flute ⌀)",
+            Field::ShankDiameter => "Shank diameter (mm)",
             Field::ShankLength => "Shank length (mm)",
             Field::NeckLength => "Neck length (mm, 0=none)",
             Field::NeckDiameter => "Neck ⌀ (mm, 0=cut ⌀)",
@@ -910,8 +910,8 @@ impl Field {
                  cutting flute and non-cutting shank for gouge checks."
             }
             Field::ShankDiameter => {
-                "Diameter of the (non-cutting) shank above the flutes. 0 = the same as \
-                 the cutting diameter (no distinct shank)."
+                "Diameter of the (non-cutting) shank above the flutes (often equal to the \
+                 flute diameter)."
             }
             Field::ShankLength => {
                 "Length of the (non-cutting) shank above the flutes. Overall length = \
@@ -2929,7 +2929,7 @@ impl App {
                 Field::ToolLength => Some(t.length),
                 // Effective flute (resolves the 0-sentinel), so shank = overall − flute.
                 Field::FluteLength => Some(t.flute_len()),
-                Field::ShankDiameter => Some(t.shank_diameter),
+                Field::ShankDiameter => Some(t.shank_dia()),
                 Field::ShankLength => Some((t.length - t.flute_len()).max(0.0)),
                 Field::NeckLength => Some(t.neck_length),
                 Field::NeckDiameter => Some(t.neck_diameter),
@@ -2983,7 +2983,7 @@ impl App {
                 _ => None,
             },
             Field::ShankDiameter => match self.controller.selection() {
-                Selection::Tool(i) => setup.tools.get(i).map(|t| t.shank_diameter),
+                Selection::Tool(i) => setup.tools.get(i).map(|t| t.shank_dia()),
                 _ => None,
             },
             Field::ShankLength => match self.controller.selection() {
@@ -4075,7 +4075,7 @@ impl App {
             list = list.push(
                 row![
                     help_wrap(
-                        text("Cutting dir.").width(Length::Fixed(80.0)).size(13),
+                        text("Cutting direction").width(Length::Fixed(112.0)).size(13),
                         "Down-cut vs up-cut (helix direction); a physical property of the \
                          tool, like the flute count. Square end mills also allow a straight \
                          (axial) flute.",
@@ -4083,7 +4083,7 @@ impl App {
                     ),
                     pick_list(dir_opts, Some(t.cutting_direction), Message::ToolCuttingDirChanged)
                         .text_size(13)
-                        .width(Length::Fixed(145.0)),
+                        .width(Length::Fixed(113.0)),
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),
