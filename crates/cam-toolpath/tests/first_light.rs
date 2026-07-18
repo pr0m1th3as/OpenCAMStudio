@@ -47,6 +47,7 @@ fn document() -> Document {
         length: 30.0,
         flutes: 2,
         kind: ToolKind::EndMill,
+        ..Default::default()
     };
     let outer = ProfileOp {
         clearing: cam_model::Clearing::default(),
@@ -191,6 +192,7 @@ fn tool_too_large_for_hole_reports_error() {
         length: 30.0,
         flutes: 2,
         kind: ToolKind::EndMill,
+        ..Default::default()
     };
     let op = ProfileOp {
         clearing: cam_model::Clearing::default(),
@@ -230,6 +232,7 @@ fn cancellation_stops_before_emitting() {
         length: 30.0,
         flutes: 2,
         kind: ToolKind::EndMill,
+        ..Default::default()
     };
     let op = ProfileOp {
         clearing: cam_model::Clearing::default(),
@@ -276,6 +279,7 @@ fn lead_overlap_recuts_past_the_start() {
         length: 30.0,
         flutes: 2,
         kind: ToolKind::EndMill,
+        ..Default::default()
     };
     let overlap = 2.0;
     let op = ProfileOp {
@@ -379,6 +383,7 @@ fn offset_leaves_stock_on_the_wall() {
             length: 30.0,
             flutes: 2,
             kind: ToolKind::EndMill,
+            ..Default::default()
         }];
         let env = JobEnv {
             heights: Heights::new(5.0, 2.0, 0.0),
@@ -444,6 +449,7 @@ fn end_mill_tools() -> [Tool; 1] {
         length: 30.0,
         flutes: 2,
         kind: ToolKind::EndMill,
+        ..Default::default()
     }]
 }
 
@@ -714,6 +720,7 @@ fn arc_lead_and_helix_plunge_post_to_helical_gcode() {
         length: 30.0,
         flutes: 2,
         kind: ToolKind::EndMill,
+        ..Default::default()
     };
     let doc = Document::new(Setup {
         name: "lead_helix".into(),

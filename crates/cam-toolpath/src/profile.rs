@@ -933,6 +933,7 @@ mod tests {
             length: 30.0,
             flutes: 2,
             kind: ToolKind::EndMill,
+            ..Default::default()
         }];
         let env = crate::JobEnv {
             heights: Heights::new(5.0, 2.0, 0.0),
@@ -1055,6 +1056,7 @@ mod tests {
             length: 30.0,
             flutes: 2,
             kind: ToolKind::EndMill,
+            ..Default::default()
         }];
         let env = crate::JobEnv {
             heights: Heights::new(5.0, 2.0, 0.0),

@@ -277,6 +277,7 @@ mod tests {
             length: 30.0,
             flutes: 2,
             kind: ToolKind::EndMill,
+            ..Default::default()
         }
     }
 

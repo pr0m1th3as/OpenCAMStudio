@@ -365,6 +365,7 @@ mod tests {
             length: 30.0,
             flutes: 3,
             kind: ToolKind::ThreadMill { pitch: None },
+            ..Default::default()
         }
     }
 
@@ -469,6 +470,7 @@ mod tests {
             length: 30.0,
             flutes: 3,
             kind: ToolKind::ThreadMill { pitch: Some(pitch) },
+            ..Default::default()
         }
     }
 

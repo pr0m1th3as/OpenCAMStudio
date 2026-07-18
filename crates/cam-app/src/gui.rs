@@ -649,6 +649,14 @@ enum Field {
     StartOffZ,
     ToolDiameter,
     ToolLength,
+    /// Length of cut (flute length) from the tip, mm; 0 = fully fluted (= overall length).
+    FluteLength,
+    /// Shank diameter, mm; 0 = same as the cutting diameter (no distinct shank).
+    ShankDiameter,
+    /// Reduced-neck length from the cutting end, mm; 0 = no reduced neck.
+    NeckLength,
+    /// Reduced-neck diameter, mm; 0 = same as the cutting diameter.
+    NeckDiameter,
     Flutes,
     /// Bull-nose corner radius (mm).
     CornerRadius,
@@ -730,6 +738,10 @@ impl Field {
             Field::StartOffZ => "Offset Z (mm)",
             Field::ToolDiameter => "Tool ⌀ (mm)",
             Field::ToolLength => "Length (mm)",
+            Field::FluteLength => "Flute length (mm, 0=full)",
+            Field::ShankDiameter => "Shank ⌀ (mm, 0=cut ⌀)",
+            Field::NeckLength => "Neck length (mm, 0=none)",
+            Field::NeckDiameter => "Neck ⌀ (mm, 0=cut ⌀)",
             Field::Flutes => "Flutes",
             Field::CornerRadius => "Corner radius (mm)",
             Field::ChamferAngle => "Point angle (deg)",
@@ -813,8 +825,24 @@ impl Field {
             Field::StartOffZ => "Z offset of the program start point from the origin.",
             Field::ToolDiameter => "Cutting diameter of the tool (mm).",
             Field::ToolLength => {
-                "Overall/usable length of the tool — used for reach checks and the \
-                 backplot; it does not change the cutting geometry."
+                "Overall length of the tool — the stickout below the holder. Used for \
+                 reach checks and the backplot; does not change the cutting geometry."
+            }
+            Field::FluteLength => {
+                "Length of the cutting edge (length of cut) measured from the tip. \
+                 0 = fully fluted (equals the overall length). Splits the tool into \
+                 cutting flute and non-cutting shank for gouge checks."
+            }
+            Field::ShankDiameter => {
+                "Diameter of the (non-cutting) shank above the flutes. 0 = the same as \
+                 the cutting diameter (no distinct shank)."
+            }
+            Field::NeckLength => {
+                "Length of a reduced-diameter neck above the flutes (reach/stub tools). \
+                 0 = no reduced neck."
+            }
+            Field::NeckDiameter => {
+                "Diameter of the reduced neck. 0 = the same as the cutting diameter."
             }
             Field::Flutes => {
                 "Number of cutting edges. Informational for now (feed-per-tooth math \
@@ -2481,7 +2509,15 @@ impl App {
     fn inspector_fields(&self) -> Vec<Field> {
         // Common tool fields plus the selected tool's kind-specific parameters.
         let tool_fields = |kind: Option<ToolKind>| {
-            let mut f = vec![Field::ToolDiameter, Field::ToolLength, Field::Flutes];
+            let mut f = vec![
+                Field::ToolDiameter,
+                Field::ToolLength,
+                Field::FluteLength,
+                Field::ShankDiameter,
+                Field::NeckLength,
+                Field::NeckDiameter,
+                Field::Flutes,
+            ];
             if let Some(k) = kind {
                 f.extend(tool_kind_fields(k));
             }
@@ -2623,6 +2659,10 @@ impl App {
             return match field {
                 Field::ToolDiameter => Some(t.diameter),
                 Field::ToolLength => Some(t.length),
+                Field::FluteLength => Some(t.flute_length),
+                Field::ShankDiameter => Some(t.shank_diameter),
+                Field::NeckLength => Some(t.neck_length),
+                Field::NeckDiameter => Some(t.neck_diameter),
                 Field::Flutes => Some(t.flutes as f64),
                 _ => tool_kind_field(t.kind, field),
             };
@@ -2711,6 +2751,18 @@ impl App {
                 if let Some(&v) = parsed.get(&Field::ToolLength) {
                     t.length = v;
                 }
+                if let Some(&v) = parsed.get(&Field::FluteLength) {
+                    t.flute_length = v.max(0.0);
+                }
+                if let Some(&v) = parsed.get(&Field::ShankDiameter) {
+                    t.shank_diameter = v.max(0.0);
+                }
+                if let Some(&v) = parsed.get(&Field::NeckLength) {
+                    t.neck_length = v.max(0.0);
+                }
+                if let Some(&v) = parsed.get(&Field::NeckDiameter) {
+                    t.neck_diameter = v.max(0.0);
+                }
                 if let Some(&v) = parsed.get(&Field::Flutes) {
                     t.flutes = v.round().max(1.0) as u32;
                 }
@@ -2779,6 +2831,18 @@ impl App {
                 }
                 if let Some(&v) = parsed.get(&Field::ToolLength) {
                     t.length = v;
+                }
+                if let Some(&v) = parsed.get(&Field::FluteLength) {
+                    t.flute_length = v.max(0.0);
+                }
+                if let Some(&v) = parsed.get(&Field::ShankDiameter) {
+                    t.shank_diameter = v.max(0.0);
+                }
+                if let Some(&v) = parsed.get(&Field::NeckLength) {
+                    t.neck_length = v.max(0.0);
+                }
+                if let Some(&v) = parsed.get(&Field::NeckDiameter) {
+                    t.neck_diameter = v.max(0.0);
                 }
                 if let Some(&v) = parsed.get(&Field::Flutes) {
                     // Flutes is an integer count; round the typed value.

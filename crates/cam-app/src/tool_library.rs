@@ -26,6 +26,7 @@ impl ToolLibrary {
             length: 30.0,
             flutes: 2,
             kind: ToolKind::EndMill,
+            ..Default::default()
         };
         Self {
             tools: vec![em(1, 3.0), em(2, 6.0), em(3, 10.0)],
@@ -108,6 +109,7 @@ impl ToolLibrary {
             length: 30.0,
             flutes: 2,
             kind: ToolKind::EndMill,
+            ..Default::default()
         });
         self.tools.len() - 1
     }
@@ -148,6 +150,7 @@ mod tests {
             length: 30.0,
             flutes: 2,
             kind,
+            ..Default::default()
         }
     }
 

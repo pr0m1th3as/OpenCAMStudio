@@ -112,6 +112,7 @@ mod tests {
             kind: ToolKind::Drill {
                 point_angle_deg: 118.0,
             },
+            ..Default::default()
         }
     }
 

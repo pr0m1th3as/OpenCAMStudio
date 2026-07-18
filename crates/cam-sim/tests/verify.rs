@@ -62,6 +62,7 @@ fn setup(operations: Vec<Operation>) -> Document {
             length: 30.0,
             flutes: 2,
             kind: ToolKind::EndMill,
+            ..Default::default()
         }],
         operations,
         origin: [0.0, 0.0, 0.0],
@@ -226,6 +227,7 @@ fn a_bad_setup_that_rapids_low_is_caught() {
             length: 30.0,
             flutes: 2,
             kind: ToolKind::EndMill,
+            ..Default::default()
         }],
         // Two separate profiles: linking from the first's retract to the second's
         // approach forces a *lateral* rapid across the (too-low) clearance plane, over

@@ -550,6 +550,7 @@ impl AppController {
             length: 30.0,
             flutes: 2,
             kind: ToolKind::EndMill,
+            ..Default::default()
         };
         self.document.edit(move |doc| doc.setup.tools.push(tool));
         let index = self.document.current().setup.tools.len() - 1;
@@ -1436,6 +1437,7 @@ impl AppController {
                 length: 30.0,
                 flutes: 2,
                 kind: ToolKind::EndMill,
+                ..Default::default()
             }]
         } else {
             Vec::new()
@@ -1785,6 +1787,7 @@ fn empty_document(p: &JobParams) -> Document {
             length: 30.0,
             flutes: 2,
             kind: ToolKind::EndMill,
+            ..Default::default()
         }],
         operations: Vec::new(),
         origin: [0.0, 0.0, 0.0],
@@ -2353,6 +2356,7 @@ mod tests {
             length: 30.0,
             flutes: 2,
             kind: ToolKind::EndMill,
+            ..Default::default()
         };
         let n1 = app.use_tool(bit);
         assert_eq!(app.document().setup.tools.len(), base + 1);

@@ -78,6 +78,7 @@ fn import_and_plan() -> (String, Vec<cam_toolpath::Diagnostic>, usize, usize) {
             length: 30.0,
             flutes: 2,
             kind: ToolKind::EndMill,
+            ..Default::default()
         }],
         operations: ops,
         origin: [0.0, 0.0, 0.0],

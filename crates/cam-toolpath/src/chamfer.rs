@@ -355,6 +355,7 @@ mod tests {
                 included_angle_deg,
                 tip_diameter,
             },
+            ..Default::default()
         }
     }
 
@@ -430,6 +431,7 @@ mod tests {
             length: 30.0,
             flutes: 2,
             kind: ToolKind::EndMill,
+            ..Default::default()
         };
         let r = run(op(1.0), end_mill);
         assert!(r.has_errors());

@@ -158,27 +158,96 @@ impl std::fmt::Display for ToolKind {
     }
 }
 
-/// A cutting tool. The P2 slice is the minimum a post/cycle needs; feeds, speeds
-/// and a richer library land with the document model at P3.
+/// A cutting tool. The P2 slice was `number/diameter/length/flutes/kind`; the tool
+/// subsystem (see `TOOLING_PLAN.md`) adds the **non-cutting** geometry the sim's
+/// gouge checks and the tool-library preview reason about — all `#[serde(default)]`
+/// so pre-existing tool libraries and `.ocam` projects load unchanged.
+///
+/// The enriched dimensions use `0.0` as an **"unspecified" sentinel** resolved by the
+/// [`Tool::flute_len`], [`Tool::shank_dia`], [`Tool::neck_dia`] accessors, so an old
+/// tool (all sentinels) behaves exactly as before: fully fluted, no distinct shank.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Tool {
     /// Tool number (emitted as `Tn`).
     pub number: u32,
     /// Cutting diameter, mm.
     pub diameter: f64,
-    /// Overall tool length, mm (informational for now; the tool library and
-    /// gouge-against-holder checks are the eventual consumers).
+    /// Overall tool length — the stickout below the holder, mm.
     pub length: f64,
+    /// Length of the cutting edge (length of cut) from the tip, mm. `0.0` = unspecified
+    /// → treated as fully fluted (equals `length`); see [`Tool::flute_len`]. Drives the
+    /// cutting/non-cutting split of a generated generatrix.
+    #[serde(default)]
+    pub flute_length: f64,
+    /// Shank diameter, mm. `0.0` = unspecified → equals the cutting `diameter` (no
+    /// distinct shank); see [`Tool::shank_dia`].
+    #[serde(default)]
+    pub shank_diameter: f64,
+    /// Reduced-neck length from the cutting end, mm. `0.0` = no reduced neck.
+    #[serde(default)]
+    pub neck_length: f64,
+    /// Reduced-neck diameter, mm. `0.0` = unspecified → equals the cutting `diameter`;
+    /// see [`Tool::neck_dia`].
+    #[serde(default)]
+    pub neck_diameter: f64,
     /// Number of flutes.
     pub flutes: u32,
     /// Tool geometry class.
     pub kind: ToolKind,
 }
 
+impl Default for Tool {
+    /// A bare ⌀0 end mill — a base for struct-update literals (`..Default::default()`).
+    /// Not a usable tool on its own; callers set at least number/diameter/kind.
+    fn default() -> Self {
+        Self {
+            number: 0,
+            diameter: 0.0,
+            length: 0.0,
+            flute_length: 0.0,
+            shank_diameter: 0.0,
+            neck_length: 0.0,
+            neck_diameter: 0.0,
+            flutes: 0,
+            kind: ToolKind::EndMill,
+        }
+    }
+}
+
 impl Tool {
     /// The tool radius (half the diameter), mm.
     pub fn radius(&self) -> f64 {
         0.5 * self.diameter
+    }
+
+    /// Effective length of cut: the explicit [`flute_length`](Self::flute_length), or
+    /// the overall [`length`](Self::length) when unspecified (`0.0` ⇒ fully fluted).
+    pub fn flute_len(&self) -> f64 {
+        if self.flute_length > 0.0 {
+            self.flute_length
+        } else {
+            self.length
+        }
+    }
+
+    /// Effective shank diameter: the explicit [`shank_diameter`](Self::shank_diameter),
+    /// or the cutting [`diameter`](Self::diameter) when unspecified.
+    pub fn shank_dia(&self) -> f64 {
+        if self.shank_diameter > 0.0 {
+            self.shank_diameter
+        } else {
+            self.diameter
+        }
+    }
+
+    /// Effective neck diameter: the explicit [`neck_diameter`](Self::neck_diameter),
+    /// or the cutting [`diameter`](Self::diameter) when unspecified.
+    pub fn neck_dia(&self) -> f64 {
+        if self.neck_diameter > 0.0 {
+            self.neck_diameter
+        } else {
+            self.diameter
+        }
     }
 }
 
@@ -224,6 +293,7 @@ mod tests {
             length: 30.0,
             flutes: 2,
             kind: ToolKind::EndMill,
+            ..Default::default()
         };
         assert_eq!(t.radius(), 3.0);
     }
@@ -263,5 +333,62 @@ mod tests {
             serde_json::from_str::<ToolKind>("\"FaceMill\"").unwrap(),
             ToolKind::FaceMill
         );
+    }
+
+    #[test]
+    fn enriched_dims_resolve_their_unspecified_sentinels() {
+        // All sentinels (an "old" tool): fully fluted, shank == cutting diameter.
+        let bare = Tool {
+            number: 1,
+            diameter: 6.0,
+            length: 40.0,
+            flutes: 2,
+            kind: ToolKind::EndMill,
+            ..Default::default()
+        };
+        assert_eq!(bare.flute_len(), 40.0, "unspecified flute length ⇒ overall length");
+        assert_eq!(bare.shank_dia(), 6.0, "unspecified shank ⇒ cutting diameter");
+        assert_eq!(bare.neck_dia(), 6.0, "unspecified neck ⇒ cutting diameter");
+
+        // Explicit values win.
+        let stub = Tool {
+            flute_length: 12.0,
+            shank_diameter: 8.0,
+            neck_length: 20.0,
+            neck_diameter: 4.0,
+            ..bare
+        };
+        assert_eq!(stub.flute_len(), 12.0);
+        assert_eq!(stub.shank_dia(), 8.0);
+        assert_eq!(stub.neck_dia(), 4.0);
+    }
+
+    #[test]
+    fn tool_json_round_trips_with_enriched_dims() {
+        let t = Tool {
+            number: 3,
+            diameter: 10.0,
+            length: 60.0,
+            flute_length: 30.0,
+            shank_diameter: 10.0,
+            neck_length: 15.0,
+            neck_diameter: 6.0,
+            flutes: 3,
+            kind: ToolKind::BullNose { corner_radius: 1.0 },
+        };
+        let back: Tool = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        assert_eq!(t, back);
+    }
+
+    #[test]
+    fn pre_tooling_tool_json_loads_with_default_sentinels() {
+        // A tool saved before the enriched dims existed (only the P2 fields) must
+        // still deserialize — the new fields are `#[serde(default)]` → 0.0 sentinels.
+        let legacy = r#"{"number":2,"diameter":6.0,"length":30.0,"flutes":2,"kind":"EndMill"}"#;
+        let t: Tool = serde_json::from_str(legacy).unwrap();
+        assert_eq!(t.diameter, 6.0);
+        assert_eq!(t.flute_length, 0.0);
+        assert_eq!(t.flute_len(), 30.0, "legacy tool reads as fully fluted");
+        assert_eq!(t.shank_dia(), 6.0);
     }
 }
