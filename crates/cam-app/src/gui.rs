@@ -2294,13 +2294,22 @@ impl App {
                 // Route to whichever tool the inspector is editing: the library
                 // entry (Tooling tab) or the selected setup tool. Switching kind
                 // resets its parameters to the new kind's defaults.
+                // Straight flute only applies to a Square End Mill; changing to any other
+                // kind falls back to a down-cut.
+                let fix_dir = |t: &mut cam_model::Tool| {
+                    t.kind = kind;
+                    if !matches!(kind, ToolKind::EndMill) && t.cutting_direction == CutDir::Straight
+                    {
+                        t.cutting_direction = CutDir::Down;
+                    }
+                };
                 if self.library_mode() {
                     if let Some(t) = self.library.tools.get_mut(self.lib_sel) {
-                        t.kind = kind;
+                        fix_dir(t);
                         self.library.save();
                     }
                 } else if let Selection::Tool(i) = self.controller.selection() {
-                    self.controller.edit_tool(i, |t| t.kind = kind);
+                    self.controller.edit_tool(i, fix_dir);
                     self.rerun();
                 }
                 // The kind-specific fields depend on the kind — repopulate them.
@@ -2747,12 +2756,23 @@ impl App {
         // The Cutting-direction control is rendered separately (it's a picker, not a
         // numeric field), as is the Type picker.
         let tool_fields = |kind: Option<ToolKind>| match kind {
-            Some(ToolKind::EndMill) => vec![
+            // Square & Ball Nose end mills share the exact end-mill field set.
+            Some(ToolKind::EndMill | ToolKind::BallMill) => vec![
                 Field::ToolDiameter, // "Flute ⌀"
                 Field::FluteLength,
                 Field::ShankDiameter,
                 Field::ShankLength,
                 Field::ToolLength, // "Overall length"
+                Field::Flutes,
+            ],
+            // Rounded-Edge (bull-nose) end mill: the same, plus a corner radius.
+            Some(ToolKind::BullNose { .. }) => vec![
+                Field::ToolDiameter,
+                Field::CornerRadius,
+                Field::FluteLength,
+                Field::ShankDiameter,
+                Field::ShankLength,
+                Field::ToolLength,
                 Field::Flutes,
             ],
             other => {
@@ -4045,20 +4065,23 @@ impl App {
         }
         if let Some(t) = self.library.tools.get(self.lib_sel) {
             // Cutting direction (a picker, not a numeric field) — Andreas's field 7.
+            // "Straight flute" is offered only for a Square End Mill.
+            let dir_opts = if matches!(t.kind, ToolKind::EndMill) {
+                vec![CutDir::Down, CutDir::Up, CutDir::Straight]
+            } else {
+                vec![CutDir::Down, CutDir::Up]
+            };
             list = list.push(row![
                 label_help(
                     "Cutting dir.",
-                    "Down-cut vs up-cut (helix direction). A physical property of the \
-                     tool, like the flute count.",
+                    "Down-cut vs up-cut (helix direction); a physical property of the \
+                     tool, like the flute count. Square end mills also allow a straight \
+                     (axial) flute.",
                     self.tooltips,
                 ),
-                pick_list(
-                    vec![CutDir::Down, CutDir::Up],
-                    Some(t.cutting_direction),
-                    Message::ToolCuttingDirChanged,
-                )
-                .text_size(13)
-                .width(Length::Fixed(120.0)),
+                pick_list(dir_opts, Some(t.cutting_direction), Message::ToolCuttingDirChanged)
+                    .text_size(13)
+                    .width(Length::Fixed(120.0)),
             ]);
             list = list.push(row![
                 label_help("Type", help::TOOL_TYPE, self.tooltips),
@@ -5905,48 +5928,86 @@ impl canvas::Program<Message> for ToolCanvas {
             }
         }
 
-        // Flutes + cutting direction. Each flute is a helix on the cutting band; project
-        // it onto the side view and draw only the **front-facing** portions (cos ψ > 0),
-        // so a 2-flute mill shows one flute from the tip and the second only after it
-        // helixes round — exactly the real side-view read. Count the lines for the flute
-        // number; the lean shows the cutting direction. (Pitch = one turn over the flute
-        // length is a visualisation choice for legibility, not the true helix angle.)
-        let n = self.flutes.max(1);
-        let r = (self.diameter * 0.5).max(1e-3);
-        let flute_len = self.flute_length.max(1e-3);
-        let s = match self.cutting_direction {
-            CutDir::Down => -1.0_f64,
-            CutDir::Up => 1.0,
+        // Flutes + cutting direction. Each flute is projected onto the side view, drawn
+        // only where it faces the viewer, and **tapered to the tool's actual radius at
+        // that height** (`radius_at`) so on a ball / rounded nose the flutes converge at
+        // the tip instead of running full width. Count the lines for the flute number; a
+        // helical lean shows the cutting direction (Down vs Up), while straight (axial)
+        // flutes read as vertical. (Helix pitch = one turn over the flute length is a
+        // legibility choice, not the true helix angle.)
+        use std::f64::consts::{PI, TAU};
+        let boundary = self.profile.polyline(0.05);
+        let radius_at = |z: f64| -> f64 {
+            let mut best = 0.0_f64;
+            for w in boundary.windows(2) {
+                let (a, b) = (w[0], w[1]);
+                if z + 1e-9 < a.y.min(b.y) || z - 1e-9 > a.y.max(b.y) {
+                    continue;
+                }
+                let r = if (b.y - a.y).abs() < 1e-9 {
+                    a.x.max(b.x)
+                } else {
+                    let t = ((z - a.y) / (b.y - a.y)).clamp(0.0, 1.0);
+                    a.x + t * (b.x - a.x)
+                };
+                best = best.max(r);
+            }
+            best
         };
+        let n = self.flutes.max(1);
+        let flute_len = self.flute_length.max(1e-3);
         let flute_col = Color { a: 0.75, ..fg };
         let steps = 48;
-        for k in 0..n {
-            let psi0 = (k as f64) * std::f64::consts::TAU / (n as f64);
-            let mut seg: Vec<P> = Vec::new();
-            let mut segments: Vec<Vec<P>> = Vec::new();
-            for i in 0..=steps {
-                let z = flute_len * (i as f64) / (steps as f64);
-                let psi = psi0 + s * std::f64::consts::TAU * (z / flute_len);
-                if psi.cos() > 0.0 {
-                    seg.push(map(r * psi.sin(), z, 1.0));
-                } else if seg.len() >= 2 {
-                    segments.push(std::mem::take(&mut seg));
-                } else {
-                    seg.clear();
+
+        let mut flute_paths: Vec<Vec<P>> = Vec::new();
+        match self.cutting_direction {
+            CutDir::Straight => {
+                // ~N/2 visible front flutes, spread across the width, each tapering to the tip.
+                let front = n.div_ceil(2).max(1);
+                for j in 0..front {
+                    let theta = ((j as f64 + 0.5) / front as f64) * PI - PI / 2.0;
+                    let pts = (0..=steps)
+                        .map(|i| {
+                            let z = flute_len * (i as f64) / (steps as f64);
+                            map(radius_at(z) * theta.sin(), z, 1.0)
+                        })
+                        .collect();
+                    flute_paths.push(pts);
                 }
             }
-            if seg.len() >= 2 {
-                segments.push(seg);
-            }
-            for sg in segments {
-                let path = canvas::Path::new(|b| {
-                    b.move_to(sg[0]);
-                    for p in &sg[1..] {
-                        b.line_to(*p);
+            dir => {
+                let s = if dir == CutDir::Up { 1.0_f64 } else { -1.0 };
+                for k in 0..n {
+                    let psi0 = (k as f64) * TAU / (n as f64);
+                    let mut seg: Vec<P> = Vec::new();
+                    for i in 0..=steps {
+                        let z = flute_len * (i as f64) / (steps as f64);
+                        let psi = psi0 + s * TAU * (z / flute_len);
+                        if psi.cos() > 0.0 {
+                            seg.push(map(radius_at(z) * psi.sin(), z, 1.0));
+                        } else if seg.len() >= 2 {
+                            flute_paths.push(std::mem::take(&mut seg));
+                        } else {
+                            seg.clear();
+                        }
                     }
-                });
-                frame.stroke(&path, canvas::Stroke::default().with_color(flute_col).with_width(1.0));
+                    if seg.len() >= 2 {
+                        flute_paths.push(seg);
+                    }
+                }
             }
+        }
+        for pts in flute_paths {
+            if pts.len() < 2 {
+                continue;
+            }
+            let path = canvas::Path::new(|b| {
+                b.move_to(pts[0]);
+                for p in &pts[1..] {
+                    b.line_to(*p);
+                }
+            });
+            frame.stroke(&path, canvas::Stroke::default().with_color(flute_col).with_width(1.0));
         }
 
         // Dimension annotations (text only — no scale bars, kept minimal).

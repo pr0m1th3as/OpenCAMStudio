@@ -148,9 +148,9 @@ pub enum ToolKind {
 impl std::fmt::Display for ToolKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
-            ToolKind::EndMill => "End mill",
-            ToolKind::BallMill => "Ball mill",
-            ToolKind::BullNose { .. } => "Bull-nose mill",
+            ToolKind::EndMill => "Square End Mill",
+            ToolKind::BallMill => "Ball Nose End Mill",
+            ToolKind::BullNose { .. } => "Rounded-Edge End Mill",
             ToolKind::ChamferMill { .. } => "Chamfer mill",
             ToolKind::Drill { .. } => "Drill",
             ToolKind::FaceMill => "Face mill",
@@ -174,6 +174,8 @@ pub enum CutDir {
     Down,
     /// Up-cut (up-milling helix).
     Up,
+    /// Straight (axial) flutes — no helix. Only meaningful for a square end mill.
+    Straight,
 }
 
 impl std::fmt::Display for CutDir {
@@ -181,6 +183,7 @@ impl std::fmt::Display for CutDir {
         f.write_str(match self {
             CutDir::Down => "Down-cut",
             CutDir::Up => "Up-cut",
+            CutDir::Straight => "Straight flute",
         })
     }
 }
