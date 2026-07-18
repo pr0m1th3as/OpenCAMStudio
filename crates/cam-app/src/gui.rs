@@ -275,6 +275,7 @@ async fn confirm_export_duplicates(detail: String) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pane {
     Project,
+    Library,
     Viewport,
     Inspector,
     Output,
@@ -284,6 +285,7 @@ impl Pane {
     fn name(self) -> &'static str {
         match self {
             Pane::Project => "Project",
+            Pane::Library => "Tool Library",
             Pane::Viewport => "Viewport",
             Pane::Inspector => "Inspector",
             Pane::Output => "Output",
@@ -295,6 +297,7 @@ impl Pane {
     fn min_size(self) -> f32 {
         match self {
             Pane::Project => 200.0,   // fits the Duplicate/Delete row
+            Pane::Library => 200.0,   // fits the Serial/Family tabs + rows
             Pane::Viewport => 200.0,  // the main view stays usable
             Pane::Inspector => 240.0, // fits the field rows
             Pane::Output => 60.0,     // a short console is fine
@@ -305,7 +308,9 @@ impl Pane {
     /// — it simply takes the space where it is split back in.
     fn dock_edge(self) -> Option<pane_grid::Edge> {
         match self {
-            Pane::Project => Some(pane_grid::Edge::Left),
+            // Library docks Left, like Project — it substitutes for it on the
+            // Tooling tab, and can also sit alongside it.
+            Pane::Project | Pane::Library => Some(pane_grid::Edge::Left),
             Pane::Inspector => Some(pane_grid::Edge::Right),
             Pane::Output => Some(pane_grid::Edge::Bottom),
             Pane::Viewport => None,
@@ -314,7 +319,22 @@ impl Pane {
 }
 
 /// Every pane, in Windows-menu order.
-const ALL_PANES: [Pane; 4] = [Pane::Project, Pane::Viewport, Pane::Inspector, Pane::Output];
+const ALL_PANES: [Pane; 5] = [
+    Pane::Project,
+    Pane::Library,
+    Pane::Viewport,
+    Pane::Inspector,
+    Pane::Output,
+];
+
+/// How the Tool Library pane lists its tools — the pane's two internal tabs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LibraryView {
+    /// Serial order by tool number (T1, T2, …).
+    Serial,
+    /// Grouped by tool family (all end mills, then drills, …), sorted by diameter.
+    Family,
+}
 
 /// A tab in the top-bar ribbon. Each tab shows a band of grouped commands.
 /// Operations and Tooling are added as those capabilities land.
@@ -1166,6 +1186,8 @@ struct App {
     library: ToolLibrary,
     /// The library tool selected for editing in the Tooling-tab library editor.
     lib_sel: usize,
+    /// Which internal tab the Tool Library pane shows (Serial / Family).
+    library_view: LibraryView,
     /// The operation whose right-click context menu is open, and where to anchor it
     /// (window-absolute coords, captured from `window_cursor` at right-click time).
     open_op_menu: Option<u32>,
@@ -1566,6 +1588,8 @@ enum Message {
     NewTool,
     /// Delete the selected tool.
     DeleteTool,
+    /// Switch the Tool Library pane's internal tab (Serial / Family).
+    SetLibraryView(LibraryView),
     /// Open the project-tree right-click menu for the tool numbered `u32` (only wired
     /// for tools not in the library).
     ToolMenu(u32),
@@ -1669,6 +1693,7 @@ impl App {
             cursor: None,
             library: ToolLibrary::load(),
             lib_sel: 0,
+            library_view: LibraryView::Serial,
             open_op_menu: None,
             op_menu_pos: iced::Point::ORIGIN,
             open_tool_menu: None,
@@ -2368,6 +2393,7 @@ impl App {
                 self.lib_sel = i;
                 self.refresh_fields();
             }
+            Message::SetLibraryView(view) => self.library_view = view,
             Message::OpMenu(id) => {
                 self.controller.select(Selection::Operation(id));
                 self.focus_ops.clear();
@@ -2379,7 +2405,19 @@ impl App {
             Message::CloseOpMenu => self.open_op_menu = None,
             Message::WindowCursor(p) => self.window_cursor = p,
             Message::SelectRibbonTab(tab) => {
+                let was_tooling = self.active_tab == RibbonTab::Tooling;
+                let now_tooling = tab == RibbonTab::Tooling;
                 self.active_tab = tab;
+                // Default behaviour: entering the Tooling tab substitutes the Tool
+                // Library pane for the Project pane (and vice versa on leaving). The
+                // user can still re-open either from the Windows tab to see both.
+                if now_tooling && !was_tooling {
+                    self.set_pane_visible(Pane::Project, false);
+                    self.set_pane_visible(Pane::Library, true);
+                } else if was_tooling && !now_tooling {
+                    self.set_pane_visible(Pane::Library, false);
+                    self.set_pane_visible(Pane::Project, true);
+                }
                 // The Tooling tab turns the Inspector into the library editor, so the
                 // field buffers must reload for the new context.
                 self.refresh_fields();
@@ -2529,6 +2567,8 @@ impl App {
     fn apply_fixed_layout(&mut self) {
         self.set_pane_px(Pane::Output, self.output_px);
         self.set_pane_px(Pane::Project, self.project_px);
+        // The Library pane shares the left slot's width with Project.
+        self.set_pane_px(Pane::Library, self.project_px);
         self.set_pane_px(Pane::Inspector, self.inspector_px);
     }
 
@@ -2572,7 +2612,7 @@ impl App {
                 (1.0 - ratio) * dim
             };
             match pane {
-                Pane::Project => self.project_px = px,
+                Pane::Project | Pane::Library => self.project_px = px,
                 Pane::Inspector => self.inspector_px = px,
                 Pane::Output => self.output_px = px,
                 Pane::Viewport => {}
@@ -3485,6 +3525,7 @@ impl App {
     fn pane_content(&self, pane: Pane) -> Element<'_, Message> {
         let inner: Element<'_, Message> = match pane {
             Pane::Project => self.project_tree(),
+            Pane::Library => self.library_pane(),
             // In Tooling mode (or with a tool selected) the viewport shows the tool's 2D
             // cross-section instead of the 3D backplot (Phase 5).
             Pane::Viewport => match self.preview_tool() {
@@ -3842,27 +3883,86 @@ impl App {
         col.into()
     }
 
-    /// The Tooling-tab tool-library editor: a selectable list of library tools plus
-    /// the selected tool's editable fields (reusing the inspector field pipeline).
-    /// New / Delete live on the Tooling ribbon tab.
-    fn library_editor(&self) -> Element<'_, Message> {
-        let mut list = column![
-            text("Tool Library").size(15),
-            text("Reusable across projects · New / Delete on the Tooling tab").size(11),
+    /// The **Tool Library pane** — a selectable list of every library tool, in one of
+    /// two internal tabs: **Serial** (by number) or **Family** (grouped by kind, sorted
+    /// by diameter). Substitutes for the Project pane on the Tooling tab; the selected
+    /// tool's *fields* live in the Inspector (kept clean). New / Delete are on the
+    /// Tooling ribbon.
+    fn library_pane(&self) -> Element<'_, Message> {
+        let tab = |label: &str, view: LibraryView| {
+            let active = self.library_view == view;
+            button(text(label.to_string()).size(12))
+                .padding(Padding::from([3.0, 12.0]))
+                .on_press(Message::SetLibraryView(view))
+                .style(move |_theme, status| snap_toggle_style(active, status))
+        };
+        let mut list = column![row![
+            tab("Serial", LibraryView::Serial),
+            tab("Family", LibraryView::Family),
         ]
-        .spacing(8)
-        .padding(8);
+        .spacing(6)]
+        .spacing(4)
+        .padding(6);
 
-        let mut rows = column![].spacing(2);
-        for (i, t) in self.library.tools.iter().enumerate() {
-            let label = format!("T{} ⌀{} {}", t.number, fmt_num(t.diameter), t.kind);
-            rows = rows.push(select_row(
-                label,
-                i == self.lib_sel,
-                Message::SelectLibraryTool(i),
-            ));
+        if self.library.tools.is_empty() {
+            list = list.push(tree_note("empty — add a tool with New"));
         }
-        list = list.push(rows);
+
+        // (index, tool) pairs so a selection keeps the real library index whatever the
+        // display order.
+        let mut items: Vec<(usize, &cam_model::Tool)> =
+            self.library.tools.iter().enumerate().collect();
+        match self.library_view {
+            LibraryView::Serial => {
+                items.sort_by_key(|(_, t)| t.number);
+                for (i, t) in items {
+                    list = list.push(select_row(
+                        format!("⌀{} {} (T{})", fmt_num(t.diameter), t.kind, t.number),
+                        i == self.lib_sel,
+                        Message::SelectLibraryTool(i),
+                    ));
+                }
+            }
+            LibraryView::Family => {
+                items.sort_by(|(_, a), (_, b)| {
+                    kind_order(a.kind)
+                        .cmp(&kind_order(b.kind))
+                        .then(a.diameter.total_cmp(&b.diameter))
+                        .then(a.number.cmp(&b.number))
+                });
+                let mut current: Option<String> = None;
+                for (i, t) in items {
+                    let fam = t.kind.to_string();
+                    if current.as_deref() != Some(fam.as_str()) {
+                        list = list.push(tree_header(&fam));
+                        current = Some(fam);
+                    }
+                    list = list.push(select_row(
+                        format!("⌀{} (T{})", fmt_num(t.diameter), t.number),
+                        i == self.lib_sel,
+                        Message::SelectLibraryTool(i),
+                    ));
+                }
+            }
+        }
+
+        scrollable(list)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    /// The Tooling-tab tool-library editor in the **Inspector**: just the selected
+    /// tool's editable fields (the list lives in the Tool Library pane). New / Delete
+    /// live on the Tooling ribbon tab.
+    fn library_editor(&self) -> Element<'_, Message> {
+        let name = self
+            .library
+            .tools
+            .get(self.lib_sel)
+            .map(|t| format!("Tool T{} — ⌀{} {}", t.number, fmt_num(t.diameter), t.kind))
+            .unwrap_or_else(|| "Tool Library".to_string());
+        let mut list = column![text(name).size(15)].spacing(8).padding(8);
 
         for field in self.inspector_fields() {
             let value = self.fields.get(&field).cloned().unwrap_or_default();
@@ -4860,6 +4960,19 @@ fn select_row<'a>(label: String, active: bool, on_press: Message) -> Element<'a,
 }
 
 /// A section header row in the project tree.
+/// A stable family sort/order key for the Tool Library pane's Family view.
+fn kind_order(kind: ToolKind) -> u8 {
+    match kind {
+        ToolKind::EndMill => 0,
+        ToolKind::BallMill => 1,
+        ToolKind::BullNose { .. } => 2,
+        ToolKind::FaceMill => 3,
+        ToolKind::ChamferMill { .. } => 4,
+        ToolKind::Drill { .. } => 5,
+        ToolKind::ThreadMill { .. } => 6,
+    }
+}
+
 fn tree_header<'a>(label: &str) -> Element<'a, Message> {
     container(text(label.to_string()).size(11).color(palette::GROUP_LABEL))
         .padding(Padding::from([6.0, 4.0]))
