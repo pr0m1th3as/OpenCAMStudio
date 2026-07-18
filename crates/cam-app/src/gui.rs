@@ -1545,6 +1545,8 @@ enum Message {
     NewTool,
     /// Delete the selected tool.
     DeleteTool,
+    /// Promote the selected project tool into the shop library (§6.3).
+    AddToLibrary,
     /// Switch the active ribbon tab.
     SelectRibbonTab(RibbonTab),
     /// Open/close the collapse-popup for a collapsed group (index in the active tab).
@@ -1747,10 +1749,16 @@ impl App {
             Message::ProjectToOpen(Some(path)) => {
                 self.status = match self.controller.open_project(&path) {
                     Ok(()) => {
+                        // Reconcile the project's tool numbers against the shop library
+                        // (TOOLING_PLAN §6): matched tools adopt the shop's numbering.
+                        let report = self.controller.reconcile_tools(&self.library.tools);
                         self.focus_ops.clear();
                         self.refresh_fields();
                         self.rerun();
-                        format!("Opened {}.", path.display())
+                        match report.summary() {
+                            Some(s) => format!("Opened {}. Tools: {s}.", path.display()),
+                            None => format!("Opened {}.", path.display()),
+                        }
                     }
                     Err(e) => format!("Open failed: {e}"),
                 };
@@ -2255,6 +2263,22 @@ impl App {
                     self.lib_sel = self.lib_sel.min(self.library.tools.len() - 1);
                     self.library.save();
                     self.refresh_fields();
+                }
+            }
+            Message::AddToLibrary => {
+                // Promote the selected project-local tool into the shop library, then
+                // reconcile so it adopts the shop number (§6.3). Idempotent by geometry.
+                if let Selection::Tool(i) = self.controller.selection() {
+                    if let Some(&tool) = self.controller.document().setup.tools.get(i) {
+                        self.library.add_tool(tool);
+                        self.library.save();
+                        let report = self.controller.reconcile_tools(&self.library.tools);
+                        self.refresh_fields();
+                        self.status = match report.summary() {
+                            Some(s) => format!("Added tool to library. {s}."),
+                            None => "Added tool to library.".to_string(),
+                        };
+                    }
                 }
             }
             Message::SelectLibraryTool(i) => {
@@ -3142,6 +3166,14 @@ impl App {
                         "Delete",
                         // Keep at least one tool in the library.
                         (self.library.tools.len() > 1).then_some(Message::DeleteTool),
+                    ),
+                    // Promote the selected *project* tool into the shop library (§6.3);
+                    // enabled only when a project tool is the current selection.
+                    cmd(
+                        Icon::Duplicate,
+                        "To library",
+                        matches!(self.controller.selection(), Selection::Tool(_))
+                            .then_some(Message::AddToLibrary),
                     ),
                 ],
             }],

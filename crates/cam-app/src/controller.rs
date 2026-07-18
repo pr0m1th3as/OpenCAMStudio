@@ -15,8 +15,9 @@ use cam_import::{read_cad_file, read_dxf_str, ImportError, ImportOptions};
 
 use crate::project::Project;
 use cam_model::{
-    Axis, ChamferOp, Comp, Document, DrillOp, FaceOp, Hand, Heights, History, Lead, Machine,
-    Operation, Plunge, PocketOp, ProfileOp, Setup, Side, Stock, ThreadOp, Tool, ToolKind,
+    reconcile_tool_numbers, Axis, ChamferOp, Comp, Document, DrillOp, FaceOp, Hand, Heights,
+    History, Lead, Machine, Operation, Plunge, PocketOp, ProfileOp, ReconcileReport, Setup, Side,
+    Stock, ThreadOp, Tool, ToolKind,
 };
 use cam_post::{PostError, PostKind, PostOptions};
 use cam_render::{mesh_vertices, MeshVertex, Scene, PART};
@@ -519,6 +520,23 @@ impl AppController {
     pub fn edit_start_offset(&mut self, f: impl FnOnce(&mut Option<[f64; 3]>)) {
         self.document.edit(|doc| f(&mut doc.setup.start_offset));
         self.invalidate();
+    }
+
+    /// Reconcile the just-loaded setup's tool numbers against the shop `shop` library
+    /// (`TOOLING_PLAN.md` §6, Phase 2). Matched tools adopt the shop's number and every
+    /// operation reference is rewritten; unmatched tools stay project-local. This is
+    /// **load-time normalisation**, so on any change the undo baseline is reset to the
+    /// reconciled state (there is no "undo the renumber" — the project simply opened
+    /// this way). Returns the report so the shell can surface a summary.
+    pub fn reconcile_tools(&mut self, shop: &[Tool]) -> ReconcileReport {
+        let mut doc = self.document.current().clone();
+        let report = reconcile_tool_numbers(&mut doc.setup, shop);
+        if report.changed() {
+            self.document = History::new(doc);
+            self.reconcile_selection();
+            self.invalidate();
+        }
+        report
     }
 
     /// Edit a tool as one undoable change. A no-op if the index is out of range.

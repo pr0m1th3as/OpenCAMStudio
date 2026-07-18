@@ -97,14 +97,8 @@ impl ToolLibrary {
     /// Append a fresh default tool (numbered one past the highest) and return its
     /// index. The caller typically selects it and edits its fields.
     pub fn add_default(&mut self) -> usize {
-        let number = self
-            .tools
-            .iter()
-            .map(|t| t.number)
-            .max()
-            .map_or(1, |m| m + 1);
         self.tools.push(Tool {
-            number,
+            number: self.next_number(),
             diameter: 6.0,
             length: 30.0,
             flutes: 2,
@@ -112,6 +106,26 @@ impl ToolLibrary {
             ..Default::default()
         });
         self.tools.len() - 1
+    }
+
+    /// The next free shop number (one past the highest in use).
+    fn next_number(&self) -> u32 {
+        self.tools.iter().map(|t| t.number).max().map_or(1, |m| m + 1)
+    }
+
+    /// Promote `tool` into the shop library (the "Add to library" action, §6.3),
+    /// **idempotent by geometry**: if a tool of the same [`identity`](Tool::identity)
+    /// already exists, its number is returned and nothing is inserted; otherwise the
+    /// tool is added with the next free shop number, which is returned. The caller
+    /// then reconciles the project so the promoted tool adopts this number.
+    pub fn add_tool(&mut self, mut tool: Tool) -> u32 {
+        if let Some(existing) = self.tools.iter().find(|t| t.identity() == tool.identity()) {
+            return existing.number;
+        }
+        let number = self.next_number();
+        tool.number = number;
+        self.tools.push(tool);
+        number
     }
 }
 
@@ -276,5 +290,28 @@ mod tests {
         let i = lib.add_default();
         assert_eq!(i, lib.tools.len() - 1);
         assert_eq!(lib.tools[i].number, top + 1);
+    }
+
+    #[test]
+    fn add_tool_is_idempotent_by_geometry() {
+        // Starter library is ⌀3/6/10 end mills.
+        let mut lib = ToolLibrary::defaults();
+        let before = lib.tools.len();
+
+        // A genuinely new tool gets the next free number and is inserted.
+        let new = mk(99, 8.0, ToolKind::Drill { point_angle_deg: 118.0 });
+        let n = lib.add_tool(new);
+        assert_eq!(n, 4, "next free shop number");
+        assert_eq!(lib.tools.len(), before + 1);
+
+        // Re-adding the *same geometry* (any number) is a no-op returning its number.
+        let dup = mk(123, 8.0, ToolKind::Drill { point_angle_deg: 118.0 });
+        let n2 = lib.add_tool(dup);
+        assert_eq!(n2, 4, "identical geometry returns the existing number");
+        assert_eq!(lib.tools.len(), before + 1, "no duplicate inserted");
+
+        // Adding a ⌀6 (which the starter library already has as #2) is also a no-op.
+        assert_eq!(lib.add_tool(mk(50, 6.0, ToolKind::EndMill)), 2);
+        assert_eq!(lib.tools.len(), before + 1);
     }
 }

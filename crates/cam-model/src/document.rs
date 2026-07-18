@@ -628,6 +628,20 @@ impl Operation {
         }
     }
 
+    /// Overwrite the number of the tool this operation cuts with, whatever its kind.
+    /// Used by tool-number reconciliation (see [`crate::reconcile`]) to rewrite every
+    /// reference when a setup adopts the shop's canonical numbering.
+    pub fn set_tool(&mut self, tool: u32) {
+        match self {
+            Operation::Profile(op) => op.tool = tool,
+            Operation::Drill(op) => op.tool = tool,
+            Operation::Pocket(op) => op.tool = tool,
+            Operation::Face(op) => op.tool = tool,
+            Operation::Chamfer(op) => op.tool = tool,
+            Operation::Thread(op) => op.tool = tool,
+        }
+    }
+
     /// Whether two operations describe the **same work** — identical in every
     /// field *except* their `id` (and so the same kind, tool, geometry, depths,
     /// feeds, leads…). Two such operations emit byte-identical toolpaths, so if
