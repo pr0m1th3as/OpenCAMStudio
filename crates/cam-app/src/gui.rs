@@ -5915,8 +5915,8 @@ impl canvas::Program<Message> for ToolCanvas {
         let r = (self.diameter * 0.5).max(1e-3);
         let flute_len = self.flute_length.max(1e-3);
         let s = match self.cutting_direction {
-            CutDir::Down => 1.0_f64,
-            CutDir::Up => -1.0,
+            CutDir::Down => -1.0_f64,
+            CutDir::Up => 1.0,
         };
         let flute_col = Color { a: 0.75, ..fg };
         let steps = 48;
