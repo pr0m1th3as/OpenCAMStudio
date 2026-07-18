@@ -4056,7 +4056,7 @@ impl App {
             .library
             .tools
             .get(self.lib_sel)
-            .map(|t| format!("Tool T{} — ⌀{} {}", t.number, fmt_num(t.diameter), t.kind))
+            .map(|t| format!("T{} — ⌀{} {}", t.number, fmt_num(t.diameter), t.kind))
             .unwrap_or_else(|| "Tool Library".to_string());
         let mut list = column![text(name).size(15)].spacing(8).padding(8);
 
