@@ -306,6 +306,11 @@ impl Tool {
         // flute_length 0 clamps the flute top to the cone top, so the cone is cutting
         // and the shaft above is non-cutting.
         let mut flute_length = self.flute_len();
+        // Shaft radius above the cutting end. A V-bit is defined by a single diameter —
+        // the shaft it flares up to — so its cone always meets the shank exactly (the
+        // "flute diameter" of a V-bit is undefined: it varies along the cone). This also
+        // makes a stale `shank_diameter` incapable of producing an arrow.
+        let mut shank_radius = self.shank_dia() * 0.5;
         let bottom = match self.kind {
             ToolKind::EndMill | ToolKind::FaceMill | ToolKind::ThreadMill { .. } => {
                 BottomShape::Flat
@@ -328,6 +333,7 @@ impl Tool {
                 tip_radius,
             } => {
                 flute_length = 0.0;
+                shank_radius = self.radius(); // cone flares exactly to the shaft
                 BottomShape::VTip {
                     half_angle_rad: (included_angle_deg * 0.5).to_radians(),
                     tip_radius,
@@ -337,7 +343,7 @@ impl Tool {
         cam_geo::generatrix(&cam_geo::GeneratrixSpec {
             radius: self.radius(),
             flute_length,
-            shank_radius: self.shank_dia() * 0.5,
+            shank_radius,
             length: self.length,
             neck_length: self.neck_length,
             neck_radius: self.neck_dia() * 0.5,

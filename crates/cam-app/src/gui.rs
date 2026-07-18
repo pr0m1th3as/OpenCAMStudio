@@ -2910,6 +2910,16 @@ impl App {
         }
     }
 
+    /// The inspector label for a field, kind-aware. A V-bit's transverse measurement is
+    /// its shaft, not a (variable) flute diameter, so `ToolDiameter` reads "Shank
+    /// diameter" there.
+    fn field_label(&self, field: Field) -> &'static str {
+        match (self.inspected_tool_kind(), field) {
+            (Some(ToolKind::VBit { .. }), Field::ToolDiameter) => "Shank diameter (mm)",
+            _ => field.label(),
+        }
+    }
+
     /// Whether a field's current buffer value is invalid (flagged red). Rules:
     /// - **Corner radius** ≤ flute radius (⌀/2) — rounded-edge end mill.
     /// - **Flute length** > 0 everywhere; ≥ corner radius (rounded-edge); ≥ flute radius
@@ -2934,16 +2944,9 @@ impl App {
                 }
             }
             Field::TipRadius => {
-                // A V-bit's tip radius cannot exceed the flute radius (⌀/2).
+                // A V-bit's tip radius cannot exceed the shaft radius (⌀/2).
                 matches!((buf(Field::TipRadius), buf(Field::ToolDiameter)),
                     (Some(tr), Some(d)) if tr > d * 0.5 + 1e-9)
-            }
-            Field::ShankDiameter => {
-                // A V-bit's cone flares up to the flute ⌀; the shaft above must be at
-                // least that wide, else the cutter is wider than its shank (an "arrow").
-                matches!(self.inspected_tool_kind(), Some(ToolKind::VBit { .. }))
-                    && matches!((buf(Field::ShankDiameter), buf(Field::ToolDiameter)),
-                        (Some(s), Some(d)) if s < d - 1e-9)
             }
             Field::FluteLength => {
                 let Some(fl) = buf(Field::FluteLength) else {
@@ -3052,11 +3055,12 @@ impl App {
                 Field::ToolLength,
                 Field::PointAngle,
             ],
-            // V-bit: flute (cone-flare) ⌀, shaft ⌀, overall length, point angle, tip
-            // radius. No flute length / count (the cutting cone's length is derived).
+            // V-bit: a single shaft ⌀ (rendered via ToolDiameter, relabelled "Shank
+            // diameter" — see `field_label`), overall length, point angle, tip radius.
+            // A V-bit has *no* flute diameter: the cutting ⌀ varies along the cone, so
+            // the only fixed transverse measurement is the shaft it flares up to.
             Some(ToolKind::VBit { .. }) => vec![
                 Field::ToolDiameter,
-                Field::ShankDiameter,
                 Field::ToolLength,
                 Field::PointAngle,
                 Field::TipRadius,
@@ -4399,7 +4403,7 @@ impl App {
 
         for field in self.inspector_fields() {
             let value = self.fields.get(&field).cloned().unwrap_or_default();
-            list = list.push(field_row_styled(field, &value, self.tooltips, self.field_invalid(field)));
+            list = list.push(field_row_labeled(field, self.field_label(field), &value, self.tooltips, self.field_invalid(field)));
         }
         if let Some(t) = self.library.tools.get(self.lib_sel) {
             // Cutting direction (a picker, not a numeric field) applies to the end-mill
@@ -4541,7 +4545,7 @@ impl App {
                 continue;
             }
             let value = self.fields.get(&field).cloned().unwrap_or_default();
-            list = list.push(field_row_styled(field, &value, self.tooltips, self.field_invalid(field)));
+            list = list.push(field_row_labeled(field, self.field_label(field), &value, self.tooltips, self.field_invalid(field)));
         }
         // The program start-point editor lives on the Origin node (offset from it).
         if let Selection::Origin = self.controller.selection() {
@@ -5501,6 +5505,18 @@ fn field_row_styled<'a>(
     show: bool,
     invalid: bool,
 ) -> Element<'a, Message> {
+    field_row_labeled(field, field.label(), value, show, invalid)
+}
+
+/// As [`field_row_styled`], but with an explicit label so a field can be renamed per
+/// tool kind (e.g. a V-bit's `ToolDiameter` reads "Shank diameter").
+fn field_row_labeled<'a>(
+    field: Field,
+    label: &'a str,
+    value: &str,
+    show: bool,
+    invalid: bool,
+) -> Element<'a, Message> {
     let mut input = text_input("", value)
         .on_input(move |v| Message::FieldChanged(field, v))
         .on_submit(Message::Apply)
@@ -5514,7 +5530,7 @@ fn field_row_styled<'a>(
             s
         });
     }
-    row![label_help(field.label(), field.help(), show), input]
+    row![label_help(label, field.help(), show), input]
         .spacing(8)
         .align_y(Alignment::Center)
         .into()
@@ -6248,6 +6264,9 @@ struct ToolCanvas {
     /// Axial advance per helix turn (drill bits ≈ 3·⌀ for a realistic pitch; other
     /// kinds do one turn over the cutting region).
     flute_pitch: f64,
+    /// Sign of the helix lean (+1 leans one way, −1 the other). Derived from the
+    /// cutting direction, but inverted for a twist drill so it reads right-hand.
+    flute_sign: f64,
 }
 
 impl ToolCanvas {
@@ -6273,6 +6292,11 @@ impl ToolCanvas {
             flute_pitch: match tool.kind {
                 ToolKind::Drill { .. } => (3.0 * tool.diameter).max(1e-3),
                 _ => cutting_top,
+            },
+            flute_sign: {
+                let base = if tool.cutting_direction == CutDir::Up { 1.0 } else { -1.0 };
+                // A twist drill leans the opposite way to a down-cut end mill.
+                if matches!(tool.kind, ToolKind::Drill { .. }) { -base } else { base }
             },
             profile,
         }
@@ -6396,8 +6420,8 @@ impl canvas::Program<Message> for ToolCanvas {
                         flute_paths.push(pts);
                     }
                 }
-                dir => {
-                    let s = if dir == CutDir::Up { 1.0_f64 } else { -1.0 };
+                _ => {
+                    let s = self.flute_sign;
                     for k in 0..n {
                         let psi0 = (k as f64) * TAU / (n as f64);
                         let mut seg: Vec<P> = Vec::new();
