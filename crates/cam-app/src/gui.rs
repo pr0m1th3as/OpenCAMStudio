@@ -626,6 +626,28 @@ impl std::fmt::Display for ToolKindPick {
     }
 }
 
+/// A thread mill's cutting form — the single-tooth vs multiple-teeth toggle. Maps onto
+/// `ThreadMill { pitch }`: single-point ⇔ `None` (one tooth, cuts any pitch by its
+/// helical lead), full-form ⇔ `Some(pitch)` (a stack of teeth at a fixed pitch).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThreadForm {
+    SinglePoint,
+    FullForm,
+}
+
+impl ThreadForm {
+    const ALL: [ThreadForm; 2] = [ThreadForm::SinglePoint, ThreadForm::FullForm];
+}
+
+impl std::fmt::Display for ThreadForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ThreadForm::SinglePoint => "Single-point",
+            ThreadForm::FullForm => "Full-form",
+        })
+    }
+}
+
 /// The kind-specific inspector fields for a tool of `kind` (empty for kinds fully
 /// described by diameter).
 fn tool_kind_fields(kind: ToolKind) -> Vec<Field> {
@@ -724,8 +746,11 @@ fn apply_tool_kind_fields(kind: &mut ToolKind, parsed: &BTreeMap<Field, f64>) {
         }
         ToolKind::ThreadMill { pitch } => {
             if let Some(v) = get(Field::ToolThreadPitch) {
-                // 0 (or negative) means single-form; a positive value is full-profile.
-                *pitch = (v > 0.0).then_some(v);
+                // The single-point/full-form choice is the toggle's job; the pitch field
+                // only sets the value, and only when already full-form.
+                if pitch.is_some() && v > 0.0 {
+                    *pitch = Some(v);
+                }
             }
         }
         ToolKind::VBit {
@@ -876,7 +901,7 @@ impl Field {
             Field::TipDiameter => "Tip ⌀ (mm)",
             Field::TipRadius => "Tip radius (mm)",
             Field::PointAngle => "Point angle (deg)",
-            Field::ToolThreadPitch => "Tool pitch (mm, 0=any)",
+            Field::ToolThreadPitch => "Pitch (mm)",
             Field::Depth => "Depth (mm)",
             Field::DrillStartOffset => "Start offset (mm)",
             Field::Peck => "Peck (mm, 0=off)",
@@ -1001,8 +1026,9 @@ impl Field {
                  the tip so the full diameter reaches the intended depth."
             }
             Field::ToolThreadPitch => {
-                "Ground pitch of a fixed-pitch thread mill (mm). 0 = a single-form \
-                 cutter that can mill any pitch."
+                "Ground pitch of a full-form thread mill (mm) — the axial spacing of its \
+                 stacked teeth. (Single-point mills, set via the toggle, have no fixed \
+                 pitch.)"
             }
             Field::Depth => {
                 "Total cut depth below the top of stock (a positive distance). The \
@@ -1691,6 +1717,9 @@ enum Message {
     ToolKindChanged(ToolKind),
     /// Change the selected tool's cutting direction (down-cut / up-cut).
     ToolCuttingDirChanged(CutDir),
+    /// Toggle a thread mill between single-point (one tooth) and full-form (teeth at a
+    /// fixed pitch).
+    ThreadFormChanged(ThreadForm),
     /// Change the selected profile's lead-in / lead-out / plunge kind (committed
     /// immediately with default parameters; sizes are then edited as fields).
     LeadInKindChanged(LeadKind),
@@ -2432,6 +2461,28 @@ impl App {
                     self.refresh_fields();
                 }
             }
+            Message::ThreadFormChanged(form) => {
+                // Single-point ⇒ pitch None (one tooth); full-form ⇒ Some(pitch), keeping
+                // any prior value or seeding a sensible default.
+                let set_form = |t: &mut cam_model::Tool| {
+                    if let ToolKind::ThreadMill { pitch } = &mut t.kind {
+                        *pitch = match form {
+                            ThreadForm::SinglePoint => None,
+                            ThreadForm::FullForm => Some(pitch.unwrap_or(1.0)),
+                        };
+                    }
+                };
+                if self.library_mode() {
+                    if let Some(t) = self.tool_edit.as_mut() {
+                        set_form(t);
+                    }
+                    self.refresh_fields();
+                } else if let Selection::Tool(i) = self.controller.selection() {
+                    self.controller.edit_tool(i, set_form);
+                    self.rerun();
+                    self.refresh_fields();
+                }
+            }
             Message::LeadInKindChanged(kind) => {
                 self.controller.edit_selected_operation(|op| match op {
                     Operation::Profile(p) => p.lead_in = kind.to_lead(p.lead_in),
@@ -2956,6 +3007,9 @@ impl App {
             (Some(ToolKind::FaceMill), Field::ToolDiameter) => "Cutting diameter (mm)",
             (Some(ToolKind::FaceMill), Field::FluteLength) => "Body height (mm)",
             (Some(ToolKind::FaceMill), Field::ShankDiameter) => "Arbor diameter (mm)",
+            // Thread mill: its ⌀ is the cutting ⌀; FluteLength is the threaded band.
+            (Some(ToolKind::ThreadMill { .. }), Field::ToolDiameter) => "Cutting diameter (mm)",
+            (Some(ToolKind::ThreadMill { .. }), Field::FluteLength) => "Thread length (mm)",
             _ => field.label(),
         }
     }
@@ -3006,6 +3060,10 @@ impl App {
                 matches!(self.inspected_tool_kind(), Some(ToolKind::FaceMill))
                     && matches!((buf(Field::ShankDiameter), buf(Field::ToolDiameter)),
                         (Some(arbor), Some(d)) if arbor > d + 1e-9)
+            }
+            Field::ToolThreadPitch => {
+                // Shown only for a full-form thread mill, where the pitch must be positive.
+                !matches!(buf(Field::ToolThreadPitch), Some(p) if p > 0.0)
             }
             Field::FluteLength => {
                 let Some(fl) = buf(Field::FluteLength) else {
@@ -3167,6 +3225,23 @@ impl App {
                 Field::ToolLength,
                 Field::Flutes,
             ],
+            // Thread mill: the end-mill field set. The single-point/full-form choice is a
+            // toggle (rendered separately); the pitch field appears only in full-form. No
+            // neck.
+            Some(ToolKind::ThreadMill { pitch }) => {
+                let mut f = vec![
+                    Field::ToolDiameter,
+                    Field::FluteLength,
+                    Field::ShankDiameter,
+                    Field::ShankLength,
+                    Field::ToolLength,
+                ];
+                if pitch.is_some() {
+                    f.push(Field::ToolThreadPitch);
+                }
+                f.push(Field::Flutes);
+                f
+            }
             other => {
                 let mut f = vec![
                     Field::ToolDiameter,
@@ -4512,7 +4587,9 @@ impl App {
             let value = self.fields.get(&field).cloned().unwrap_or_default();
             list = list.push(field_row_labeled(field, self.field_label(field), &value, self.tooltips, self.field_invalid(field)));
         }
-        if let Some(t) = self.library.tools.get(self.lib_sel) {
+        if let Some(t) = self.preview_tool() {
+            // Read from the working copy so the pickers (cutting direction, Type, thread
+            // form) track live edits, matching the fields and viewport.
             // Cutting direction (a picker, not a numeric field) applies to the end-mill
             // family only; "Straight flute" is offered only for a Square End Mill.
             let is_end_mill = matches!(
@@ -4541,6 +4618,30 @@ impl App {
                         )
                         .text_size(13)
                         .width(Length::Fixed(113.0)),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                );
+            }
+            // Thread form (single-point vs full-form) — a thread-mill-only toggle.
+            if let ToolKind::ThreadMill { pitch } = t.kind {
+                let form = if pitch.is_some() {
+                    ThreadForm::FullForm
+                } else {
+                    ThreadForm::SinglePoint
+                };
+                list = list.push(
+                    row![
+                        help_wrap(
+                            text("Thread form").width(Length::Fixed(112.0)).size(13),
+                            "Single-point mills carry one tooth and cut any pitch by their \
+                             helical lead; full-form mills carry a stack of teeth at a fixed \
+                             ground pitch.",
+                            self.tooltips,
+                        ),
+                        pick_list(&ThreadForm::ALL[..], Some(form), Message::ThreadFormChanged)
+                            .text_size(13)
+                            .width(Length::Fixed(113.0)),
                     ]
                     .spacing(8)
                     .align_y(Alignment::Center),
@@ -5607,7 +5708,16 @@ fn library_extra(t: &cam_model::Tool) -> Option<String> {
             included_angle_deg,
             tip_diameter,
         } => Some(format!("{}°, ⌀{}", fmt_num(included_angle_deg), fmt_num(tip_diameter))),
-        ToolKind::FaceMill | ToolKind::ThreadMill { .. } => Some(flute_count(t.flutes)),
+        // Thread mill: pitch first (its distinguishing trait), then flute count.
+        ToolKind::ThreadMill { pitch } => Some(format!(
+            "{}, {}",
+            match pitch {
+                Some(p) => format!("P{}", fmt_num(p)),
+                None => "any pitch".to_string(),
+            },
+            flute_count(t.flutes)
+        )),
+        ToolKind::FaceMill => Some(flute_count(t.flutes)),
         ToolKind::Drill { .. } => None,
     }
 }
@@ -6422,6 +6532,10 @@ struct ToolCanvas {
     /// Draw a row of 90° square inserts seated at the bottom of the body (face mills),
     /// so the silhouette reads as a real shell mill rather than a bare inverted-T.
     draw_face_inserts: bool,
+    /// Thread-mill teeth over the cutting band: `Some(pitch)` for a full-form mill (teeth
+    /// repeat at the pitch), `Some` with a `None` inner meaning single-point (one tooth).
+    /// Outer `None` = not a thread mill.
+    thread_teeth: Option<Option<f64>>,
 }
 
 impl ToolCanvas {
@@ -6442,12 +6556,15 @@ impl ToolCanvas {
             flute_length: cutting_top,
             flutes: tool.flutes,
             cutting_direction: tool.cutting_direction,
-            // V-bits, chamfer mills and face mills show no flute helix (cone / shell-mill
-            // body reads clean; face-mill inserts aren't helical); a drill's helix
-            // revolves every ~3·⌀.
+            // V-bits, chamfer mills, face mills and thread mills show no flute helix (the
+            // cone / shell-mill body / thread teeth read cleaner without it); a drill's
+            // helix revolves every ~3·⌀.
             draw_flutes: !matches!(
                 tool.kind,
-                ToolKind::VBit { .. } | ToolKind::ChamferMill { .. } | ToolKind::FaceMill
+                ToolKind::VBit { .. }
+                    | ToolKind::ChamferMill { .. }
+                    | ToolKind::FaceMill
+                    | ToolKind::ThreadMill { .. }
             ),
             flute_pitch: match tool.kind {
                 ToolKind::Drill { .. } => (3.0 * tool.diameter).max(1e-3),
@@ -6459,6 +6576,10 @@ impl ToolCanvas {
                 if matches!(tool.kind, ToolKind::Drill { .. }) { -base } else { base }
             },
             draw_face_inserts: matches!(tool.kind, ToolKind::FaceMill),
+            thread_teeth: match tool.kind {
+                ToolKind::ThreadMill { pitch } => Some(pitch),
+                _ => None,
+            },
             profile,
         }
     }
@@ -6560,6 +6681,43 @@ impl canvas::Program<Message> for ToolCanvas {
                 });
                 frame.fill(&rect, insert_fill);
                 frame.stroke(&rect, canvas::Stroke::default().with_color(fg).with_width(1.2));
+            }
+        }
+
+        // Thread-mill teeth: a saw-tooth profile over the cutting band, at the periphery,
+        // mirrored both sides. A full-form mill (Some pitch) repeats teeth at that pitch;
+        // a single-point mill (None) shows one representative tooth. The envelope profile
+        // itself stays a flat cylinder — these teeth are a legibility overlay, not the
+        // true 60° cutting form (that fidelity is deferred).
+        if let Some(pitch_opt) = self.thread_teeth {
+            let r = self.profile.max_radius();
+            let fl = self.flute_length.max(1e-3); // threaded band height
+            // One representative tooth, sized to the band, for single-point (or a pitch
+            // too coarse to fit even one full tooth in the thread length).
+            let one_tooth = ((fl * 0.5).min(2.0 * r).max(0.1), 1usize);
+            let (pitch, count) = match pitch_opt {
+                Some(p) if p > 0.05 => match (fl / p).floor() as usize {
+                    0 => one_tooth,
+                    c => (p, c),
+                },
+                _ => one_tooth,
+            };
+            let depth = (0.6 * pitch).min(r * 0.6); // 60° thread crest→root ≈ 0.61·p
+            // Triangular wave: root (r−depth) at tooth boundaries, crest (r) at centres.
+            let mut wave: Vec<(f64, f64)> = Vec::with_capacity(2 * count + 1);
+            for k in 0..=2 * count {
+                let z = (k as f64) * (pitch / 2.0);
+                let x = if k % 2 == 0 { r - depth } else { r };
+                wave.push((x, z));
+            }
+            for sign in [1.0_f32, -1.0] {
+                let path = canvas::Path::new(|b| {
+                    b.move_to(map(wave[0].0, wave[0].1, sign));
+                    for &(x, z) in &wave[1..] {
+                        b.line_to(map(x, z, sign));
+                    }
+                });
+                frame.stroke(&path, canvas::Stroke::default().with_color(fg).with_width(2.0));
             }
         }
 
