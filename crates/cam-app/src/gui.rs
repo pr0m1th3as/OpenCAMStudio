@@ -2934,9 +2934,16 @@ impl App {
                 }
             }
             Field::TipRadius => {
-                // A V-bit's tip radius cannot exceed the shaft radius (⌀/2).
+                // A V-bit's tip radius cannot exceed the flute radius (⌀/2).
                 matches!((buf(Field::TipRadius), buf(Field::ToolDiameter)),
                     (Some(tr), Some(d)) if tr > d * 0.5 + 1e-9)
+            }
+            Field::ShankDiameter => {
+                // A V-bit's cone flares up to the flute ⌀; the shaft above must be at
+                // least that wide, else the cutter is wider than its shank (an "arrow").
+                matches!(self.inspected_tool_kind(), Some(ToolKind::VBit { .. }))
+                    && matches!((buf(Field::ShankDiameter), buf(Field::ToolDiameter)),
+                        (Some(s), Some(d)) if s < d - 1e-9)
             }
             Field::FluteLength => {
                 let Some(fl) = buf(Field::FluteLength) else {
@@ -3045,10 +3052,11 @@ impl App {
                 Field::ToolLength,
                 Field::PointAngle,
             ],
-            // V-bit: shaft ⌀, overall length, point angle, tip radius. No flute length /
-            // count (the cutting cone's length is derived).
+            // V-bit: flute (cone-flare) ⌀, shaft ⌀, overall length, point angle, tip
+            // radius. No flute length / count (the cutting cone's length is derived).
             Some(ToolKind::VBit { .. }) => vec![
                 Field::ToolDiameter,
+                Field::ShankDiameter,
                 Field::ToolLength,
                 Field::PointAngle,
                 Field::TipRadius,
