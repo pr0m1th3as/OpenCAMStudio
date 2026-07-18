@@ -3579,10 +3579,12 @@ impl App {
                 .tools
                 .iter()
                 .any(|lt| lt.identity() == t.identity());
-            // Numbered ⇒ in the library; un-numbered ⇒ project-local. The presence of
-            // the number *is* the distinction (kept deliberately simple).
+            // Numbered ⇒ in the library; un-numbered ⇒ project-local. The number goes
+            // at the *end* (`⌀6 End mill (T5)`) so descriptions align left; a
+            // project-local tool has no `(Tn)` at all — the presence of the number *is*
+            // the distinction (kept deliberately simple).
             let label = if in_library {
-                format!("T{} — ⌀{} {}", t.number, fmt_num(t.diameter), t.kind)
+                format!("⌀{} {} (T{})", fmt_num(t.diameter), t.kind, t.number)
             } else {
                 format!("⌀{} {}", fmt_num(t.diameter), t.kind)
             };
