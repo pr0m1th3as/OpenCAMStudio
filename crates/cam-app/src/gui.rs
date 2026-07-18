@@ -3259,7 +3259,9 @@ impl App {
             }
         };
         if self.library_mode() {
-            return tool_fields(self.library.tools.get(self.lib_sel).map(|t| t.kind));
+            // Use the working-copy kind (via inspected_tool_kind) so a Type change swaps
+            // in the new field set immediately, without waiting for Apply.
+            return tool_fields(self.inspected_tool_kind());
         }
         match self.controller.selection() {
             Selection::Setup => vec![Field::Clearance, Field::Retract, Field::TopOfStock],
