@@ -49,6 +49,7 @@ mod point;
 mod polygon;
 mod polyline;
 mod stroke;
+mod toolprofile;
 
 pub use arc::Arc;
 pub use arcfit::{fit_arcs, PathSeg};
@@ -60,6 +61,7 @@ pub use offset::{offset, JoinStyle};
 pub use point::Point;
 pub use polygon::{Containment, Polygon};
 pub use polyline::Polyline;
+pub use toolprofile::{generatrix, BottomShape, GeneratrixSpec, Profile2D, ProfileSeg, SegShape};
 pub use stroke::{stroke_path, CapStyle};
 
 /// The internal integer grid resolution, in millimetres.

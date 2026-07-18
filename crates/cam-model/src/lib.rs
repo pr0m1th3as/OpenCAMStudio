@@ -251,6 +251,42 @@ impl Tool {
             self.diameter
         }
     }
+
+    /// This tool's **2D revolve generatrix** (`TOOLING_PLAN.md` Phase 4): the built-in
+    /// kinds mapped onto a kernel-neutral [`cam_geo::GeneratrixSpec`] and generated. The
+    /// cutting-end shape comes from [`kind`](Self::kind); the flute/shank split from the
+    /// effective cutter dimensions. (`ThreadMill` uses a flat cylinder envelope for now —
+    /// the true tooth form is a later refinement; see the build log.)
+    pub fn profile(&self) -> cam_geo::Profile2D {
+        use cam_geo::BottomShape;
+        let bottom = match self.kind {
+            ToolKind::EndMill | ToolKind::FaceMill | ToolKind::ThreadMill { .. } => {
+                BottomShape::Flat
+            }
+            ToolKind::BallMill => BottomShape::Ball,
+            ToolKind::BullNose { corner_radius } => BottomShape::BullNose { corner_radius },
+            ToolKind::ChamferMill {
+                included_angle_deg,
+                tip_diameter,
+            } => BottomShape::Cone {
+                half_angle_rad: (included_angle_deg * 0.5).to_radians(),
+                flat_radius: tip_diameter * 0.5,
+            },
+            ToolKind::Drill { point_angle_deg } => BottomShape::Cone {
+                half_angle_rad: (point_angle_deg * 0.5).to_radians(),
+                flat_radius: 0.0,
+            },
+        };
+        cam_geo::generatrix(&cam_geo::GeneratrixSpec {
+            radius: self.radius(),
+            flute_length: self.flute_len(),
+            shank_radius: self.shank_dia() * 0.5,
+            length: self.length,
+            neck_length: self.neck_length,
+            neck_radius: self.neck_dia() * 0.5,
+            bottom,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -380,6 +416,38 @@ mod tests {
         };
         let back: Tool = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
         assert_eq!(t, back);
+    }
+
+    #[test]
+    fn profile_maps_each_kind_to_its_cutting_end() {
+        use cam_geo::SegShape;
+        let mk = |kind| Tool {
+            number: 1,
+            diameter: 8.0,
+            length: 40.0,
+            flute_length: 20.0,
+            flutes: 2,
+            kind,
+            ..Default::default()
+        };
+        // End mill: flat bottom (first segment a line to (r, 0)).
+        let em = mk(ToolKind::EndMill).profile();
+        assert_eq!(em.segs[0].shape, SegShape::Line);
+        assert!(em.segs[0].cutting);
+        assert_eq!(em.max_radius(), 4.0);
+        assert_eq!(em.height(), 40.0);
+        // Ball: first segment is a cutting arc.
+        let ball = mk(ToolKind::BallMill).profile();
+        assert!(matches!(ball.segs[0].shape, SegShape::Arc { .. }));
+        // Chamfer with a flat tip: flat tip line then a cone flank, both cutting.
+        let cham = mk(ToolKind::ChamferMill {
+            included_angle_deg: 90.0,
+            tip_diameter: 1.0,
+        })
+        .profile();
+        assert!(cham.segs[0].cutting && cham.segs[1].cutting);
+        // Flute split honoured: nothing above z=20 cuts.
+        assert!(em.segs.iter().filter(|s| s.cutting).all(|s| s.end.y <= 20.0 + 1e-9));
     }
 
     #[test]
