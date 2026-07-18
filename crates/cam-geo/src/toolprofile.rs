@@ -214,6 +214,26 @@ impl Profile2D {
             .fold(self.start.y, f64::max)
     }
 
+    /// The boundary as per-segment tessellated polylines paired with their cutting flag —
+    /// `(points, cutting)`, each sub-polyline sharing endpoints with its neighbours. Lets
+    /// the preview style cutting vs non-cutting **per segment** (solid vs dashed).
+    pub fn segment_polylines(&self, arc_tol: f64) -> Vec<(Vec<Point>, bool)> {
+        let mut out = Vec::with_capacity(self.segs.len());
+        let mut prev = self.start;
+        for s in &self.segs {
+            let mut pts = vec![prev];
+            match s.shape {
+                SegShape::Line => pts.push(s.end),
+                SegShape::Arc { center, ccw } => {
+                    tessellate_arc(prev, s.end, center, ccw, arc_tol.max(1e-3), &mut pts);
+                }
+            }
+            out.push((pts, s.cutting));
+            prev = s.end;
+        }
+        out
+    }
+
     /// Tessellate the boundary into a `(r, z)` polyline, arcs approximated with at most
     /// `arc_tol` mm of chord deviation. Includes `start` first. Used by the preview and
     /// by tests (bounds/monotonicity checks).

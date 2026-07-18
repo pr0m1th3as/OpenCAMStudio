@@ -30,6 +30,6 @@ cam-render = { path = "../cam-render" }
 cam-sim = { path = "../cam-sim" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-iced = { version = "0.14", features = ["wgpu", "svg"], optional = true }
+iced = { version = "0.14", features = ["wgpu", "svg", "canvas"], optional = true }
 wgpu = { version = "27", optional = true }
 rfd = { version = "0.17", optional = true }

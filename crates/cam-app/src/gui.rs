@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use iced::widget::pane_grid::{self, PaneGrid};
 use iced::widget::{
-    button, checkbox, column, container, mouse_area, pick_list, row, scrollable, shader, slider,
-    text, text_input, tooltip, Space,
+    button, canvas, checkbox, column, container, mouse_area, pick_list, row, scrollable, shader,
+    slider, text, text_input, tooltip, Space,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
@@ -2581,6 +2581,19 @@ impl App {
         self.active_tab == RibbonTab::Tooling
     }
 
+    /// The tool whose cross-section the viewport should preview (Phase 5): the selected
+    /// library tool while the Tooling tab is active, else a selected project tool. `None`
+    /// ⇒ show the normal 3D backplot.
+    fn preview_tool(&self) -> Option<cam_model::Tool> {
+        if self.library_mode() {
+            return self.library.tools.get(self.lib_sel).copied();
+        }
+        match self.controller.selection() {
+            Selection::Tool(i) => self.controller.document().setup.tools.get(i).copied(),
+            _ => None,
+        }
+    }
+
     /// Which fields the inspector shows for the current selection.
     fn inspector_fields(&self) -> Vec<Field> {
         // Common tool fields plus the selected tool's kind-specific parameters.
@@ -3399,26 +3412,38 @@ impl App {
     fn pane_content(&self, pane: Pane) -> Element<'_, Message> {
         let inner: Element<'_, Message> = match pane {
             Pane::Project => self.project_tree(),
-            Pane::Viewport => container(
-                shader(Viewport::new(
-                    &self.controller,
-                    self.show_stock,
-                    self.view,
-                    self.show_gizmo,
-                    self.gizmo_size,
-                    &self.focus_ops.iter().copied().collect::<Vec<_>>(),
-                    self.snap_hover.map(|h| (h, self.snap_aperture)),
-                    self.hover_loop,
-                    self.in_origin_pick(),
-                    self.show_origin,
-                    self.origin_first,
-                ))
+            // In Tooling mode (or with a tool selected) the viewport shows the tool's 2D
+            // cross-section instead of the 3D backplot (Phase 5).
+            Pane::Viewport => match self.preview_tool() {
+                Some(tool) => container(
+                    canvas(ToolCanvas::new(&tool))
+                        .width(Length::Fill)
+                        .height(Length::Fill),
+                )
                 .width(Length::Fill)
-                .height(Length::Fill),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into(),
+                .height(Length::Fill)
+                .into(),
+                None => container(
+                    shader(Viewport::new(
+                        &self.controller,
+                        self.show_stock,
+                        self.view,
+                        self.show_gizmo,
+                        self.gizmo_size,
+                        &self.focus_ops.iter().copied().collect::<Vec<_>>(),
+                        self.snap_hover.map(|h| (h, self.snap_aperture)),
+                        self.hover_loop,
+                        self.in_origin_pick(),
+                        self.show_origin,
+                        self.origin_first,
+                    ))
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+            },
             Pane::Inspector => self.inspector(),
             Pane::Output => self.output(),
         };
@@ -5478,6 +5503,114 @@ impl shader::Primitive for ScenePrimitive {
         gizmo_pass.set_viewport(gx as f32, gy as f32, size as f32, size as f32, 0.0, 1.0);
         gizmo_pass.set_scissor_rect(gx, gy, size, size);
         pipeline.gizmo.draw(&mut gizmo_pass);
+    }
+}
+
+/// A 2D cross-section preview of a tool's generatrix (TOOLING_PLAN Phase 5), shown in
+/// place of the 3D backplot while a tool is being edited. The generatrix is mirrored
+/// about the axis for a full-silhouette read; **cutting** surfaces draw as a solid,
+/// thicker line and **non-cutting** (shank/neck/top) as a thin **dashed** line — the
+/// distinction is by *linestyle, never hue* (colour-blind-safe). A few dimension labels
+/// annotate the driving values.
+struct ToolCanvas {
+    profile: cam_geo::Profile2D,
+    diameter: f64,
+    length: f64,
+    flute_length: f64,
+}
+
+impl ToolCanvas {
+    fn new(tool: &cam_model::Tool) -> Self {
+        Self {
+            profile: tool.profile(),
+            diameter: tool.diameter,
+            length: tool.length,
+            flute_length: tool.flute_len(),
+        }
+    }
+}
+
+impl canvas::Program<Message> for ToolCanvas {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &iced::Renderer,
+        theme: &iced::Theme,
+        bounds: iced::Rectangle,
+        _cursor: iced::mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        use iced::Point as P;
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        let fg = theme.palette().text;
+        let faint = Color { a: 0.4, ..fg };
+
+        let max_r = self.profile.max_radius().max(1e-3) as f32;
+        let height = self.profile.height().max(1e-3) as f32;
+        let margin = 28.0_f32;
+        let avail_w = (bounds.width - 2.0 * margin).max(1.0);
+        let avail_h = (bounds.height - 2.0 * margin).max(1.0);
+        // Fit the *mirrored* silhouette (width 2·max_r) and the height, keeping aspect.
+        let scale = (avail_w / (2.0 * max_r)).min(avail_h / height);
+        let cx = bounds.width / 2.0;
+        let bottom = bounds.height - margin;
+        let map = |r: f64, z: f64, sign: f32| P::new(cx + sign * (r as f32) * scale, bottom - (z as f32) * scale);
+
+        // Axis of revolution: a faint dashed vertical line.
+        let axis_dash = [4.0_f32, 4.0];
+        let axis = canvas::Path::line(map(0.0, 0.0, 1.0), map(0.0, height as f64, 1.0));
+        frame.stroke(
+            &axis,
+            canvas::Stroke {
+                line_dash: canvas::LineDash { segments: &axis_dash, offset: 0 },
+                ..canvas::Stroke::default().with_color(faint).with_width(1.0)
+            },
+        );
+
+        // The generatrix, per segment, mirrored to both sides.
+        let dash = [5.0_f32, 4.0];
+        for (pts, cutting) in self.profile.segment_polylines(0.05) {
+            for sign in [1.0_f32, -1.0] {
+                let path = canvas::Path::new(|b| {
+                    let mut first = true;
+                    for p in &pts {
+                        let sp = map(p.x, p.y, sign);
+                        if first {
+                            b.move_to(sp);
+                            first = false;
+                        } else {
+                            b.line_to(sp);
+                        }
+                    }
+                });
+                let stroke = if cutting {
+                    canvas::Stroke::default().with_color(fg).with_width(2.2)
+                } else {
+                    canvas::Stroke {
+                        line_dash: canvas::LineDash { segments: &dash, offset: 0 },
+                        ..canvas::Stroke::default().with_color(fg).with_width(1.2)
+                    }
+                };
+                frame.stroke(&path, stroke);
+            }
+        }
+
+        // Dimension annotations (text only — no scale bars, kept minimal).
+        let label = |frame: &mut canvas::Frame, s: String, y: f32| {
+            frame.fill_text(canvas::Text {
+                content: s,
+                position: P::new(8.0, y),
+                color: fg,
+                size: iced::Pixels(12.0),
+                ..canvas::Text::default()
+            });
+        };
+        label(&mut frame, format!("⌀ {:.3} mm", self.diameter), 6.0);
+        label(&mut frame, format!("length {:.1} mm", self.length), 22.0);
+        label(&mut frame, format!("flute {:.1} mm", self.flute_length), 38.0);
+
+        vec![frame.into_geometry()]
     }
 }
 
