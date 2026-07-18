@@ -1294,6 +1294,11 @@ struct App {
     library: ToolLibrary,
     /// The library tool selected for editing in the Tooling-tab library editor.
     lib_sel: usize,
+    /// A live **working copy** of the selected library tool while editing in the Tooling
+    /// tab. Field edits apply here first (so the viewport previews them instantly without
+    /// an Apply); the committed library entry is only overwritten on Apply. `None` outside
+    /// Tooling mode. Dirty ⇔ this differs from the committed entry.
+    tool_edit: Option<cam_model::Tool>,
     /// Which internal tab the Tool Library pane shows (Serial / Family).
     library_view: LibraryView,
     /// The operation whose right-click context menu is open, and where to anchor it
@@ -1821,6 +1826,7 @@ impl App {
             cursor: None,
             library: ToolLibrary::load(),
             lib_sel: 0,
+            tool_edit: None,
             library_view: LibraryView::Ordered,
             open_op_menu: None,
             op_menu_pos: iced::Point::ORIGIN,
@@ -1908,16 +1914,11 @@ impl App {
             // recomputed until Apply, so undo has one step per real change.
             Message::FieldChanged(field, value) => {
                 self.fields.insert(field, value);
-                // Engage the overall = flute + shank constraint **live** for the three
-                // length fields (library editor), so the derived field updates as focus
-                // leaves the box — no need to click Apply.
-                if self.library_mode()
-                    && matches!(
-                        field,
-                        Field::FluteLength | Field::ShankLength | Field::ToolLength
-                    )
-                {
-                    self.live_apply_lengths(field);
+                // In the Tooling editor, every field edit flows into the working copy so
+                // the viewport previews it instantly (no Apply needed); the length trio
+                // also refreshes its derived buffers. Apply then commits the working copy.
+                if self.library_mode() {
+                    self.live_edit(field);
                 }
             }
             Message::MachineNameChanged(name) => {
@@ -1928,8 +1929,9 @@ impl App {
                 self.status = format!("Post: {kind}.");
             }
             Message::Apply => {
-                // Blocked while any field is invalid (also catches Enter-to-apply).
-                if !self.any_field_invalid() {
+                // Blocked while any field is invalid or there is nothing to commit (also
+                // catches Enter-to-apply).
+                if !self.any_field_invalid() && self.inspector_dirty() {
                     self.apply_inspector();
                 }
             }
@@ -2008,7 +2010,7 @@ impl App {
                             self.library = lib;
                             self.library.save(); // becomes the working (config-dir) library
                             self.lib_sel = 0;
-                            self.refresh_fields();
+                            self.reload_tool_edit();
                             format!("Imported {n} tool(s) from {}.", path.display())
                         }
                         Ok(OcamFile::Project(_)) => {
@@ -2396,28 +2398,31 @@ impl App {
                     }
                 };
                 if self.library_mode() {
-                    if let Some(t) = self.library.tools.get_mut(self.lib_sel) {
+                    // Edit the working copy (a pending change committed on Apply), not the
+                    // library entry — keeps any in-progress numeric edits from being lost.
+                    if let Some(t) = self.tool_edit.as_mut() {
                         fix_dir(t);
-                        self.library.save();
                     }
+                    // The kind-specific fields depend on the kind — repopulate them from
+                    // the working copy (refresh_fields does *not* reset the baseline).
+                    self.refresh_fields();
                 } else if let Selection::Tool(i) = self.controller.selection() {
                     self.controller.edit_tool(i, fix_dir);
                     self.rerun();
+                    self.refresh_fields();
                 }
-                // The kind-specific fields depend on the kind — repopulate them.
-                self.refresh_fields();
             }
             Message::ToolCuttingDirChanged(dir) => {
                 if self.library_mode() {
-                    if let Some(t) = self.library.tools.get_mut(self.lib_sel) {
+                    if let Some(t) = self.tool_edit.as_mut() {
                         t.cutting_direction = dir;
-                        self.library.save();
                     }
+                    self.refresh_fields();
                 } else if let Selection::Tool(i) = self.controller.selection() {
                     self.controller.edit_tool(i, |t| t.cutting_direction = dir);
                     self.rerun();
+                    self.refresh_fields();
                 }
-                self.refresh_fields();
             }
             Message::LeadInKindChanged(kind) => {
                 self.controller.edit_selected_operation(|op| match op {
@@ -2526,14 +2531,14 @@ impl App {
                         self.controller.set_pending_tool(number);
                     }
                 }
-                self.refresh_fields();
+                self.reload_tool_edit();
             }
             Message::DeleteTool => {
                 if self.lib_sel < self.library.tools.len() && self.library.tools.len() > 1 {
                     self.library.tools.remove(self.lib_sel);
                     self.lib_sel = self.lib_sel.min(self.library.tools.len() - 1);
                     self.library.save();
-                    self.refresh_fields();
+                    self.reload_tool_edit();
                 }
             }
             Message::ToolMenu(number) => {
@@ -2566,12 +2571,12 @@ impl App {
             }
             Message::SelectLibraryTool(i) => {
                 self.lib_sel = i;
-                self.refresh_fields();
+                self.reload_tool_edit();
             }
             Message::SetLibraryView(view) => self.library_view = view,
             Message::LibToolMenu(i) => {
                 self.lib_sel = i;
-                self.refresh_fields();
+                self.reload_tool_edit();
                 self.lib_menu = Some(LibMenu { index: i, input: None });
                 self.lib_menu_pos = self.window_cursor;
             }
@@ -2596,7 +2601,7 @@ impl App {
                     if let Some(n) = menu.input.as_ref().and_then(|s| s.trim().parse::<u32>().ok()) {
                         self.library.set_number(menu.index, n);
                         self.library.save();
-                        self.refresh_fields();
+                        self.reload_tool_edit();
                     }
                 }
                 self.lib_menu = None;
@@ -2619,7 +2624,7 @@ impl App {
                 let order = self.renumber_order();
                 self.library.set_numbers_in_order(&order);
                 self.library.save();
-                self.refresh_fields();
+                self.reload_tool_edit();
                 self.status = "Renumbered the tool library.".to_string();
             }
             Message::RenumberConfirmed(false) => {}
@@ -2648,8 +2653,8 @@ impl App {
                     self.set_pane_visible(Pane::Project, true);
                 }
                 // The Tooling tab turns the Inspector into the library editor, so the
-                // field buffers must reload for the new context.
-                self.refresh_fields();
+                // field buffers (and the working-copy baseline) must reload for context.
+                self.reload_tool_edit();
             }
             Message::ToggleRibbonGroup(i) => {
                 self.open_group = if self.open_group == Some(i) {
@@ -2860,6 +2865,19 @@ impl App {
         }
     }
 
+    /// Reset the Tooling working copy to the committed library tool — the clean baseline
+    /// the dirty check (and thus the Apply button) compares against — and reload the
+    /// field buffers from it. Called at every "load" point (tool selection, New, Delete,
+    /// tab switch, post-Apply), but *not* on an in-place field/picker edit.
+    fn reload_tool_edit(&mut self) {
+        self.tool_edit = if self.library_mode() {
+            self.library.tools.get(self.lib_sel).copied()
+        } else {
+            None
+        };
+        self.refresh_fields();
+    }
+
     /// Whether either origin-pick mode (single or two-point) is active.
     fn in_origin_pick(&self) -> bool {
         self.setting_origin || self.setting_origin_2pt
@@ -2999,24 +3017,33 @@ impl App {
     /// **live** from the `edited` field's current buffer, then refresh the *other* two
     /// length buffers so the derived value shows immediately. Only fires on a valid
     /// number; the edited field's own buffer is left untouched (mid-typing).
-    fn live_apply_lengths(&mut self, edited: Field) {
+    fn live_edit(&mut self, edited: Field) {
         let Some(v) = self.fields.get(&edited).and_then(|s| s.parse::<f64>().ok()) else {
-            return;
+            return; // empty / unparseable: hold the last valid working copy
         };
         if v < 0.0 || (edited == Field::FluteLength && v <= 1e-9) {
             return; // never write a zero/negative flute (keeps the last valid state)
         }
         let mut parsed: BTreeMap<Field, f64> = BTreeMap::new();
         parsed.insert(edited, v);
-        if let Some(t) = self.library.tools.get_mut(self.lib_sel) {
+        // Apply just the edited field to the working copy (single-field semantics keep
+        // the overall = flute + shank coupling correct), then read back the derived
+        // length trio to refresh the *other* two buffers for display.
+        let derived = {
+            let Some(t) = self.tool_edit.as_mut() else {
+                return;
+            };
             apply_tool_dims(t, &parsed);
-        }
-        self.library.save();
-        for f in [Field::FluteLength, Field::ShankLength, Field::ToolLength] {
+            apply_tool_kind_fields(&mut t.kind, &parsed);
+            [
+                (Field::FluteLength, t.flute_len()),
+                (Field::ShankLength, (t.length - t.flute_len()).max(0.0)),
+                (Field::ToolLength, t.length),
+            ]
+        };
+        for (f, val) in derived {
             if f != edited {
-                if let Some(val) = self.field_value(f) {
-                    self.fields.insert(f, fmt_num(val));
-                }
+                self.fields.insert(f, fmt_num(val));
             }
         }
     }
@@ -3026,11 +3053,26 @@ impl App {
     /// ⇒ show the normal 3D backplot.
     fn preview_tool(&self) -> Option<cam_model::Tool> {
         if self.library_mode() {
-            return self.library.tools.get(self.lib_sel).copied();
+            // The live working copy (which carries the in-progress edits); fall back to
+            // the committed tool before the first edit / working copy is set.
+            return self.tool_edit.or(self.library.tools.get(self.lib_sel).copied());
         }
         match self.controller.selection() {
             Selection::Tool(i) => self.controller.document().setup.tools.get(i).copied(),
             _ => None,
+        }
+    }
+
+    /// Whether the Tooling inspector has uncommitted edits — the working copy differs
+    /// from the committed library entry. Outside Tooling mode there is no working copy,
+    /// so the Apply button keeps its usual (validity-only) gating.
+    fn inspector_dirty(&self) -> bool {
+        if !self.library_mode() {
+            return true;
+        }
+        match (self.tool_edit, self.library.tools.get(self.lib_sel)) {
+            (Some(edit), Some(saved)) => edit != *saved,
+            _ => false,
         }
     }
 
@@ -3237,7 +3279,11 @@ impl App {
     /// The model value backing a field for the current selection, if any.
     fn field_value(&self, field: Field) -> Option<f64> {
         if self.library_mode() {
-            let t = self.library.tools.get(self.lib_sel)?;
+            // Prefer the live working copy so kind/picker edits repopulate from it.
+            let t = self
+                .tool_edit
+                .as_ref()
+                .or_else(|| self.library.tools.get(self.lib_sel))?;
             return match field {
                 Field::ToolDiameter => Some(t.diameter),
                 Field::ToolLength => Some(t.length),
@@ -3338,14 +3384,17 @@ impl App {
         }
 
         // Library-tool editing writes to the library file, not the project — an
-        // embedded copy in a project is a snapshot and is left untouched.
+        // embedded copy in a project is a snapshot and is left untouched. The working
+        // copy already carries every live edit, so committing is a copy-through; refresh
+        // then resets it as the new clean baseline.
         if self.library_mode() {
-            if let Some(t) = self.library.tools.get_mut(self.lib_sel) {
-                apply_tool_dims(t, &parsed);
-                apply_tool_kind_fields(&mut t.kind, &parsed);
+            if let (Some(edit), Some(slot)) =
+                (self.tool_edit, self.library.tools.get_mut(self.lib_sel))
+            {
+                *slot = edit;
             }
             self.library.save();
-            self.refresh_fields();
+            self.reload_tool_edit();
             return;
         }
 
@@ -4415,10 +4464,10 @@ impl App {
     /// tool's editable fields (the list lives in the Tool Library pane). New / Delete
     /// live on the Tooling ribbon tab.
     fn library_editor(&self) -> Element<'_, Message> {
+        // Read the header from the working copy so ⌀/kind track the live edits, matching
+        // the viewport preview (the committed list/pane updates on Apply).
         let name = self
-            .library
-            .tools
-            .get(self.lib_sel)
+            .preview_tool()
             .map(|t| format!("T{} — ⌀{} {}", t.number, fmt_num(t.diameter), t.kind))
             .unwrap_or_else(|| "Tool Library".to_string());
         let mut list = column![text(name).size(15)].spacing(8).padding(8);
@@ -4481,7 +4530,7 @@ impl App {
             );
             // Apply is disabled while any field is invalid.
             list = list.push(
-                button("Apply").on_press_maybe((!self.any_field_invalid()).then_some(Message::Apply)),
+                button("Apply").on_press_maybe((!self.any_field_invalid() && self.inspector_dirty()).then_some(Message::Apply)),
             );
         }
 
@@ -4764,7 +4813,7 @@ impl App {
         }
 
         list = list.push(
-            button("Apply").on_press_maybe((!self.any_field_invalid()).then_some(Message::Apply)),
+            button("Apply").on_press_maybe((!self.any_field_invalid() && self.inspector_dirty()).then_some(Message::Apply)),
         );
 
         scrollable(list)
@@ -6388,9 +6437,10 @@ impl canvas::Program<Message> for ToolCanvas {
         let bottom = bounds.height - margin;
         let map = |r: f64, z: f64, sign: f32| P::new(cx + sign * (r as f32) * scale, bottom - (z as f32) * scale);
 
-        // Axis of revolution: a faint dashed vertical line.
+        // Axis of revolution: a faint dashed vertical line spanning the whole viewport
+        // (top to bottom), not just the tool's extent — a full symmetry reference.
         let axis_dash = [4.0_f32, 4.0];
-        let axis = canvas::Path::line(map(0.0, 0.0, 1.0), map(0.0, height as f64, 1.0));
+        let axis = canvas::Path::line(P::new(cx, 0.0), P::new(cx, bounds.height));
         frame.stroke(
             &axis,
             canvas::Stroke {
