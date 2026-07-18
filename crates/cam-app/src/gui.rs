@@ -1854,7 +1854,12 @@ impl App {
                 self.controller.set_post_kind(kind);
                 self.status = format!("Post: {kind}.");
             }
-            Message::Apply => self.apply_inspector(),
+            Message::Apply => {
+                // Blocked while any field is invalid (also catches Enter-to-apply).
+                if !self.any_field_invalid() {
+                    self.apply_inspector();
+                }
+            }
             Message::NewProject => {
                 self.controller.new_project();
                 self.focus_ops.clear();
@@ -2749,8 +2754,21 @@ impl App {
         self.active_tab == RibbonTab::Tooling
     }
 
-    /// Whether a field's current buffer value is invalid (flagged red). A rounded-edge
-    /// end mill's **corner radius must not exceed the flute radius** (⌀/2).
+    /// The kind of the tool the inspector is editing (library entry or project tool).
+    fn inspected_tool_kind(&self) -> Option<ToolKind> {
+        if self.library_mode() {
+            self.library.tools.get(self.lib_sel).map(|t| t.kind)
+        } else if let Selection::Tool(i) = self.controller.selection() {
+            self.controller.document().setup.tools.get(i).map(|t| t.kind)
+        } else {
+            None
+        }
+    }
+
+    /// Whether a field's current buffer value is invalid (flagged red). Rules:
+    /// - **Corner radius** ≤ flute radius (⌀/2) — rounded-edge end mill.
+    /// - **Flute length** > 0 everywhere; ≥ corner radius (rounded-edge); ≥ flute radius
+    ///   ⌀/2 (ball nose) — the cutting-end feature must fit inside the flute.
     fn field_invalid(&self, field: Field) -> bool {
         let buf = |f: Field| self.fields.get(&f).and_then(|s| s.parse::<f64>().ok());
         match field {
@@ -2758,8 +2776,30 @@ impl App {
                 matches!((buf(Field::CornerRadius), buf(Field::ToolDiameter)),
                     (Some(cr), Some(d)) if cr > d * 0.5 + 1e-9)
             }
+            Field::FluteLength => {
+                let Some(fl) = buf(Field::FluteLength) else {
+                    return true; // empty / unparseable
+                };
+                if fl <= 1e-9 {
+                    return true; // flute length cannot be 0 (anywhere)
+                }
+                match self.inspected_tool_kind() {
+                    Some(ToolKind::BullNose { .. }) => {
+                        matches!(buf(Field::CornerRadius), Some(cr) if fl < cr - 1e-9)
+                    }
+                    Some(ToolKind::BallMill) => {
+                        matches!(buf(Field::ToolDiameter), Some(d) if fl < d * 0.5 - 1e-9)
+                    }
+                    _ => false,
+                }
+            }
             _ => false,
         }
+    }
+
+    /// Whether any inspector field is currently invalid (Apply is disabled if so).
+    fn any_field_invalid(&self) -> bool {
+        self.inspector_fields().iter().any(|&f| self.field_invalid(f))
     }
 
     /// Apply the flute/shank/overall length constraint to the selected library tool
@@ -2770,8 +2810,8 @@ impl App {
         let Some(v) = self.fields.get(&edited).and_then(|s| s.parse::<f64>().ok()) else {
             return;
         };
-        if v < 0.0 {
-            return;
+        if v < 0.0 || (edited == Field::FluteLength && v <= 1e-9) {
+            return; // never write a zero/negative flute (keeps the last valid state)
         }
         let mut parsed: BTreeMap<Field, f64> = BTreeMap::new();
         parsed.insert(edited, v);
@@ -4159,7 +4199,10 @@ impl App {
                 .spacing(8)
                 .align_y(Alignment::Center),
             );
-            list = list.push(button("Apply").on_press(Message::Apply));
+            // Apply is disabled while any field is invalid.
+            list = list.push(
+                button("Apply").on_press_maybe((!self.any_field_invalid()).then_some(Message::Apply)),
+            );
         }
 
         scrollable(list)
@@ -4440,7 +4483,9 @@ impl App {
             }
         }
 
-        list = list.push(button("Apply").on_press(Message::Apply));
+        list = list.push(
+            button("Apply").on_press_maybe((!self.any_field_invalid()).then_some(Message::Apply)),
+        );
 
         scrollable(list)
             .width(Length::Fill)
