@@ -129,9 +129,11 @@ impl ToolLibrary {
         self.tools.len() - 1
     }
 
-    /// The next free shop number (one past the highest in use).
+    /// The **lowest free** shop number (≥ 1) — fills gaps left by deleted tools rather
+    /// than always taking `max + 1`.
     fn next_number(&self) -> u32 {
-        self.tools.iter().map(|t| t.number).max().map_or(1, |m| m + 1)
+        let used: std::collections::BTreeSet<u32> = self.tools.iter().map(|t| t.number).collect();
+        (1..).find(|n| !used.contains(n)).expect("u32 space is never exhausted")
     }
 
     /// Promote `tool` into the shop library (the "Add to library" action, §6.3),
@@ -311,6 +313,18 @@ mod tests {
         let i = lib.add_default();
         assert_eq!(i, lib.tools.len() - 1);
         assert_eq!(lib.tools[i].number, top + 1);
+    }
+
+    #[test]
+    fn new_tool_fills_the_lowest_free_number() {
+        // Starter is 1/2/3; delete #2 so there is a gap.
+        let mut lib = ToolLibrary::defaults();
+        lib.tools.retain(|t| t.number != 2);
+        let idx = lib.add_default();
+        assert_eq!(lib.tools[idx].number, 2, "the freed #2 is reused, not #4");
+        // Now 1/2/3 again → next is 4.
+        lib.add_default();
+        assert_eq!(lib.tools.last().unwrap().number, 4);
     }
 
     #[test]
