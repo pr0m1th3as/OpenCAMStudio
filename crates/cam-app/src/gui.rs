@@ -2937,6 +2937,9 @@ impl App {
             (Some(ToolKind::VBit { .. } | ToolKind::ChamferMill { .. }), Field::ToolDiameter) => {
                 "Shank diameter (mm)"
             }
+            // Face mill: the flute/shank fields describe the shell-mill body and its arbor.
+            (Some(ToolKind::FaceMill), Field::FluteLength) => "Body height (mm)",
+            (Some(ToolKind::FaceMill), Field::ShankDiameter) => "Arbor diameter (mm)",
             _ => field.label(),
         }
     }
@@ -2980,6 +2983,13 @@ impl App {
                 // The flat tip must be narrower than the shaft ⌀, else there is no cone.
                 matches!((buf(Field::TipDiameter), buf(Field::ToolDiameter)),
                     (Some(tip), Some(d)) if tip >= d - 1e-9)
+            }
+            Field::ShankDiameter => {
+                // A face mill's arbor cannot be wider than its cutting body (⌀), else the
+                // silhouette flares out above the body. Only enforced for face mills.
+                matches!(self.inspected_tool_kind(), Some(ToolKind::FaceMill))
+                    && matches!((buf(Field::ShankDiameter), buf(Field::ToolDiameter)),
+                        (Some(arbor), Some(d)) if arbor > d + 1e-9)
             }
             Field::FluteLength => {
                 let Some(fl) = buf(Field::FluteLength) else {
@@ -3130,6 +3140,16 @@ impl App {
                 Field::ToolLength,
                 Field::ChamferAngle,
                 Field::TipDiameter,
+            ],
+            // Face mill (shell mill): a wide cutting body on a narrower arbor. FluteLength
+            // is relabelled "Body height" and ShankDiameter "Arbor diameter" (see
+            // `field_label`). No shank-length / neck — the arbor length is overall − body.
+            Some(ToolKind::FaceMill) => vec![
+                Field::ToolDiameter,
+                Field::FluteLength,
+                Field::ShankDiameter,
+                Field::ToolLength,
+                Field::Flutes,
             ],
             other => {
                 let mut f = vec![
@@ -6393,9 +6413,13 @@ impl ToolCanvas {
             flute_length: cutting_top,
             flutes: tool.flutes,
             cutting_direction: tool.cutting_direction,
-            // V-bits and chamfer mills show no flute helix (the cone reads clean); a
-            // drill bit's helix revolves every ~3·⌀.
-            draw_flutes: !matches!(tool.kind, ToolKind::VBit { .. } | ToolKind::ChamferMill { .. }),
+            // V-bits, chamfer mills and face mills show no flute helix (cone / shell-mill
+            // body reads clean; face-mill inserts aren't helical); a drill's helix
+            // revolves every ~3·⌀.
+            draw_flutes: !matches!(
+                tool.kind,
+                ToolKind::VBit { .. } | ToolKind::ChamferMill { .. } | ToolKind::FaceMill
+            ),
             flute_pitch: match tool.kind {
                 ToolKind::Drill { .. } => (3.0 * tool.diameter).max(1e-3),
                 _ => cutting_top,

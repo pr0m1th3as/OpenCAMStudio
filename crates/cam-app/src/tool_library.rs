@@ -111,21 +111,38 @@ impl ToolLibrary {
     /// tool is currently selected (a chamfer mill begets a chamfer mill, etc.).
     ///
     /// Seeded with a sensible flute/shank split: `flute = 2·⌀`, `shank = 2.5·flute`
-    /// (so `overall = flute + shank`), the end-mill defaults Andreas specified.
+    /// (so `overall = flute + shank`), the end-mill defaults Andreas specified. A
+    /// **face mill** instead seeds as a real shell mill — a wide, squat cutting body
+    /// (⌀ = cutting ⌀, height = flute length) on a short, narrower arbor (shank ⌀).
     pub fn add_of_kind(&mut self, kind: ToolKind) -> usize {
-        let diameter = 6.0;
-        let flute = 2.0 * diameter;
-        let shank = 2.5 * flute;
-        self.tools.push(Tool {
-            number: self.next_number(),
-            diameter,
-            flute_length: flute,
-            shank_diameter: diameter, // explicit shank ⌀ (= flute ⌀ by default)
-            length: flute + shank,
-            flutes: 2,
-            kind,
-            ..Default::default()
-        });
+        let number = self.next_number();
+        let tool = if matches!(kind, ToolKind::FaceMill) {
+            Tool {
+                number,
+                diameter: 50.0,       // cutting ⌀ (the disc)
+                flute_length: 30.0,   // body height (the wide body)
+                shank_diameter: 22.0, // arbor ⌀ (the stub above the body)
+                length: 42.0,         // overall (arbor sticks up 12 mm)
+                flutes: 5,            // inserts
+                kind,
+                ..Default::default()
+            }
+        } else {
+            let diameter = 6.0;
+            let flute = 2.0 * diameter;
+            let shank = 2.5 * flute;
+            Tool {
+                number,
+                diameter,
+                flute_length: flute,
+                shank_diameter: diameter, // explicit shank ⌀ (= flute ⌀ by default)
+                length: flute + shank,
+                flutes: 2,
+                kind,
+                ..Default::default()
+            }
+        };
+        self.tools.push(tool);
         self.tools.len() - 1
     }
 
