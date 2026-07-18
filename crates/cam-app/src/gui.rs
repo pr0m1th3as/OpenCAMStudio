@@ -796,9 +796,10 @@ enum Field {
     StartOffZ,
     ToolDiameter,
     ToolLength,
-    /// Length of cut (flute length) from the tip, mm; 0 = fully fluted (= overall length).
+    /// Length of cut (flute length) from the tip, mm. Also reused, kind-aware, as a face
+    /// mill's body height and a thread mill's thread length.
     FluteLength,
-    /// Shank diameter, mm; 0 = same as the cutting diameter (no distinct shank).
+    /// Shank diameter, mm (a face mill's arbor diameter, kind-aware).
     ShankDiameter,
     /// Shank length, mm — a *derived* field: overall = flute + shank (editing it moves
     /// overall length; editing overall moves it back).
@@ -977,24 +978,24 @@ impl Field {
             }
             Field::StartOffY => "Y offset of the program start point from the origin.",
             Field::StartOffZ => "Z offset of the program start point from the origin.",
-            Field::ToolDiameter => "Cutting diameter of the tool (mm).",
+            Field::ToolDiameter => "The tool's cutting diameter (mm).",
             Field::ToolLength => {
                 "Overall length of the tool — the stickout below the holder. Used for \
                  reach checks and the backplot; does not change the cutting geometry."
             }
             Field::FluteLength => {
-                "Length of the cutting edge (length of cut) measured from the tip. \
-                 0 = fully fluted (equals the overall length). Splits the tool into \
-                 cutting flute and non-cutting shank for gouge checks."
+                "Length of the cutting edge (length of cut) measured from the tip. The \
+                 rest of the tool, up to the overall length, is the non-cutting shank; \
+                 the split is used for gouge/collision checks."
             }
             Field::ShankDiameter => {
-                "Diameter of the (non-cutting) shank above the flutes (often equal to the \
-                 flute diameter)."
+                "Diameter of the non-cutting shank above the cutting portion (typically \
+                 equal to the cutting diameter)."
             }
             Field::ShankLength => {
-                "Length of the (non-cutting) shank above the flutes. Overall length = \
-                 flute length + shank length; editing this moves the overall length, and \
-                 editing the overall length moves the shank."
+                "Length of the non-cutting shank above the cutting portion. Overall length \
+                 = cutting length + shank length; editing the shank moves the overall \
+                 length, and editing the overall length moves the shank."
             }
             Field::NeckLength => {
                 "Length of a reduced-diameter neck above the flutes (reach/stub tools). \
@@ -1004,26 +1005,28 @@ impl Field {
                 "Diameter of the reduced neck. 0 = the same as the cutting diameter."
             }
             Field::Flutes => {
-                "Number of cutting edges. Informational for now (feed-per-tooth math \
-                 comes later); does not change the path."
+                "Number of cutting edges (or inserts). Informational for now — \
+                 feed-per-tooth math comes later; it does not change the toolpath."
             }
             Field::CornerRadius => {
-                "Corner (bull-nose) radius of the end mill. 0 = a sharp square end; \
-                 equal to the tool radius = a ball nose."
+                "Corner radius of the rounded-edge (bull-nose) end mill — the fillet \
+                 between the flat bottom and the side. Must be smaller than the tool \
+                 radius (⌀/2)."
             }
             Field::ChamferAngle => {
-                "Included point angle of the chamfer/V tool (e.g. 90° for a 45° \
-                 chamfer). Sets how depth maps to chamfer width."
+                "Included angle of the chamfer mill's cone (the full point angle, e.g. \
+                 90° for a 45° chamfer). Sets how cut depth maps to chamfer width."
             }
             Field::TipDiameter => {
-                "Flat diameter at the very tip of a chamfer/V tool. 0 = a true point."
+                "Diameter of the flat, non-cutting tip of a chamfer mill (0 = a sharp \
+                 point). Only the angled flank cuts."
             }
             Field::TipRadius => {
-                "Rounded-tip radius of a carving V-bit. 0 = a sharp point."
+                "Rounded-tip radius of a carving V-bit (0 = a sharp point)."
             }
             Field::PointAngle => {
-                "Included angle of the drill point (e.g. 118° or 135°) — used to place \
-                 the tip so the full diameter reaches the intended depth."
+                "Included angle of the tool's point (the full cone angle) — e.g. a \
+                 drill's 118°/135° point, or a V-bit's 60°/90° included angle."
             }
             Field::ToolThreadPitch => {
                 "Ground pitch of a full-form thread mill (mm) — the axial spacing of its \
@@ -3014,6 +3017,64 @@ impl App {
         }
     }
 
+    /// Kind-aware tooltip for a Tooling-inspector field — the same field means different
+    /// things across tool kinds (a V-bit's `ToolDiameter` is its shaft, a face mill's is
+    /// the cutting disc, …), so the help matches the (kind-aware) label. Non-tool fields,
+    /// and kinds where the generic wording already fits, fall back to `field.help()`.
+    fn field_help(&self, field: Field) -> &'static str {
+        use ToolKind::*;
+        match (self.inspected_tool_kind(), field) {
+            // Cutting/flute diameter — the meaning turns on the kind.
+            (Some(EndMill | BallMill | BullNose { .. }), Field::ToolDiameter) => {
+                "Diameter across the flutes — the end mill's cutting diameter."
+            }
+            (Some(Drill { .. }), Field::ToolDiameter) => {
+                "The drill's cutting diameter — the ⌀ of the hole it produces."
+            }
+            (Some(VBit { .. } | ChamferMill { .. }), Field::ToolDiameter) => {
+                "Shaft diameter — the cone flares up to this, and the shaft continues \
+                 above it. (These tools have no single flute ⌀: the cutting ⌀ varies \
+                 continuously along the cone.)"
+            }
+            (Some(FaceMill), Field::ToolDiameter) => {
+                "Cutting diameter — the ⌀ of the disc the inserts sweep; it drives the \
+                 facing stepover."
+            }
+            (Some(ThreadMill { .. }), Field::ToolDiameter) => {
+                "Cutting diameter of the thread mill — it must clear the thread's minor \
+                 diameter to enter the hole."
+            }
+            // Cutting-length family.
+            (Some(Drill { .. }), Field::FluteLength) => {
+                "Flute length — the fluted (cutting) portion from the tip; the plain shank \
+                 continues above it. Must be at least the drill-point cone height."
+            }
+            (Some(FaceMill), Field::FluteLength) => {
+                "Body height — the axial length of the wide cutting body; the narrower \
+                 arbor continues above it up to the overall length."
+            }
+            (Some(ThreadMill { .. }), Field::FluteLength) => {
+                "Thread length — the length of the threaded cutting band, which bounds the \
+                 thread depth reachable in one helical pass."
+            }
+            // Shank / arbor.
+            (Some(FaceMill), Field::ShankDiameter) => {
+                "Arbor diameter — the mounting stub above the cutting body (narrower than \
+                 the cutting ⌀)."
+            }
+            // Point angle serves both the drill and the V-bit.
+            (Some(Drill { .. }), Field::PointAngle) => {
+                "Included angle of the drill point (e.g. 118° or 135°), placed so the full \
+                 diameter reaches the intended depth. Bounded to 90°–135°."
+            }
+            (Some(VBit { .. }), Field::PointAngle) => {
+                "Included angle of the V-bit's cone (e.g. 60° or 90°) — the point angle \
+                 that sets how cut depth maps to cut width."
+            }
+            _ => field.help(),
+        }
+    }
+
     /// Whether a field's current buffer value is invalid (flagged red). Rules:
     /// - **Corner radius** ≤ flute radius (⌀/2) — rounded-edge end mill.
     /// - **Flute length** > 0 everywhere; ≥ corner radius (rounded-edge); ≥ flute radius
@@ -4587,7 +4648,7 @@ impl App {
 
         for field in self.inspector_fields() {
             let value = self.fields.get(&field).cloned().unwrap_or_default();
-            list = list.push(field_row_labeled(field, self.field_label(field), &value, self.tooltips, self.field_invalid(field)));
+            list = list.push(field_row_labeled(field, self.field_label(field), self.field_help(field), &value, self.tooltips, self.field_invalid(field)));
         }
         if let Some(t) = self.preview_tool() {
             // Read from the working copy so the pickers (cutting direction, Type, thread
@@ -4755,7 +4816,7 @@ impl App {
                 continue;
             }
             let value = self.fields.get(&field).cloned().unwrap_or_default();
-            list = list.push(field_row_labeled(field, self.field_label(field), &value, self.tooltips, self.field_invalid(field)));
+            list = list.push(field_row_labeled(field, self.field_label(field), self.field_help(field), &value, self.tooltips, self.field_invalid(field)));
         }
         // The program start-point editor lives on the Origin node (offset from it).
         if let Selection::Origin = self.controller.selection() {
@@ -5769,14 +5830,16 @@ fn field_row_styled<'a>(
     show: bool,
     invalid: bool,
 ) -> Element<'a, Message> {
-    field_row_labeled(field, field.label(), value, show, invalid)
+    field_row_labeled(field, field.label(), field.help(), value, show, invalid)
 }
 
-/// As [`field_row_styled`], but with an explicit label so a field can be renamed per
-/// tool kind (e.g. a V-bit's `ToolDiameter` reads "Shank diameter").
+/// As [`field_row_styled`], but with an explicit label and tooltip so a field can be
+/// renamed and re-explained per tool kind (e.g. a V-bit's `ToolDiameter` reads "Shank
+/// diameter" with matching help).
 fn field_row_labeled<'a>(
     field: Field,
     label: &'a str,
+    help: &'static str,
     value: &str,
     show: bool,
     invalid: bool,
@@ -5794,7 +5857,7 @@ fn field_row_labeled<'a>(
             s
         });
     }
-    row![label_help(label, field.help(), show), input]
+    row![label_help(label, help, show), input]
         .spacing(8)
         .align_y(Alignment::Center)
         .into()
