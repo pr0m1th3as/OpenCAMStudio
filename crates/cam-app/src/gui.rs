@@ -86,6 +86,8 @@ enum Icon {
     Chamfer,
     Face,
     NewTool,
+    ImportLibrary,
+    ExportLibrary,
     Duplicate,
     Delete,
     ShowStock,
@@ -114,6 +116,8 @@ impl Icon {
             Icon::Chamfer => include_bytes!("../assets/icons/chamfer.svg"),
             Icon::Face => include_bytes!("../assets/icons/face.svg"),
             Icon::NewTool => include_bytes!("../assets/icons/endmill.svg"),
+            Icon::ImportLibrary => include_bytes!("../assets/icons/import_library.svg"),
+            Icon::ExportLibrary => include_bytes!("../assets/icons/export_library.svg"),
             Icon::Duplicate => include_bytes!("../assets/icons/copy.svg"),
             Icon::Delete => include_bytes!("../assets/icons/erase.svg"),
             Icon::ShowStock => include_bytes!("../assets/icons/box3d.svg"),
@@ -145,6 +149,10 @@ impl Icon {
             Icon::Chamfer => "Add a Chamfer operation — break an edge with a V/chamfer tool.",
             Icon::Face => "Add a Face operation — skim the top of the stock flat.",
             Icon::NewTool => "Add a new tool to the library.",
+            Icon::ImportLibrary => {
+                "Import a tool library from a .ocam file, replacing the working library."
+            }
+            Icon::ExportLibrary => "Export the working tool library to a .ocam file to share.",
             Icon::Duplicate => "Duplicate the selected operation.",
             Icon::Delete => "Delete the selected item.",
             Icon::ShowStock => "Show or hide the simulated stock surface in the viewport.",
@@ -1452,14 +1460,14 @@ enum Message {
     SaveProjectAs,
     /// The chosen path to save to (`None` = cancelled).
     ProjectToSave(Option<PathBuf>),
-    /// Prompt for a `.ocam` to export the current tool library to.
-    SaveLibrary,
+    /// Prompt for a `.ocam` to **export** the working tool library to.
+    ExportLibrary,
     /// The chosen path to write the library to (`None` = cancelled).
-    LibraryToSave(Option<PathBuf>),
-    /// Prompt for a `.ocam` tool library to load (replaces the working library).
-    LoadLibrary,
-    /// The chosen library file to load (`None` = cancelled).
-    LibraryToLoad(Option<PathBuf>),
+    LibraryToExport(Option<PathBuf>),
+    /// Prompt for a `.ocam` tool library to **import** (replaces the working library).
+    ImportLibrary,
+    /// The chosen library file to import (`None` = cancelled).
+    LibraryToImport(Option<PathBuf>),
     /// Prompt for and import a `.dxf`/`.dwg` file.
     ImportCad,
     /// The chosen CAD file to import (`None` = cancelled).
@@ -1788,29 +1796,29 @@ impl App {
                 );
             }
             Message::ProjectToSave(Some(path)) => self.save_to(&path),
-            Message::SaveLibrary => {
+            Message::ExportLibrary => {
                 return iced::Task::perform(
                     pick_save("OpenCAMStudio tool library", "tools.ocam", &["ocam"]),
-                    Message::LibraryToSave,
+                    Message::LibraryToExport,
                 );
             }
-            Message::LibraryToSave(Some(path)) => {
+            Message::LibraryToExport(Some(path)) => {
                 let file = OcamFile::Library(self.library.clone());
                 self.status = match file.to_json() {
                     Ok(json) => match std::fs::write(&path, json) {
-                        Ok(()) => format!("Saved tool library to {}.", path.display()),
-                        Err(e) => format!("Library save failed: {e}"),
+                        Ok(()) => format!("Exported tool library to {}.", path.display()),
+                        Err(e) => format!("Library export failed: {e}"),
                     },
-                    Err(e) => format!("Library save failed: {e}"),
+                    Err(e) => format!("Library export failed: {e}"),
                 };
             }
-            Message::LoadLibrary => {
+            Message::ImportLibrary => {
                 return iced::Task::perform(
                     pick_open("OpenCAMStudio tool library", &["ocam"]),
-                    Message::LibraryToLoad,
+                    Message::LibraryToImport,
                 );
             }
-            Message::LibraryToLoad(Some(path)) => {
+            Message::LibraryToImport(Some(path)) => {
                 self.status = match std::fs::read_to_string(&path) {
                     Ok(text) => match OcamFile::from_json(&text) {
                         Ok(OcamFile::Library(lib)) => {
@@ -1819,14 +1827,14 @@ impl App {
                             self.library.save(); // becomes the working (config-dir) library
                             self.lib_sel = 0;
                             self.refresh_fields();
-                            format!("Loaded {n} tool(s) from {}.", path.display())
+                            format!("Imported {n} tool(s) from {}.", path.display())
                         }
                         Ok(OcamFile::Project(_)) => {
                             "That .ocam is a project, not a tool library.".to_string()
                         }
-                        Err(e) => format!("Library load failed: {e}"),
+                        Err(e) => format!("Library import failed: {e}"),
                     },
-                    Err(e) => format!("Library load failed: {e}"),
+                    Err(e) => format!("Library import failed: {e}"),
                 };
             }
             Message::ImportCad => {
@@ -1881,8 +1889,8 @@ impl App {
             // Cancelled dialogs — nothing to do.
             Message::ProjectToOpen(None)
             | Message::ProjectToSave(None)
-            | Message::LibraryToSave(None)
-            | Message::LibraryToLoad(None)
+            | Message::LibraryToExport(None)
+            | Message::LibraryToImport(None)
             | Message::CadToImport(None)
             | Message::NcToExport(None) => {}
             Message::Undo => {
@@ -3243,10 +3251,10 @@ impl App {
                 ],
             },
             GroupSpec {
-                title: "File",
+                title: "Library file",
                 commands: vec![
-                    cmd(Icon::Save, "Save", Some(Message::SaveLibrary)),
-                    cmd(Icon::Open, "Load", Some(Message::LoadLibrary)),
+                    cmd(Icon::ImportLibrary, "Import", Some(Message::ImportLibrary)),
+                    cmd(Icon::ExportLibrary, "Export", Some(Message::ExportLibrary)),
                 ],
             }],
             RibbonTab::View => vec![GroupSpec {

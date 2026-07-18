@@ -39,6 +39,9 @@ glance and stay visually distinct from each other:
 The remaining originals are in the flat 24×24 style:
 
 - `endmill.svg` — New tool
+- `import_library.svg`, `export_library.svg` — tool-library import/export (a
+  machinist's tool chest with a down/up arrow; deliberately distinct from the
+  project `open.svg`/`save.svg` and the CAD/G-code `cui_import.svg`/`cui_export.svg`)
 - `machine.svg` — Machine / post-processor setup (a settings gear)
 - `undo.svg`, `redo.svg`, `run.svg` — edit / run actions
 - `new.svg`, `open.svg`, `save.svg` — project file actions
