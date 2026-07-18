@@ -2920,8 +2920,14 @@ impl App {
     /// The kind of the tool the inspector is editing (library entry or project tool).
     fn inspected_tool_kind(&self) -> Option<ToolKind> {
         if self.library_mode() {
-            self.library.tools.get(self.lib_sel).map(|t| t.kind)
-        } else if let Selection::Tool(i) = self.controller.selection() {
+            // Prefer the working copy so a Type change (which edits it, not the committed
+            // entry) immediately drives the kind-specific field set, labels and validation.
+            return self
+                .tool_edit
+                .map(|t| t.kind)
+                .or_else(|| self.library.tools.get(self.lib_sel).map(|t| t.kind));
+        }
+        if let Selection::Tool(i) = self.controller.selection() {
             self.controller.document().setup.tools.get(i).map(|t| t.kind)
         } else {
             None
@@ -2937,7 +2943,9 @@ impl App {
             (Some(ToolKind::VBit { .. } | ToolKind::ChamferMill { .. }), Field::ToolDiameter) => {
                 "Shank diameter (mm)"
             }
-            // Face mill: the flute/shank fields describe the shell-mill body and its arbor.
+            // Face mill: cutting-⌀ disc, and the flute/shank fields describe the shell-mill
+            // body and its arbor.
+            (Some(ToolKind::FaceMill), Field::ToolDiameter) => "Cutting diameter (mm)",
             (Some(ToolKind::FaceMill), Field::FluteLength) => "Body height (mm)",
             (Some(ToolKind::FaceMill), Field::ShankDiameter) => "Arbor diameter (mm)",
             _ => field.label(),
