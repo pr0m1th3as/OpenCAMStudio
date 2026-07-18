@@ -2915,7 +2915,10 @@ impl App {
     /// diameter" there.
     fn field_label(&self, field: Field) -> &'static str {
         match (self.inspected_tool_kind(), field) {
-            (Some(ToolKind::VBit { .. }), Field::ToolDiameter) => "Shank diameter (mm)",
+            // V-bit and chamfer mill: the single transverse ⌀ is the shaft they flare to.
+            (Some(ToolKind::VBit { .. } | ToolKind::ChamferMill { .. }), Field::ToolDiameter) => {
+                "Shank diameter (mm)"
+            }
             _ => field.label(),
         }
     }
@@ -2947,6 +2950,18 @@ impl App {
                 // A V-bit's tip radius cannot exceed the shaft radius (⌀/2).
                 matches!((buf(Field::TipRadius), buf(Field::ToolDiameter)),
                     (Some(tr), Some(d)) if tr > d * 0.5 + 1e-9)
+            }
+            Field::ChamferAngle => {
+                // A chamfer mill's included angle just has to be a valid cone.
+                let Some(a) = buf(Field::ChamferAngle) else {
+                    return true;
+                };
+                !(0.0 < a && a < 180.0)
+            }
+            Field::TipDiameter => {
+                // The flat tip must be narrower than the shaft ⌀, else there is no cone.
+                matches!((buf(Field::TipDiameter), buf(Field::ToolDiameter)),
+                    (Some(tip), Some(d)) if tip >= d - 1e-9)
             }
             Field::FluteLength => {
                 let Some(fl) = buf(Field::FluteLength) else {
@@ -3064,6 +3079,15 @@ impl App {
                 Field::ToolLength,
                 Field::PointAngle,
                 Field::TipRadius,
+            ],
+            // Chamfer mill: like a V-bit but its tip is a flat (non-cutting) instead of a
+            // rounded one — a single shaft ⌀, overall length, point angle, and a flat tip
+            // ⌀ in place of the V-bit's tip radius.
+            Some(ToolKind::ChamferMill { .. }) => vec![
+                Field::ToolDiameter,
+                Field::ToolLength,
+                Field::ChamferAngle,
+                Field::TipDiameter,
             ],
             other => {
                 let mut f = vec![
@@ -5482,9 +5506,13 @@ fn library_extra(t: &cam_model::Tool) -> Option<String> {
             included_angle_deg,
             tip_radius,
         } => Some(format!("{}°, r{}", fmt_num(included_angle_deg), fmt_num(tip_radius))),
-        ToolKind::FaceMill | ToolKind::ChamferMill { .. } | ToolKind::ThreadMill { .. } => {
-            Some(flute_count(t.flutes))
-        }
+        // Chamfer mill mirrors the V-bit, but its tip is a flat ⌀ (non-cutting), not a
+        // rounded radius — hence `⌀…` rather than `r…`.
+        ToolKind::ChamferMill {
+            included_angle_deg,
+            tip_diameter,
+        } => Some(format!("{}°, ⌀{}", fmt_num(included_angle_deg), fmt_num(tip_diameter))),
+        ToolKind::FaceMill | ToolKind::ThreadMill { .. } => Some(flute_count(t.flutes)),
         ToolKind::Drill { .. } => None,
     }
 }
@@ -6316,8 +6344,9 @@ impl ToolCanvas {
             flute_length: cutting_top,
             flutes: tool.flutes,
             cutting_direction: tool.cutting_direction,
-            // V-bits show no flutes; a drill bit's helix revolves every ~3·⌀.
-            draw_flutes: !matches!(tool.kind, ToolKind::VBit { .. }),
+            // V-bits and chamfer mills show no flute helix (the cone reads clean); a
+            // drill bit's helix revolves every ~3·⌀.
+            draw_flutes: !matches!(tool.kind, ToolKind::VBit { .. } | ToolKind::ChamferMill { .. }),
             flute_pitch: match tool.kind {
                 ToolKind::Drill { .. } => (3.0 * tool.diameter).max(1e-3),
                 _ => cutting_top,

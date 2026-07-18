@@ -142,7 +142,8 @@ pub fn generatrix(spec: &GeneratrixSpec) -> Profile2D {
         } => {
             let rf = flat_radius.clamp(0.0, r);
             if rf > EPS {
-                segs.push(line(Point::new(rf, 0.0), true)); // flat tip
+                // Flat tip is **non-cutting** (a chamfer mill cuts only on the flank).
+                segs.push(line(Point::new(rf, 0.0), false));
             }
             // Cone flank: z = (r - rf) / tan(α) at full radius.
             let z_apex = if half_angle_rad > EPS {

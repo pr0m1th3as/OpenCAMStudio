@@ -320,10 +320,18 @@ impl Tool {
             ToolKind::ChamferMill {
                 included_angle_deg,
                 tip_diameter,
-            } => BottomShape::Cone {
-                half_angle_rad: (included_angle_deg * 0.5).to_radians(),
-                flat_radius: tip_diameter * 0.5,
-            },
+            } => {
+                // Like a V-bit but with a flat, **non-cutting** tip instead of a rounded
+                // one: the cone flank is the only cutting surface, flaring exactly to the
+                // shaft. Single diameter (= shaft); flute_length 0 leaves the shaft
+                // non-cutting.
+                flute_length = 0.0;
+                shank_radius = self.radius();
+                BottomShape::Cone {
+                    half_angle_rad: (included_angle_deg * 0.5).to_radians(),
+                    flat_radius: tip_diameter * 0.5,
+                }
+            }
             ToolKind::Drill { point_angle_deg } => BottomShape::Cone {
                 half_angle_rad: (point_angle_deg * 0.5).to_radians(),
                 flat_radius: 0.0,
@@ -503,13 +511,19 @@ mod tests {
         // Ball: first segment is a cutting arc.
         let ball = mk(ToolKind::BallMill).profile();
         assert!(matches!(ball.segs[0].shape, SegShape::Arc { .. }));
-        // Chamfer with a flat tip: flat tip line then a cone flank, both cutting.
+        // Chamfer with a flat tip: the flat tip line is **non-cutting**, only the cone
+        // flank cuts (a chamfer mill cuts on the angled flank alone).
         let cham = mk(ToolKind::ChamferMill {
             included_angle_deg: 90.0,
             tip_diameter: 1.0,
         })
         .profile();
-        assert!(cham.segs[0].cutting && cham.segs[1].cutting);
+        assert!(!cham.segs[0].cutting, "flat tip is non-cutting");
+        assert!(cham.segs[1].cutting, "cone flank cuts");
+        // The cone flares exactly to the shaft (⌀8 → r4); no arrow, and the shaft above
+        // the flank is non-cutting.
+        assert_eq!(cham.max_radius(), 4.0);
+        assert!(cham.segs.iter().filter(|s| s.cutting).all(|s| s.end.x <= 4.0 + 1e-9));
         // Flute split honoured: nothing above z=20 cuts.
         assert!(em.segs.iter().filter(|s| s.cutting).all(|s| s.end.y <= 20.0 + 1e-9));
     }
