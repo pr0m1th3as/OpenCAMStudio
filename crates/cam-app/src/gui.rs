@@ -65,6 +65,9 @@ mod palette {
     /// Warning accent (amber) — e.g. the exact-duplicate operation marker. Paired
     /// with a ⚠ glyph so the meaning survives colour-vision deficiency.
     pub const WARN: Color = rgb(0.95, 0.62, 0.10);
+    /// Error accent (red) for an invalid inspector field. A thickened border carries the
+    /// same signal by weight, so it does not rely on hue alone.
+    pub const ERROR: Color = rgb(0.92, 0.30, 0.28);
 }
 
 /// Ribbon command icons. Each variant is a small embedded SVG (see
@@ -1832,6 +1835,17 @@ impl App {
             // recomputed until Apply, so undo has one step per real change.
             Message::FieldChanged(field, value) => {
                 self.fields.insert(field, value);
+                // Engage the overall = flute + shank constraint **live** for the three
+                // length fields (library editor), so the derived field updates as focus
+                // leaves the box — no need to click Apply.
+                if self.library_mode()
+                    && matches!(
+                        field,
+                        Field::FluteLength | Field::ShankLength | Field::ToolLength
+                    )
+                {
+                    self.live_apply_lengths(field);
+                }
             }
             Message::MachineNameChanged(name) => {
                 self.controller.edit_machine(|m| m.name = name);
@@ -2733,6 +2747,45 @@ impl App {
     /// ribbon tab, independent of the project selection).
     fn library_mode(&self) -> bool {
         self.active_tab == RibbonTab::Tooling
+    }
+
+    /// Whether a field's current buffer value is invalid (flagged red). A rounded-edge
+    /// end mill's **corner radius must not exceed the flute radius** (⌀/2).
+    fn field_invalid(&self, field: Field) -> bool {
+        let buf = |f: Field| self.fields.get(&f).and_then(|s| s.parse::<f64>().ok());
+        match field {
+            Field::CornerRadius => {
+                matches!((buf(Field::CornerRadius), buf(Field::ToolDiameter)),
+                    (Some(cr), Some(d)) if cr > d * 0.5 + 1e-9)
+            }
+            _ => false,
+        }
+    }
+
+    /// Apply the flute/shank/overall length constraint to the selected library tool
+    /// **live** from the `edited` field's current buffer, then refresh the *other* two
+    /// length buffers so the derived value shows immediately. Only fires on a valid
+    /// number; the edited field's own buffer is left untouched (mid-typing).
+    fn live_apply_lengths(&mut self, edited: Field) {
+        let Some(v) = self.fields.get(&edited).and_then(|s| s.parse::<f64>().ok()) else {
+            return;
+        };
+        if v < 0.0 {
+            return;
+        }
+        let mut parsed: BTreeMap<Field, f64> = BTreeMap::new();
+        parsed.insert(edited, v);
+        if let Some(t) = self.library.tools.get_mut(self.lib_sel) {
+            apply_tool_dims(t, &parsed);
+        }
+        self.library.save();
+        for f in [Field::FluteLength, Field::ShankLength, Field::ToolLength] {
+            if f != edited {
+                if let Some(val) = self.field_value(f) {
+                    self.fields.insert(f, fmt_num(val));
+                }
+            }
+        }
     }
 
     /// The tool whose cross-section the viewport should preview (Phase 5): the selected
@@ -4062,7 +4115,7 @@ impl App {
 
         for field in self.inspector_fields() {
             let value = self.fields.get(&field).cloned().unwrap_or_default();
-            list = list.push(field_row(field, &value, self.tooltips));
+            list = list.push(field_row_styled(field, &value, self.tooltips, self.field_invalid(field)));
         }
         if let Some(t) = self.library.tools.get(self.lib_sel) {
             // Cutting direction (a picker, not a numeric field) — Andreas's field 7.
@@ -4191,7 +4244,7 @@ impl App {
                 continue;
             }
             let value = self.fields.get(&field).cloned().unwrap_or_default();
-            list = list.push(field_row(field, &value, self.tooltips));
+            list = list.push(field_row_styled(field, &value, self.tooltips, self.field_invalid(field)));
         }
         // The program start-point editor lives on the Origin node (offset from it).
         if let Selection::Origin = self.controller.selection() {
@@ -5131,16 +5184,34 @@ fn tree_note<'a>(label: &str) -> Element<'a, Message> {
 /// An inspector field row: a label (with a hover tooltip explaining it, when `show`)
 /// and a numeric text input bound to `field`.
 fn field_row<'a>(field: Field, value: &str, show: bool) -> Element<'a, Message> {
-    row![
-        label_help(field.label(), field.help(), show),
-        text_input("", value)
-            .on_input(move |v| Message::FieldChanged(field, v))
-            .on_submit(Message::Apply)
-            .width(Length::Fixed(90.0)),
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center)
-    .into()
+    field_row_styled(field, value, show, false)
+}
+
+/// As [`field_row`], but drawn as **invalid** (red border + value) when `invalid` — the
+/// thicker border also carries the signal by weight, not hue alone.
+fn field_row_styled<'a>(
+    field: Field,
+    value: &str,
+    show: bool,
+    invalid: bool,
+) -> Element<'a, Message> {
+    let mut input = text_input("", value)
+        .on_input(move |v| Message::FieldChanged(field, v))
+        .on_submit(Message::Apply)
+        .width(Length::Fixed(90.0));
+    if invalid {
+        input = input.style(|theme, status| {
+            let mut s = iced::widget::text_input::default(theme, status);
+            s.border.color = palette::ERROR;
+            s.border.width = 1.5;
+            s.value = palette::ERROR;
+            s
+        });
+    }
+    row![label_help(field.label(), field.help(), show), input]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into()
 }
 
 /// A labelled strategy picker row (lead / plunge kind, side, …) for the inspector,
