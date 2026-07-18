@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::document::Setup;
-use crate::{Tool, ToolKind};
+use crate::{CutDir, Tool, ToolKind};
 
 /// Quantise a millimetre value to whole **microns** (0.001 mm) — tools are nominal, so
 /// this both kills float noise and gives an `Eq`/`Hash`-able key with an implicit
@@ -84,6 +84,7 @@ pub struct ToolIdentity {
     neck_len_um: i64,
     neck_dia_um: i64,
     flutes: u32,
+    cutting_direction: CutDir,
 }
 
 impl Tool {
@@ -98,6 +99,7 @@ impl Tool {
             neck_len_um: q(self.neck_length),
             neck_dia_um: q(self.neck_dia()),
             flutes: self.flutes,
+            cutting_direction: self.cutting_direction,
         }
     }
 }
@@ -256,6 +258,11 @@ mod tests {
         assert_ne!(a.identity(), d.identity(), "overall length (reach)");
         assert_ne!(a.identity(), t(1, 10.0, ToolKind::EndMill).identity(), "diameter");
         assert_ne!(a.identity(), t(1, 12.0, ToolKind::BallMill).identity(), "kind");
+
+        // Cutting direction is a physical property, so it distinguishes tools too.
+        let mut up = a;
+        up.cutting_direction = CutDir::Up;
+        assert_ne!(a.identity(), up.identity(), "up-cut vs down-cut");
     }
 
     #[test]

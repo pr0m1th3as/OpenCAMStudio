@@ -20,13 +20,18 @@ pub struct ToolLibrary {
 impl ToolLibrary {
     /// The starter library seeded on first run: a few common end mills.
     pub fn defaults() -> Self {
-        let em = |number, diameter| Tool {
-            number,
-            diameter,
-            length: 30.0,
-            flutes: 2,
-            kind: ToolKind::EndMill,
-            ..Default::default()
+        // flute = 2·⌀, shank = 2.5·flute, overall = flute + shank (the end-mill convention).
+        let em = |number, diameter: f64| {
+            let flute = 2.0 * diameter;
+            Tool {
+                number,
+                diameter,
+                flute_length: flute,
+                length: flute + 2.5 * flute,
+                flutes: 2,
+                kind: ToolKind::EndMill,
+                ..Default::default()
+            }
         };
         Self {
             tools: vec![em(1, 3.0), em(2, 6.0), em(3, 10.0)],
@@ -103,11 +108,18 @@ impl ToolLibrary {
     /// Append a fresh default tool of a **given kind** (its kind-specific parameters
     /// carried through) and return its index — so "New" can seed the type from whatever
     /// tool is currently selected (a chamfer mill begets a chamfer mill, etc.).
+    ///
+    /// Seeded with a sensible flute/shank split: `flute = 2·⌀`, `shank = 2.5·flute`
+    /// (so `overall = flute + shank`), the end-mill defaults Andreas specified.
     pub fn add_of_kind(&mut self, kind: ToolKind) -> usize {
+        let diameter = 6.0;
+        let flute = 2.0 * diameter;
+        let shank = 2.5 * flute;
         self.tools.push(Tool {
             number: self.next_number(),
-            diameter: 6.0,
-            length: 30.0,
+            diameter,
+            flute_length: flute,
+            length: flute + shank,
             flutes: 2,
             kind,
             ..Default::default()
@@ -317,8 +329,11 @@ mod tests {
         assert_eq!(n2, 4, "identical geometry returns the existing number");
         assert_eq!(lib.tools.len(), before + 1, "no duplicate inserted");
 
-        // Adding a ⌀6 (which the starter library already has as #2) is also a no-op.
-        assert_eq!(lib.add_tool(mk(50, 6.0, ToolKind::EndMill)), 2);
+        // Re-adding an *existing* library tool (its exact geometry) is a no-op that
+        // returns its number, regardless of the number on the copy.
+        let mut existing = lib.tools[1]; // the ⌀6 starter end mill (#2)
+        existing.number = 77;
+        assert_eq!(lib.add_tool(existing), 2);
         assert_eq!(lib.tools.len(), before + 1);
     }
 }

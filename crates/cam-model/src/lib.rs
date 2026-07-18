@@ -160,6 +160,31 @@ impl std::fmt::Display for ToolKind {
     }
 }
 
+/// The cutting/helix direction of a milling tool — a **down-cut** (flutes push chips
+/// down, a clean top edge) or **up-cut** (chips lifted, clears deep cuts). Like the
+/// flute count, it's a physical property of the tool: a down-cut and an up-cut ⌀6 end
+/// mill are *different* tools, so it counts toward [`ToolIdentity`](crate::ToolIdentity).
+/// (A later consumer is the adaptive-clearing strategy; wiring is deferred.)
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+pub enum CutDir {
+    /// Down-cut (down-milling helix).
+    #[default]
+    Down,
+    /// Up-cut (up-milling helix).
+    Up,
+}
+
+impl std::fmt::Display for CutDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            CutDir::Down => "Down-cut",
+            CutDir::Up => "Up-cut",
+        })
+    }
+}
+
 /// A cutting tool. The P2 slice was `number/diameter/length/flutes/kind`; the tool
 /// subsystem (see `TOOLING_PLAN.md`) adds the **non-cutting** geometry the sim's
 /// gouge checks and the tool-library preview reason about — all `#[serde(default)]`
@@ -194,6 +219,10 @@ pub struct Tool {
     pub neck_diameter: f64,
     /// Number of flutes.
     pub flutes: u32,
+    /// Cutting/helix direction (down-cut / up-cut) — a physical tool property, in
+    /// identity. `#[serde(default)]` (→ `Down`) so older tools load unchanged.
+    #[serde(default)]
+    pub cutting_direction: CutDir,
     /// Tool geometry class.
     pub kind: ToolKind,
 }
@@ -211,6 +240,7 @@ impl Default for Tool {
             neck_length: 0.0,
             neck_diameter: 0.0,
             flutes: 0,
+            cutting_direction: CutDir::Down,
             kind: ToolKind::EndMill,
         }
     }
@@ -412,6 +442,7 @@ mod tests {
             neck_length: 15.0,
             neck_diameter: 6.0,
             flutes: 3,
+            cutting_direction: CutDir::Up,
             kind: ToolKind::BullNose { corner_radius: 1.0 },
         };
         let back: Tool = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();

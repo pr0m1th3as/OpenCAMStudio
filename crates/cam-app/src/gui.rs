@@ -21,7 +21,9 @@ use iced::widget::{
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
-use cam_model::{Axis, Envelope, Hand, Lead, Machine, Operation, Plunge, Point3, Side, ToolKind};
+use cam_model::{
+    Axis, CutDir, Envelope, Hand, Lead, Machine, Operation, Plunge, Point3, Side, ToolKind,
+};
 use cam_post::PostKind;
 
 use crate::project::OcamFile;
@@ -616,6 +618,47 @@ fn tool_kind_field(kind: ToolKind, field: Field) -> Option<f64> {
 }
 
 /// Write the parsed inspector fields onto a tool's kind-specific parameters.
+/// Write the parsed common tool dimensions onto `t`, enforcing the length constraint
+/// **overall = flute + shank**: editing flute or shank recomputes overall; editing
+/// overall recomputes the shank (flute held fixed), with shank floored at 0. The
+/// effective flute (`flute_len()`) is materialised into `flute_length` on any edit so
+/// the three stay consistent. Kind-specific parameters are handled separately by
+/// [`apply_tool_kind_fields`].
+fn apply_tool_dims(t: &mut cam_model::Tool, parsed: &BTreeMap<Field, f64>) {
+    if let Some(&v) = parsed.get(&Field::ToolDiameter) {
+        t.diameter = v.max(0.0);
+    }
+    if let Some(&v) = parsed.get(&Field::ShankDiameter) {
+        t.shank_diameter = v.max(0.0);
+    }
+    if let Some(&v) = parsed.get(&Field::NeckLength) {
+        t.neck_length = v.max(0.0);
+    }
+    if let Some(&v) = parsed.get(&Field::NeckDiameter) {
+        t.neck_diameter = v.max(0.0);
+    }
+    if let Some(&v) = parsed.get(&Field::Flutes) {
+        t.flutes = v.round().max(1.0) as u32;
+    }
+
+    // overall = flute + shank. Snapshot the effective flute/shank *before* the edit.
+    let old_flute = t.flute_len();
+    let old_shank = (t.length - old_flute).max(0.0);
+    let new_flute = parsed
+        .get(&Field::FluteLength)
+        .map(|&v| v.max(0.0))
+        .unwrap_or(old_flute);
+    t.flute_length = new_flute; // materialise (drops the 0-sentinel)
+    let new_length = if let Some(&sh) = parsed.get(&Field::ShankLength) {
+        new_flute + sh.max(0.0) // shank edited ⇒ overall follows
+    } else if let Some(&ov) = parsed.get(&Field::ToolLength) {
+        ov // overall edited ⇒ shank absorbs (derived below)
+    } else {
+        new_flute + old_shank // flute may have changed; preserve the shank
+    };
+    t.length = new_length.max(new_flute); // shank ≥ 0
+}
+
 fn apply_tool_kind_fields(kind: &mut ToolKind, parsed: &BTreeMap<Field, f64>) {
     let get = |f: Field| parsed.get(&f).copied();
     match kind {
@@ -682,6 +725,9 @@ enum Field {
     FluteLength,
     /// Shank diameter, mm; 0 = same as the cutting diameter (no distinct shank).
     ShankDiameter,
+    /// Shank length, mm — a *derived* field: overall = flute + shank (editing it moves
+    /// overall length; editing overall moves it back).
+    ShankLength,
     /// Reduced-neck length from the cutting end, mm; 0 = no reduced neck.
     NeckLength,
     /// Reduced-neck diameter, mm; 0 = same as the cutting diameter.
@@ -765,10 +811,11 @@ impl Field {
             Field::StartOffX => "Offset X (mm)",
             Field::StartOffY => "Offset Y (mm)",
             Field::StartOffZ => "Offset Z (mm)",
-            Field::ToolDiameter => "Tool ⌀ (mm)",
-            Field::ToolLength => "Length (mm)",
-            Field::FluteLength => "Flute length (mm, 0=full)",
-            Field::ShankDiameter => "Shank ⌀ (mm, 0=cut ⌀)",
+            Field::ToolDiameter => "Flute ⌀ (mm)",
+            Field::ToolLength => "Overall length (mm)",
+            Field::FluteLength => "Flute length (mm)",
+            Field::ShankDiameter => "Shank ⌀ (mm, 0=flute ⌀)",
+            Field::ShankLength => "Shank length (mm)",
             Field::NeckLength => "Neck length (mm, 0=none)",
             Field::NeckDiameter => "Neck ⌀ (mm, 0=cut ⌀)",
             Field::Flutes => "Flutes",
@@ -865,6 +912,11 @@ impl Field {
             Field::ShankDiameter => {
                 "Diameter of the (non-cutting) shank above the flutes. 0 = the same as \
                  the cutting diameter (no distinct shank)."
+            }
+            Field::ShankLength => {
+                "Length of the (non-cutting) shank above the flutes. Overall length = \
+                 flute length + shank length; editing this moves the overall length, and \
+                 editing the overall length moves the shank."
             }
             Field::NeckLength => {
                 "Length of a reduced-diameter neck above the flutes (reach/stub tools). \
@@ -1572,6 +1624,8 @@ enum Message {
     WindowResized(iced::Size),
     /// Change the selected tool's geometry kind (committed immediately).
     ToolKindChanged(ToolKind),
+    /// Change the selected tool's cutting direction (down-cut / up-cut).
+    ToolCuttingDirChanged(CutDir),
     /// Change the selected profile's lead-in / lead-out / plunge kind (committed
     /// immediately with default parameters; sizes are then edited as fields).
     LeadInKindChanged(LeadKind),
@@ -2252,6 +2306,18 @@ impl App {
                 // The kind-specific fields depend on the kind — repopulate them.
                 self.refresh_fields();
             }
+            Message::ToolCuttingDirChanged(dir) => {
+                if self.library_mode() {
+                    if let Some(t) = self.library.tools.get_mut(self.lib_sel) {
+                        t.cutting_direction = dir;
+                        self.library.save();
+                    }
+                } else if let Selection::Tool(i) = self.controller.selection() {
+                    self.controller.edit_tool(i, |t| t.cutting_direction = dir);
+                    self.rerun();
+                }
+                self.refresh_fields();
+            }
             Message::LeadInKindChanged(kind) => {
                 self.controller.edit_selected_operation(|op| match op {
                     Operation::Profile(p) => p.lead_in = kind.to_lead(p.lead_in),
@@ -2675,21 +2741,35 @@ impl App {
 
     /// Which fields the inspector shows for the current selection.
     fn inspector_fields(&self) -> Vec<Field> {
-        // Common tool fields plus the selected tool's kind-specific parameters.
-        let tool_fields = |kind: Option<ToolKind>| {
-            let mut f = vec![
-                Field::ToolDiameter,
-                Field::ToolLength,
+        // The field set is **kind-specific** — the end mill has its own characterisation
+        // (Andreas): flute ⌀, flute length, shank ⌀, shank length, overall length,
+        // flutes — no neck. Other kinds keep the generic set until characterised in turn.
+        // The Cutting-direction control is rendered separately (it's a picker, not a
+        // numeric field), as is the Type picker.
+        let tool_fields = |kind: Option<ToolKind>| match kind {
+            Some(ToolKind::EndMill) => vec![
+                Field::ToolDiameter, // "Flute ⌀"
                 Field::FluteLength,
                 Field::ShankDiameter,
-                Field::NeckLength,
-                Field::NeckDiameter,
+                Field::ShankLength,
+                Field::ToolLength, // "Overall length"
                 Field::Flutes,
-            ];
-            if let Some(k) = kind {
-                f.extend(tool_kind_fields(k));
+            ],
+            other => {
+                let mut f = vec![
+                    Field::ToolDiameter,
+                    Field::ToolLength,
+                    Field::FluteLength,
+                    Field::ShankDiameter,
+                    Field::NeckLength,
+                    Field::NeckDiameter,
+                    Field::Flutes,
+                ];
+                if let Some(k) = other {
+                    f.extend(tool_kind_fields(k));
+                }
+                f
             }
-            f
         };
         if self.library_mode() {
             return tool_fields(self.library.tools.get(self.lib_sel).map(|t| t.kind));
@@ -2827,8 +2907,10 @@ impl App {
             return match field {
                 Field::ToolDiameter => Some(t.diameter),
                 Field::ToolLength => Some(t.length),
-                Field::FluteLength => Some(t.flute_length),
+                // Effective flute (resolves the 0-sentinel), so shank = overall − flute.
+                Field::FluteLength => Some(t.flute_len()),
                 Field::ShankDiameter => Some(t.shank_diameter),
+                Field::ShankLength => Some((t.length - t.flute_len()).max(0.0)),
                 Field::NeckLength => Some(t.neck_length),
                 Field::NeckDiameter => Some(t.neck_diameter),
                 Field::Flutes => Some(t.flutes as f64),
@@ -2876,6 +2958,18 @@ impl App {
                 Selection::Tool(i) => setup.tools.get(i).map(|t| t.length),
                 _ => None,
             },
+            Field::FluteLength => match self.controller.selection() {
+                Selection::Tool(i) => setup.tools.get(i).map(|t| t.flute_len()),
+                _ => None,
+            },
+            Field::ShankDiameter => match self.controller.selection() {
+                Selection::Tool(i) => setup.tools.get(i).map(|t| t.shank_diameter),
+                _ => None,
+            },
+            Field::ShankLength => match self.controller.selection() {
+                Selection::Tool(i) => setup.tools.get(i).map(|t| (t.length - t.flute_len()).max(0.0)),
+                _ => None,
+            },
             Field::Flutes => match self.controller.selection() {
                 Selection::Tool(i) => setup.tools.get(i).map(|t| t.flutes as f64),
                 _ => None,
@@ -2913,27 +3007,7 @@ impl App {
         // embedded copy in a project is a snapshot and is left untouched.
         if self.library_mode() {
             if let Some(t) = self.library.tools.get_mut(self.lib_sel) {
-                if let Some(&v) = parsed.get(&Field::ToolDiameter) {
-                    t.diameter = v;
-                }
-                if let Some(&v) = parsed.get(&Field::ToolLength) {
-                    t.length = v;
-                }
-                if let Some(&v) = parsed.get(&Field::FluteLength) {
-                    t.flute_length = v.max(0.0);
-                }
-                if let Some(&v) = parsed.get(&Field::ShankDiameter) {
-                    t.shank_diameter = v.max(0.0);
-                }
-                if let Some(&v) = parsed.get(&Field::NeckLength) {
-                    t.neck_length = v.max(0.0);
-                }
-                if let Some(&v) = parsed.get(&Field::NeckDiameter) {
-                    t.neck_diameter = v.max(0.0);
-                }
-                if let Some(&v) = parsed.get(&Field::Flutes) {
-                    t.flutes = v.round().max(1.0) as u32;
-                }
+                apply_tool_dims(t, &parsed);
                 apply_tool_kind_fields(&mut t.kind, &parsed);
             }
             self.library.save();
@@ -2994,28 +3068,7 @@ impl App {
                 });
             }
             Selection::Tool(i) => self.controller.edit_tool(i, |t| {
-                if let Some(&v) = parsed.get(&Field::ToolDiameter) {
-                    t.diameter = v;
-                }
-                if let Some(&v) = parsed.get(&Field::ToolLength) {
-                    t.length = v;
-                }
-                if let Some(&v) = parsed.get(&Field::FluteLength) {
-                    t.flute_length = v.max(0.0);
-                }
-                if let Some(&v) = parsed.get(&Field::ShankDiameter) {
-                    t.shank_diameter = v.max(0.0);
-                }
-                if let Some(&v) = parsed.get(&Field::NeckLength) {
-                    t.neck_length = v.max(0.0);
-                }
-                if let Some(&v) = parsed.get(&Field::NeckDiameter) {
-                    t.neck_diameter = v.max(0.0);
-                }
-                if let Some(&v) = parsed.get(&Field::Flutes) {
-                    // Flutes is an integer count; round the typed value.
-                    t.flutes = v.round().max(1.0) as u32;
-                }
+                apply_tool_dims(t, &parsed);
                 apply_tool_kind_fields(&mut t.kind, &parsed);
             }),
             Selection::Operation(_) => self
@@ -3991,6 +4044,22 @@ impl App {
             list = list.push(field_row(field, &value, self.tooltips));
         }
         if let Some(t) = self.library.tools.get(self.lib_sel) {
+            // Cutting direction (a picker, not a numeric field) — Andreas's field 7.
+            list = list.push(row![
+                label_help(
+                    "Cutting dir.",
+                    "Down-cut vs up-cut (helix direction). A physical property of the \
+                     tool, like the flute count.",
+                    self.tooltips,
+                ),
+                pick_list(
+                    vec![CutDir::Down, CutDir::Up],
+                    Some(t.cutting_direction),
+                    Message::ToolCuttingDirChanged,
+                )
+                .text_size(13)
+                .width(Length::Fixed(120.0)),
+            ]);
             list = list.push(row![
                 label_help("Type", help::TOOL_TYPE, self.tooltips),
                 pick_list(&ToolKindPick::ALL[..], Some(ToolKindPick::of(t.kind)), |p| {
@@ -5753,6 +5822,8 @@ struct ToolCanvas {
     diameter: f64,
     length: f64,
     flute_length: f64,
+    flutes: u32,
+    cutting_direction: CutDir,
 }
 
 impl ToolCanvas {
@@ -5762,6 +5833,8 @@ impl ToolCanvas {
             diameter: tool.diameter,
             length: tool.length,
             flute_length: tool.flute_len(),
+            flutes: tool.flutes,
+            cutting_direction: tool.cutting_direction,
         }
     }
 }
@@ -5832,6 +5905,50 @@ impl canvas::Program<Message> for ToolCanvas {
             }
         }
 
+        // Flutes + cutting direction. Each flute is a helix on the cutting band; project
+        // it onto the side view and draw only the **front-facing** portions (cos ψ > 0),
+        // so a 2-flute mill shows one flute from the tip and the second only after it
+        // helixes round — exactly the real side-view read. Count the lines for the flute
+        // number; the lean shows the cutting direction. (Pitch = one turn over the flute
+        // length is a visualisation choice for legibility, not the true helix angle.)
+        let n = self.flutes.max(1);
+        let r = (self.diameter * 0.5).max(1e-3);
+        let flute_len = self.flute_length.max(1e-3);
+        let s = match self.cutting_direction {
+            CutDir::Down => 1.0_f64,
+            CutDir::Up => -1.0,
+        };
+        let flute_col = Color { a: 0.75, ..fg };
+        let steps = 48;
+        for k in 0..n {
+            let psi0 = (k as f64) * std::f64::consts::TAU / (n as f64);
+            let mut seg: Vec<P> = Vec::new();
+            let mut segments: Vec<Vec<P>> = Vec::new();
+            for i in 0..=steps {
+                let z = flute_len * (i as f64) / (steps as f64);
+                let psi = psi0 + s * std::f64::consts::TAU * (z / flute_len);
+                if psi.cos() > 0.0 {
+                    seg.push(map(r * psi.sin(), z, 1.0));
+                } else if seg.len() >= 2 {
+                    segments.push(std::mem::take(&mut seg));
+                } else {
+                    seg.clear();
+                }
+            }
+            if seg.len() >= 2 {
+                segments.push(seg);
+            }
+            for sg in segments {
+                let path = canvas::Path::new(|b| {
+                    b.move_to(sg[0]);
+                    for p in &sg[1..] {
+                        b.line_to(*p);
+                    }
+                });
+                frame.stroke(&path, canvas::Stroke::default().with_color(flute_col).with_width(1.0));
+            }
+        }
+
         // Dimension annotations (text only — no scale bars, kept minimal).
         let label = |frame: &mut canvas::Frame, s: String, y: f32| {
             frame.fill_text(canvas::Text {
@@ -5845,6 +5962,11 @@ impl canvas::Program<Message> for ToolCanvas {
         label(&mut frame, format!("⌀ {:.3} mm", self.diameter), 6.0);
         label(&mut frame, format!("length {:.1} mm", self.length), 22.0);
         label(&mut frame, format!("flute {:.1} mm", self.flute_length), 38.0);
+        label(
+            &mut frame,
+            format!("{} flute{}, {}", self.flutes, if self.flutes == 1 { "" } else { "s" }, self.cutting_direction),
+            54.0,
+        );
 
         vec![frame.into_geometry()]
     }
