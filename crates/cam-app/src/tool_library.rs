@@ -11,6 +11,39 @@ use cam_model::{Tool, ToolKind};
 
 use crate::controller::OpKind;
 
+/// A fresh tool of `kind` with sensible default dimensions and shop `number`. The
+/// end-mill family (and everything else) uses `flute = 2·⌀`, `shank = 2.5·flute`
+/// (overall = flute + shank); a **face mill** seeds as a real shell mill — a wide,
+/// squat cutting body on a short, narrower arbor. Used both by "New" and by a Type
+/// change that crosses tool families (so, e.g., a face mill is never left at ⌀6).
+pub fn default_tool(number: u32, kind: ToolKind) -> Tool {
+    if matches!(kind, ToolKind::FaceMill) {
+        return Tool {
+            number,
+            diameter: 50.0,       // cutting ⌀ (the disc)
+            flute_length: 30.0,   // body height (the wide body)
+            shank_diameter: 22.0, // arbor ⌀ (the stub above the body)
+            length: 42.0,         // overall (arbor sticks up 12 mm)
+            flutes: 5,            // inserts
+            kind,
+            ..Default::default()
+        };
+    }
+    let diameter = 6.0;
+    let flute = 2.0 * diameter;
+    let shank = 2.5 * flute;
+    Tool {
+        number,
+        diameter,
+        flute_length: flute,
+        shank_diameter: diameter, // explicit shank ⌀ (= flute ⌀ by default)
+        length: flute + shank,
+        flutes: 2,
+        kind,
+        ..Default::default()
+    }
+}
+
 /// A reusable set of tool definitions, persisted to the config directory.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolLibrary {
@@ -116,33 +149,7 @@ impl ToolLibrary {
     /// (⌀ = cutting ⌀, height = flute length) on a short, narrower arbor (shank ⌀).
     pub fn add_of_kind(&mut self, kind: ToolKind) -> usize {
         let number = self.next_number();
-        let tool = if matches!(kind, ToolKind::FaceMill) {
-            Tool {
-                number,
-                diameter: 50.0,       // cutting ⌀ (the disc)
-                flute_length: 30.0,   // body height (the wide body)
-                shank_diameter: 22.0, // arbor ⌀ (the stub above the body)
-                length: 42.0,         // overall (arbor sticks up 12 mm)
-                flutes: 5,            // inserts
-                kind,
-                ..Default::default()
-            }
-        } else {
-            let diameter = 6.0;
-            let flute = 2.0 * diameter;
-            let shank = 2.5 * flute;
-            Tool {
-                number,
-                diameter,
-                flute_length: flute,
-                shank_diameter: diameter, // explicit shank ⌀ (= flute ⌀ by default)
-                length: flute + shank,
-                flutes: 2,
-                kind,
-                ..Default::default()
-            }
-        };
-        self.tools.push(tool);
+        self.tools.push(default_tool(number, kind));
         self.tools.len() - 1
     }
 

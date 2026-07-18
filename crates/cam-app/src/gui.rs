@@ -2401,7 +2401,15 @@ impl App {
                     // Edit the working copy (a pending change committed on Apply), not the
                     // library entry — keeps any in-progress numeric edits from being lost.
                     if let Some(t) = self.tool_edit.as_mut() {
-                        fix_dir(t);
+                        // Crossing tool families resets the dimensions to the new kind's
+                        // defaults (a face mill shouldn't inherit an end mill's ⌀6);
+                        // staying within the end-mill family keeps the dimensions and just
+                        // swaps the cutting end.
+                        if end_mill_family(t.kind) && end_mill_family(kind) {
+                            fix_dir(t);
+                        } else {
+                            *t = crate::tool_library::default_tool(t.number, kind);
+                        }
                     }
                     // The kind-specific fields depend on the kind — repopulate them from
                     // the working copy (refresh_fields does *not* reset the baseline).
@@ -5553,6 +5561,16 @@ fn flute_count(flutes: u32) -> String {
     format!("{flutes} flute{}", if flutes == 1 { "" } else { "s" })
 }
 
+/// The end-mill family — square, ball-nose and rounded-edge (bull-nose) end mills —
+/// which share a field set and dimensions, so switching between them preserves the
+/// tool's measurements (a Type change *across* families resets to defaults instead).
+fn end_mill_family(kind: ToolKind) -> bool {
+    matches!(
+        kind,
+        ToolKind::EndMill | ToolKind::BallMill | ToolKind::BullNose { .. }
+    )
+}
+
 /// The **Tool Library** parenthetical — the extra, kind-specific descriptor shown only
 /// in the Library pane (never the Project pane, which carries just number + compact
 /// form). Radii use a shared `r…` form (`r0.5`, `r0`) for consistency across kinds, and
@@ -6401,6 +6419,9 @@ struct ToolCanvas {
     /// Sign of the helix lean (+1 leans one way, −1 the other). Derived from the
     /// cutting direction, but inverted for a twist drill so it reads right-hand.
     flute_sign: f64,
+    /// Draw a row of 90° square inserts seated at the bottom of the body (face mills),
+    /// so the silhouette reads as a real shell mill rather than a bare inverted-T.
+    draw_face_inserts: bool,
 }
 
 impl ToolCanvas {
@@ -6437,6 +6458,7 @@ impl ToolCanvas {
                 // A twist drill leans the opposite way to a down-cut end mill.
                 if matches!(tool.kind, ToolKind::Drill { .. }) { -base } else { base }
             },
+            draw_face_inserts: matches!(tool.kind, ToolKind::FaceMill),
             profile,
         }
     }
@@ -6506,6 +6528,38 @@ impl canvas::Program<Message> for ToolCanvas {
                     }
                 };
                 frame.stroke(&path, stroke);
+            }
+        }
+
+        // Face-mill inserts: a row of small 90° squares seated on the bottom face, their
+        // outer edges defining the cutting ⌀ — turns the bare body+arbor silhouette into a
+        // recognisable shell mill. (90° square inserts only; other insert shapes deferred.)
+        if self.draw_face_inserts {
+            let r = self.profile.max_radius();
+            let body_h = self.flute_length.max(1e-3);
+            let n = self.flutes.max(1);
+            // Insert side: a small glyph, never taller than the body (min-then-max avoids
+            // clamp's panic when the body is shorter than the floor).
+            let s = (r * 0.22).min(body_h * 0.6).max(0.1);
+            let insert_fill = Color { a: 0.30, ..fg };
+            for i in 0..n {
+                // Centres span the diameter; the two end inserts sit at ±(r − s/2) so
+                // their outer edge lands exactly on the periphery (±r).
+                let cxi = if n == 1 {
+                    0.0
+                } else {
+                    -(r - s / 2.0) + (i as f64) * (2.0 * (r - s / 2.0)) / ((n - 1) as f64)
+                };
+                let (x0, x1) = (cxi - s / 2.0, cxi + s / 2.0);
+                let rect = canvas::Path::new(|b| {
+                    b.move_to(map(x0, 0.0, 1.0));
+                    b.line_to(map(x1, 0.0, 1.0));
+                    b.line_to(map(x1, s, 1.0));
+                    b.line_to(map(x0, s, 1.0));
+                    b.close();
+                });
+                frame.fill(&rect, insert_fill);
+                frame.stroke(&rect, canvas::Stroke::default().with_color(fg).with_width(1.2));
             }
         }
 
