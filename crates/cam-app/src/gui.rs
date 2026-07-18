@@ -2894,6 +2894,10 @@ impl App {
                 matches!((buf(Field::CornerRadius), buf(Field::ToolDiameter)),
                     (Some(cr), Some(d)) if cr > d * 0.5 + 1e-9)
             }
+            Field::PointAngle => {
+                // Drill point angle is bounded to [90°, 135°].
+                !matches!(buf(Field::PointAngle), Some(a) if (90.0..=135.0).contains(&a))
+            }
             Field::FluteLength => {
                 let Some(fl) = buf(Field::FluteLength) else {
                     return true; // empty / unparseable
@@ -2907,6 +2911,12 @@ impl App {
                     }
                     Some(ToolKind::BallMill) => {
                         matches!(buf(Field::ToolDiameter), Some(d) if fl < d * 0.5 - 1e-9)
+                    }
+                    Some(ToolKind::Drill { .. }) => {
+                        // Must be at least the point cone height = (⌀/2) / tan(angle/2).
+                        matches!((buf(Field::ToolDiameter), buf(Field::PointAngle)),
+                            (Some(d), Some(pa)) if pa > 0.0
+                                && fl < (d * 0.5) / (pa * 0.5).to_radians().tan() - 1e-9)
                     }
                     _ => false,
                 }
@@ -2985,6 +2995,15 @@ impl App {
                 Field::ShankLength,
                 Field::ToolLength,
                 Field::Flutes,
+            ],
+            // Drill bit: flute/shank/overall + point angle. No flutes count, no direction.
+            Some(ToolKind::Drill { .. }) => vec![
+                Field::ToolDiameter,
+                Field::FluteLength,
+                Field::ShankDiameter,
+                Field::ShankLength,
+                Field::ToolLength,
+                Field::PointAngle,
             ],
             other => {
                 let mut f = vec![
@@ -4334,29 +4353,39 @@ impl App {
             list = list.push(field_row_styled(field, &value, self.tooltips, self.field_invalid(field)));
         }
         if let Some(t) = self.library.tools.get(self.lib_sel) {
-            // Cutting direction (a picker, not a numeric field) — Andreas's field 7.
-            // "Straight flute" is offered only for a Square End Mill.
-            let dir_opts = if matches!(t.kind, ToolKind::EndMill) {
-                vec![CutDir::Down, CutDir::Up, CutDir::Straight]
-            } else {
-                vec![CutDir::Down, CutDir::Up]
-            };
-            list = list.push(
-                row![
-                    help_wrap(
-                        text("Cutting direction").width(Length::Fixed(112.0)).size(13),
-                        "Down-cut vs up-cut (helix direction); a physical property of the \
-                         tool, like the flute count. Square end mills also allow a straight \
-                         (axial) flute.",
-                        self.tooltips,
-                    ),
-                    pick_list(dir_opts, Some(t.cutting_direction), Message::ToolCuttingDirChanged)
+            // Cutting direction (a picker, not a numeric field) applies to the end-mill
+            // family only; "Straight flute" is offered only for a Square End Mill.
+            let is_end_mill = matches!(
+                t.kind,
+                ToolKind::EndMill | ToolKind::BallMill | ToolKind::BullNose { .. }
+            );
+            if is_end_mill {
+                let dir_opts = if matches!(t.kind, ToolKind::EndMill) {
+                    vec![CutDir::Down, CutDir::Up, CutDir::Straight]
+                } else {
+                    vec![CutDir::Down, CutDir::Up]
+                };
+                list = list.push(
+                    row![
+                        help_wrap(
+                            text("Cutting direction").width(Length::Fixed(112.0)).size(13),
+                            "Down-cut vs up-cut (helix direction); a physical property of the \
+                             tool, like the flute count. Square end mills also allow a straight \
+                             (axial) flute.",
+                            self.tooltips,
+                        ),
+                        pick_list(
+                            dir_opts,
+                            Some(t.cutting_direction),
+                            Message::ToolCuttingDirChanged
+                        )
                         .text_size(13)
                         .width(Length::Fixed(113.0)),
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center),
-            );
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                );
+            }
             // Short label + fixed-width picker whose right edge lands on the value-box
             // right edge above (135 label + 8 gap + 90 box = 233), so the boxes align.
             list = list.push(

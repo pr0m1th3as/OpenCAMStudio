@@ -152,7 +152,7 @@ impl std::fmt::Display for ToolKind {
             ToolKind::BallMill => "Ball Nose End Mill",
             ToolKind::BullNose { .. } => "Rounded-Edge End Mill",
             ToolKind::ChamferMill { .. } => "Chamfer mill",
-            ToolKind::Drill { .. } => "Drill",
+            ToolKind::Drill { .. } => "Drill bit",
             ToolKind::FaceMill => "Face mill",
             ToolKind::ThreadMill { .. } => "Thread mill",
         };
