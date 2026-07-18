@@ -4072,26 +4072,40 @@ impl App {
             } else {
                 vec![CutDir::Down, CutDir::Up]
             };
-            list = list.push(row![
-                label_help(
-                    "Cutting dir.",
-                    "Down-cut vs up-cut (helix direction); a physical property of the \
-                     tool, like the flute count. Square end mills also allow a straight \
-                     (axial) flute.",
-                    self.tooltips,
-                ),
-                pick_list(dir_opts, Some(t.cutting_direction), Message::ToolCuttingDirChanged)
+            list = list.push(
+                row![
+                    help_wrap(
+                        text("Cutting dir.").width(Length::Fixed(80.0)).size(13),
+                        "Down-cut vs up-cut (helix direction); a physical property of the \
+                         tool, like the flute count. Square end mills also allow a straight \
+                         (axial) flute.",
+                        self.tooltips,
+                    ),
+                    pick_list(dir_opts, Some(t.cutting_direction), Message::ToolCuttingDirChanged)
+                        .text_size(13)
+                        .width(Length::Fixed(145.0)),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
+            // Short label + fixed-width picker whose right edge lands on the value-box
+            // right edge above (135 label + 8 gap + 90 box = 233), so the boxes align.
+            list = list.push(
+                row![
+                    help_wrap(
+                        text("Type").width(Length::Fixed(48.0)).size(13),
+                        help::TOOL_TYPE,
+                        self.tooltips,
+                    ),
+                    pick_list(&ToolKindPick::ALL[..], Some(ToolKindPick::of(t.kind)), |p| {
+                        Message::ToolKindChanged(p.to_kind())
+                    })
                     .text_size(13)
-                    .width(Length::Fixed(120.0)),
-            ]);
-            list = list.push(row![
-                label_help("Type", help::TOOL_TYPE, self.tooltips),
-                pick_list(&ToolKindPick::ALL[..], Some(ToolKindPick::of(t.kind)), |p| {
-                    Message::ToolKindChanged(p.to_kind())
-                })
-                .text_size(13)
-                .width(Length::Fill),
-            ]);
+                    .width(Length::Fixed(177.0)),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
             list = list.push(button("Apply").on_press(Message::Apply));
         }
 
@@ -4189,14 +4203,18 @@ impl App {
             if let Some(tool) = self.controller.document().setup.tools.get(i) {
                 list = list.push(
                     row![
-                        label_help("Type", help::TOOL_TYPE, self.tooltips),
+                        help_wrap(
+                            text("Type").width(Length::Fixed(48.0)).size(13),
+                            help::TOOL_TYPE,
+                            self.tooltips,
+                        ),
                         pick_list(
                             &ToolKindPick::ALL[..],
                             Some(ToolKindPick::of(tool.kind)),
                             |p| Message::ToolKindChanged(p.to_kind())
                         )
                         .text_size(13)
-                        .width(Length::Fill),
+                        .width(Length::Fixed(177.0)),
                     ]
                     .spacing(8)
                     .align_y(Alignment::Center),
