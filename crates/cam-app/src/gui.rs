@@ -4023,7 +4023,8 @@ impl App {
                 for (i, t) in items {
                     let fam = t.kind.to_string();
                     if current.as_deref() != Some(fam.as_str()) {
-                        list = list.push(tree_header(&fam));
+                        // Category headers are plural ("Square End Mills", "Drills", …).
+                        list = list.push(tree_header(&format!("{fam}s")));
                         current = Some(fam);
                     }
                     // Kind is the group header, so the row omits it: "T2: ⌀6 (4 flutes)".
@@ -4089,7 +4090,7 @@ impl App {
                     Message::ToolKindChanged(p.to_kind())
                 })
                 .text_size(13)
-                .width(Length::Fixed(120.0)),
+                .width(Length::Fill),
             ]);
             list = list.push(button("Apply").on_press(Message::Apply));
         }
@@ -4195,7 +4196,7 @@ impl App {
                             |p| Message::ToolKindChanged(p.to_kind())
                         )
                         .text_size(13)
-                        .width(Length::Fixed(120.0)),
+                        .width(Length::Fill),
                     ]
                     .spacing(8)
                     .align_y(Alignment::Center),
