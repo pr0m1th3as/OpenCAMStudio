@@ -30,14 +30,20 @@ pub fn default_tool(number: u32, kind: ToolKind) -> Tool {
         };
     }
     if matches!(kind, ToolKind::ThreadMill { .. }) {
+        // Single-profile (single-point) proportions from the SCT reference drawing: a
+        // short 60°-toothed head (A ⌀, Q length of cut), a long reduced neck (C ⌀) for
+        // reach, then a larger shank (S). Full-form seeds the same body; toggling zeroes
+        // the neck.
         return Tool {
             number,
-            diameter: 6.0,       // cutting ⌀ (must clear the thread minor ⌀)
-            flute_length: 18.0,  // threaded cutting-band length
-            shank_diameter: 6.0, // shank ⌀
-            length: 50.0,        // overall
-            flutes: 3,           // typical for a thread mill
-            kind,                // carries the pitch (None = single-point by default)
+            diameter: 5.0,        // A — cutting ⌀ (clears the thread minor ⌀)
+            flute_length: 3.0,    // Q — length of cut (the toothed head)
+            neck_diameter: 4.0,   // C — reduced neck ⌀
+            neck_length: 18.0,    // reach behind the head
+            shank_diameter: 6.0,  // S — shank ⌀ (the grip)
+            length: 50.0,         // OAL
+            flutes: 3,
+            kind,                 // carries the pitch (None = single-point by default)
             ..Default::default()
         };
     }

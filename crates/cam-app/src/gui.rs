@@ -2465,14 +2465,23 @@ impl App {
                 }
             }
             Message::ThreadFormChanged(form) => {
-                // Single-point ⇒ pitch None (one tooth); full-form ⇒ Some(pitch), keeping
-                // any prior value or seeding a sensible default.
+                // Single-point ⇒ pitch None + a reduced neck for reach; full-form ⇒
+                // Some(pitch) and no neck (a long threaded band straight into the shank).
                 let set_form = |t: &mut cam_model::Tool| {
                     if let ToolKind::ThreadMill { pitch } = &mut t.kind {
-                        *pitch = match form {
-                            ThreadForm::SinglePoint => None,
-                            ThreadForm::FullForm => Some(pitch.unwrap_or(1.0)),
-                        };
+                        match form {
+                            ThreadForm::SinglePoint => {
+                                *pitch = None;
+                                if t.neck_length <= 0.0 {
+                                    t.neck_length = 18.0;
+                                    t.neck_diameter = (t.diameter * 0.8).max(0.1);
+                                }
+                            }
+                            ThreadForm::FullForm => {
+                                *pitch = Some(pitch.unwrap_or(1.0));
+                                t.neck_length = 0.0; // no reduced neck on a full-form mill
+                            }
+                        }
                     }
                 };
                 if self.library_mode() {
@@ -3010,9 +3019,16 @@ impl App {
             (Some(ToolKind::FaceMill), Field::ToolDiameter) => "Cutting diameter (mm)",
             (Some(ToolKind::FaceMill), Field::FluteLength) => "Body height (mm)",
             (Some(ToolKind::FaceMill), Field::ShankDiameter) => "Arbor diameter (mm)",
-            // Thread mill: its ⌀ is the cutting ⌀; FluteLength is the threaded band.
+            // Thread mill: its ⌀ is the cutting ⌀. FluteLength is the length of cut for a
+            // single-point mill (short toothed head), the thread length for a full-form
+            // one; single-point also exposes the reduced neck.
             (Some(ToolKind::ThreadMill { .. }), Field::ToolDiameter) => "Cutting diameter (mm)",
-            (Some(ToolKind::ThreadMill { .. }), Field::FluteLength) => "Thread length (mm)",
+            (Some(ToolKind::ThreadMill { pitch: None }), Field::FluteLength) => "Length of cut (mm)",
+            (Some(ToolKind::ThreadMill { pitch: Some(_) }), Field::FluteLength) => {
+                "Thread length (mm)"
+            }
+            (Some(ToolKind::ThreadMill { .. }), Field::NeckDiameter) => "Neck diameter (mm)",
+            (Some(ToolKind::ThreadMill { .. }), Field::NeckLength) => "Neck length (mm)",
             _ => field.label(),
         }
     }
@@ -3053,9 +3069,21 @@ impl App {
                 "Body height — the axial length of the wide cutting body; the narrower \
                  arbor continues above it up to the overall length."
             }
-            (Some(ThreadMill { .. }), Field::FluteLength) => {
+            (Some(ThreadMill { pitch: None }), Field::FluteLength) => {
+                "Length of cut — the axial length of the short 60°-toothed head. A \
+                 single-point mill cuts any pitch by its helical lead."
+            }
+            (Some(ThreadMill { pitch: Some(_) }), Field::FluteLength) => {
                 "Thread length — the length of the threaded cutting band, which bounds the \
                  thread depth reachable in one helical pass."
+            }
+            (Some(ThreadMill { .. }), Field::NeckDiameter) => {
+                "Neck diameter — the reduced section behind the head. It must clear the \
+                 thread it cuts; a smaller neck lets the tool reach deeper into the hole."
+            }
+            (Some(ThreadMill { .. }), Field::NeckLength) => {
+                "Neck length — how far the reduced neck runs behind the head. With the head, \
+                 this sets the reach, i.e. how deep a thread the tool can cut."
             }
             // Shank / arbor.
             (Some(FaceMill), Field::ShankDiameter) => {
@@ -3125,6 +3153,18 @@ impl App {
             Field::ToolThreadPitch => {
                 // Shown only for a full-form thread mill, where the pitch must be positive.
                 !matches!(buf(Field::ToolThreadPitch), Some(p) if p > 0.0)
+            }
+            Field::NeckDiameter => {
+                // A thread mill's reduced neck must be no wider than its cutting head.
+                matches!(self.inspected_tool_kind(), Some(ToolKind::ThreadMill { .. }))
+                    && matches!((buf(Field::NeckDiameter), buf(Field::ToolDiameter)),
+                        (Some(neck), Some(d)) if neck > d + 1e-9)
+            }
+            Field::NeckLength => {
+                // Head (length of cut) + neck must leave room for a shank within the OAL.
+                matches!(self.inspected_tool_kind(), Some(ToolKind::ThreadMill { .. }))
+                    && matches!((buf(Field::NeckLength), buf(Field::FluteLength), buf(Field::ToolLength)),
+                        (Some(neck), Some(flute), Some(oal)) if flute + neck > oal + 1e-9)
             }
             Field::FluteLength => {
                 let Some(fl) = buf(Field::FluteLength) else {
@@ -3286,23 +3326,29 @@ impl App {
                 Field::ToolLength,
                 Field::Flutes,
             ],
-            // Thread mill: the end-mill field set. The single-point/full-form choice is a
-            // toggle (rendered separately); the pitch field appears only in full-form. No
-            // neck.
-            Some(ToolKind::ThreadMill { pitch }) => {
-                let mut f = vec![
-                    Field::ToolDiameter,
-                    Field::FluteLength,
-                    Field::ShankDiameter,
-                    Field::ShankLength,
-                    Field::ToolLength,
-                ];
-                if pitch.is_some() {
-                    f.push(Field::ToolThreadPitch);
-                }
-                f.push(Field::Flutes);
-                f
-            }
+            // Thread mill (single-point/full-form is a toggle, rendered separately):
+            // - single-point (single profile): a short toothed head + a reduced neck for
+            //   reach (cutting ⌀, length of cut, neck ⌀, neck length, shank ⌀, overall);
+            // - full-form: a long threaded band at a fixed pitch (cutting ⌀, thread length,
+            //   shank ⌀, shank length, overall, pitch). No neck.
+            Some(ToolKind::ThreadMill { pitch: None }) => vec![
+                Field::ToolDiameter,
+                Field::FluteLength,
+                Field::NeckDiameter,
+                Field::NeckLength,
+                Field::ShankDiameter,
+                Field::ToolLength,
+                Field::Flutes,
+            ],
+            Some(ToolKind::ThreadMill { pitch: Some(_) }) => vec![
+                Field::ToolDiameter,
+                Field::FluteLength,
+                Field::ShankDiameter,
+                Field::ShankLength,
+                Field::ToolLength,
+                Field::ToolThreadPitch,
+                Field::Flutes,
+            ],
             other => {
                 let mut f = vec![
                     Field::ToolDiameter,
@@ -6755,24 +6801,28 @@ impl canvas::Program<Message> for ToolCanvas {
         // itself stays a flat cylinder — these teeth are a legibility overlay, not the
         // true 60° cutting form (that fidelity is deferred).
         if let Some(pitch_opt) = self.thread_teeth {
-            let r = self.profile.max_radius();
-            let fl = self.flute_length.max(1e-3); // threaded band height
-            // One representative tooth, sized to the band, for single-point (or a pitch
-            // too coarse to fit even one full tooth in the thread length).
-            let one_tooth = ((fl * 0.5).min(2.0 * r).max(0.1), 1usize);
-            let (pitch, count) = match pitch_opt {
-                Some(p) if p > 0.05 => match (fl / p).floor() as usize {
-                    0 => one_tooth,
-                    c => (p, c),
-                },
-                _ => one_tooth,
+            // Teeth sit on the cutting head (⌀/2), which — unlike max_radius — is *not* the
+            // widest point: a single-point mill's shank is wider than its toothed head.
+            let r = (self.diameter * 0.5).max(1e-3);
+            let fl = self.flute_length.max(1e-3); // toothed region (length of cut / thread length)
+            // Tooth axial spacing: the thread pitch for a full-form mill; the tool's own
+            // (nominal) tooth size for a single-point mill, so a few teeth fill the head.
+            let spacing = match pitch_opt {
+                Some(p) if p > 0.05 => p,
+                _ => (0.42 * r).min(fl).max(0.05),
             };
-            let depth = (0.6 * pitch).min(r * 0.6); // 60° thread crest→root ≈ 0.61·p
-            // Triangular wave: root (r−depth) at tooth boundaries, crest (r) at centres.
-            let mut wave: Vec<(f64, f64)> = Vec::with_capacity(2 * count + 1);
-            for k in 0..=2 * count {
-                let z = (k as f64) * (pitch / 2.0);
-                let x = if k % 2 == 0 { r - depth } else { r };
+            // Standard 60° thread: a sharp V of included angle 60° has crest→root depth =
+            // (spacing/2) / tan(30°) = 0.866·spacing (capped so a coarse pitch can't eat
+            // the whole tool). Each flank then sits 30° off the radial ⇒ 60° included.
+            let depth = (0.866_025_4 * spacing).min(r * 0.7);
+            let count = ((fl / spacing).floor() as usize).max(1);
+            // Triangular wave along the periphery: crest (r) at the tip, alternating to a
+            // root (r−depth) every half-spacing.
+            let steps = 2 * count;
+            let mut wave: Vec<(f64, f64)> = Vec::with_capacity(steps + 1);
+            for k in 0..=steps {
+                let z = (k as f64) * (spacing / 2.0);
+                let x = if k % 2 == 0 { r } else { r - depth };
                 wave.push((x, z));
             }
             for sign in [1.0_f32, -1.0] {
