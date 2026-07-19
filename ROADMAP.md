@@ -20,11 +20,13 @@ narrow slice exercises **every architectural seam** with the least geometry pain
 **Status:** the 2.5-D slice is complete — **P0–P7 done** (headless pipeline, GUI,
 full 2.5-D operations, material simulation). Additive capability has since landed on
 top: **six posts** across three families (grbl / FluidNC / grblHAL, LinuxCNC,
-Fanuc / Haas), engagement-capped concentric area clearing, and a **complete tooling
-subsystem** — a cross-project library with every cutter kind fully characterised
-(per-kind revolve geometry + live 2D preview). **P8** (plugin ABI) is the next
-numbered phase; the **threading operation** (consuming the new thread-mill tools) is
-the next operation. Live per-crate state lives in `WORKSTATE.md` / `STATUS.md`.
+Fanuc / Haas), engagement-capped area clearing, a **complete tooling subsystem** (a
+cross-project library with every cutter kind fully characterised — per-kind revolve
+geometry + live 2D preview), and two further operations, **thread milling** and
+**V-carve engraving**, bringing the strategy count to seven. The tool generatrix now
+also drives **operation guards** (a tool must cut with a cutting surface) and a
+**profile-aware simulation** in both removal and collision. **P8** (plugin ABI) is the
+next numbered phase. Live per-crate state lives in `WORKSTATE.md` / `STATUS.md`.
 
 | Phase | Goal | Crates | Done when |
 |-------|------|--------|-----------|
@@ -58,10 +60,13 @@ to public.
   size/visibility, default snap set, and other view/UX knobs — all currently
   compile-time constants awaiting a prefs UI + on-disk store.
 - Feeds & speeds calculator. *(Cross-project tool library with persistence, import/
-  export, and full per-kind tool geometry — **done**.)*
-- **Threading operation** — consumes the thread-mill tools (min cutting ⌀ = hole-fit
-  gate, neck ⌀ → max thread depth, length of cut → reach; hosts the blind-hole
-  allowance). Single-point (any pitch) and full-form (fixed pitch) paths.
+  export, and full per-kind tool geometry — **done**. Threading operation — **done**:
+  hole-fit, neck-depth and reach gates, blind-hole allowance, infeed + spring passes.)*
+- **V-carve engraving, increment 2** — region carving driven by the **medial axis** of
+  the 2D shape, so the flanks touch both boundaries and depth varies along the path.
+  Increment 1 (line/stroke engraving along an open or closed path) is **done**. This is
+  planar `cam-geo` work: a cone on a vertical axis is single-valued in radius, so a
+  V-groove never undercuts and **no solid kernel is required**.
 - **Parametric tool importer** — vet-then-annotate custom-tool drawings (LINE+ARC +
   dimension annotations) into `ProfileParams` family templates; a small nonlinear
   DOF/constraint solver bakes instances to concrete tools. (DWG read path proven.)

@@ -55,14 +55,14 @@ correctness checks like "no rapid passes through stock".
 
 | Crate | Responsibility | Depends on kernel? |
 |-------|----------------|--------------------|
-| `cam-geo` | 2D toolpath geometry: polygons, **robust offset**, boolean, Z-slicing. On `geo`/`i_overlay`. The CAM heart. Also the **tool revolve generatrix** (`Profile2D`/`ProfileSeg`, line/arc segments tagged cutting/non-cutting; `BottomShape`). | **No** |
-| `cam-import` | DXF/DWG read (via `acadrust`) → contour chaining + hole nesting → `cam-geo` regions. Also exposes a raw entity-inventory read path (for the deferred custom-tool importer). | No |
+| `cam-geo` | 2D toolpath geometry: polygons, **robust offset**, boolean, Z-slicing. On `geo`/`i_overlay`. The CAM heart. Also the **tool revolve generatrix** (`Profile2D`/`ProfileSeg`, line/arc segments tagged cutting/non-cutting; `BottomShape`), the derived cutting-surface properties the operation guards read, and V-groove geometry. | **No** |
+| `cam-import` | DXF/DWG read (via `acadrust`) → contour chaining + hole nesting → `cam-geo` regions, **plus the open chains that would not close** (engravable strokes). Also exposes a raw entity-inventory read path (for the deferred custom-tool importer). | No |
 | `cam-kernel` | `Kernel` trait + a `truck`-backed impl. Import (STEP/mesh), B-rep hold, booleans for stock. Swappable → OCCT (C++ FFI) later. | is the kernel |
 | `cam-model` | Document model: `Project → Setup → Stock → Operation → Tool`. Serde. The save-file format. | No (holds refs) |
 | `cam-toolpath` | `Strategy` trait + 2.5D strategies. Consumes `cam-geo`, emits CL-data. | No |
 | `cam-cldata` | The CL-data IR: rapid/feed/arc/dwell/toolchange, neutral units. | No |
 | `cam-post` | `Post` trait + a controller **capabilities** model. Posts lower CL-data → G-code text. | No |
-| `cam-sim` | Backplot + material-removal sim (heightfield/dexel for 2.5D). Renders via `wgpu`. | mesh only |
+| `cam-sim` | Backplot + material-removal sim (heightfield for 2.5D), **profile-aware in both directions**: removal *and* collision use the tool's own shape, so a pointed tool is only as wide as its cone has opened at that depth. Renders via `wgpu`. | mesh only |
 | `cam-render` | `wgpu` viewport: part, stock, toolpath overlay. | mesh only |
 | `cam-plugin-api` | Stable ABI crate; strategies + posts compile as `cdylib` against it. | No |
 | `cam-app` | `iced` GUI shell + command system. Wires it together. | via traits |
@@ -96,8 +96,11 @@ Document { schema_version, Setup }   (Machine is app state, not saved)
          ├─ PocketOp  { tool, boundary loops, islands, depth, stepover, plunge }
          ├─ ProfileOp { tool, chain, side, comp: computed|G41/G42, leads, plunge }
          ├─ DrillOp   { tool, points, depth, peck?, dwell? }
-         ├─ ChamferOp { tool (V/chamfer mill), chain, side, width }
-         └─ ThreadOp  { tool (thread mill), points, major_dia, pitch, hand }
+         ├─ ChamferOp { tool (chamfer mill or V-bit), chain, side, width }
+         ├─ ThreadOp  { tool (thread mill), points, major_dia, pitch, hand,
+         │              passes, spring_passes, blind-hole allowance }
+         └─ EngraveOp { tool (V-bit), chain, closed?, top, depth, stepdown }
+                        no side, no radius comp — the tool centre follows the path
 
 Machine (distinct from Post): { rapid rate, max spindle, feed limits,
                                 work envelope, tool-change pos, safe-Z rule }
@@ -119,7 +122,21 @@ Machine (distinct from Post): { rapid rate, max spindle, feed limits,
   background task, so the UI never freezes and strategies are trivially testable.
 - **Diagnostics, not panics.** Strategies return typed warnings/errors with
   geometry references ("tool too big for pocket", "open contour", "would gouge"),
-  surfaced in the UI.
+  surfaced in the UI. Each diagnostic names the operation it came from, so the UI
+  can mark *which* one failed.
+- **Tools are used per their defined cutting surfaces, and the check is derived,
+  not enumerated.** Every tool has a revolve generatrix whose segments are tagged
+  cutting or non-cutting; the operation guards ask *that* — does the tool have a
+  cylindrical cutting flank, a cutting tip, a flat cutting bottom, and does the cut
+  stay on the cutting edge — rather than matching on `ToolKind`. An imported custom
+  tool is therefore guarded on identical terms to a built-in, with no new code. The
+  split is **possibility vs preference**: cutting with a *non-cutting* surface, or
+  running past the cutting edge onto neck/shank, is an **error** (it cannot work);
+  a tool that cuts but leaves a worse result is a **warning** (the machinist may
+  have a reason). Refusing G-code that physically cannot cut is not overriding the
+  operator's judgement. A few rules genuinely are not in the geometry — a twist
+  drill's flute side *is* tagged cutting yet must never side-mill — and those are
+  stated explicitly, with the reason.
 - **Undo/redo via commands.** All document mutations go through commands `cam-app`
   can stack; `cam-model` is never mutated ad hoc.
 - **Determinism.** Same input → same G-code (integer geometry helps) — required

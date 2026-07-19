@@ -59,8 +59,8 @@ Across the top is a tabbed **icon ribbon**; below it are three docked panes —
   size when you resize the window; only the Viewport grows or shrinks. Drag a
   divider to set a side pane's size — that size is remembered across later window
   resizes. Panes are framed with visible separators.
-- The **Viewport is always visible.** The **Windows** ribbon tab has a checkbox
-  per pane to show/hide **Project / Inspector / Output** (not the Viewport);
+- The **Viewport is always visible.** The **View → Panes** group has a checkbox per
+  pane to show/hide **Project / Tools / Inspector / Output** (not the Viewport);
   hiding one hands its room to the Viewport.
 
 ### The ribbon
@@ -68,15 +68,18 @@ Across the top is a tabbed **icon ribbon**; below it are three docked panes —
 - **Home** — *Project* (New · Open · Save · Save As), *Data* (Import · Export ·
   Sample), *Edit* (Undo · Redo · Run). New/Open/Save/Import/Export use native
   file dialogs; **Sample** loads a built-in rectangle-with-a-hole demo (no dialog).
-- **Operations** — *Create*: Profile · Pocket · Drill · **Thread** · Face.
-  Clicking a kind starts the operation-creation wizard. (Thread is a placeholder
-  for now — it reports "not yet implemented".)
+- **Operations** — *Create*: Profile · Pocket · Drill · Thread · Chamfer ·
+  **Engrave** · Face. Clicking a kind starts the operation-creation wizard.
 - **Tooling** — the cross-project **tool library** manager (New · Delete ·
   Renumber · Import Library · Export Library). While this tab is active the
   **Tool Library pane** replaces the Project pane, the Inspector becomes the tool
   editor, and the Viewport shows a **2D cross-section** of the selected tool.
-- **View** — Show stock · Reset view · Cube on/off.
-- **Windows** — the pane show/hide checkboxes.
+- **View** — Show stock · Reset view · Cube on/off · Origin · Tips, then the
+  orientation-cube **size slider**, then **Panes** — the pane show/hide checkboxes
+  (the Tool Library is listed as *Tools* to keep the band narrow).
+
+Tabs read left to right in workflow order: **Home → Edit → Operations → Tooling →
+View**.
 
 The ribbon collapses responsively as the window narrows (groups degrade
 right-to-left; a collapsed group opens as a popup under its button).
@@ -89,8 +92,15 @@ right-to-left; a collapsed group opens as a popup under its button).
     operation — tools are chosen from the library during op setup, not here.
   - Each **operation** row has an include **checkbox** (untick to exclude it from
     the toolpath and simulation — it stays in the tree, marked *(excluded)*),
-    inline **↑ / ↓** reorder arrows, and a **right-click menu** with **Duplicate**
-    and **Delete**.
+    inline **↑ / ↓** reorder arrows, and a **right-click menu** with **Duplicate**,
+    **Delete** and **Reinitialize**.
+  - **Reinitialize** re-runs the creation wizard for that operation and replaces it
+    **in place**, keeping its id and its position in the job. This is the *only* way
+    to change an existing operation's tool: the tool is bound at creation, alongside
+    the geometry.
+  - An operation whose last run **failed** is marked with a red **⚠**; hover it for
+    the reason. It stays in the tree so you can fix the offending field — but export
+    is blocked while any error stands, so a marked row can never reach the machine.
 - **Viewport** (centre) — a native 3D `wgpu` view of the backplot and simulated
   stock. **Left-drag** orbits (a turntable, unclamped, so you can tilt to the
   underside), **right-drag** pans, the **wheel** zooms; it opens top-down. A
@@ -112,17 +122,60 @@ right-to-left; a collapsed group opens as a popup under its button).
 
 1. Load geometry — **Home → Sample**, or **Home → Import** a `.dxf`/`.dwg`. A real
    import comes in as **geometry only**: no operations and no tools yet.
-2. **Operations** tab → pick a kind. The Inspector becomes the wizard: choose a
-   **tool from the library** dropdown (or **＋ New** to add one), then **click a
-   boundary line** in the Viewport. Picking is line-based — click the outer
-   contour *or* an inner hole; the click snaps to the nearest loop edge, and the
-   picked vertex sets the toolpath start. Choosing the tool embeds a copy into the
-   project.
-3. **Pocket** enters **island mode** after the boundary pick: click enclosed loops
+2. **Operations** tab → pick a kind. The Inspector becomes the wizard.
+3. Choose a **Tool family**, then a **Tool** within it. The families offered are
+   bounded by the operation — a pocket lists only end mills, engraving only V-bits —
+   so a library of hundreds stays usable. If a family is empty the wizard says so and
+   points you at the Tooling tab.
+4. **Click the geometry** in the Viewport. Picking is line-based — click the outer
+   contour, an inner hole, or an imported **open stroke** (engraving only); the click
+   snaps to the nearest loop edge, and the picked vertex sets the toolpath start.
+5. **Tool and geometry may be chosen in either order**, and either may be changed
+   until you commit: re-picking simply moves the boundary, and changing family clears
+   the tool. Nothing is created until **Confirm**, which stays disabled until both are
+   settled.
+6. **Pocket** enters **island mode** once a boundary is picked: click enclosed loops
    to toggle them as excluded islands (highlighted gold), then **Confirm**.
-4. The operation appears in the tree, and its tool under **Tools (in use)**.
-5. Select the operation and edit its fields / Side / lead / plunge in the
-   Inspector; **Apply** to recompute.
+7. The operation appears in the tree, and its tool under **Tools (in use)**. Choosing
+   a tool embeds a copy into the project, so `.ocam` files stay self-contained.
+8. Select the operation and edit its fields / Side / lead / plunge in the Inspector;
+   **Apply** to recompute. The **tool is not editable here** — use Reinitialize.
+
+### Engraving
+
+Engraving cuts a V-section groove with the tool centred **on** the path — no side, no
+radius compensation. It is a different operation from chamfering, and the difference is
+physical: a **chamfer mill's tip is a flat that does not cut**, so it would rub; a
+**V-bit's tip is rounded and does cut**. Engraving therefore requires a **V-bit**, and
+selecting a chamfer mill is refused with that reason.
+
+- The groove's **width follows from the depth and the bit**, not from a separate
+  setting. The program comment states it, e.g. a 60° V-bit with a 0.1 mm tip radius
+  cutting 0.4 mm deep gives a 0.577 mm groove.
+- **Depth** is limited by where the cone flares out to the tool's full cutting
+  diameter; past that the shank would rub, and the operation is refused.
+- **Stepdown** `0` cuts the full depth in one pass (normal for a surface mark);
+  otherwise the depth is stepped, landing exactly on the target.
+- **Open strokes** (imported lettering or decorative paths) engrave open — the tool
+  lifts at the far end rather than closing back to the start. Closed loops close.
+  Note the importer reads **LINE / ARC / CIRCLE / LWPOLYLINE** only: text must be
+  exploded to curves in your CAD package, and splines are skipped.
+
+### Tools must be able to cut
+
+Every operation checks that the surface doing the cutting *is* a cutting surface,
+reading the tool's own profile rather than its type:
+
+- **Errors** (no G-code produced) when a **non-cutting** surface would do the work —
+  engraving or drilling with a chamfer mill, profiling with a V-bit (its cone has no
+  cylindrical flank, so it cannot cut a vertical wall at any depth), threading with
+  anything but a thread mill — or when the cut runs **past the flute length** onto the
+  shank.
+- **Warns** but proceeds when the tool cuts, just not well — facing with a ball-nose
+  leaves a scalloped floor; plunging an end mill as a drill has no point geometry to
+  centre the hole.
+
+The reason appears in the **Output** pane and against the operation in the tree.
 
 ### The tool library
 
@@ -153,10 +206,14 @@ self-contained; the library is the template you pick from.
     flute-helix lean.
   - **Drill bit** — adds a point angle (bounded 90–135°); the helix reads as a
     right-hand twist.
-  - **V-bit** — a single shaft ⌀ + point angle + tip radius (the cone flares
-    exactly to the shaft).
-  - **Chamfer mill** — a V-bit with a flat, **non-cutting** tip (only the angled
-    flank cuts).
+  - **V-bit** — a single shaft ⌀ + point angle + **rounded** tip radius (the cone
+    flares exactly to the shaft). The rounded tip *cuts*, which is what lets a V-bit
+    engrave.
+  - **Chamfer mill** — a cone with a flat, **non-cutting** tip (only the angled
+    flank cuts). This is exactly what separates it from a V-bit, and why it cannot
+    engrave. Both tips have a physical **minimum size** — no cutter is ground to a
+    true zero point — so a V-bit's tip radius must be ≥ 0.05 mm and a chamfer mill's
+    tip ⌀ ≥ 0.10 mm; below that the field is flagged and **Apply** stays disabled.
   - **Face mill** — a shell mill: cutting ⌀, body height, arbor ⌀, overall, and an
     insert count drawn as a row of 90° inserts on the body.
   - **Thread mill** — a **Single-point / Full-form** toggle. Single-point (single
@@ -172,9 +229,14 @@ self-contained; the library is the template you pick from.
   *and* material-removal **collisions** from the simulation (e.g. a rapid plowing
   through remaining stock, which a green backplot would hide).
 - **View → Show stock** overlays the *simulated* stock surface under the backplot.
-- **Home → Export** posts the toolpath to grbl G-code. It is blocked if the run
-  had errors **or** the simulation found a rapid through stock; the status line
-  says why. Otherwise it reports the line count.
+  The simulation grid **refines to the narrowest cut in the program**, so a
+  sub-millimetre engraved groove is actually visible rather than falling between
+  cells; it is capped so refining cannot turn a preview into a hang.
+- **Home → Export** posts the toolpath to the selected controller dialect. It is
+  blocked if the run had errors **or** the simulation found a rapid through stock;
+  the status line says why. Otherwise it reports the line count. Program comments are
+  reduced to printable ASCII (`°` becomes `deg`, `⌀` becomes `dia`) — grbl tolerates
+  UTF-8, Fanuc/Haas controls and 7-bit DNC links often do not.
 - **Undo / Redo** step through document edits.
 
 ### What to check when testing the GUI
@@ -185,16 +247,25 @@ things worth eyeballing:
 - **Layout:** the window opens with the ribbon + Project / Viewport / Inspector /
   Output. Resizing the window changes **only** the Viewport; the side panes and
   Output keep their size. Drag a side divider, then resize the window — the pane
-  keeps its dragged size. Separators are visible. The **Windows** tab hides/shows
-  Project / Inspector / Output but never the Viewport.
+  keeps its dragged size. Separators are visible. **View → Panes** hides/shows
+  Project / Tools / Inspector / Output but never the Viewport.
 - **Project tree:** rows read as a tree (plain text, selected row highlighted —
-  not blue buttons). **Right-click an operation** → a Duplicate / Delete menu at
-  the cursor; clicking off dismisses it. The include checkbox and ↑ / ↓ work.
+  not blue buttons). **Right-click an operation** → a Delete / Duplicate /
+  Reinitialize menu at the cursor; clicking off dismisses it. The include checkbox
+  and ↑ / ↓ work. Reinitialize should replace the op **in place**, keeping its
+  position in the list.
 - **Tools (in use):** after creating an op, its tool appears here read-only; with
   no ops the section shows "(none yet …)".
-- **Operation wizard:** Operations → Profile, pick a tool from the library, click
+- **Operation wizard:** Operations → Profile, choose a family then a tool, click
   the outer rectangle → it profiles the rectangle; click the inner circle → the
-  circle. A Pocket enters island mode (click islands gold, Confirm).
+  circle. Then check the order does not matter: start again, click the geometry
+  **first**, and confirm **Confirm** stays disabled until a tool is chosen. Re-pick a
+  different loop before confirming and check the selection moves. A Pocket enters
+  island mode (click islands gold, Confirm).
+- **Guards:** point an operation at a tool that cannot do the job — face with a
+  chamfer mill, profile with a V-bit, thread with an end mill — and confirm the
+  Output pane explains why and the operation is marked ⚠ in the tree, while merely
+  poor choices (facing with a ball-nose) only warn.
 - **Tool library:** Tooling tab → the Tool Library pane replaces Project and the
   Viewport shows the selected tool's 2D cross-section. New / Delete; switch the
   **Type** and watch the field set + silhouette change live; edit a field and
