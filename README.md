@@ -8,16 +8,24 @@ A CAM application for CNC toolpath generation, built in Rust.
 
 ## What works
 
-- **Operations** — profile, pocket, drill, face, chamfer, thread-mill; leads and
-  ramp/helix plunges.
+- **Operations** — profile, pocket, drill, face, chamfer; leads and ramp/helix
+  plunges; engagement-capped concentric area clearing. (A thread-milling operation
+  is next — see the tooling note below.)
 - **Geometry in** — DXF/DWG import with contour chaining and hole nesting;
   AutoCAD-style object snaps (end / mid / quadrant / nearest) when picking.
+- **Tooling** — a cross-project tool library with every cutter kind fully
+  characterised: square / ball-nose / rounded-edge end mills, drill, V-bit,
+  chamfer mill, face mill (shell mill), and single-profile / full-form thread
+  mills. Each carries real flute/shank/neck geometry and a per-kind revolve
+  profile shown in a **live 2D cross-section preview** as you edit; import/export
+  `.ocam` libraries; gap-filling / swap / bulk tool numbering.
 - **Setup** — workpiece origin (datum) + program start point; part-relative
   stock; first-class clearance/retract heights.
 - **Verify** — heightfield material-removal simulation with gouge and
   rapid-through-stock detection.
-- **G-code out** — grbl and Fanuc posts from one controller-neutral IR (canned
-  cycles where supported, expanded where not).
+- **G-code out** — six posts across three families (grbl / FluidNC / grblHAL,
+  LinuxCNC, Fanuc / Haas) from one controller-neutral IR, with canned cycles where
+  supported and expanded where not.
 - **Shell** — a `wgpu` viewport (backplot, solid stock, orientation cube) in an
   `iced` desktop GUI.
 

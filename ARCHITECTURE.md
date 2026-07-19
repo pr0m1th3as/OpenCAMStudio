@@ -55,8 +55,8 @@ correctness checks like "no rapid passes through stock".
 
 | Crate | Responsibility | Depends on kernel? |
 |-------|----------------|--------------------|
-| `cam-geo` | 2D toolpath geometry: polygons, **robust offset**, boolean, Z-slicing. On `geo`/`i_overlay`. The CAM heart. | **No** |
-| `cam-import` | DXF/DWG read (via `acadrust`) → contour chaining + hole nesting → `cam-geo` regions. | No |
+| `cam-geo` | 2D toolpath geometry: polygons, **robust offset**, boolean, Z-slicing. On `geo`/`i_overlay`. The CAM heart. Also the **tool revolve generatrix** (`Profile2D`/`ProfileSeg`, line/arc segments tagged cutting/non-cutting; `BottomShape`). | **No** |
+| `cam-import` | DXF/DWG read (via `acadrust`) → contour chaining + hole nesting → `cam-geo` regions. Also exposes a raw entity-inventory read path (for the deferred custom-tool importer). | No |
 | `cam-kernel` | `Kernel` trait + a `truck`-backed impl. Import (STEP/mesh), B-rep hold, booleans for stock. Swappable → OCCT (C++ FFI) later. | is the kernel |
 | `cam-model` | Document model: `Project → Setup → Stock → Operation → Tool`. Serde. The save-file format. | No (holds refs) |
 | `cam-toolpath` | `Strategy` trait + 2.5D strategies. Consumes `cam-geo`, emits CL-data. | No |
@@ -89,7 +89,8 @@ Document { schema_version, Setup }   (Machine is app state, not saved)
      ├─ Origin       { part XY/Z datum → G-code (0,0,0); post applies −origin }
      ├─ Stock        { part bbox + per-axis XY offsets, top + thickness }
      ├─ Heights      { clearance, retract, top-of-stock, Z0 convention }
-     ├─ ToolLibrary  [ Tool { dia, flutes, kind + per-kind geometry } ]
+     ├─ ToolLibrary  [ Tool { dia, flute/shank/neck length+⌀, flutes, cutting_dir,
+     │                        kind + per-kind params → per-kind revolve Profile2D } ]
      └─ Operation[]  (ordered; each carries its own depth + feeds)
          ├─ FaceOp    { tool, stepdown, stepover, boundary }
          ├─ PocketOp  { tool, boundary loops, islands, depth, stepover, plunge }
@@ -131,12 +132,18 @@ each post declares what its controller supports and lowers accordingly. (A
 **Machine** — physical limits — is a separate object the post queries; see Core
 design rules.)
 
-| Controller | Notable capabilities |
-|-----------|----------------------|
-| grbl | G0/G1/G2/G3 only; **no canned cycles** (expand pecking to explicit moves); limited comp |
-| FluidNC | grbl superset; richer |
-| Fanuc | canned cycles (G81/G83), cutter comp (G41/G42), work offsets (G54–G59), tool changes |
-| Haas | Fanuc-like dialect |
+Six posts ship, in three output families (the dialect name is never emitted, so
+members of a family are byte-identical for milling by design — routing between
+*families* is what carries meaning):
+
+| Controller | Family | Notable capabilities |
+|-----------|--------|----------------------|
+| grbl | grbl | G0/G1/G2/G3 only; **no canned cycles** (expand pecking to explicit moves); limited comp |
+| FluidNC | grbl | grbl superset |
+| grblHAL | grbl | grbl superset |
+| LinuxCNC | LinuxCNC | canned cycles; work offsets; RS274NGC style |
+| Fanuc | Fanuc | canned cycles (G81/G83), cutter comp (G41/G42), work offsets (G54–G59), tool changes |
+| Haas | Fanuc | Fanuc-like dialect |
 
 ## Explicitly out of scope (for now)
 

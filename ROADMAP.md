@@ -18,8 +18,13 @@ narrow slice exercises **every architectural seam** with the least geometry pain
 ## Build order (each phase independently demoable)
 
 **Status:** the 2.5-D slice is complete — **P0–P7 done** (headless pipeline, GUI,
-full 2.5-D operations, grbl + Fanuc posts, material simulation). **P8** (plugin
-ABI) is next. Live per-crate state lives in `WORKSTATE.md` / `STATUS.md`.
+full 2.5-D operations, material simulation). Additive capability has since landed on
+top: **six posts** across three families (grbl / FluidNC / grblHAL, LinuxCNC,
+Fanuc / Haas), engagement-capped concentric area clearing, and a **complete tooling
+subsystem** — a cross-project library with every cutter kind fully characterised
+(per-kind revolve geometry + live 2D preview). **P8** (plugin ABI) is the next
+numbered phase; the **threading operation** (consuming the new thread-mill tools) is
+the next operation. Live per-crate state lives in `WORKSTATE.md` / `STATUS.md`.
 
 | Phase | Goal | Crates | Done when |
 |-------|------|--------|-----------|
@@ -52,7 +57,14 @@ to public.
   distance (`SNAP_PICK_PX`) & marker size (`SNAP_MARK_SCALE`), orientation-cube
   size/visibility, default snap set, and other view/UX knobs — all currently
   compile-time constants awaiting a prefs UI + on-disk store.
-- Feeds & speeds calculator; tool library persistence/import.
+- Feeds & speeds calculator. *(Cross-project tool library with persistence, import/
+  export, and full per-kind tool geometry — **done**.)*
+- **Threading operation** — consumes the thread-mill tools (min cutting ⌀ = hole-fit
+  gate, neck ⌀ → max thread depth, length of cut → reach; hosts the blind-hole
+  allowance). Single-point (any pitch) and full-form (fixed pitch) paths.
+- **Parametric tool importer** — vet-then-annotate custom-tool drawings (LINE+ARC +
+  dimension annotations) into `ProfileParams` family templates; a small nonlinear
+  DOF/constraint solver bakes instances to concrete tools. (DWG read path proven.)
 - Rest-material awareness between operations.
 - 3-axis: Z-level roughing, waterline/scallop finishing (needs `cam-geo` 3D and
   real `Kernel` use).

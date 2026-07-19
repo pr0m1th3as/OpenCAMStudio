@@ -71,8 +71,10 @@ Across the top is a tabbed **icon ribbon**; below it are three docked panes —
 - **Operations** — *Create*: Profile · Pocket · Drill · **Thread** · Face.
   Clicking a kind starts the operation-creation wizard. (Thread is a placeholder
   for now — it reports "not yet implemented".)
-- **Tooling** — the cross-project **tool library** manager (New · Delete). While
-  this tab is active the Inspector becomes the library editor.
+- **Tooling** — the cross-project **tool library** manager (New · Delete ·
+  Renumber · Import Library · Export Library). While this tab is active the
+  **Tool Library pane** replaces the Project pane, the Inspector becomes the tool
+  editor, and the Viewport shows a **2D cross-section** of the selected tool.
 - **View** — Show stock · Reset view · Cube on/off.
 - **Windows** — the pane show/hide checkboxes.
 
@@ -100,8 +102,10 @@ right-to-left; a collapsed group opens as a popup under its button).
   Clearance / Retract / Top of stock; an Operation exposes Depth / Stepdown /
   (Stepover) / Feed / Plunge feed plus **Side / Lead-in / Lead-out / Plunge**
   pickers). Press **Enter** or **Apply** to commit (one undo step, recomputes the
-  toolpath). The Inspector is instead the **library editor** while the Tooling tab
-  is active, and the **operation wizard** while a pick is pending.
+  toolpath). While the Tooling tab is active the Inspector is instead the **tool
+  editor** (kind-aware fields + a Type picker; edits preview live in the Viewport
+  and **Apply** commits, greyed until you actually change something), and while a
+  pick is pending it is the **operation wizard**.
 - **Output** (bottom) — the status line and run / collision diagnostics.
 
 ### Creating an operation
@@ -122,15 +126,43 @@ right-to-left; a collapsed group opens as a popup under its button).
 
 ### The tool library
 
-- Cross-project and persistent, stored in the platform config directory
-  (`~/.config/OpenCAMStudio/tools.json` on Linux; `%APPDATA%` on Windows;
-  `~/Library/Application Support` on macOS). Seeded with a few default end mills
-  on first run.
-- **Tooling** tab: **New** adds a tool, **Delete** removes the selected one; select
-  a library tool to edit its **diameter / length / flutes / kind** in the Inspector
-  (saved to disk immediately).
-- A project **embeds copies** of the tools it uses, so `.ocam` files stay
-  self-contained; the library is the template you pick from.
+Cross-project and persistent, stored in the platform config directory
+(`~/.config/OpenCAMStudio/` on Linux; `%APPDATA%` on Windows; `~/Library/
+Application Support` on macOS). Seeded with a few default end mills on first run.
+A project **embeds copies** of the tools it uses, so `.ocam` files stay
+self-contained; the library is the template you pick from.
+
+- **Tool Library pane** (replaces Project while the Tooling tab is active): every
+  library tool, in two views — **Ordered** (by number, `T1: ⌀6 …`) or **Grouped**
+  (by family, then size). Right-click a row → **Set number…** (swaps if the number
+  is taken). Select a tool to edit it.
+- **Ribbon actions:** **New** (adds a tool, seeding its *type* from the current
+  selection and taking the lowest free number), **Delete**, **Renumber** (guarded
+  bulk 1…N in the pane's current order), **Import / Export Library** (a `.ocam`
+  tagged as a library, distinct from a project `.ocam`).
+- **Editing is live.** Pick a tool → the Inspector shows a **Type** picker plus the
+  fields that kind actually has, and the Viewport draws the tool's **2D cross-
+  section** (mirrored silhouette; **solid = cutting** surface, **dashed = non-
+  cutting** shank/neck/tip — never colour alone). Every field or picker change
+  updates the preview immediately; **Apply** commits it to the library on disk and
+  is greyed until there is an unsaved change.
+- **Tool kinds**, each with its own fields, validation, and silhouette:
+  - **End mills** — Square, Ball-nose, Rounded-edge (bull-nose; adds a corner
+    radius). Flute ⌀ / flute length / shank ⌀ / shank length / overall / flutes,
+    plus a **cutting direction** (Down / Up, and Straight for square) shown as the
+    flute-helix lean.
+  - **Drill bit** — adds a point angle (bounded 90–135°); the helix reads as a
+    right-hand twist.
+  - **V-bit** — a single shaft ⌀ + point angle + tip radius (the cone flares
+    exactly to the shaft).
+  - **Chamfer mill** — a V-bit with a flat, **non-cutting** tip (only the angled
+    flank cuts).
+  - **Face mill** — a shell mill: cutting ⌀, body height, arbor ⌀, overall, and an
+    insert count drawn as a row of 90° inserts on the body.
+  - **Thread mill** — a **Single-point / Full-form** toggle. Single-point (single
+    profile) has a min cutting ⌀, a reduced neck (which sets the max thread depth),
+    and a length of cut, drawn as one 60° tooth on a long reduced neck. Full-form
+    has a cutting ⌀, thread length, and pitch, drawn as a stack of 60° threads.
 
 ### Run / export
 
@@ -163,8 +195,14 @@ things worth eyeballing:
 - **Operation wizard:** Operations → Profile, pick a tool from the library, click
   the outer rectangle → it profiles the rectangle; click the inner circle → the
   circle. A Pocket enters island mode (click islands gold, Confirm).
-- **Tool library:** Tooling tab → New / Delete; edit a tool's fields; **restart
-  the app** and confirm the edits persisted (`tools.json`).
+- **Tool library:** Tooling tab → the Tool Library pane replaces Project and the
+  Viewport shows the selected tool's 2D cross-section. New / Delete; switch the
+  **Type** and watch the field set + silhouette change live; edit a field and
+  confirm the preview updates *before* Apply, that **Apply** is greyed until you
+  change something (and greys again if you revert), and that cutting surfaces draw
+  solid vs dashed shanks. Try Renumber and right-click **Set number…**. **Export
+  Library** then **Import Library** and confirm the round-trip. **Restart the app**
+  and confirm edits persisted.
 - **Files:** Import a real `.dwg` → geometry only (no ops). Save an `.ocam`,
   reopen it → geometry and embedded tools survive.
 - **Viewport:** left-drag orbits (turntable, all the way to the underside), right-
