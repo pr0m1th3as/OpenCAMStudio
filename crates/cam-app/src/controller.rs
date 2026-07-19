@@ -203,6 +203,14 @@ impl LoopRef {
         }
     }
 
+    /// A reference to the `h`-th hole of region `region`.
+    pub fn hole(region: usize, h: usize) -> Self {
+        Self {
+            region,
+            part: LoopPart::Hole(h),
+        }
+    }
+
     /// Whether this refers to an open path rather than a closed loop.
     pub fn is_open(self) -> bool {
         matches!(self.part, LoopPart::Open)
@@ -213,6 +221,13 @@ impl LoopRef {
 /// other strategy needs a closed region to offset, clear, or bound.
 pub fn op_accepts_open_paths(kind: OpKind) -> bool {
     matches!(kind, OpKind::Engrave)
+}
+
+/// Whether an operation kind takes **islands** — enclosed areas left standing. Only the
+/// kinds that consume an *area* do: a pocket must be told what not to clear, and a carve
+/// what not to carve (the counters of letters, most of all).
+pub fn op_takes_islands(kind: OpKind) -> bool {
+    matches!(kind, OpKind::Pocket | OpKind::Carve)
 }
 
 /// An operation being created via the pick wizard: the kind, the tool, the picked
@@ -711,7 +726,9 @@ impl AppController {
     /// This is what the read-only Project→Tools view shows.
     pub fn used_tools(&self) -> Vec<&Tool> {
         let setup = &self.document.current().setup;
-        let used: BTreeSet<u32> = setup.operations.iter().map(|o| o.tool()).collect();
+        // Every tool an operation uses, not just its defining one — a carve's clearing
+        // end mill is on the setup sheet and in the changer, so it belongs here.
+        let used: BTreeSet<u32> = setup.operations.iter().flat_map(Operation::tools).collect();
         setup
             .tools
             .iter()
@@ -723,13 +740,16 @@ impl AppController {
     /// and the saved `.ocam` — to just the tools in use). One undoable change if it
     /// removes anything.
     pub fn prune_unused_tools(&mut self) {
+        // Must count EVERY tool an operation references: pruning on the defining tool
+        // alone would drop a carve's clearing end mill out of the setup, leaving the
+        // operation pointing at a tool that is no longer there.
         let used: BTreeSet<u32> = self
             .document
             .current()
             .setup
             .operations
             .iter()
-            .map(|o| o.tool())
+            .flat_map(Operation::tools)
             .collect();
         let has_unused = self
             .document
@@ -1064,6 +1084,7 @@ impl AppController {
                     clear_stepdown: 0.0,
                     clear_feed: 0.0,
                     clear_plunge_feed: 0.0,
+                    clear_plunge: Plunge::Straight,
                     start,
                 })
             }
@@ -1403,8 +1424,20 @@ impl AppController {
                 None => return PickResult::Missed,
             },
         };
-        // Islands are a pocket-only second stage, and only once a boundary exists.
-        let island_mode = pending.kind == OpKind::Pocket && pending.boundary.is_some();
+        // Islands are a second stage, once a boundary exists, for the kinds that
+        // consume an area and so must be told what to leave standing.
+        let island_mode = op_takes_islands(pending.kind) && pending.boundary.is_some();
+        // Carving a letter needs its counter left uncut, and a counter is exactly a
+        // hole of the picked region — so seed the islands from the geometry's own
+        // nesting rather than making the operator click each one. They stay togglable.
+        let nested: Vec<LoopRef> = match (pending.kind, picked.part) {
+            (OpKind::Carve, LoopPart::Outer) => self
+                .regions
+                .get(picked.region)
+                .map(|r| (0..r.holes().len()).map(|h| LoopRef::hole(picked.region, h)).collect())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
         let p = self.pending_op.as_mut().unwrap();
         if island_mode {
             if Some(picked) == p.boundary {
@@ -1419,6 +1452,7 @@ impl AppController {
         } else {
             p.boundary = Some(picked);
             p.start = Some(start);
+            p.islands = nested;
         }
         PickResult::Selecting
     }
@@ -3439,6 +3473,92 @@ mod tests {
             Some(Operation::Pocket(o)) => assert_eq!(o.islands.len(), 1),
             other => panic!("expected a pocket with one island, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_carve_auto_includes_the_regions_holes_as_islands() {
+        // A letter's counter must be left standing, and a counter is exactly a hole of
+        // the picked region. Making the operator click each one is busywork the
+        // geometry already answers -- but they stay togglable, as a pocket's are.
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        app.begin_operation(OpKind::Carve);
+        app.set_pending_tool(1);
+        app.pick_operation_geometry([10.4, 25.0], 2.0, &[SnapKind::End]);
+        let pending = app.pending_op().unwrap();
+        assert_eq!(pending.boundary.unwrap().part, LoopPart::Outer);
+        assert_eq!(
+            pending.islands,
+            vec![LoopRef::hole(0, 0)],
+            "the circle should be an island without a second click"
+        );
+        // And it can still be toggled off.
+        app.pick_operation_geometry([45.4, 30.0], 2.0, &[SnapKind::End]);
+        assert!(app.pending_op().unwrap().islands.is_empty());
+
+        // Re-add and confirm: the carve carries the island through.
+        app.pick_operation_geometry([45.4, 30.0], 2.0, &[SnapKind::End]);
+        assert!(app.confirm_operation());
+        match app.selected_operation() {
+            Some(Operation::Carve(o)) => assert_eq!(o.islands.len(), 1),
+            other => panic!("expected a carve with one island, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pocket_still_starts_with_no_islands() {
+        // The auto-include is carve-only: a pocket's islands are a deliberate choice
+        // about what to leave standing, not a property of the drawing.
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        app.begin_operation(OpKind::Pocket);
+        app.set_pending_tool(1);
+        app.pick_operation_geometry([10.4, 25.0], 2.0, &[SnapKind::End]);
+        assert!(app.pending_op().unwrap().islands.is_empty());
+    }
+
+    #[test]
+    fn a_carves_clearing_tool_counts_as_in_use_and_survives_pruning() {
+        // The bug this pins: counting only the defining tool would show an incomplete
+        // setup sheet, and -- far worse -- prune the clearing end mill out of the
+        // document, leaving the operation referencing a tool that is no longer there.
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        let mill = Tool {
+            number: 7,
+            diameter: 4.0,
+            length: 30.0,
+            flute_length: 20.0,
+            flutes: 2,
+            kind: ToolKind::EndMill,
+            ..Default::default()
+        };
+        app.begin_operation(OpKind::Carve);
+        app.set_pending_tool(1);
+        app.pick_operation_geometry([10.4, 25.0], 2.0, &[SnapKind::End]);
+        assert!(app.confirm_operation());
+        let id = match app.selection() {
+            Selection::Operation(id) => id,
+            other => panic!("expected the carve selected, got {other:?}"),
+        };
+        // Embedded after creation, exactly as the inspector's "Clear flat areas" does:
+        // confirming an operation prunes unreferenced tools, so a tool embedded before
+        // the carve exists would be swept away again.
+        let number = app.use_tool(mill);
+        app.edit_operation(id, |op| {
+            if let Operation::Carve(c) = op {
+                c.clear_tool = Some(number);
+            }
+        });
+        assert!(
+            app.used_tools().iter().any(|t| t.number == number),
+            "the clearing tool belongs on the setup sheet"
+        );
+        app.prune_unused_tools();
+        assert!(
+            app.document().setup.tools.iter().any(|t| t.number == number),
+            "pruning must not drop a tool an operation still references"
+        );
     }
 
     #[test]

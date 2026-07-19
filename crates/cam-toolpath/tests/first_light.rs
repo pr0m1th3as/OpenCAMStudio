@@ -813,6 +813,7 @@ fn carve_document(clear_tool: Option<u32>, trailing_tool: Option<u32>) -> Docume
         clear_stepdown: 0.0,
         clear_feed: 0.0,
         clear_plunge_feed: 0.0,
+        clear_plunge: Plunge::Straight,
         start: None,
     };
     let mut operations = vec![Operation::Carve(carve)];

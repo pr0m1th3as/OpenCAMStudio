@@ -41,7 +41,7 @@ use std::sync::Arc;
 use cam_cldata::Program;
 use cam_model::{Heights, Tool};
 
-pub use carve::CarveStrategy;
+pub use carve::{carve_shape, CarveShape, CarveStrategy};
 pub use chamfer::ChamferStrategy;
 pub use engrave::EngraveStrategy;
 pub use drill::DrillStrategy;

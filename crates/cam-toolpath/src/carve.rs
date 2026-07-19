@@ -76,7 +76,7 @@
 
 use cam_cldata::{MoveKind, Point3, Program, Step, Tag};
 use cam_geo::{offset, vtip_depth_for_half_width, vtip_half_width, vtip_max_depth, JoinStyle, Polygon};
-use cam_model::{CarveOp, Clearing, Lead, Plunge, ToolKind};
+use cam_model::{CarveOp, Clearing, Lead, Plunge, Tool, ToolKind};
 
 use crate::{CancelToken, Diagnostic, JobEnv, Strategy, StrategyResult};
 
@@ -360,26 +360,12 @@ impl Strategy for CarveStrategy {
         // exactly reaches the widest inscribed point and no flat floor remains. If that
         // distance lies beyond `w_max`, the depth cap has stopped the V short and left a
         // flat land behind.
-        let w_full = vanishing_width(&region, op.offset);
+        let (w_full, flat) = shape_facts(&region, op.offset, w_max);
         let full_depth = vtip_depth_for_half_width(alpha, tip_radius, w_full);
         let reach = if full_depth > max_depth + 1e-9 {
             format!(", though tool {} reaches only {max_depth:.3} mm", op.tool)
         } else {
             String::new()
-        };
-
-        // The flat land itself: the region beyond where the capped V reaches. Its
-        // boundary is the innermost carve ring, so the two meet by construction — the
-        // ring at `w_max` sits at `depth`, which is exactly this floor's Z.
-        let flat = if w_full > w_max + FLAT_LAND_TOL_MM {
-            offset(
-                std::slice::from_ref(&region),
-                -(op.offset + w_max),
-                JoinStyle::Round,
-            )
-            .unwrap_or_default()
-        } else {
-            Vec::new()
         };
 
         if !flat.is_empty() {
@@ -440,16 +426,39 @@ impl Strategy for CarveStrategy {
                     op.id, op.depth
                 )));
             } else {
-                if !crate::guards::check_flat_floor(op.id, "carve clearing", ctool, &mut diagnostics)
-                    || !crate::guards::check_plunge(op.id, "carve clearing", ctool, &mut diagnostics)
-                    || !crate::guards::check_axial_reach(
+                // The clearing tool exists for exactly one reason: to leave a flat
+                // floor where the cone cannot. A tool that cannot leave one has no
+                // purpose here — it is not "worse", it is the wrong tool for the job,
+                // and the V-bit alone would do as well. So this is an error, unlike the
+                // general flat-floor guard, which warns for a merely scalloped floor.
+                if !ctool.profile().cuts_flat_bottom() {
+                    if ctool.profile().has_cutting_tip() {
+                        fail!(
+                            "operation {}: tool {ct} ({}) is not flat-bottomed, so it                              would leave a scalloped floor, not the flat one the                              clearing pass exists for. Use an end mill or bull nose, or                              no clearing tool at all.",
+                            op.id,
+                            ctool.kind
+                        );
+                    }
+                    fail!(
+                        "operation {}: tool {ct} ({}) has a non-cutting tip - it would                          leave an uncut ridge under its axis instead of a floor.",
                         op.id,
-                        "carve clearing",
-                        ctool,
-                        op.depth,
-                        &mut diagnostics,
-                    )
+                        ctool.kind
+                    );
+                }
+                // A straight drop into solid stock needs the axis to cut. Any other
+                // entry eases in along the path, so the rule does not apply.
+                if matches!(op.clear_plunge, Plunge::Straight)
+                    && !crate::guards::check_plunge(op.id, "carve clearing", ctool, &mut diagnostics)
                 {
+                    bail!();
+                }
+                if !crate::guards::check_axial_reach(
+                    op.id,
+                    "carve clearing",
+                    ctool,
+                    op.depth,
+                    &mut diagnostics,
+                ) {
                     bail!();
                 }
 
@@ -485,7 +494,7 @@ impl Strategy for CarveStrategy {
                         first: r,
                         spacing,
                         clearing: Clearing::default(),
-                        plunge: Plunge::Straight,
+                        plunge: op.clear_plunge,
                         feed,
                         plunge_feed,
                         lead_overlap: 0.0,
@@ -571,6 +580,69 @@ impl Strategy for CarveStrategy {
             cancelled: false,
         }
     }
+}
+
+/// What a carve's shape allows, independent of running the strategy.
+///
+/// The inspector needs these three numbers *live*, as soon as region, tool and depth are
+/// set, so it can tell the operator whether to deepen, accept, or add a clearing tool —
+/// without waiting for a run. They come from the same code the strategy uses, so the
+/// inspector and the diagnostics can never disagree.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CarveShape {
+    /// The depth at which the V exactly consumes the shape, leaving no flat floor —
+    /// the shape's *natural full depth*.
+    pub full_depth: f64,
+    /// The deepest this V-bit can cut before its cone reaches full diameter and the
+    /// shank would rub. `full_depth` beyond this cannot be reached with this tool.
+    pub tool_max_depth: f64,
+    /// How many separate flat areas the current depth cap leaves. `0` = none.
+    pub flat_areas: usize,
+}
+
+/// Work out what `op`'s shape allows with `tool`, without generating a toolpath.
+///
+/// `None` when the question is not yet meaningful: the tool is not a V-bit, its angle is
+/// degenerate, the depth is unset, or the boundary does not bound a region.
+pub fn carve_shape(op: &CarveOp, tool: &Tool) -> Option<CarveShape> {
+    let ToolKind::VBit {
+        included_angle_deg,
+        tip_radius,
+    } = tool.kind
+    else {
+        return None;
+    };
+    let alpha = 0.5 * included_angle_deg.to_radians();
+    if !(alpha > 0.0 && alpha < std::f64::consts::FRAC_PI_2) || op.depth <= 0.0 {
+        return None;
+    }
+    let region = Polygon::with_holes(op.boundary.clone(), op.islands.clone()).ok()?;
+    let w_max = vtip_half_width(alpha, tip_radius, op.depth);
+    let (w_full, flat) = shape_facts(&region, op.offset, w_max);
+    Some(CarveShape {
+        full_depth: vtip_depth_for_half_width(alpha, tip_radius, w_full),
+        tool_max_depth: vtip_max_depth(alpha, tip_radius, tool.radius()),
+        flat_areas: flat.len(),
+    })
+}
+
+/// The two facts the shape yields: the inward distance at which its offsets vanish, and
+/// the flat land a cap at `w_max` leaves behind (empty when the V consumes the shape).
+fn shape_facts(region: &Polygon, hold_off: f64, w_max: f64) -> (f64, Vec<Polygon>) {
+    let w_full = vanishing_width(region, hold_off);
+    let flat = if w_full > w_max + FLAT_LAND_TOL_MM {
+        // Its boundary is the innermost carve ring, so the carved wall and this floor
+        // meet by construction.
+        offset(
+            std::slice::from_ref(region),
+            -(hold_off + w_max),
+            JoinStyle::Round,
+        )
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    (w_full, flat)
 }
 
 /// How far past `w_max` the offsets must survive before a flat land is called real, mm.
@@ -792,6 +864,7 @@ mod tests {
             clear_stepdown: 0.0,
             clear_feed: 0.0,
             clear_plunge_feed: 0.0,
+            clear_plunge: Plunge::Straight,
             start: None,
         }
     }
@@ -1394,6 +1467,71 @@ mod tests {
     }
 
     #[test]
+    fn a_ball_nose_clearing_tool_is_an_error_not_a_warning() {
+        // The clearing tool exists to leave a flat floor. A ball nose cuts, but leaves
+        // scallops -- which is what the V-bit already does, so it buys a tool change
+        // and nothing else. Wrong tool for the job, not merely a worse one.
+        let mut o = op(1.0);
+        o.clear_tool = Some(2);
+        let mut ball = endmill(2, 4.0);
+        ball.kind = ToolKind::BallMill;
+        let e = errors(&run_with(o, &[vbit(90.0, 0.0), ball]));
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(e[0].contains("not flat-bottomed"), "{e:?}");
+        assert!(e[0].contains("scalloped"), "{e:?}");
+    }
+
+    #[test]
+    fn a_non_cutting_tipped_clearing_tool_says_so_specifically() {
+        let mut o = op(1.0);
+        o.clear_tool = Some(2);
+        let mut cham = endmill(2, 4.0);
+        cham.kind = ToolKind::ChamferMill {
+            included_angle_deg: 90.0,
+            tip_diameter: 0.2,
+        };
+        let e = errors(&run_with(o, &[vbit(90.0, 0.0), cham]));
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(e[0].contains("non-cutting tip"), "{e:?}");
+    }
+
+    #[test]
+    fn a_bull_nose_clears_fine_since_its_centre_is_flat() {
+        let mut o = op(1.0);
+        o.clear_tool = Some(2);
+        let mut bull = endmill(2, 4.0);
+        bull.kind = ToolKind::BullNose { corner_radius: 0.5 };
+        let r = run_with(o, &[vbit(90.0, 0.0), bull]);
+        assert!(errors(&r).is_empty(), "{:?}", errors(&r));
+        assert!(warnings(&r).is_empty(), "{:?}", warnings(&r));
+    }
+
+    #[test]
+    fn the_clearing_plunge_style_is_the_operators_choice() {
+        // A straight drop into solid stock is not always wanted; a helix eases in.
+        let mut o = op(1.0);
+        o.clear_tool = Some(2);
+        o.clear_plunge = Plunge::Helix {
+            radius: 1.0,
+            pitch: 0.5,
+        };
+        let r = run_with(o, &[vbit(90.0, 0.0), endmill(2, 4.0)]);
+        assert!(errors(&r).is_empty(), "{:?}", errors(&r));
+        // A helical entry emits arcs before the floor is reached; a straight one does not.
+        let steps = r.program.steps();
+        let change = steps
+            .iter()
+            .position(|s| matches!(s, Step::ToolChange { .. }))
+            .unwrap();
+        assert!(
+            steps[..change]
+                .iter()
+                .any(|s| matches!(s, Step::Arc { tag, .. } if tag.kind == MoveKind::Plunge)),
+            "no helical plunge was emitted"
+        );
+    }
+
+    #[test]
     fn a_clearing_tool_that_cannot_reach_the_depth_is_an_error() {
         // 2 mm of flute cannot cut a 3 mm-deep floor: past that it is the shank in the
         // pocket, which is a hard error, not a preference.
@@ -1498,6 +1636,39 @@ mod tests {
         let r = run(o, vbit(90.0, 0.0));
         let i = infos(&r);
         assert!(i[0].contains("2 flat areas"), "{i:?}");
+    }
+
+    #[test]
+    fn carve_shape_agrees_with_what_the_strategy_reports() {
+        // The inspector and the diagnostics must never disagree: same code, so pin it.
+        let o = op(1.0);
+        let t = vbit(90.0, 0.0);
+        let shape = carve_shape(&o, &t).expect("a V-bit and a valid region");
+        assert!((shape.full_depth - 10.0).abs() < 2e-3, "{shape:?}");
+        assert!((shape.tool_max_depth - 3.0).abs() < 1e-9, "{shape:?}");
+        assert_eq!(shape.flat_areas, 1);
+        let i = infos(&run(o, t));
+        assert!(i[0].contains(&format!("{:.3}", shape.full_depth)), "{i:?}");
+
+        // A shape the carve consumes reports no flat areas, live.
+        let mut consumed = op(2.9);
+        consumed.boundary = square(3.0);
+        let shape = carve_shape(&consumed, &t).unwrap();
+        assert_eq!(shape.flat_areas, 0);
+        assert!((shape.full_depth - 1.5).abs() < 2e-3, "{shape:?}");
+    }
+
+    #[test]
+    fn carve_shape_declines_the_questions_it_cannot_answer() {
+        let t = vbit(90.0, 0.0);
+        assert!(carve_shape(&op(0.0), &t).is_none(), "an unset depth");
+        assert!(
+            carve_shape(&op(1.0), &tool_of(ToolKind::EndMill)).is_none(),
+            "not a V-bit"
+        );
+        let mut open = op(1.0);
+        open.boundary = Contour::new(vec![Point::new(0.0, 0.0), Point::new(1.0, 0.0)]);
+        assert!(carve_shape(&open, &t).is_none(), "not a region");
     }
 
     // --- the ring schedule ---

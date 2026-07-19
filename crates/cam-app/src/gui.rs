@@ -102,6 +102,7 @@ enum Icon {
     Thread,
     Chamfer,
     Engrave,
+    Carve,
     Face,
     NewTool,
     Renumber,
@@ -134,6 +135,7 @@ impl Icon {
             Icon::Thread => include_bytes!("../assets/icons/thread.svg"),
             Icon::Chamfer => include_bytes!("../assets/icons/chamfer.svg"),
             Icon::Engrave => include_bytes!("../assets/icons/engrave.svg"),
+            Icon::Carve => include_bytes!("../assets/icons/carve.svg"),
             Icon::Face => include_bytes!("../assets/icons/face.svg"),
             Icon::NewTool => include_bytes!("../assets/icons/endmill.svg"),
             Icon::Renumber => include_bytes!("../assets/icons/renumber.svg"),
@@ -171,6 +173,9 @@ impl Icon {
             Icon::Engrave => "Add an Engrave operation — plough a V-groove along a path with a V-bit. \
                               Groove width follows from the depth and the bit's angle; a chamfer mill \
                               will not do (its tip does not cut).",
+            Icon::Carve => "Add a Carve operation — carve out the AREA a closed boundary encloses \
+                            with a V-bit. Unlike engraving, the tool never touches the boundary: its \
+                            flanks land on it, and the depth follows from the shape's own width.",
             Icon::Face => "Add a Face operation — skim the top of the stock flat.",
             Icon::NewTool => "Add a new tool to the library.",
             Icon::Renumber => {
@@ -214,7 +219,8 @@ use cam_render::{MeshVertex, OrbitCamera, Scene, Vertex, PART};
 use cam_toolpath::{CancelToken, Severity};
 
 use crate::{
-    op_accepts_open_paths, op_selects_circles, AppController, LoopRef, OpKind, PendingOp,
+    op_accepts_open_paths, op_selects_circles, op_takes_islands, AppController, LoopRef, OpKind,
+    PendingOp,
     PickResult, Selection, SnapHit,
     SnapKind,
 };
@@ -1290,6 +1296,15 @@ mod help {
         "Milling direction. Climb (recommended) gives a cleaner finish and is required for \
          adaptive clearing; unticking it is conventional milling, which reverses the pass \
          direction.";
+    pub const CARVE_CLEAR: &str =
+        "Clear the flat areas the depth cap leaves with a second, flat-bottomed tool \
+         before the V-bit runs. A cone cannot leave a flat floor, so without this those \
+         areas come out ridged. The end mill also takes the bulk material, sparing the \
+         carving tip.";
+    pub const CARVE_CLEAR_PLUNGE: &str =
+        "How the clearing tool enters downward. The flat area is entered in solid stock, \
+         so a tool that is not centre-cutting -- or a deep carve in hard material -- \
+         wants a ramp or helix rather than a straight drop.";
     pub const CARVE_STAY_DOWN: &str =
         "Link the carve rings without lifting where it is safe to do so, instead of \
          retracting to clearance for each. A carve can run to hundreds of rings, so this \
@@ -1504,7 +1519,7 @@ const SNAP_MARK_SCALE: f32 = 1.2;
 fn op_uses_snaps(kind: OpKind) -> bool {
     matches!(
         kind,
-        OpKind::Profile | OpKind::Chamfer | OpKind::Pocket | OpKind::Engrave
+        OpKind::Profile | OpKind::Chamfer | OpKind::Pocket | OpKind::Engrave | OpKind::Carve
     )
 }
 
@@ -1786,6 +1801,12 @@ enum Message {
     ThreadClimbChanged(bool),
     /// Toggle whether the selected carve links its rings without lifting.
     CarveStayDownToggled(bool),
+    /// Turn the selected carve's flat-area clearing pass on or off.
+    CarveClearToggled(bool),
+    /// Choose the library tool (by index) that clears the selected carve's flat areas.
+    CarveClearToolChanged(usize),
+    /// Change how the selected carve's clearing tool enters in Z.
+    CarveClearPlungeChanged(PlungeKind),
     /// A world `(x, y)` picked in the viewport plus the pickbox aperture in world
     /// mm (completes a pending operation).
     PickWorld([f32; 2], f32),
@@ -2411,9 +2432,10 @@ impl App {
                     PickResult::Selecting => {
                         let pending = self.controller.pending_op();
                         let has_tool = pending.as_ref().is_some_and(|p| p.tool.is_some());
-                        let pocket = pending.as_ref().is_some_and(|p| p.kind == OpKind::Pocket);
+                        let islands =
+                            pending.as_ref().is_some_and(|p| op_takes_islands(p.kind));
                         let n = pending.map_or(0, |p| p.islands.len());
-                        self.status = if pocket {
+                        self.status = if islands {
                             format!("Boundary set — click areas to exclude ({n}), then Confirm.")
                         } else if has_tool {
                             "Geometry set — Confirm to create the operation.".to_string()
@@ -2757,6 +2779,47 @@ impl App {
                 self.controller.edit_selected_operation(|op| {
                     if let Operation::Carve(c) = op {
                         c.stay_down = on;
+                    }
+                });
+                self.rerun();
+            }
+            Message::CarveClearToggled(on) => {
+                // Turning it on seeds the first flat-bottomed tool in the library, so
+                // the operator gets a working clearing pass from one click and refines
+                // it after. Turning it off leaves the carve V-bit-only (and ridged).
+                let seed = on
+                    .then(|| {
+                        self.library
+                            .tools
+                            .iter()
+                            .find(|t| matches!(t.kind, ToolKind::EndMill | ToolKind::BullNose { .. }))
+                            .copied()
+                    })
+                    .flatten()
+                    .map(|t| self.controller.use_tool(t));
+                self.controller.edit_selected_operation(|op| {
+                    if let Operation::Carve(c) = op {
+                        c.clear_tool = if on { seed } else { None };
+                    }
+                });
+                self.rerun();
+            }
+            Message::CarveClearToolChanged(index) => {
+                let Some(tool) = self.library.tools.get(index).copied() else {
+                    return iced::Task::none();
+                };
+                let number = self.controller.use_tool(tool);
+                self.controller.edit_selected_operation(|op| {
+                    if let Operation::Carve(c) = op {
+                        c.clear_tool = Some(number);
+                    }
+                });
+                self.rerun();
+            }
+            Message::CarveClearPlungeChanged(kind) => {
+                self.controller.edit_selected_operation(|op| {
+                    if let Operation::Carve(c) = op {
+                        c.clear_plunge = kind.to_plunge();
                     }
                 });
                 self.rerun();
@@ -4254,6 +4317,7 @@ impl App {
                     cmd(Icon::Thread, "Thread", begin(OpKind::Thread)),
                     cmd(Icon::Chamfer, "Chamfer", begin(OpKind::Chamfer)),
                     cmd(Icon::Engrave, "Engrave", begin(OpKind::Engrave)),
+                    cmd(Icon::Carve, "Carve", begin(OpKind::Carve)),
                     cmd(Icon::Face, "Face", begin(OpKind::Face)),
                 ],
             }],
@@ -4685,6 +4749,18 @@ impl App {
             // On an exact duplicate, mark it ⚠ and name its twin(s) by id — both
             // would post the same toolpath.
             let mut controls = row![include, name].spacing(4).align_y(Alignment::Center);
+            // A multi-tool operation names both, in cutting order, so the tree tells
+            // the truth about what the spindle does. Muted, so it reads as information
+            // rather than as the warnings beside it. Single-tool ops show nothing.
+            let tools = op.tools();
+            if tools.len() > 1 {
+                let list = tools
+                    .iter()
+                    .map(|t| format!("T{t}"))
+                    .collect::<Vec<_>>()
+                    .join(" + ");
+                controls = controls.push(text(list).size(11).color(palette::GROUP_LABEL));
+            }
             // An operation that failed its last run: ⚠ in the error colour, with the
             // message on hover. Glyph + colour together, so it survives colour-vision
             // deficiency.
@@ -4860,7 +4936,7 @@ impl App {
                 (false, false) => "Choose a tool and click the geometry in the viewport.".to_string(),
                 (true, false) => "Now click the geometry in the viewport.".to_string(),
                 (false, true) => "Geometry selected — now choose a tool.".to_string(),
-                (true, true) if pending.kind == OpKind::Pocket => format!(
+                (true, true) if op_takes_islands(pending.kind) => format!(
                     "Click enclosed areas to exclude ({} selected), then Confirm.",
                     pending.islands.len()
                 ),
@@ -5402,6 +5478,124 @@ impl App {
                         .spacing(8)
                         .align_y(Alignment::Center),
                     );
+
+                    // What the shape itself allows, computed live from region + tool +
+                    // depth — no run needed. This is the line that tells the operator
+                    // whether to deepen, accept, or add the second tool.
+                    let shape = self
+                        .controller
+                        .document()
+                        .setup
+                        .tools
+                        .iter()
+                        .find(|t| t.number == c.tool)
+                        .and_then(|t| cam_toolpath::carve_shape(c, t));
+                    if let Some(sh) = shape {
+                        let reach = if sh.full_depth > sh.tool_max_depth + 1e-9 {
+                            format!(", past tool {}'s {:.2} mm limit", c.tool, sh.tool_max_depth)
+                        } else {
+                            String::new()
+                        };
+                        let line = if sh.flat_areas == 0 {
+                            format!(
+                                "Carves out at {:.2} mm{reach} — no flat areas.",
+                                sh.full_depth
+                            )
+                        } else if sh.flat_areas == 1 {
+                            format!(
+                                "Full depth for this shape is {:.2} mm{reach}; this cap \
+                                 leaves 1 flat area.",
+                                sh.full_depth
+                            )
+                        } else {
+                            format!(
+                                "Full depth for this shape is {:.2} mm{reach}; this cap \
+                                 leaves {} flat areas.",
+                                sh.full_depth, sh.flat_areas
+                            )
+                        };
+                        list = list.push(text(line).size(12).color(palette::GROUP_LABEL));
+
+                        // The clearing tool is offered only when there is something for
+                        // it to clear — otherwise it buys a tool change and nothing else.
+                        if sh.flat_areas > 0 {
+                            list = list.push(
+                                row![
+                                    label_help(
+                                        "Clear flat areas",
+                                        help::CARVE_CLEAR,
+                                        self.tooltips
+                                    ),
+                                    checkbox(c.clear_tool.is_some())
+                                        .size(15)
+                                        .on_toggle(Message::CarveClearToggled),
+                                ]
+                                .spacing(8)
+                                .align_y(Alignment::Center),
+                            );
+                            if c.clear_tool.is_some() {
+                                // Flat-bottomed families only: the clearing pass exists
+                                // to leave a flat floor, and the strategy errors on a
+                                // tool that cannot.
+                                let choices: Vec<ToolChoice> = self
+                                    .library
+                                    .tools
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, t)| {
+                                        matches!(
+                                            t.kind,
+                                            ToolKind::EndMill | ToolKind::BullNose { .. }
+                                        )
+                                    })
+                                    .map(|(index, t)| ToolChoice {
+                                        index,
+                                        number: t.number,
+                                        diameter: t.diameter,
+                                        kind: t.kind,
+                                    })
+                                    .collect();
+                                let current = c.clear_tool.and_then(|n| {
+                                    let embedded = self
+                                        .controller
+                                        .document()
+                                        .setup
+                                        .tools
+                                        .iter()
+                                        .find(|t| t.number == n)
+                                        .copied()?;
+                                    let i = self.library.tools.iter().position(|l| {
+                                        l.diameter == embedded.diameter
+                                            && l.length == embedded.length
+                                            && l.flutes == embedded.flutes
+                                            && l.kind == embedded.kind
+                                    })?;
+                                    choices.iter().find(|ch| ch.index == i).cloned()
+                                });
+                                list = list.push(
+                                    row![
+                                        label_help("Clearing tool", help::CARVE_CLEAR, self.tooltips),
+                                        pick_list(choices, current, |ch| {
+                                            Message::CarveClearToolChanged(ch.index)
+                                        })
+                                        .placeholder("Choose an end mill")
+                                        .text_size(13)
+                                        .width(Length::Fill),
+                                    ]
+                                    .spacing(8)
+                                    .align_y(Alignment::Center),
+                                );
+                                list = list.push(profile_picker(
+                                    "Clearing plunge",
+                                    help::CARVE_CLEAR_PLUNGE,
+                                    self.tooltips,
+                                    PlungeKind::of(c.clear_plunge),
+                                    &PlungeKind::ALL[..],
+                                    Message::CarveClearPlungeChanged,
+                                ));
+                            }
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -7512,6 +7706,9 @@ mod ribbon_tests {
         assert_eq!(families_for(OpKind::Thread), &[F::ThreadMill]);
         assert_eq!(families_for(OpKind::Chamfer), &[F::ChamferMill, F::VBit]);
         assert_eq!(families_for(OpKind::Engrave), &[F::VBit]);
+        // Carving is a V-bit operation for the same reason engraving is: the cut's
+        // shape is the tool's own cone.
+        assert_eq!(families_for(OpKind::Carve), &[F::VBit]);
     }
 
     #[test]
@@ -7542,6 +7739,7 @@ mod ribbon_tests {
             OpKind::Thread,
             OpKind::Chamfer,
             OpKind::Engrave,
+            OpKind::Carve,
         ] {
             assert!(!families_for(op).is_empty(), "{op:?} offers nothing");
         }

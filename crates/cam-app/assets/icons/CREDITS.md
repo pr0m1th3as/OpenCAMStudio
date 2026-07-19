@@ -31,6 +31,10 @@ showing what each operation does to it:
 - `face.svg` — Face operation (machined top face)
 - `engrave.svg` — Engrave operation (a V-bit ploughing a V-groove into the top face;
   deliberately distinct from `chamfer.svg`, whose bevel sits on a *corner*)
+- `carve.svg` — Carve operation (an *area* carved out of the top face: V-sloped walls
+  running down to a cleared flat floor, with the bit standing off the boundary so its
+  flank is on the wall. Deliberately distinct from `engrave.svg`, whose tool ploughs a
+  single narrow groove with its tip and never leaves a floor)
 
 The hole-making Operations use a **flat tool glyph** instead, so they read at a
 glance and stay visually distinct from each other:

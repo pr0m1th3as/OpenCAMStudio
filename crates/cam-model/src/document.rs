@@ -164,9 +164,10 @@ pub enum Lead {
 }
 
 /// How the tool enters the material in Z at the start of each pass.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Plunge {
     /// A straight vertical plunge (the default; fine for drills/centre-cutting mills).
+    #[default]
     Straight,
     /// Descend at `angle_deg` from horizontal along the toolpath (linear ramp).
     Ramp { angle_deg: f64 },
@@ -721,6 +722,11 @@ pub struct CarveOp {
     /// Clearing plunge feed, mm/min. `0` inherits `plunge_feed`.
     #[serde(default)]
     pub clear_plunge_feed: f64,
+    /// How the clearing tool enters the material in Z at each level. A carve's flat
+    /// land is entered in solid stock, so a tool that is not centre-cutting — or a
+    /// deep, hard carve — wants a ramp or a helix rather than a straight drop.
+    #[serde(default)]
+    pub clear_plunge: Plunge,
     /// Preferred start location (part XY): each ring begins at the point nearest here.
     /// `None` uses the strategy's default entry.
     #[serde(default)]
@@ -956,6 +962,7 @@ mod tests {
             clear_stepdown: 0.0,
             clear_feed: 0.0,
             clear_plunge_feed: 0.0,
+            clear_plunge: Plunge::Straight,
             start: None,
         })
     }
