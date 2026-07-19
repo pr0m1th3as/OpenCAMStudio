@@ -216,17 +216,16 @@ impl Strategy for CarveStrategy {
         // count and the depth actually reached, and neither is known until the offsets
         // have been walked (they may vanish well before `w_max`).
         let mut body = Program::new();
-        let mut rings_cut = 0usize;
-        let mut lifts = 0usize;
         let mut deepest = 0.0f64;
-        // Where the tool is, when it is still down: its XY and its Z.
-        let mut at: Option<(cam_geo::Point, f64)> = None;
-        // The region the tool may traverse at that Z without gouging — the offset region
-        // bounded by the ring it has just finished (see the module docs). Held one level
-        // behind, so the first ring of a new width is judged against the width the tool is
-        // coming *from*, and later rings of the same width against their own.
-        let mut guard: Vec<Polygon> = Vec::new();
+        let mut st = RingState::default();
+        let tags = RingTags {
+            link,
+            plunge,
+            cut,
+            retract,
+        };
 
+        // --- pass 1: the V walls, from the boundary inward to the depth cap ---
         for &w in &widths {
             if cancel.is_cancelled() {
                 return StrategyResult {
@@ -249,106 +248,17 @@ impl Strategy for CarveStrategy {
             }
 
             let depth = vtip_depth_for_half_width(alpha, tip_radius, w).min(op.depth);
-            let z = op.top - depth;
             deepest = deepest.max(depth);
-
-            let mut first_of_this_width = true;
-            for poly in &rings {
-                // A hole in the offset result is a ring around an island (or a counter of
-                // a letter): it is carved at the same depth, being the same distance from
-                // a boundary.
-                for contour in std::iter::once(poly.outer()).chain(poly.holes()) {
-                    if !contour.is_valid() {
-                        continue;
-                    }
-                    // When staying down, begin this ring at the point nearest where the
-                    // tool already is, so the link is as short as it can be — the
-                    // operator's `start` then applies only to the first ring, which is
-                    // where the entry witness actually lands.
-                    let nearest = at.map(|(q, _)| {
-                        crate::profile::rotate_to_start(contour.points(), Some([q.x, q.y]))
-                    });
-                    let linked = op.stay_down
-                        && match (&at, &nearest) {
-                            (Some((q, _)), Some(cand)) => link_is_safe(&guard, *q, cand[0]),
-                            _ => false,
-                        };
-                    let pts = match (linked, nearest) {
-                        (true, Some(cand)) => cand,
-                        _ => crate::profile::rotate_to_start(contour.points(), op.start),
-                    };
-                    let start = pts[0];
-
-                    match (linked, at) {
-                        (true, Some((_, zq))) => {
-                            // Traverse at the *previous* ring's depth, where the region
-                            // just verified guarantees no gouge, and only then sink to
-                            // this ring's depth. Both moves cut real material — the shelf
-                            // between the two rings — so they are fed, not rapid.
-                            body.push(Step::Linear {
-                                to: Point3::new(start.x, start.y, zq),
-                                feed: op.feed,
-                                tag: cut,
-                            });
-                            body.push(Step::Linear {
-                                to: Point3::new(start.x, start.y, z),
-                                feed: op.plunge_feed,
-                                tag: plunge,
-                            });
-                        }
-                        _ => {
-                            // Lift and come back down: either the operator asked for it,
-                            // or this particular link failed its safety check.
-                            if let Some((q, _)) = at {
-                                body.push(Step::Rapid {
-                                    to: Point3::new(q.x, q.y, env.heights.clearance),
-                                    tag: retract,
-                                });
-                            }
-                            body.push(Step::Rapid {
-                                to: Point3::new(start.x, start.y, env.heights.clearance),
-                                tag: link,
-                            });
-                            body.push(Step::Rapid {
-                                to: Point3::new(start.x, start.y, env.heights.retract.max(op.top)),
-                                tag: link,
-                            });
-                            body.push(Step::Linear {
-                                to: Point3::new(start.x, start.y, z),
-                                feed: op.plunge_feed,
-                                tag: plunge,
-                            });
-                            lifts += 1;
-                        }
-                    }
-
-                    crate::emit::cut_loop(&mut body, &pts, op.feed, cut, z);
-                    rings_cut += 1;
-                    // `cut_loop` closes back to the start, so that is where the tool is.
-                    at = Some((start, z));
-                    if first_of_this_width {
-                        // From here on, links are judged against *this* width's region.
-                        guard.clone_from(&rings);
-                        first_of_this_width = false;
-                    }
-                }
-            }
-        }
-
-        // Whatever happened, come home to clearance.
-        if let Some((q, _)) = at {
-            body.push(Step::Rapid {
-                to: Point3::new(q.x, q.y, env.heights.clearance),
-                tag: retract,
-            });
-        }
-
-        if rings_cut == 0 {
-            fail!(
-                "operation {}: nothing to carve - the region vanishes {:.3} mm in, before \
-                 the first ring. The hold-off may exceed the region's own width.",
-                op.id,
-                op.offset + widths.first().copied().unwrap_or(0.0)
+            emit_rings(
+                &mut body,
+                &mut st,
+                &rings,
+                &rings,
+                op.top - depth,
+                op,
+                &env.heights,
+                tags,
+                0.0,
             );
         }
 
@@ -380,12 +290,14 @@ impl Strategy for CarveStrategy {
                 // Not an error: it does cut. But a cone cannot leave a flat floor —
                 // adjacent passes leave uncut material between them — so say so.
                 diagnostics.push(Diagnostic::warning(format!(
-                    "operation {}: {} left at full depth with no clearing tool. The \
-                     V-bit will cut them, but a cone cannot leave a flat floor, so they \
-                     will be ridged. Set a clearing end mill, or deepen to \
-                     {full_depth:.3} mm{reach}.",
+                    "operation {}: {} at full depth with no clearing tool. The V-bit \
+                     cuts them in {:.3} mm rings, but a cone cannot leave a flat floor, \
+                     so they come out ridged by about {:.3} mm. Set a clearing end mill, \
+                     or deepen to {full_depth:.3} mm{reach}.",
                     op.id,
                     areas_phrase(flat.len()),
+                    step,
+                    vtip_depth_for_half_width(alpha, tip_radius, 0.5 * step),
                 )));
             }
         } else {
@@ -404,6 +316,9 @@ impl Strategy for CarveStrategy {
         // land's boundary.
         let mut clear_body = Program::new();
         let mut clear_comment = None;
+        // What the clearing tool actually swept, so the V-bit can be sent only where it
+        // did not reach. Empty when there is no clearing pass.
+        let mut swept: Vec<Polygon> = Vec::new();
         if let Some(clear) = op.clear {
             let ct = clear.tool;
             let cp = clear.params;
@@ -563,6 +478,7 @@ impl Strategy for CarveStrategy {
                         areas_phrase(flat.len())
                     )));
                 }
+                swept = swept_by(&clear_body, r);
                 clear_comment = Some(format!(
                     "Carve clearing: {} at {:.3} mm deep with tool {ct} dia {:.3}, \
                      {:.3} mm stepover, {}",
@@ -573,6 +489,94 @@ impl Strategy for CarveStrategy {
                     crate::passes_phrase(levels.len())
                 ));
             }
+        }
+
+        // --- pass 2: the floor ---
+        //
+        // Pass 1 stops at `w_max`, which is only the *edge* of the flat land. Everything
+        // inside it still has to be cut by something, and two cases arise:
+        //
+        // - **No clearing tool.** Nothing has touched the flat land, so the V-bit must
+        //   cut all of it. (Without this it was left as solid stock at full height, while
+        //   the diagnostic cheerfully described a merely *ridged* floor.)
+        // - **A clearing tool.** The end mill took the bulk, but a round cutter cannot
+        //   reach into a sharp corner: it leaves a lens of stock at every concave corner
+        //   of the flat land, reaching `r·(√2−1)` in from a right-angled one. Pass 1 never
+        //   goes there, so those would stand as raised nubs on the finished floor.
+        //
+        // Either way the V-bit runs concentric rings at **constant** full depth over
+        // whatever is left. That is gouge-free by the same superadditivity argument that
+        // licenses the stay-down links: with the tip at `f(w_max)` anywhere at or beyond
+        // `w_max` from the boundary, `f(s) + f(w_max − s) ≥ f(w_max)` bounds what the cone
+        // can reach back out to the wall.
+        let floor_region = if swept.is_empty() {
+            flat.clone()
+        } else {
+            match cam_geo::difference(&flat, &swept) {
+                Ok(rest) => rest,
+                Err(e) => fail!("operation {}: rest-region failed: {e}", op.id),
+            }
+        };
+        let floor_z = op.top - op.depth;
+        // With no clearing tool the flat land's own boundary was already cut as pass 1's
+        // innermost ring, so start one step in. A rest region has its own boundary, which
+        // nothing has cut, so start on it.
+        let mut d = if swept.is_empty() { step } else { 0.0 };
+        let mut floor_rings = 0usize;
+        loop {
+            if cancel.is_cancelled() {
+                return StrategyResult {
+                    program: body,
+                    diagnostics,
+                    cancelled: true,
+                };
+            }
+            let rings = if d <= 0.0 {
+                floor_region.clone()
+            } else {
+                match offset(&floor_region, -d, JoinStyle::Round) {
+                    Ok(r) => r,
+                    Err(e) => fail!("operation {}: floor offset failed: {e}", op.id),
+                }
+            };
+            if rings.is_empty() {
+                break;
+            }
+            // Travel at full depth is safe anywhere inside the flat land, so that — not
+            // the individual ring — is what bounds a stay-down link here.
+            emit_rings(
+                &mut body,
+                &mut st,
+                &rings,
+                &flat,
+                floor_z,
+                op,
+                &env.heights,
+                tags,
+                step,
+            );
+            floor_rings += 1;
+            if floor_rings > 0 {
+                deepest = deepest.max(op.depth);
+            }
+            d += step;
+        }
+
+        // Whatever happened, come home to clearance.
+        if let Some((q, _)) = st.at {
+            body.push(Step::Rapid {
+                to: Point3::new(q.x, q.y, env.heights.clearance),
+                tag: retract,
+            });
+        }
+
+        if st.rings_cut == 0 {
+            fail!(
+                "operation {}: nothing to carve - the region vanishes {:.3} mm in, before \
+                 the first ring. The hold-off may exceed the region's own width.",
+                op.id,
+                op.offset + widths.first().copied().unwrap_or(0.0)
+            );
         }
 
         let mut program = Program::new();
@@ -588,8 +592,10 @@ impl Strategy for CarveStrategy {
             program.push(Step::ToolChange { tool: op.tool });
         }
         program.push(Step::Comment(format!(
-            "Carve: {rings_cut} rings at {step:.3} mm, to {deepest:.3} mm deep with a \
-             {included_angle_deg} deg V-bit, {lifts} lifts"
+            "Carve: {} rings at {step:.3} mm, to {deepest:.3} mm deep with a \
+             {included_angle_deg} deg V-bit, {} lifts",
+            st.rings_cut,
+            st.lifts
         )));
         program.extend(body);
 
@@ -599,6 +605,184 @@ impl Strategy for CarveStrategy {
             cancelled: false,
         }
     }
+}
+
+/// Tags for the four move roles a ring pass emits.
+#[derive(Clone, Copy)]
+struct RingTags {
+    link: Tag,
+    plunge: Tag,
+    cut: Tag,
+    retract: Tag,
+}
+
+/// State carried across the ring passes, so pass 2 can link on from where pass 1 left
+/// the tool rather than lifting between them.
+#[derive(Default)]
+struct RingState {
+    /// Where the tool is while still down: its XY and its Z.
+    at: Option<(cam_geo::Point, f64)>,
+    /// The region it may traverse at that Z without gouging (see the module docs). Held
+    /// one pass behind, so a new ring is judged against the region it is coming *from*.
+    guard: Vec<Polygon>,
+    rings_cut: usize,
+    lifts: usize,
+}
+
+/// Cut every contour of `rings` at height `z`, linking without lifting where that is
+/// safe, and leave `guard_next` as the region the following ring will be judged against.
+#[allow(clippy::too_many_arguments)]
+fn emit_rings(
+    body: &mut Program,
+    st: &mut RingState,
+    rings: &[Polygon],
+    guard_next: &[Polygon],
+    z: f64,
+    op: &CarveOp,
+    heights: &cam_model::Heights,
+    tags: RingTags,
+    min_perimeter: f64,
+) {
+    let mut first = true;
+    for poly in rings {
+        // A hole in the offset result is a ring around an island (or the counter of a
+        // letter): it is cut at the same depth, being the same distance from a boundary.
+        for contour in std::iter::once(poly.outer()).chain(poly.holes()) {
+            if !contour.is_valid() {
+                continue;
+            }
+            // A ring shorter than one step is the sliver left as an offset closes out.
+            // Cutting it costs a whole plunge/retract cycle to remove almost nothing:
+            // what it leaves is under a quarter of a step, well inside the ridge the
+            // neighbouring pass leaves anyway.
+            if min_perimeter > 0.0 && perimeter(contour) < min_perimeter {
+                continue;
+            }
+            // When staying down, begin this ring at the point nearest where the tool
+            // already is, so the link is as short as it can be — the operator's `start`
+            // then applies only to the first ring, which is where the entry witness lands.
+            let nearest = st
+                .at
+                .map(|(q, _)| crate::profile::rotate_to_start(contour.points(), Some([q.x, q.y])));
+            let linked = op.stay_down
+                && match (&st.at, &nearest) {
+                    (Some((q, _)), Some(cand)) => link_is_safe(&st.guard, *q, cand[0]),
+                    _ => false,
+                };
+            let pts = match (linked, nearest) {
+                (true, Some(cand)) => cand,
+                _ => crate::profile::rotate_to_start(contour.points(), op.start),
+            };
+            let start = pts[0];
+
+            match (linked, st.at) {
+                (true, Some((_, zq))) => {
+                    // Traverse at the *previous* ring's depth, where the region just
+                    // verified guarantees no gouge, and only then sink to this ring's
+                    // depth. Both moves cut real material, so they are fed, not rapid.
+                    body.push(Step::Linear {
+                        to: Point3::new(start.x, start.y, zq),
+                        feed: op.feed,
+                        tag: tags.cut,
+                    });
+                    if (z - zq).abs() > 1e-12 {
+                        body.push(Step::Linear {
+                            to: Point3::new(start.x, start.y, z),
+                            feed: op.plunge_feed,
+                            tag: tags.plunge,
+                        });
+                    }
+                }
+                _ => {
+                    // Lift and come back down: either the operator asked for it, or this
+                    // particular link failed its safety check.
+                    if let Some((q, _)) = st.at {
+                        body.push(Step::Rapid {
+                            to: Point3::new(q.x, q.y, heights.clearance),
+                            tag: tags.retract,
+                        });
+                    }
+                    body.push(Step::Rapid {
+                        to: Point3::new(start.x, start.y, heights.clearance),
+                        tag: tags.link,
+                    });
+                    body.push(Step::Rapid {
+                        to: Point3::new(start.x, start.y, heights.retract.max(op.top)),
+                        tag: tags.link,
+                    });
+                    body.push(Step::Linear {
+                        to: Point3::new(start.x, start.y, z),
+                        feed: op.plunge_feed,
+                        tag: tags.plunge,
+                    });
+                    st.lifts += 1;
+                }
+            }
+
+            crate::emit::cut_loop(body, &pts, op.feed, tags.cut, z);
+            st.rings_cut += 1;
+            // `cut_loop` closes back to the start, so that is where the tool is.
+            st.at = Some((start, z));
+            if first {
+                st.guard = guard_next.to_vec();
+                first = false;
+            }
+        }
+    }
+}
+
+/// The closed length of a contour, mm.
+fn perimeter(c: &cam_geo::Contour) -> f64 {
+    let pts = c.points();
+    let mut total = 0.0;
+    for i in 0..pts.len() {
+        let a = pts[i];
+        let b = pts[(i + 1) % pts.len()];
+        total += (b.x - a.x).hypot(b.y - a.y);
+    }
+    total
+}
+
+/// The area a clearing pass's cutter actually swept, as polygons — its cutting moves
+/// stroked by the tool radius.
+///
+/// This is what makes the V-bit's floor pass a *rest* pass: it is sent only where the
+/// end mill could not reach, which for a flat-bottomed round cutter is every concave
+/// corner of the flat land.
+fn swept_by(clear_body: &Program, radius: f64) -> Vec<Polygon> {
+    let mut out = Vec::new();
+    let mut run: Vec<cam_geo::Point> = Vec::new();
+    let mut flush = |run: &mut Vec<cam_geo::Point>| {
+        if run.len() >= 2 {
+            let path = cam_geo::Polyline::new(std::mem::take(run));
+            if let Ok(mut polys) = cam_geo::stroke_path(&path, radius, cam_geo::CapStyle::Round, JoinStyle::Round)
+            {
+                out.append(&mut polys);
+            }
+        } else {
+            run.clear();
+        }
+    };
+    for step in clear_body.steps() {
+        match step {
+            Step::Linear { to, tag, .. } if tag.kind == MoveKind::Cutting => {
+                run.push(cam_geo::Point::new(to.x, to.y));
+            }
+            Step::Arc { end, tag, .. } if tag.kind == MoveKind::Cutting => {
+                run.push(cam_geo::Point::new(end.x, end.y));
+            }
+            Step::Linear { to, tag, .. } if tag.kind == MoveKind::Plunge => {
+                // A plunge starts a run at that XY: the tool is down from here.
+                flush(&mut run);
+                run.push(cam_geo::Point::new(to.x, to.y));
+            }
+            Step::Rapid { .. } => flush(&mut run),
+            _ => {}
+        }
+    }
+    flush(&mut run);
+    // One region, so the difference against it is a clean rest set.
+    cam_geo::union(&out, &[]).unwrap_or(out)
 }
 
 /// What a carve's shape allows, independent of running the strategy.
@@ -1032,9 +1216,11 @@ mod tests {
             let d = -z; // depth below top 0.0
             // distance from the nearest wall of the [0,20]² square
             let inset = x.min(y).min(20.0 - x).min(20.0 - y);
+            // Until the cap bites; past it the floor is flat at the cap.
+            let want = inset.min(1.5);
             assert!(
-                (inset - d).abs() < OFFSET_TOL,
-                "point ({x:.4},{y:.4}) at depth {d:.4} is {inset:.4} from the wall"
+                (want - d).abs() < OFFSET_TOL,
+                "point ({x:.4},{y:.4}) at depth {d:.4} wants {want:.4} ({inset:.4} in)"
             );
         }
     }
@@ -1107,10 +1293,10 @@ mod tests {
             let dx = (8.0 - x).max(x - 12.0).max(0.0);
             let dy = (8.0 - y).max(y - 12.0).max(0.0);
             let island = (dx * dx + dy * dy).sqrt();
-            let inset = outer.min(island);
+            let want = outer.min(island).min(1.0);
             assert!(
-                (inset + z).abs() < OFFSET_TOL,
-                "({x:.4},{y:.4},{z:.4}) is {inset:.4} from a wall"
+                (want + z).abs() < OFFSET_TOL,
+                "({x:.4},{y:.4},{z:.4}) wants {want:.4}"
             );
         }
     }
@@ -1123,7 +1309,8 @@ mod tests {
         let r = run(o, vbit(90.0, 0.0));
         for (x, y, z) in cuts(&r) {
             let inset = x.min(y).min(20.0 - x).min(20.0 - y);
-            assert!((inset - 1.0 + z).abs() < OFFSET_TOL, "({x:.4},{y:.4},{z:.4})");
+            let want = (inset - 1.0).min(1.0);
+            assert!((want + z).abs() < OFFSET_TOL, "({x:.4},{y:.4},{z:.4}) wants {want:.4}");
         }
     }
 
@@ -1157,8 +1344,9 @@ mod tests {
         let mut o = op(1.0);
         o.ring_step = 0.5;
         let r = run(o, vbit(90.0, 0.0));
-        assert_eq!(plunges(&r), 2);
-        assert_eq!(retracts(&r), 2);
+        // Two wall rings, then the floor rings that consume the flat land.
+        assert!(plunges(&r) > 2, "{}", plunges(&r));
+        assert_eq!(retracts(&r), plunges(&r));
         // And no rapid ever ends on the stock surface itself.
         for s in r.program.steps() {
             if let Step::Rapid { to, tag } = s {
@@ -1803,6 +1991,180 @@ mod tests {
         let mut open = op(1.0);
         open.boundary = Contour::new(vec![Point::new(0.0, 0.0), Point::new(1.0, 0.0)]);
         assert!(carve_shape(&open, &t).is_none(), "not a region");
+    }
+
+
+    #[test]
+    fn nothing_stands_in_the_corners_the_clearing_tool_cannot_reach() {
+        // 20 mm square, 1 mm cap, 90 deg sharp V-bit (f(x) == x), dia 4 end mill (r=2).
+        let mut o = op(1.0);
+        o.ring_step = 0.25;
+        o.clear = Some(cam_model::CarveClearing {
+            tool: 2,
+            params: cam_model::ClearParams::default(),
+        });
+        let r = run_with(o, &[vbit(90.0, 0.0), endmill(2, 4.0)]);
+        assert!(errors(&r).is_empty(), "{:?}", errors(&r));
+        let steps = r.program.steps();
+        let change = steps.iter().position(|s| matches!(s, Step::ToolChange { .. })).unwrap();
+
+        let collect = |range: &[Step], floor_only: bool| {
+            let mut segs: Vec<((f64, f64), (f64, f64))> = Vec::new();
+            let mut last: Option<(f64, f64)> = None;
+            for s in range {
+                match s {
+                    Step::Rapid { to, .. } => last = Some((to.x, to.y)),
+                    Step::Linear { to, tag, .. } => {
+                        let at_floor = !floor_only || (to.z + 1.0).abs() < 1e-9;
+                        if tag.kind == MoveKind::Cutting && at_floor {
+                            if let Some(q) = last { segs.push((q, (to.x, to.y))); }
+                        }
+                        last = Some((to.x, to.y));
+                    }
+                    Step::Arc { end, center, dir, tag, .. } => {
+                        let at_floor = !floor_only || (end.z + 1.0).abs() < 1e-9;
+                        if tag.kind == MoveKind::Cutting && at_floor {
+                            // Densify: a chord across a 90 deg arc misses it by r(1-cos45),
+                            // which for these lens boundaries is most of the answer.
+                            if let Some(q) = last {
+                                let c = (center.x, center.y);
+                                let r0 = ((q.0 - c.0).powi(2) + (q.1 - c.1).powi(2)).sqrt();
+                                let a0 = (q.1 - c.1).atan2(q.0 - c.0);
+                                let a1 = (end.y - c.1).atan2(end.x - c.0);
+                                let ccw = matches!(dir, cam_cldata::ArcDir::Ccw);
+                                let mut sweep = a1 - a0;
+                                if ccw && sweep <= 0.0 { sweep += std::f64::consts::TAU; }
+                                if !ccw && sweep >= 0.0 { sweep -= std::f64::consts::TAU; }
+                                let n = 64;
+                                let mut prev = q;
+                                for k in 1..=n {
+                                    let a = a0 + sweep * (k as f64) / (n as f64);
+                                    let pt = (c.0 + r0 * a.cos(), c.1 + r0 * a.sin());
+                                    segs.push((prev, pt));
+                                    prev = pt;
+                                }
+                            }
+                        }
+                        last = Some((end.x, end.y));
+                    }
+                    _ => {}
+                }
+            }
+            segs
+        };
+        let mill = collect(&steps[..change], false);
+        let vbit_floor = collect(&steps[change..], true);
+
+        let dist_seg = |p: (f64, f64), a: (f64, f64), b: (f64, f64)| {
+            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+            let l2 = dx * dx + dy * dy;
+            let t = if l2 <= 0.0 { 0.0 } else { (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / l2).clamp(0.0, 1.0) };
+            let (cx, cy) = (a.0 + t * dx, a.1 + t * dy);
+            ((p.0 - cx).powi(2) + (p.1 - cy).powi(2)).sqrt()
+        };
+        let (lo, hi) = (1.0_f64, 19.0_f64);   // the flat land
+        let step = 0.02_f64;
+        let mut worst = 0.0_f64;
+        let mut worst_at = (0.0, 0.0);
+        let n = ((hi - lo) / step) as usize;
+        for i in 0..=n {
+            for j in 0..=n {
+                let p = (lo + i as f64 * step, lo + j as f64 * step);
+                let dm = mill.iter().map(|(a, b)| dist_seg(p, *a, *b)).fold(f64::MAX, f64::min);
+                if dm <= 2.0 + 1e-9 { continue; }             // the end mill floored it
+                // Otherwise only the V-bit's cone has been here: material stands from
+                // the floor up to f(distance to the nearest V-bit floor pass).
+                let dv = vbit_floor.iter().map(|(a, b)| dist_seg(p, *a, *b)).fold(f64::MAX, f64::min);
+                let h = dv.min(1.0);                           // 90 deg sharp: f(x) == x
+                if h > worst { worst = h; worst_at = p; }
+            }
+        }
+        // A round cutter cannot enter a sharp corner: it leaves a lens of stock at each
+        // corner of the flat land, reaching r*(sqrt(2)-1) = 0.83 mm in from a right angle
+        // with this dia 4 mill. Before the V-bit's floor pass existed, that lens stood
+        // 0.580 mm proud of a 1.000 mm floor -- a nub over half the carve's depth.
+        //
+        // What may remain is the V-bit's own ridging between adjacent passes, f(step/2)
+        // = 0.125 mm here. Allow a whole ring step, which is loose enough for the corner
+        // geometry not to tile exactly and far tighter than the defect it guards.
+        assert!(
+            worst <= 0.25 + 1e-9,
+            "material stands {worst:.4} mm proud at {worst_at:?}; the ring ridge is only {:.4}",
+            0.25 / 2.0
+        );
+    }
+
+    #[test]
+    fn a_carve_with_no_clearing_tool_still_cuts_the_flat_land() {
+        // The bug the floor pass also fixes, and the worse of the two: the rings used to
+        // stop at w_max, which is only the EDGE of the flat land. Everything inside it
+        // was left as solid stock at full height -- while the diagnostic described a
+        // merely *ridged* floor. It has to be cut, ridges and all.
+        let mut o = op(1.0);
+        o.ring_step = 0.5;
+        let r = run(o, vbit(90.0, 0.0));
+        assert!(errors(&r).is_empty(), "{:?}", errors(&r));
+        // The flat land of a 20 mm square capped at 1 mm is [1,19]^2. Cutting must
+        // happen well inside it, at full depth -- not merely on its boundary.
+        let inside = cuts(&r)
+            .into_iter()
+            .filter(|&(x, y, z)| {
+                (z + 1.0).abs() < 1e-9
+                    && x > 2.0
+                    && x < 18.0
+                    && y > 2.0
+                    && y < 18.0
+            })
+            .count();
+        assert!(inside > 0, "the flat land was never entered");
+        // And the deepest cut is still the cap, not deeper.
+        let deepest = cuts(&r).into_iter().map(|(_, _, z)| z).fold(0.0_f64, f64::min);
+        assert!((deepest + 1.0).abs() < 1e-9, "deepest={deepest}");
+    }
+
+    #[test]
+    fn the_floor_pass_is_a_rest_pass_when_a_clearing_tool_ran() {
+        // With an end mill on the flat land, the V-bit must go only where it could not
+        // reach -- the corners -- not re-scrub the whole floor, which would drag its tip
+        // across finished material for no gain.
+        let mut with = op(1.0);
+        with.ring_step = 0.25;
+        with.clear = Some(cam_model::CarveClearing {
+            tool: 2,
+            params: cam_model::ClearParams::default(),
+        });
+        let mut without = with.clone();
+        without.clear = None;
+        // Length, not move count: the rest lenses are curved, so they carry many short
+        // segments while covering very little ground.
+        let floor_len = |r: &StrategyResult| {
+            let mut total = 0.0;
+            let mut prev: Option<(f64, f64)> = None;
+            for s in r.program.steps() {
+                match s {
+                    // A rapid breaks the chain: what follows is a fresh entry, not a cut
+                    // continuing from where the last one stopped.
+                    Step::Rapid { to, .. } => prev = Some((to.x, to.y)),
+                    Step::Linear { to, tag, .. } | Step::Arc { end: to, tag, .. } => {
+                        let floor = (to.z + 1.0).abs() < 1e-9;
+                        if tag.kind == MoveKind::Cutting && floor {
+                            if let Some(q) = prev {
+                                total += ((to.x - q.0).powi(2) + (to.y - q.1).powi(2)).sqrt();
+                            }
+                        }
+                        prev = Some((to.x, to.y));
+                    }
+                    _ => {}
+                }
+            }
+            total
+        };
+        let a = floor_len(&run_with(with, &[vbit(90.0, 0.0), endmill(2, 4.0)]));
+        let b = floor_len(&run(without, vbit(90.0, 0.0)));
+        assert!(
+            a * 4.0 < b,
+            "the rest pass should be a small fraction of the full floor: {a:.1} vs {b:.1} mm"
+        );
     }
 
     // --- the ring schedule ---
