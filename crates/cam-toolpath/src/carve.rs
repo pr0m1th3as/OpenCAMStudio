@@ -76,7 +76,7 @@
 
 use cam_cldata::{MoveKind, Point3, Program, Step, Tag};
 use cam_geo::{offset, vtip_depth_for_half_width, vtip_half_width, vtip_max_depth, JoinStyle, Polygon};
-use cam_model::{CarveOp, ToolKind};
+use cam_model::{CarveOp, Clearing, Lead, Plunge, ToolKind};
 
 use crate::{CancelToken, Diagnostic, JobEnv, Strategy, StrategyResult};
 
@@ -368,13 +368,21 @@ impl Strategy for CarveStrategy {
             String::new()
         };
 
-        if w_full > w_max + FLAT_LAND_TOL_MM {
-            let flat = offset(
+        // The flat land itself: the region beyond where the capped V reaches. Its
+        // boundary is the innermost carve ring, so the two meet by construction — the
+        // ring at `w_max` sits at `depth`, which is exactly this floor's Z.
+        let flat = if w_full > w_max + FLAT_LAND_TOL_MM {
+            offset(
                 std::slice::from_ref(&region),
                 -(op.offset + w_max),
                 JoinStyle::Round,
             )
-            .unwrap_or_default();
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        if !flat.is_empty() {
             diagnostics.push(Diagnostic::info(format!(
                 "operation {}: full depth for this shape is {full_depth:.3} mm{reach}; \
                  the {:.3} mm cap leaves {}",
@@ -402,7 +410,155 @@ impl Strategy for CarveStrategy {
             )));
         }
 
+        // --- the clearing pass: strong tool first, on the flat land only ---
+        //
+        // It runs *before* the carve for two reasons. Bulk removal belongs to the end
+        // mill, and a fine carving tip taking full-depth material is how one is snapped.
+        // The V-bit then tapers down to meet the floor this leaves, exactly at the flat
+        // land's boundary.
+        let mut clear_body = Program::new();
+        let mut clear_comment = None;
+        if let Some(ct) = op.clear_tool {
+            let Some(ctool) = env.tool(ct) else {
+                fail!(
+                    "operation {}: clearing tool {ct} is not in the setup",
+                    op.id
+                );
+            };
+            if ct == op.tool {
+                fail!(
+                    "operation {}: the clearing tool and the carving tool are both {ct}. \
+                     A V-bit cannot leave the flat floor the clearing pass exists for.",
+                    op.id
+                );
+            }
+            if flat.is_empty() {
+                diagnostics.push(Diagnostic::warning(format!(
+                    "operation {}: tool {ct} is set to clear flat areas, but at {:.3} mm \
+                     this shape leaves none - the tool change buys nothing. Clear the \
+                     clearing tool, or cap the depth shallower.",
+                    op.id, op.depth
+                )));
+            } else {
+                if !crate::guards::check_flat_floor(op.id, "carve clearing", ctool, &mut diagnostics)
+                    || !crate::guards::check_plunge(op.id, "carve clearing", ctool, &mut diagnostics)
+                    || !crate::guards::check_axial_reach(
+                        op.id,
+                        "carve clearing",
+                        ctool,
+                        op.depth,
+                        &mut diagnostics,
+                    )
+                {
+                    bail!();
+                }
+
+                let r = ctool.radius();
+                let spacing = if op.clear_stepover > 0.0 {
+                    op.clear_stepover
+                } else {
+                    0.5 * ctool.diameter
+                };
+                let stepdown = if op.clear_stepdown > 0.0 {
+                    op.clear_stepdown
+                } else {
+                    op.depth
+                };
+                let feed = if op.clear_feed > 0.0 { op.clear_feed } else { op.feed };
+                let plunge_feed = if op.clear_plunge_feed > 0.0 {
+                    op.clear_plunge_feed
+                } else {
+                    op.plunge_feed
+                };
+                let levels = crate::profile::depth_levels(op.top, op.top - op.depth, stepdown);
+
+                let mut cleared = 0usize;
+                let mut too_small = 0usize;
+                for area in &flat {
+                    // `first = r` puts the outermost ring's *edge* on the flat land's
+                    // boundary, so the floor is cleared right out to where the carved
+                    // wall meets it. No finishing allowance: the V-bit is the finish.
+                    let job = crate::clearing::ClearJob {
+                        id: op.id,
+                        radius: r,
+                        finish: 0.0,
+                        first: r,
+                        spacing,
+                        clearing: Clearing::default(),
+                        plunge: Plunge::Straight,
+                        feed,
+                        plunge_feed,
+                        lead_overlap: 0.0,
+                        lead_in: Lead::None,
+                        lead_out: Lead::None,
+                        start: op.start,
+                        guard: &[],
+                    };
+                    match crate::clearing::clear(
+                        &mut clear_body,
+                        area,
+                        &job,
+                        &env.heights,
+                        &levels,
+                        cancel,
+                    ) {
+                        Ok(0) => too_small += 1,
+                        Ok(_) => cleared += 1,
+                        Err(crate::rings::RingsError::Cancelled) => {
+                            return StrategyResult {
+                                diagnostics,
+                                cancelled: true,
+                                ..Default::default()
+                            };
+                        }
+                        Err(crate::rings::RingsError::Offset(e)) => {
+                            fail!("operation {}: clearing offset failed: {e}", op.id)
+                        }
+                    }
+                }
+
+                if cleared == 0 {
+                    fail!(
+                        "operation {}: tool {ct} (dia {:.3}) does not fit any of the {} \
+                         it was set to clear. Use a smaller clearing tool, or none.",
+                        op.id,
+                        ctool.diameter,
+                        areas_phrase(flat.len())
+                    );
+                }
+                if too_small > 0 {
+                    diagnostics.push(Diagnostic::warning(format!(
+                        "operation {}: tool {ct} (dia {:.3}) does not fit {} of the {}; \
+                         those keep the ridged floor the V-bit leaves.",
+                        op.id,
+                        ctool.diameter,
+                        too_small,
+                        areas_phrase(flat.len())
+                    )));
+                }
+                clear_comment = Some(format!(
+                    "Carve clearing: {} at {:.3} mm deep with tool {ct} dia {:.3}, \
+                     {:.3} mm stepover",
+                    areas_phrase(cleared),
+                    op.depth,
+                    ctool.diameter,
+                    spacing
+                ));
+            }
+        }
+
         let mut program = Program::new();
+        if let Some(c) = clear_comment {
+            program.push(Step::Comment(c));
+        }
+        program.extend(clear_body);
+        if op.clear_tool.is_some() {
+            // The planner put the clearing tool in the spindle for us (it is `tools()[0]`),
+            // so the change back to the V-bit is ours to emit — and it is emitted even
+            // when there was nothing to clear, or the fragment would leave the wrong tool
+            // loaded for whatever the operation does next.
+            program.push(Step::ToolChange { tool: op.tool });
+        }
         program.push(Step::Comment(format!(
             "Carve: {rings_cut} rings at {step:.3} mm, to {deepest:.3} mm deep with a \
              {included_angle_deg} deg V-bit, {lifts} lifts"
@@ -641,13 +797,29 @@ mod tests {
     }
 
     fn run(op: CarveOp, tool: Tool) -> StrategyResult {
-        let tools = [tool];
+        run_with(op, &[tool])
+    }
+
+    fn run_with(op: CarveOp, tools: &[Tool]) -> StrategyResult {
         let env = JobEnv {
             heights: Heights::new(5.0, 2.0, 0.0),
-            tools: &tools,
+            tools,
             stock: None,
         };
         CarveStrategy::new(op).compute(&env, &CancelToken::new())
+    }
+
+    /// An end mill, numbered, for the clearing pass.
+    fn endmill(number: u32, diameter: f64) -> Tool {
+        Tool {
+            number,
+            diameter,
+            length: 30.0,
+            flute_length: 20.0,
+            flutes: 2,
+            kind: ToolKind::EndMill,
+            ..Default::default()
+        }
     }
 
     fn errors(r: &StrategyResult) -> Vec<String> {
@@ -1110,8 +1282,169 @@ mod tests {
     fn setting_a_clearing_tool_silences_the_ridged_floor_warning() {
         let mut o = op(1.0);
         o.clear_tool = Some(2);
-        let r = run(o, vbit(90.0, 0.0));
+        let r = run_with(o, &[vbit(90.0, 0.0), endmill(2, 4.0)]);
+        assert!(errors(&r).is_empty(), "{:?}", errors(&r));
         assert!(warnings(&r).is_empty(), "{:?}", warnings(&r));
+    }
+
+    // --- the clearing pass and the tool change ---
+
+    /// The program's tool changes and the index of the first cutting move after each.
+    fn tool_changes(r: &StrategyResult) -> Vec<u32> {
+        r.program
+            .steps()
+            .iter()
+            .filter_map(|s| match s {
+                Step::ToolChange { tool } => Some(*tool),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_clearing_pass_runs_first_and_hands_back_to_the_v_bit() {
+        // The ordering is the whole point: bulk removal with the strong tool, then a
+        // change, then the carve. A fine carving tip taking full-depth material is how
+        // one is snapped.
+        let mut o = op(1.0);
+        o.clear_tool = Some(2);
+        let r = run_with(o, &[vbit(90.0, 0.0), endmill(2, 4.0)]);
+        assert!(errors(&r).is_empty(), "{:?}", errors(&r));
+        assert_eq!(tool_changes(&r), vec![1], "one change, back to the V-bit");
+
+        // Everything before that change belongs to the clearing pass, everything after
+        // to the carve — and both must actually contain cutting.
+        let steps = r.program.steps();
+        let change = steps
+            .iter()
+            .position(|s| matches!(s, Step::ToolChange { .. }))
+            .expect("a tool change");
+        let cutting = |r: &[Step]| {
+            r.iter().any(
+                |s| matches!(s, Step::Linear { tag, .. } | Step::Arc { tag, .. } if tag.kind == MoveKind::Cutting),
+            )
+        };
+        assert!(cutting(&steps[..change]), "the clearing pass cut nothing");
+        assert!(cutting(&steps[change + 1..]), "the carve cut nothing");
+    }
+
+    #[test]
+    fn the_clearing_pass_reaches_full_depth_and_stays_inside_the_flat_land() {
+        // The flat land of a 20 mm square capped at 1 mm is the square inset by
+        // w_max = 1 mm. The end mill must clear it at exactly the cap depth and never
+        // stray outside it, or it would cut through the carved V wall.
+        let mut o = op(1.0);
+        o.clear_tool = Some(2);
+        let r = run_with(o, &[vbit(90.0, 0.0), endmill(2, 4.0)]);
+        let steps = r.program.steps();
+        let change = steps
+            .iter()
+            .position(|s| matches!(s, Step::ToolChange { .. }))
+            .unwrap();
+        let mut saw = false;
+        for s in &steps[..change] {
+            let (x, y, z) = match s {
+                Step::Linear { to, tag, .. } if tag.kind == MoveKind::Cutting => (to.x, to.y, to.z),
+                Step::Arc { end, tag, .. } if tag.kind == MoveKind::Cutting => {
+                    (end.x, end.y, end.z)
+                }
+                _ => continue,
+            };
+            saw = true;
+            assert!((z + 1.0).abs() < 1e-9, "clearing at z={z}, not the 1 mm cap");
+            // Inside the flat land (inset 1 mm) by at least the tool radius (2 mm).
+            let inset = x.min(y).min(20.0 - x).min(20.0 - y);
+            assert!(
+                inset >= 1.0 + 2.0 - OFFSET_TOL,
+                "({x:.4},{y:.4}) is {inset:.4} in - the cutter would breach the V wall"
+            );
+        }
+        assert!(saw, "the clearing pass emitted no cutting");
+    }
+
+    #[test]
+    fn a_clearing_tool_missing_from_the_setup_is_an_error() {
+        let mut o = op(1.0);
+        o.clear_tool = Some(9);
+        let e = errors(&run(o, vbit(90.0, 0.0)));
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(e[0].contains("clearing tool 9 is not in the setup"), "{e:?}");
+    }
+
+    #[test]
+    fn clearing_with_the_carving_tool_itself_is_an_error() {
+        // It would be a no-op tool change and a floor the cone cannot flatten.
+        let mut o = op(1.0);
+        o.clear_tool = Some(1);
+        let e = errors(&run(o, vbit(90.0, 0.0)));
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(e[0].contains("both"), "{e:?}");
+    }
+
+    #[test]
+    fn a_clearing_tool_too_large_for_the_flat_land_is_an_error() {
+        // The flat land here is an 18 mm square; a 30 mm cutter cannot enter it, so
+        // there is nothing to clear with and the operator must be told, not left with
+        // a silent tool change.
+        let mut o = op(1.0);
+        o.clear_tool = Some(2);
+        let e = errors(&run_with(o, &[vbit(90.0, 0.0), endmill(2, 30.0)]));
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(e[0].contains("does not fit"), "{e:?}");
+    }
+
+    #[test]
+    fn a_clearing_tool_that_cannot_reach_the_depth_is_an_error() {
+        // 2 mm of flute cannot cut a 3 mm-deep floor: past that it is the shank in the
+        // pocket, which is a hard error, not a preference.
+        let mut o = op(2.5);
+        o.clear_tool = Some(2);
+        let mut short = endmill(2, 4.0);
+        short.flute_length = 2.0;
+        let e = errors(&run_with(o, &[vbit(90.0, 0.0), short]));
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(e[0].contains("cutting edge"), "{e:?}");
+    }
+
+    #[test]
+    fn a_clearing_tool_with_nothing_to_clear_warns_but_still_hands_over() {
+        // The shape carves out entirely, so the clearing tool has no flat land. The
+        // change back to the V-bit must still be emitted: the planner loaded the
+        // clearing tool for us, and leaving it in the spindle would carve with it.
+        let mut o = op(2.9);
+        o.boundary = square(3.0);
+        o.ring_step = 0.5;
+        o.clear_tool = Some(2);
+        let r = run_with(o, &[vbit(90.0, 0.0), endmill(2, 4.0)]);
+        assert!(errors(&r).is_empty(), "{:?}", errors(&r));
+        let w = warnings(&r);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("leaves none"), "{w:?}");
+        assert_eq!(tool_changes(&r), vec![1], "the hand-back is not optional");
+    }
+
+    #[test]
+    fn the_clearing_stepdown_splits_the_depth() {
+        let mut o = op(2.0);
+        o.clear_tool = Some(2);
+        o.clear_stepdown = 0.8;
+        let r = run_with(o, &[vbit(90.0, 0.0), endmill(2, 4.0)]);
+        assert!(errors(&r).is_empty(), "{:?}", errors(&r));
+        let steps = r.program.steps();
+        let change = steps
+            .iter()
+            .position(|s| matches!(s, Step::ToolChange { .. }))
+            .unwrap();
+        let mut zs: Vec<f64> = steps[..change]
+            .iter()
+            .filter_map(|s| match s {
+                Step::Linear { to, tag, .. } if tag.kind == MoveKind::Cutting => Some(to.z),
+                Step::Arc { end, tag, .. } if tag.kind == MoveKind::Cutting => Some(end.z),
+                _ => None,
+            })
+            .collect();
+        zs.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+        assert_zs(&zs, &[-0.8, -1.6, -2.0]);
     }
 
     #[test]

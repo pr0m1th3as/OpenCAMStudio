@@ -759,3 +759,152 @@ fn arc_lead_and_helix_plunge_post_to_helical_gcode() {
         .any(|l| (l.contains("G2") || l.contains("G3")) && l.contains('Z'));
     assert!(helical, "expected a helical G2/G3 with a Z word:\n{nc}");
 }
+
+// --- multi-tool operations: the tool-change ledger ---
+
+/// A ⌀40 disc, carved 1 mm deep with a 90° V-bit (tool 1) after a ⌀6 end mill
+/// (tool 2) has cleared the flat land it leaves — then a plain profile with a
+/// third tool, so the planner's bookkeeping after a multi-tool fragment is
+/// exercised rather than assumed.
+fn carve_document(clear_tool: Option<u32>, trailing_tool: Option<u32>) -> Document {
+    let vbit = Tool {
+        number: 1,
+        diameter: 6.0,
+        length: 30.0,
+        flutes: 1,
+        kind: ToolKind::VBit {
+            included_angle_deg: 90.0,
+            tip_radius: 0.1,
+        },
+        ..Default::default()
+    };
+    let mill = Tool {
+        number: 2,
+        diameter: 6.0,
+        length: 30.0,
+        flute_length: 20.0,
+        flutes: 2,
+        kind: ToolKind::EndMill,
+        ..Default::default()
+    };
+    let other = Tool {
+        number: 3,
+        diameter: 3.0,
+        length: 30.0,
+        flute_length: 20.0,
+        flutes: 2,
+        kind: ToolKind::EndMill,
+        ..Default::default()
+    };
+    let carve = cam_model::CarveOp {
+        id: 0,
+        tool: 1,
+        clear_tool,
+        boundary: rect(0.0, 0.0, 40.0, 40.0),
+        islands: Vec::new(),
+        top: 0.0,
+        depth: 1.0,
+        offset: 0.0,
+        ring_step: 0.5,
+        feed: 300.0,
+        plunge_feed: 100.0,
+        stay_down: true,
+        clear_stepover: 0.0,
+        clear_stepdown: 0.0,
+        clear_feed: 0.0,
+        clear_plunge_feed: 0.0,
+        start: None,
+    };
+    let mut operations = vec![Operation::Carve(carve)];
+    if let Some(t) = trailing_tool {
+        operations.push(Operation::Profile(ProfileOp {
+            clearing: cam_model::Clearing::default(),
+            id: 1,
+            tool: t,
+            chain: rect(0.0, 0.0, 40.0, 40.0),
+            side: Side::Outside,
+            comp: Comp::Computed,
+            offset: 0.0,
+            depth: 2.0,
+            stepdown: 2.0,
+            stepover: 0.0,
+            feed: 300.0,
+            plunge_feed: 100.0,
+            start: None,
+            lead_in: Lead::None,
+            lead_out: Lead::None,
+            lead_overlap: 0.0,
+            plunge: Plunge::Straight,
+        }));
+    }
+    Document::new(Setup {
+        name: "carve".into(),
+        heights: Heights::new(5.0, 2.0, 0.0),
+        stock: Stock::BoundingBox {
+            x_offset: 0.0,
+            y_offset: 0.0,
+            top: 0.0,
+            thickness: 10.0,
+        },
+        tools: vec![vbit, mill, other],
+        operations,
+        origin: [0.0, 0.0, 0.0],
+        start_offset: None,
+    })
+}
+
+fn tool_changes(program: &Program) -> Vec<u32> {
+    program
+        .steps()
+        .iter()
+        .filter_map(|s| match s {
+            Step::ToolChange { tool } => Some(*tool),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_two_tool_operation_loads_its_first_tool_then_changes_itself() {
+    // The planner must load the *clearing* tool for a Carve, not its defining tool:
+    // `tools()[0]` is what has to be in the spindle when the fragment starts. The
+    // change to the V-bit belongs to the strategy, which alone knows the order.
+    let doc = carve_document(Some(2), None);
+    let (program, diags) = build_job(&doc, 1000.0, SpindleDir::Cw, None, &CancelToken::new());
+    assert!(
+        !diags
+            .iter()
+            .any(|d| d.severity == cam_toolpath::Severity::Error),
+        "{diags:?}"
+    );
+    assert_eq!(tool_changes(&program), vec![2, 1]);
+}
+
+#[test]
+fn the_planner_resyncs_the_spindle_tool_after_a_multi_tool_fragment() {
+    // The bug this pins: if the planner assumed the operation left `tools()[0]` in the
+    // spindle, it would think tool 2 was still loaded and emit a change to it for the
+    // next operation — while the machine actually holds the V-bit. The carve would be
+    // followed by a profile cut with the wrong cutter.
+    let doc = carve_document(Some(2), Some(2));
+    let (program, _) = build_job(&doc, 1000.0, SpindleDir::Cw, None, &CancelToken::new());
+    // Clearing tool, hand-back to the V-bit, then genuinely back to tool 2 for the
+    // profile — the last change is NOT elided.
+    assert_eq!(tool_changes(&program), vec![2, 1, 2]);
+}
+
+#[test]
+fn a_following_operation_on_the_carving_tool_needs_no_change() {
+    // The other direction: the fragment really did leave tool 1 loaded, so an operation
+    // that wants tool 1 must not be given a redundant change.
+    let doc = carve_document(Some(2), Some(1));
+    let (program, _) = build_job(&doc, 1000.0, SpindleDir::Cw, None, &CancelToken::new());
+    assert_eq!(tool_changes(&program), vec![2, 1]);
+}
+
+#[test]
+fn a_single_tool_carve_behaves_like_every_other_operation() {
+    let doc = carve_document(None, Some(2));
+    let (program, _) = build_job(&doc, 1000.0, SpindleDir::Cw, None, &CancelToken::new());
+    assert_eq!(tool_changes(&program), vec![1, 2]);
+}
