@@ -408,6 +408,16 @@ impl AppController {
         &self.open_paths
     }
 
+    /// Whether any geometry is loaded at all — closed regions **or** open paths.
+    ///
+    /// Use this rather than `regions().is_empty()` for "is there something to work
+    /// on": a drawing can legitimately be nothing but engravable strokes, and
+    /// treating those as "no geometry" hides them from the viewport and blocks
+    /// operation creation.
+    pub fn has_geometry(&self) -> bool {
+        !self.regions.is_empty() || !self.open_paths.is_empty()
+    }
+
     /// The name of the loaded drawing.
     pub fn source_name(&self) -> &str {
         &self.source_name
@@ -839,13 +849,19 @@ impl AppController {
     /// with the first tool, and select it. A convenience over the pick wizard,
     /// kept for headless use/tests. A no-op if no geometry is loaded.
     pub fn new_operation(&mut self, kind: OpKind) {
-        if self.regions.is_empty() {
+        if !self.has_geometry() {
             return;
         }
         let tool = self.first_tool_number();
-        let boundary = LoopRef {
-            region: 0,
-            part: LoopPart::Outer,
+        // Prefer the first closed region; with a strokes-only drawing fall back to the
+        // first open path (which only an engraving operation will accept).
+        let boundary = if self.regions.is_empty() {
+            LoopRef::open(0)
+        } else {
+            LoopRef {
+                region: 0,
+                part: LoopPart::Outer,
+            }
         };
         if let Some(op) = self.build_op(kind, boundary, &[], tool, None) {
             self.add_operation(op);
@@ -1078,7 +1094,7 @@ impl AppController {
     /// library during setup (the GUI seeds a default and calls [`Self::use_tool`]);
     /// `tool` starts at the first embedded tool's number, or 1 as a placeholder.
     pub fn begin_operation(&mut self, kind: OpKind) {
-        if self.regions.is_empty() {
+        if !self.has_geometry() {
             return;
         }
         self.pending_op = Some(PendingOp {
@@ -2550,6 +2566,51 @@ mod tests {
             }
             other => panic!("expected face, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_scene_draws_open_paths_as_well_as_regions() {
+        // Regression: the viewport built its scene from regions alone, so an
+        // imported stroke was invisible — the drawing looked like it had lost
+        // geometry. Both the run-path scene (here) and the GUI's pre-run scene must
+        // include open paths.
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_WITH_STROKE_DXF, "part.dxf").unwrap();
+        // The rectangle ring plus the V stroke: at least one strip must trace the
+        // stroke's vertices, and it must NOT be closed back to its start.
+        let stroke = app.open_paths()[0].points().to_vec();
+        let out = app.run(&CancelToken::new());
+        let first = [stroke[0].x as f32, stroke[0].y as f32, 0.0];
+        let hit = out.scene.strips.iter().find(|s| {
+            s.points.len() == stroke.len()
+                && s.points[0][0] == first[0]
+                && s.points[0][1] == first[1]
+        });
+        let hit = hit.expect("the open stroke must be in the scene");
+        assert_ne!(
+            hit.points.first(),
+            hit.points.last(),
+            "an open stroke must not be drawn closed"
+        );
+    }
+
+    #[test]
+    fn geometry_is_present_when_only_open_paths_were_imported() {
+        // A drawing can legitimately be nothing but engravable strokes. Treating
+        // "no regions" as "no geometry" would hide it and block op creation.
+        const STROKES_ONLY: &str = "\
+0\nSECTION\n2\nENTITIES\n\
+0\nLINE\n10\n20.0\n20\n20.0\n11\n30.0\n21\n40.0\n\
+0\nLINE\n10\n30.0\n20\n40.0\n11\n40.0\n21\n20.0\n\
+0\nENDSEC\n0\nEOF\n";
+        let mut app = AppController::new(machine());
+        app.open_dxf(STROKES_ONLY, "strokes.dxf").unwrap();
+        assert!(app.regions().is_empty(), "nothing closes");
+        assert_eq!(app.open_paths().len(), 1);
+        assert!(app.has_geometry(), "strokes are geometry");
+        // And the creation wizard must be willing to start.
+        app.begin_operation(OpKind::Engrave);
+        assert!(app.pending_op().is_some(), "engraving must be startable");
     }
 
     #[test]

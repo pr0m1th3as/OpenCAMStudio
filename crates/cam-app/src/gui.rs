@@ -1543,15 +1543,20 @@ fn add_snap_marker(scene: &mut Scene, hit: SnapHit, aperture: f64, z: f32) {
     scene.add_strip(strip, SNAP_MARK);
 }
 
-/// Add a closed contour to the scene as a highlight strip in `color`.
-fn add_loop_highlight(scene: &mut Scene, c: &cam_geo::Contour, color: [f32; 4]) {
-    let mut strip: Vec<[f32; 3]> = c
-        .points()
-        .iter()
-        .map(|p| [p.x as f32, p.y as f32, 0.0])
-        .collect();
-    if let Some(&first) = strip.first() {
-        strip.push(first); // close the loop
+/// Highlight a picked path. `closed` closes it back to its start; an **open**
+/// imported stroke must not be closed, or the highlight would show a segment the
+/// toolpath will never cut.
+fn add_path_highlight(
+    scene: &mut Scene,
+    pts: &[cam_geo::Point],
+    closed: bool,
+    color: [f32; 4],
+) {
+    let mut strip: Vec<[f32; 3]> = pts.iter().map(|p| [p.x as f32, p.y as f32, 0.0]).collect();
+    if closed {
+        if let Some(&first) = strip.first() {
+            strip.push(first);
+        }
     }
     scene.add_strip(strip, color);
 }
@@ -4119,7 +4124,7 @@ impl App {
     /// The command groups for the active tab, or `None` for the Windows tab (which
     /// is a pane-toggle list, not icon commands).
     fn ribbon_specs(&self) -> Option<Vec<GroupSpec>> {
-        let has_geo = !self.controller.regions().is_empty();
+        let has_geo = self.controller.has_geometry();
         // A new op needs geometry to pick; its tool is drawn from the library, so the
         // library must have at least one tool (it seeds defaults, so it always does).
         let can_create = has_geo && !self.library.tools.is_empty();
@@ -6324,6 +6329,11 @@ impl Viewport {
                 for region in controller.regions() {
                     scene.add_region(region, PART);
                 }
+                // Open imported strokes too, or an engravable path is invisible until
+                // (and unless) a run happens to include it.
+                for path in controller.open_paths() {
+                    scene.add_open_path(path.points(), PART);
+                }
                 scene
             }
         };
@@ -6342,24 +6352,24 @@ impl Viewport {
         if let Some(pending) = controller.pending_op() {
             // The loop under the cursor (what a click selects), drawn first so the
             // boundary/island highlights paint over it once chosen.
-            if let Some(c) = hover_loop
+            if let Some((pts, closed)) = hover_loop
                 .filter(|l| Some(*l) != pending.boundary)
-                .and_then(|l| controller.loop_contour(l))
+                .and_then(|l| controller.loop_points(l))
             {
-                add_loop_highlight(&mut scene, c, PICK_HOVER);
+                add_path_highlight(&mut scene, &pts, closed, PICK_HOVER);
             }
-            if let Some(c) = pending.boundary.and_then(|b| controller.loop_contour(b)) {
-                add_loop_highlight(&mut scene, c, PICK_BOUNDARY);
+            if let Some((pts, closed)) = pending.boundary.and_then(|b| controller.loop_points(b)) {
+                add_path_highlight(&mut scene, &pts, closed, PICK_BOUNDARY);
             }
             for island in &pending.islands {
-                if let Some(c) = controller.loop_contour(*island) {
-                    add_loop_highlight(&mut scene, c, PICK_ISLAND);
+                if let Some((pts, closed)) = controller.loop_points(*island) {
+                    add_path_highlight(&mut scene, &pts, closed, PICK_ISLAND);
                 }
             }
         }
         // The workpiece-origin datum marker (View toggle), only once geometry is
         // loaded — never on an empty document at startup — and sized to the scene.
-        if show_origin && !controller.regions().is_empty() {
+        if show_origin && controller.has_geometry() {
             if let Some((mn, mx)) = bounds {
                 let origin = controller.document().setup.origin;
                 let r = ((mx[0] - mn[0]).max(mx[1] - mn[1]) * 0.06).max(1.0);
@@ -6393,7 +6403,7 @@ impl Viewport {
         // Frame on the stock (stable across parameter edits) so the part keeps a
         // constant on-screen size; fall back to the scene extent before any
         // geometry is loaded.
-        let frame_bounds = if controller.regions().is_empty() {
+        let frame_bounds = if !controller.has_geometry() {
             bounds
         } else {
             let (mn, mx) = controller.stock_box();
