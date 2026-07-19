@@ -229,7 +229,7 @@ fn carve_doc() -> Document {
     let op = CarveOp {
         id: 0,
         tool: 1,
-        clear_tool: Some(2),
+        clear: Some(cam_model::CarveClearing { tool: 2, params: cam_model::ClearParams::default() }),
         boundary: rect(0.0, 0.0, 40.0, 40.0),
         islands: Vec::new(),
         top: TOP,
@@ -239,11 +239,6 @@ fn carve_doc() -> Document {
         feed: 300.0,
         plunge_feed: 100.0,
         stay_down: true,
-        clear_stepover: 0.0,
-        clear_stepdown: 0.0,
-        clear_feed: 0.0,
-        clear_plunge_feed: 0.0,
-        clear_plunge: Plunge::Straight,
         start: None,
     };
     setup(vec![Operation::Carve(op)], vec![vbit, end_mill(2, 6.0)])

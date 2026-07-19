@@ -295,6 +295,87 @@ impl Default for Clearing {
     }
 }
 
+/// The parameters of an **area-clearing pass** — everything a pocket takes except its
+/// geometry and depth.
+///
+/// Factored out because a carve's clearing pass is not a reduced pocket, it is a pocket
+/// over a derived region: the same engine, the same controls, the same expectations. A
+/// set of `clear_*` scalars copied beside it would drift from the real thing the first
+/// time either gained a control the other did not.
+///
+/// [`PocketOp`] still carries these flat, and should adopt this struct as a deliberate
+/// schema bump with a migration — its fields are already on disk in saved projects,
+/// which this struct's first user ([`CarveOp`]) is not.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ClearParams {
+    /// Maximum depth removed per pass, mm. `0` clears the full depth in one pass.
+    #[serde(default)]
+    pub stepdown: f64,
+    /// Fraction of the tool diameter that adjacent rings overlap (0..1). The radial
+    /// ring spacing is `diameter * (1 - overlap)`.
+    #[serde(default)]
+    pub overlap: f64,
+    /// Finishing allowance left on the walls, mm.
+    ///
+    /// **A carve must leave this at `0`.** In a pocket the skin is removed later by a
+    /// finishing profile; a carve has no such pass. The V-bit's innermost ring runs
+    /// *along* the flat land's boundary, it does not clear beside it, so an allowance
+    /// would leave an uncut full-depth ridge exactly at the wall/floor junction.
+    #[serde(default)]
+    pub offset: f64,
+    /// Cutting feed, mm/min.
+    #[serde(default)]
+    pub feed: f64,
+    /// Plunge feed, mm/min.
+    #[serde(default)]
+    pub plunge_feed: f64,
+    /// How the tool enters the material in Z at each pass.
+    #[serde(default)]
+    pub plunge: Plunge,
+    /// Lead-in onto the finished walls, eased from the cleared interior.
+    #[serde(default)]
+    pub lead_in: Lead,
+    /// Lead-out off the walls after the finishing pass.
+    #[serde(default)]
+    pub lead_out: Lead,
+    /// Distance each ring keeps cutting past its start before retracting, mm, so the
+    /// loop-closure junction leaves no witness dent.
+    #[serde(default)]
+    pub lead_overlap: f64,
+    /// Constant-engagement clearing parameters (engagement cap + climb).
+    #[serde(default)]
+    pub clearing: Clearing,
+}
+
+impl Default for ClearParams {
+    fn default() -> Self {
+        Self {
+            stepdown: 0.0,
+            // Half the diameter: the same spacing a pocket's own default overlap gives.
+            overlap: 0.5,
+            offset: 0.0,
+            feed: 0.0,
+            plunge_feed: 0.0,
+            plunge: Plunge::Straight,
+            lead_in: Lead::None,
+            lead_out: Lead::None,
+            lead_overlap: 0.0,
+            clearing: Clearing::default(),
+        }
+    }
+}
+
+/// A carve's optional **clearing pass**: which tool clears the flat land, and how.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CarveClearing {
+    /// The flat-bottomed tool that clears the flat land at full depth, before the
+    /// V-bit runs.
+    pub tool: u32,
+    /// How it clears. Feeds of `0` inherit the carve's own.
+    #[serde(default)]
+    pub params: ClearParams,
+}
+
 /// A 2.5-D pocket-clearing operation: remove all material inside a closed
 /// boundary (leaving any islands standing), in concentric offset rings, in
 /// stepdown passes, down to a depth.
@@ -667,11 +748,11 @@ pub struct CarveOp {
     /// The V-bit — the defining tool, chosen in the creation wizard. The strategy reads
     /// its half-angle and tip radius; the carve's shape follows from them.
     pub tool: u32,
-    /// An end mill that clears the flat land at full depth **before** the V-bit runs.
-    /// `None` means the V-bit does the lot, which cuts but leaves a **ridged** floor —
-    /// a cone cannot leave a flat one — and is warned about, not rejected.
+    /// The clearing pass that removes the flat land at full depth **before** the V-bit
+    /// runs. `None` means the V-bit does the lot, which cuts but leaves a **ridged**
+    /// floor — a cone cannot leave a flat one — and is warned about, not rejected.
     #[serde(default)]
-    pub clear_tool: Option<u32>,
+    pub clear: Option<CarveClearing>,
     /// The closed boundary of the region to carve, in the part/WCS frame.
     pub boundary: Contour,
     /// Closed islands left uncut — holes, and the counters of letters. Auto-populated
@@ -709,24 +790,6 @@ pub struct CarveOp {
     /// between every ring.
     #[serde(default)]
     pub stay_down: bool,
-    /// Stepover of the clearing pass, mm. `0` derives `0.5·⌀`. Only meaningful with
-    /// `clear_tool`.
-    #[serde(default)]
-    pub clear_stepover: f64,
-    /// Maximum depth per clearing pass, mm. `0` clears the full depth in one pass.
-    #[serde(default)]
-    pub clear_stepdown: f64,
-    /// Clearing feed, mm/min. `0` inherits `feed`.
-    #[serde(default)]
-    pub clear_feed: f64,
-    /// Clearing plunge feed, mm/min. `0` inherits `plunge_feed`.
-    #[serde(default)]
-    pub clear_plunge_feed: f64,
-    /// How the clearing tool enters the material in Z at each level. A carve's flat
-    /// land is entered in solid stock, so a tool that is not centre-cutting — or a
-    /// deep, hard carve — wants a ramp or a helix rather than a straight drop.
-    #[serde(default)]
-    pub clear_plunge: Plunge,
     /// Preferred start location (part XY): each ring begins at the point nearest here.
     /// `None` uses the strategy's default entry.
     #[serde(default)]
@@ -795,7 +858,7 @@ impl Operation {
     /// intervening [`cam_cldata::Step::ToolChange`], since it alone knows the order.
     pub fn tools(&self) -> Vec<u32> {
         match self {
-            Operation::Carve(op) => match op.clear_tool {
+            Operation::Carve(op) => match op.clear.map(|c| c.tool) {
                 Some(clear) if clear != op.tool => vec![clear, op.tool],
                 _ => vec![op.tool],
             },
@@ -842,7 +905,9 @@ impl Operation {
         let t = f(self.tool());
         self.set_tool(t);
         if let Operation::Carve(op) = self {
-            op.clear_tool = op.clear_tool.map(&f);
+            if let Some(c) = &mut op.clear {
+                c.tool = f(c.tool);
+            }
         }
     }
 
@@ -944,7 +1009,7 @@ mod tests {
         Operation::Carve(CarveOp {
             id: 3,
             tool: 4,
-            clear_tool,
+            clear: clear_tool.map(|t| CarveClearing { tool: t, params: ClearParams::default() }),
             boundary: Contour::new(vec![
                 Point::new(0.0, 0.0),
                 Point::new(10.0, 0.0),
@@ -958,11 +1023,6 @@ mod tests {
             feed: 300.0,
             plunge_feed: 100.0,
             stay_down: false,
-            clear_stepover: 0.0,
-            clear_stepdown: 0.0,
-            clear_feed: 0.0,
-            clear_plunge_feed: 0.0,
-            clear_plunge: Plunge::Straight,
             start: None,
         })
     }

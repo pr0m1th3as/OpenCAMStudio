@@ -19,8 +19,8 @@ mod reconcile;
 
 pub use cam_cldata::Point3;
 pub use document::{
-    Axis, CarveOp, ChamferOp, Clearing, Comp, Document, DrillOp, EngraveOp, FaceOp, Hand, Heights,
-    Lead,
+    Axis, CarveClearing, CarveOp, ChamferOp, ClearParams, Clearing, Comp, Document, DrillOp,
+    EngraveOp, FaceOp, Hand, Heights, Lead,
     Operation, Plunge, PocketOp, ProfileOp, Setup, Side, Stock, ThreadOp, SCHEMA_VERSION,
 };
 pub use history::History;

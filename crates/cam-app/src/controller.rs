@@ -1066,7 +1066,7 @@ impl AppController {
                     // No clearing tool by default: the V-bit alone is the simple case,
                     // and the inspector offers the second tool only once the shape is
                     // known to leave a flat land.
-                    clear_tool: None,
+                    clear: None,
                     boundary: chain,
                     islands: island_contours,
                     top: p.top_of_stock,
@@ -1080,11 +1080,6 @@ impl AppController {
                     // On by default: a carve is hundreds of rings, and every link is
                     // verified before it is taken (the ones that would gouge still lift).
                     stay_down: true,
-                    clear_stepover: 0.0,
-                    clear_stepdown: 0.0,
-                    clear_feed: 0.0,
-                    clear_plunge_feed: 0.0,
-                    clear_plunge: Plunge::Straight,
                     start,
                 })
             }
@@ -3547,7 +3542,10 @@ mod tests {
         let number = app.use_tool(mill);
         app.edit_operation(id, |op| {
             if let Operation::Carve(c) = op {
-                c.clear_tool = Some(number);
+                c.clear = Some(cam_model::CarveClearing {
+                    tool: number,
+                    params: cam_model::ClearParams::default(),
+                });
             }
         });
         assert!(

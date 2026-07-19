@@ -33,3 +33,8 @@ serde_json = { workspace = true }
 iced = { version = "0.14", features = ["wgpu", "svg", "canvas"], optional = true }
 wgpu = { version = "27", optional = true }
 rfd = { version = "0.17", optional = true }
+
+[dev-dependencies]
+# Test-only: parse the bundled SVG icons so a malformed one fails loudly instead of
+# rendering as nothing. MPL-2.0, so GPL-3.0-compatible (as acadrust already is).
+roxmltree = "0.20"

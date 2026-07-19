@@ -22,7 +22,8 @@ use iced::widget::{
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
 use cam_model::{
-    Axis, CutDir, Envelope, Hand, Lead, Machine, Operation, Plunge, Point3, Side, ToolKind,
+    Axis, CarveClearing, ClearParams, CutDir, Envelope, Hand, Lead, Machine, Operation, Plunge,
+    Point3, Side, ToolKind,
 };
 use cam_post::PostKind;
 
@@ -116,6 +117,42 @@ enum Icon {
     SetOrigin,
     Info,
     Machine,
+}
+
+impl Icon {
+    /// Every icon, so tests can sweep the whole bundled set. Kept beside the enum:
+    /// a variant added without a line here fails `every_icon_is_listed_in_all`.
+    #[cfg(test)]
+    const ALL: [Icon; 28] = [
+        Icon::New,
+        Icon::Open,
+        Icon::Save,
+        Icon::Import,
+        Icon::Export,
+        Icon::Undo,
+        Icon::Redo,
+        Icon::Run,
+        Icon::Profile,
+        Icon::Pocket,
+        Icon::Drill,
+        Icon::Thread,
+        Icon::Chamfer,
+        Icon::Engrave,
+        Icon::Carve,
+        Icon::Face,
+        Icon::NewTool,
+        Icon::Renumber,
+        Icon::ImportLibrary,
+        Icon::ExportLibrary,
+        Icon::Duplicate,
+        Icon::Delete,
+        Icon::ShowStock,
+        Icon::ResetView,
+        Icon::ShowCube,
+        Icon::SetOrigin,
+        Icon::Info,
+        Icon::Machine,
+    ];
 }
 
 impl Icon {
@@ -944,6 +981,26 @@ enum Field {
     PlungeB,
     /// Carve: radial spacing of the carve rings (mm); 0 = auto.
     RingStep,
+    /// Carve clearing pass: max depth per pass (mm); 0 = full depth in one.
+    ClearStepdown,
+    /// Carve clearing pass: ring overlap as a percentage of the tool diameter.
+    ClearOverlap,
+    /// Carve clearing pass: engagement cap (mm); 0 = plain concentric.
+    ClearEngagement,
+    /// Carve clearing pass: cutting feed (mm/min); 0 inherits the carve's.
+    ClearFeed,
+    /// Carve clearing pass: plunge feed (mm/min); 0 inherits the carve's.
+    ClearPlungeFeed,
+    /// Carve clearing pass: closure overlap past the start (mm).
+    ClearLeadOverlap,
+    /// Carve clearing pass: lead-in size (mm).
+    ClearLeadInSize,
+    /// Carve clearing pass: lead-out size (mm).
+    ClearLeadOutSize,
+    /// Carve clearing pass: plunge parameter A (ramp/zig-zag angle, or helix radius).
+    ClearPlungeA,
+    /// Carve clearing pass: plunge parameter B (zig-zag length, or helix pitch).
+    ClearPlungeB,
 }
 
 impl Field {
@@ -1007,6 +1064,16 @@ impl Field {
             Field::FaceOvershoot => "Overshoot (mm)",
             Field::Engagement => "Engagement (mm, 0=off)",
             Field::RingStep => "Ring step (mm, 0=auto)",
+            Field::ClearStepdown => "Clear stepdown (mm, 0=full)",
+            Field::ClearOverlap => "Clear overlap (%)",
+            Field::ClearEngagement => "Clear engagement (mm, 0=off)",
+            Field::ClearFeed => "Clear feed (mm/min, 0=same)",
+            Field::ClearPlungeFeed => "Clear plunge feed (0=same)",
+            Field::ClearLeadOverlap => "Clear lead overlap (mm)",
+            Field::ClearLeadInSize => "Clear lead-in size (mm)",
+            Field::ClearLeadOutSize => "Clear lead-out size (mm)",
+            Field::ClearPlungeA => "Clear plunge A",
+            Field::ClearPlungeB => "Clear plunge B",
             Field::PlungeA => "Plunge angle/radius",
             Field::PlungeB => "Plunge length/pitch",
         }
@@ -1235,6 +1302,43 @@ impl Field {
                 "How far apart the carve rings step inward (mm). A finish control, like a \
                  scallop tolerance: finer rings give a smoother carved surface and a \
                  longer program. 0 = choose automatically."
+            }
+            Field::ClearStepdown => {
+                "Maximum depth the clearing tool removes per pass (mm). 0 takes the whole \
+                 flat-area depth in one pass."
+            }
+            Field::ClearOverlap => {
+                "How much each clearing ring overlaps the previous, as a percent of the \
+                 clearing tool's diameter. Higher = smoother floor, more passes."
+            }
+            Field::ClearEngagement => {
+                "Adaptive-clearing engagement cap for the clearing pass: the largest \
+                 radial width of cut it takes at once (mm). 0 = plain concentric \
+                 clearing. Climb only."
+            }
+            Field::ClearFeed => {
+                "Cutting feed for the clearing pass (mm/min). 0 uses the carve's own \
+                 feed -- but an end mill and a V-bit rarely want the same number."
+            }
+            Field::ClearPlungeFeed => {
+                "Plunge feed for the clearing pass (mm/min). 0 uses the carve's own."
+            }
+            Field::ClearLeadOverlap => {
+                "How far each clearing ring keeps cutting past its start before leaving \
+                 (mm), to erase the entry/exit witness mark."
+            }
+            Field::ClearLeadInSize => {
+                "Size of the clearing pass's lead-in onto the flat area's edge -- arc \
+                 radius for an arc lead, ramp length for a linear one (mm)."
+            }
+            Field::ClearLeadOutSize => "Size of the clearing pass's lead-out (see lead-in).",
+            Field::ClearPlungeA => {
+                "First clearing-plunge parameter: the ramp/zig-zag angle in degrees, or \
+                 the helix radius in mm, depending on the plunge type."
+            }
+            Field::ClearPlungeB => {
+                "Second clearing-plunge parameter: the zig-zag length, or the helix pitch \
+                 (mm). Unused for a straight plunge."
             }
         }
     }
@@ -1807,6 +1911,12 @@ enum Message {
     CarveClearToolChanged(usize),
     /// Change how the selected carve's clearing tool enters in Z.
     CarveClearPlungeChanged(PlungeKind),
+    /// Climb vs conventional for the selected carve's clearing pass.
+    CarveClearClimbToggled(bool),
+    /// Wall lead-in kind for the selected carve's clearing pass.
+    CarveClearLeadInChanged(LeadKind),
+    /// Wall lead-out kind for the selected carve's clearing pass.
+    CarveClearLeadOutChanged(LeadKind),
     /// A world `(x, y)` picked in the viewport plus the pickbox aperture in world
     /// mm (completes a pending operation).
     PickWorld([f32; 2], f32),
@@ -2799,7 +2909,19 @@ impl App {
                     .map(|t| self.controller.use_tool(t));
                 self.controller.edit_selected_operation(|op| {
                     if let Operation::Carve(c) = op {
-                        c.clear_tool = if on { seed } else { None };
+                        c.clear = match (on, seed) {
+                            // Seed the feeds from the carve's own, so the pass is
+                            // runnable from one click; they are editable straight after.
+                            (true, Some(tool)) => Some(CarveClearing {
+                                tool,
+                                params: ClearParams {
+                                    feed: c.feed,
+                                    plunge_feed: c.plunge_feed,
+                                    ..Default::default()
+                                },
+                            }),
+                            _ => None,
+                        };
                     }
                 });
                 self.rerun();
@@ -2811,7 +2933,16 @@ impl App {
                 let number = self.controller.use_tool(tool);
                 self.controller.edit_selected_operation(|op| {
                     if let Operation::Carve(c) = op {
-                        c.clear_tool = Some(number);
+                        // Keep the parameters; only the cutter changes.
+                        match &mut c.clear {
+                            Some(cl) => cl.tool = number,
+                            none => {
+                                *none = Some(CarveClearing {
+                                    tool: number,
+                                    params: ClearParams::default(),
+                                })
+                            }
+                        }
                     }
                 });
                 self.rerun();
@@ -2819,7 +2950,39 @@ impl App {
             Message::CarveClearPlungeChanged(kind) => {
                 self.controller.edit_selected_operation(|op| {
                     if let Operation::Carve(c) = op {
-                        c.clear_plunge = kind.to_plunge();
+                        if let Some(cl) = &mut c.clear {
+                            cl.params.plunge = kind.to_plunge();
+                        }
+                    }
+                });
+                self.rerun();
+            }
+            Message::CarveClearClimbToggled(on) => {
+                self.controller.edit_selected_operation(|op| {
+                    if let Operation::Carve(c) = op {
+                        if let Some(cl) = &mut c.clear {
+                            cl.params.clearing.climb = on;
+                        }
+                    }
+                });
+                self.rerun();
+            }
+            Message::CarveClearLeadInChanged(kind) => {
+                self.controller.edit_selected_operation(|op| {
+                    if let Operation::Carve(c) = op {
+                        if let Some(cl) = &mut c.clear {
+                            cl.params.lead_in = kind.to_lead(cl.params.lead_in);
+                        }
+                    }
+                });
+                self.rerun();
+            }
+            Message::CarveClearLeadOutChanged(kind) => {
+                self.controller.edit_selected_operation(|op| {
+                    if let Operation::Carve(c) = op {
+                        if let Some(cl) = &mut c.clear {
+                            cl.params.lead_out = kind.to_lead(cl.params.lead_out);
+                        }
                     }
                 });
                 self.rerun();
@@ -3751,14 +3914,44 @@ impl App {
                 // Carve has no stepdown (single-pass, deferred) and no stepover: its
                 // ring spacing plays that role, and `Depth` is a *cap* the shape may
                 // not reach.
-                Some(Operation::Carve(_)) => {
-                    vec![
+                Some(Operation::Carve(c)) => {
+                    let mut fields = vec![
                         Field::Depth,
                         Field::ProfileOffset,
                         Field::RingStep,
                         Field::Feed,
                         Field::PlungeFeed,
-                    ]
+                    ];
+                    // The clearing pass is a pocket over a derived region, so it gets a
+                    // pocket's controls -- all but two. `Depth` is not its own (the
+                    // carve's cap sets it), and a wall finishing allowance would leave a
+                    // full-depth ridge at the wall/floor junction, since the V-bit's
+                    // innermost ring runs along that boundary rather than beside it.
+                    if let Some(cl) = &c.clear {
+                        fields.extend([
+                            Field::ClearStepdown,
+                            Field::ClearOverlap,
+                            Field::ClearEngagement,
+                            Field::ClearFeed,
+                            Field::ClearPlungeFeed,
+                            Field::ClearLeadOverlap,
+                        ]);
+                        if cl.params.lead_in != Lead::None {
+                            fields.push(Field::ClearLeadInSize);
+                        }
+                        if cl.params.lead_out != Lead::None {
+                            fields.push(Field::ClearLeadOutSize);
+                        }
+                        match cl.params.plunge {
+                            Plunge::Straight => {}
+                            Plunge::Ramp { .. } => fields.push(Field::ClearPlungeA),
+                            Plunge::Helix { .. } | Plunge::ZigZag { .. } => {
+                                fields.push(Field::ClearPlungeA);
+                                fields.push(Field::ClearPlungeB);
+                            }
+                        }
+                    }
+                    fields
                 }
                 Some(Operation::Thread(t)) => {
                     let mut fields = vec![
@@ -5526,14 +5719,14 @@ impl App {
                                         help::CARVE_CLEAR,
                                         self.tooltips
                                     ),
-                                    checkbox(c.clear_tool.is_some())
+                                    checkbox(c.clear.is_some())
                                         .size(15)
                                         .on_toggle(Message::CarveClearToggled),
                                 ]
                                 .spacing(8)
                                 .align_y(Alignment::Center),
                             );
-                            if c.clear_tool.is_some() {
+                            if let Some(cl) = &c.clear {
                                 // Flat-bottomed families only: the clearing pass exists
                                 // to leave a flat floor, and the strategy errors on a
                                 // tool that cannot.
@@ -5555,7 +5748,7 @@ impl App {
                                         kind: t.kind,
                                     })
                                     .collect();
-                                let current = c.clear_tool.and_then(|n| {
+                                let current = Some(cl.tool).and_then(|n| {
                                     let embedded = self
                                         .controller
                                         .document()
@@ -5585,13 +5778,42 @@ impl App {
                                     .spacing(8)
                                     .align_y(Alignment::Center),
                                 );
+                                // A pocket's controls, because that is what this pass
+                                // is. The numeric fields come through the normal field
+                                // list; these are the pickers and the toggle.
                                 list = list.push(profile_picker(
                                     "Clearing plunge",
                                     help::CARVE_CLEAR_PLUNGE,
                                     self.tooltips,
-                                    PlungeKind::of(c.clear_plunge),
+                                    PlungeKind::of(cl.params.plunge),
                                     &PlungeKind::ALL[..],
                                     Message::CarveClearPlungeChanged,
+                                ));
+                                list = list.push(
+                                    row![
+                                        label_help("Clearing climb", help::CLIMB, self.tooltips),
+                                        checkbox(cl.params.clearing.climb)
+                                            .size(15)
+                                            .on_toggle(Message::CarveClearClimbToggled),
+                                    ]
+                                    .spacing(8)
+                                    .align_y(Alignment::Center),
+                                );
+                                list = list.push(profile_picker(
+                                    "Clearing lead-in",
+                                    help::LEAD_IN,
+                                    self.tooltips,
+                                    LeadKind::of(cl.params.lead_in),
+                                    &LeadKind::ALL[..],
+                                    Message::CarveClearLeadInChanged,
+                                ));
+                                list = list.push(profile_picker(
+                                    "Clearing lead-out",
+                                    help::LEAD_OUT,
+                                    self.tooltips,
+                                    LeadKind::of(cl.params.lead_out),
+                                    &LeadKind::ALL[..],
+                                    Message::CarveClearLeadOutChanged,
                                 ));
                             }
                         }
@@ -6080,6 +6302,16 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Carve(o), Field::RingStep) => Some(o.ring_step),
         (Operation::Carve(o), Field::Feed) => Some(o.feed),
         (Operation::Carve(o), Field::PlungeFeed) => Some(o.plunge_feed),
+        (Operation::Carve(o), Field::ClearStepdown) => Some(o.clear?.params.stepdown),
+        (Operation::Carve(o), Field::ClearOverlap) => Some(o.clear?.params.overlap * 100.0),
+        (Operation::Carve(o), Field::ClearEngagement) => Some(o.clear?.params.clearing.engagement),
+        (Operation::Carve(o), Field::ClearFeed) => Some(o.clear?.params.feed),
+        (Operation::Carve(o), Field::ClearPlungeFeed) => Some(o.clear?.params.plunge_feed),
+        (Operation::Carve(o), Field::ClearLeadOverlap) => Some(o.clear?.params.lead_overlap),
+        (Operation::Carve(o), Field::ClearLeadInSize) => Some(lead_size(o.clear?.params.lead_in)),
+        (Operation::Carve(o), Field::ClearLeadOutSize) => Some(lead_size(o.clear?.params.lead_out)),
+        (Operation::Carve(o), Field::ClearPlungeA) => Some(plunge_params(o.clear?.params.plunge).0),
+        (Operation::Carve(o), Field::ClearPlungeB) => Some(plunge_params(o.clear?.params.plunge).1),
         (Operation::Profile(o), Field::Engagement) => Some(o.clearing.engagement),
         (Operation::Profile(o), Field::PlungeA) => Some(plunge_params(o.plunge).0),
         (Operation::Profile(o), Field::PlungeB) => Some(plunge_params(o.plunge).1),
@@ -6325,6 +6557,37 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
             }
         }
         Operation::Carve(o) => {
+            if let Some(cl) = &mut o.clear {
+                let p = &mut cl.params;
+                if let Some(v) = get(Field::ClearStepdown) {
+                    p.stepdown = v.max(0.0);
+                }
+                if let Some(v) = get(Field::ClearOverlap) {
+                    p.overlap = (v / 100.0).clamp(0.0, 0.99);
+                }
+                if let Some(v) = get(Field::ClearEngagement) {
+                    p.clearing.engagement = v.max(0.0);
+                }
+                if let Some(v) = get(Field::ClearFeed) {
+                    p.feed = v.max(0.0);
+                }
+                if let Some(v) = get(Field::ClearPlungeFeed) {
+                    p.plunge_feed = v.max(0.0);
+                }
+                if let Some(v) = get(Field::ClearLeadOverlap) {
+                    p.lead_overlap = v.max(0.0);
+                }
+                if let Some(v) = get(Field::ClearLeadInSize) {
+                    p.lead_in = set_lead_size(p.lead_in, v);
+                }
+                if let Some(v) = get(Field::ClearLeadOutSize) {
+                    p.lead_out = set_lead_size(p.lead_out, v);
+                }
+                let (a, b) = plunge_params(p.plunge);
+                let a = get(Field::ClearPlungeA).unwrap_or(a);
+                let b = get(Field::ClearPlungeB).unwrap_or(b);
+                p.plunge = set_plunge_params(p.plunge, a, b);
+            }
             if let Some(v) = get(Field::Depth) {
                 o.depth = v;
             }
@@ -7709,6 +7972,35 @@ mod ribbon_tests {
         // Carving is a V-bit operation for the same reason engraving is: the cut's
         // shape is the tool's own cone.
         assert_eq!(families_for(OpKind::Carve), &[F::VBit]);
+    }
+
+    #[test]
+    fn every_bundled_icon_is_well_formed_svg() {
+        // carve.svg once shipped with "--" inside an XML comment, which XML forbids.
+        // The renderer does not complain: it simply draws nothing, so the button came
+        // out blank and no test, build or clippy run had a word to say about it.
+        // Parse every icon so a malformed one fails loudly instead of silently.
+        for icon in Icon::ALL {
+            let bytes = icon.bytes();
+            let text = std::str::from_utf8(bytes).expect("an icon must be UTF-8");
+            let doc = roxmltree::Document::parse(text)
+                .unwrap_or_else(|e| panic!("{icon:?} is not well-formed SVG: {e}"));
+            assert_eq!(
+                doc.root_element().tag_name().name(),
+                "svg",
+                "{icon:?} is not an SVG"
+            );
+        }
+    }
+
+    #[test]
+    fn every_icon_is_listed_in_all() {
+        // A cheap guard on the sweep above: if a variant is added without extending
+        // ALL, the icon it names goes unchecked.
+        let mut seen: Vec<&[u8]> = Icon::ALL.iter().map(|i| i.bytes()).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), Icon::ALL.len(), "two variants share one asset");
     }
 
     #[test]
