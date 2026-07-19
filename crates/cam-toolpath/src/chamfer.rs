@@ -14,6 +14,16 @@
 //! Then the flank meets the top face `w` inside the edge and the tip sits at the
 //! bevel's lower corner — one pass, since a chamfer is shallow. Derived by placing
 //! the cone so the tip lands at the bevel bottom (see the project notes).
+//!
+//! ## Chamfer mill *or* V-bit
+//!
+//! Either tool chamfers, because a chamfer is cut by the **flank**, which both have.
+//! They differ only in what sits at the bottom: a chamfer mill has a flat tip of
+//! radius `rt`, a V-bit a *rounded* one. Extending the V-bit's flank line down to the
+//! tool's lowest point gives an equivalent flat radius of `rt·(1 − sin α)/cos α` — the
+//! ball tucks **under** the flank — after which every formula here is unchanged.
+//! (Note the asymmetry: engraving does *not* accept a chamfer mill, because it cuts
+//! with the tip, which on a chamfer mill does not cut at all.)
 
 use cam_cldata::{MoveKind, Point3, Program, Step, Tag};
 use cam_geo::{offset, Contour, JoinStyle, Polygon};
@@ -60,16 +70,44 @@ impl Strategy for ChamferStrategy {
             bail!();
         };
 
-        // A chamfer needs an angled tool — the bevel angle comes from the tool.
-        let (included_angle_deg, tip_diameter) = match tool.kind {
+        // A chamfer needs an angled tool — the bevel angle comes from the tool. Both a
+        // chamfer mill and a **V-bit** qualify: a chamfer is cut by the *flank*, which
+        // both have. (The reverse is not true — engraving needs a cutting tip, so it
+        // rejects a chamfer mill; see [`crate::engrave`].)
+        //
+        // `tip_offset` is the radius at which the cutting flank meets the tool's
+        // lowest point — how far the axis must clear the corner:
+        //
+        // - **chamfer mill**: the flat tip's radius, directly.
+        // - **V-bit**: the flat that its *rounded* tip is equivalent to. Extending the
+        //   flank line `r = rt·cos α + (z − z_t)·tan α` down to `z = 0` (with the
+        //   tangent point `z_t = rt·(1 − sin α)`) gives an intercept of
+        //   `rt·(1 − sin α)/cos α` — so the ball tucks *under* the flank and the tool
+        //   sits closer to the edge than its tip radius would suggest. Every formula
+        //   below then carries over unchanged, since the flank line is identical.
+        let (included_angle_deg, tip_offset) = match tool.kind {
             ToolKind::ChamferMill {
                 included_angle_deg,
                 tip_diameter,
-            } => (included_angle_deg, tip_diameter),
+            } => (included_angle_deg, 0.5 * tip_diameter),
+            ToolKind::VBit {
+                included_angle_deg,
+                tip_radius,
+            } => {
+                let a = 0.5 * included_angle_deg.to_radians();
+                let cos_a = a.cos();
+                let equiv = if cos_a > 1e-9 {
+                    tip_radius * (1.0 - a.sin()) / cos_a
+                } else {
+                    0.0
+                };
+                (included_angle_deg, equiv)
+            }
             _ => {
                 diagnostics.push(Diagnostic::error(format!(
-                    "operation {}: tool {} is not a chamfer/V mill; a chamfer needs its point angle",
-                    op.id, op.tool
+                    "operation {}: tool {} is a {}; a chamfer needs an angled tool \
+                     (a chamfer mill or a V-bit) whose flank forms the bevel",
+                    op.id, op.tool, tool.kind
                 )));
                 bail!();
             }
@@ -101,7 +139,6 @@ impl Strategy for ChamferStrategy {
             bail!();
         }
 
-        let tip_radius = 0.5 * tip_diameter;
         // The tool flank shares the bevel's angle, so it lies along the finished
         // bevel plane; sliding the tool down that plane changes which flank section
         // cuts. `d_min` is the tip's natural depth (tip exactly at the bevel bottom).
@@ -141,7 +178,7 @@ impl Strategy for ChamferStrategy {
         // Offset the tool axis to the air side by the deep-plunge shift plus the tip
         // radius (0 for a sharp V at the tip keeps it on the edge). Sign follows the
         // profile convention.
-        let off = delta * tan_a + tip_radius;
+        let off = delta * tan_a + tip_offset;
         let signed = match op.side {
             Side::Outside => off,
             Side::Inside => -off,
@@ -344,6 +381,20 @@ mod tests {
     use cam_cldata::Step;
     use cam_geo::{Contour, Point};
     use cam_model::{Heights, Lead, Tool};
+
+    fn vbit_tool(included_angle_deg: f64, tip_radius: f64) -> Tool {
+        Tool {
+            number: 1,
+            diameter: 6.0,
+            length: 30.0,
+            flutes: 1,
+            kind: ToolKind::VBit {
+                included_angle_deg,
+                tip_radius,
+            },
+            ..Default::default()
+        }
+    }
 
     fn chamfer_tool(included_angle_deg: f64, tip_diameter: f64) -> Tool {
         Tool {
@@ -637,5 +688,76 @@ mod tests {
         let r = run(o, chamfer_tool(90.0, 0.0));
         assert!(!r.has_errors(), "{:?}", r.diagnostics);
         assert_eq!(plunge_count(&r), 9, "equal-area gradual ⇒ 9 passes for 3 mm @ step 1");
+    }
+
+
+    fn xy_of_first_cut(prog: &Program) -> [f64; 2] {
+        prog.steps()
+            .iter()
+            .find_map(|s| match s {
+                Step::Linear { to, tag, .. } if tag.kind == MoveKind::Cutting => Some([to.x, to.y]),
+                Step::Arc { end, tag, .. } if tag.kind == MoveKind::Cutting => Some([end.x, end.y]),
+                _ => None,
+            })
+            .expect("a cutting move")
+    }
+
+    #[test]
+    fn a_vbit_is_accepted_for_chamfering() {
+        let r = run(op(1.0), vbit_tool(90.0, 0.0));
+        assert!(
+            r.diagnostics
+                .iter()
+                .all(|d| d.severity != crate::Severity::Error),
+            "{:?}",
+            r.diagnostics
+        );
+        assert!(!r.program.steps().is_empty());
+    }
+
+    #[test]
+    fn a_sharp_vbit_matches_a_sharp_chamfer_mill_exactly() {
+        // Same flank, no tip on either → byte-identical geometry.
+        let a = run(op(1.0), vbit_tool(90.0, 0.0));
+        let b = run(op(1.0), chamfer_tool(90.0, 0.0));
+        assert_eq!(a.program.steps(), b.program.steps());
+    }
+
+    #[test]
+    fn a_rounded_tip_is_equivalent_to_a_smaller_flat_not_its_own_radius() {
+        // The bug this guards: treating the V-bit's tip radius as if it were a flat
+        // radius would offset the tool too far from the edge, cutting a narrow bevel.
+        // The correct equivalent flat is rt·(1 − sin α)/cos α, which is strictly
+        // smaller (the ball tucks under the flank).
+        let (deg, rt) = (90.0_f64, 0.5_f64);
+        let a = 0.5 * deg.to_radians();
+        let equiv = rt * (1.0 - a.sin()) / a.cos();
+        assert!(equiv < rt, "equiv {equiv} should tuck under rt {rt}");
+
+        let got = xy_of_first_cut(&run(op(1.0), vbit_tool(deg, rt)).program);
+        let want = xy_of_first_cut(&run(op(1.0), chamfer_tool(deg, 2.0 * equiv)).program);
+        let wrong = xy_of_first_cut(&run(op(1.0), chamfer_tool(deg, 2.0 * rt)).program);
+        assert!(
+            (got[0] - want[0]).abs() < 1e-9 && (got[1] - want[1]).abs() < 1e-9,
+            "got {got:?} want {want:?}"
+        );
+        assert!(
+            (got[0] - wrong[0]).abs() > 1e-6 || (got[1] - wrong[1]).abs() > 1e-6,
+            "the naive tip-radius-as-flat reading must differ"
+        );
+    }
+
+    #[test]
+    fn a_flat_end_mill_is_still_rejected() {
+        let mut t = chamfer_tool(90.0, 0.0);
+        t.kind = ToolKind::EndMill;
+        let r = run(op(1.0), t);
+        let errs: Vec<_> = r
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == crate::Severity::Error)
+            .collect();
+        assert_eq!(errs.len(), 1, "{:?}", r.diagnostics);
+        assert!(errs[0].message.contains("chamfer mill or a V-bit"));
     }
 }
