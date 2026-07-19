@@ -17,6 +17,7 @@
 //!   `cdylib` plugin ABI later is cheap.
 
 mod chamfer;
+mod engrave;
 mod clearing;
 mod adaptive;
 mod clearsim;
@@ -39,6 +40,7 @@ use cam_cldata::Program;
 use cam_model::{Heights, Tool};
 
 pub use chamfer::ChamferStrategy;
+pub use engrave::EngraveStrategy;
 pub use drill::DrillStrategy;
 pub use face::FaceStrategy;
 pub use plan::build_job;

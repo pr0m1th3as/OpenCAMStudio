@@ -146,6 +146,9 @@ impl ToolLibrary {
             OpKind::Drill => first(|k| matches!(k, ToolKind::Drill { .. })),
             OpKind::Thread => first(|k| matches!(k, ToolKind::ThreadMill { .. })),
             OpKind::Chamfer => first(|k| matches!(k, ToolKind::ChamferMill { .. })),
+            // Engraving *requires* a V-bit (a chamfer mill's tip does not cut), so
+            // this is the one default that matches the strategy's hard gate.
+            OpKind::Engrave => first(|k| matches!(k, ToolKind::VBit { .. })),
         };
         preferred.or_else(|| self.tools.first()).copied()
     }
@@ -438,4 +441,29 @@ mod tests {
         assert_eq!(lib.add_tool(existing), 2);
         assert_eq!(lib.tools.len(), before + 1);
     }
+    #[test]
+    fn engrave_defaults_to_a_v_bit_not_a_chamfer_mill() {
+        // The strategy hard-rejects a chamfer mill, so the default must not hand the
+        // user an operation that cannot possibly run.
+        let lib = ToolLibrary {
+            tools: vec![
+                mk(1, 6.0, ToolKind::ChamferMill {
+                    included_angle_deg: 90.0,
+                    tip_diameter: 0.0,
+                }),
+                mk(2, 6.0, ToolKind::VBit {
+                    included_angle_deg: 60.0,
+                    tip_radius: 0.2,
+                }),
+            ],
+        };
+        assert_eq!(
+            lib.default_tool_for(OpKind::Engrave).unwrap().number,
+            2,
+            "must pick the V-bit over the chamfer mill"
+        );
+        // Chamfering still prefers the chamfer mill.
+        assert_eq!(lib.default_tool_for(OpKind::Chamfer).unwrap().number, 1);
+    }
+
 }

@@ -9,8 +9,8 @@ use cam_cldata::{Coolant, MoveKind, Point3, Program, SpindleDir, Step, Tag};
 use cam_model::{Document, Operation};
 
 use crate::{
-    CancelToken, ChamferStrategy, Diagnostic, DrillStrategy, FaceStrategy, JobEnv, PocketStrategy,
-    ProfileStrategy, Strategy, StrategyResult, ThreadStrategy,
+    CancelToken, ChamferStrategy, Diagnostic, DrillStrategy, EngraveStrategy, FaceStrategy, JobEnv,
+    PocketStrategy, ProfileStrategy, Strategy, StrategyResult, ThreadStrategy,
 };
 
 /// Assemble a whole-job [`Program`] from a [`Document`].
@@ -106,6 +106,7 @@ fn compute(operation: &Operation, env: &JobEnv, cancel: &CancelToken) -> Strateg
         Operation::Face(op) => FaceStrategy::new(op.clone()).compute(env, cancel),
         Operation::Chamfer(op) => ChamferStrategy::new(op.clone()).compute(env, cancel),
         Operation::Thread(op) => ThreadStrategy::new(op.clone()).compute(env, cancel),
+        Operation::Engrave(op) => EngraveStrategy::new(op.clone()).compute(env, cancel),
     }
 }
 
@@ -117,5 +118,6 @@ fn operation_tool(operation: &Operation) -> u32 {
         Operation::Face(op) => op.tool,
         Operation::Chamfer(op) => op.tool,
         Operation::Thread(op) => op.tool,
+        Operation::Engrave(op) => op.tool,
     }
 }

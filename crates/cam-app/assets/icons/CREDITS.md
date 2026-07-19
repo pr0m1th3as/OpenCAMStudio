@@ -29,6 +29,8 @@ showing what each operation does to it:
 - `profile.svg` — Profile operation (contour toolpath around the part)
 - `pocket.svg` — Pocket operation (recess cut into the top)
 - `face.svg` — Face operation (machined top face)
+- `engrave.svg` — Engrave operation (a V-bit ploughing a V-groove into the top face;
+  deliberately distinct from `chamfer.svg`, whose bevel sits on a *corner*)
 
 The hole-making Operations use a **flat tool glyph** instead, so they read at a
 glance and stay visually distinct from each other:

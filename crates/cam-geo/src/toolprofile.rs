@@ -311,6 +311,70 @@ fn tessellate_arc(from: Point, to: Point, center: Point, ccw: bool, tol: f64, ou
     }
 }
 
+/// Half the width of the groove a **V-bit** cuts when its tip is sunk `depth` mm
+/// below a flat surface — i.e. the radius at which the [`BottomShape::VTip`] profile
+/// stands `depth` above its lowest point.
+///
+/// The tip is a `tip_radius` ball centred on the axis at `(0, tip_radius)`, tangent
+/// to the cone at radial `tip_radius·cos α`, height `tip_radius·(1 − sin α)`. So the
+/// width is **piecewise**:
+///
+/// - in the ball (`depth ≤ tip_radius·(1 − sin α)`): `√(2·rt·depth − depth²)`
+/// - on the flank: `rt·cos α + (depth − rt·(1 − sin α))·tan α`
+///
+/// The two agree at the tangent point (both give `rt·cos α`), so the result is
+/// continuous. For a **sharp** tip (`tip_radius == 0`) this reduces to the familiar
+/// `depth·tan α`; note that for a *tipped* bit the naive `depth·tan α` badly
+/// understates the width at shallow depth — exactly the engraving regime — since the
+/// ball term grows as `√depth`.
+///
+/// A non-positive `depth` gives `0`. The result is **not** clamped to the tool's
+/// cutting radius: callers that care (an engraving strategy checking the cone has not
+/// flared past the shank) should gate on [`vtip_max_depth`] first.
+pub fn vtip_half_width(half_angle_rad: f64, tip_radius: f64, depth: f64) -> f64 {
+    if depth <= 0.0 {
+        return 0.0;
+    }
+    let a = half_angle_rad;
+    let rt = tip_radius.max(0.0);
+    if rt <= EPS || a <= EPS {
+        // Sharp cone: the flank starts at the point itself.
+        return if a > EPS { depth * a.tan() } else { 0.0 };
+    }
+    let z_t = rt * (1.0 - a.sin()); // tangent height, ball → cone
+    if depth <= z_t {
+        // On the ball: a circle of radius rt centred at height rt.
+        (2.0 * rt * depth - depth * depth).max(0.0).sqrt()
+    } else {
+        rt * a.cos() + (depth - z_t) * a.tan()
+    }
+}
+
+/// The greatest depth a **V-bit** of cutting radius `radius` can engrave before the
+/// cone flares past its cutting edge into the shank — the height of the
+/// [`BottomShape::VTip`] profile at the full cutting radius.
+///
+/// Cutting deeper than this rubs the shank against the groove walls: no cutting edge
+/// is in contact, so it is a hard limit, not a preference.
+pub fn vtip_max_depth(half_angle_rad: f64, tip_radius: f64, radius: f64) -> f64 {
+    let a = half_angle_rad;
+    let r = radius.max(0.0);
+    if a <= EPS {
+        return 0.0;
+    }
+    let rt = tip_radius.clamp(0.0, r);
+    if rt <= EPS {
+        return r / a.tan();
+    }
+    let r_t = rt * a.cos();
+    let z_t = rt * (1.0 - a.sin());
+    if r <= r_t {
+        // The cutting radius ends inside the tip ball.
+        return rt - (rt * rt - r * r).max(0.0).sqrt();
+    }
+    z_t + (r - r_t) / a.tan()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,6 +388,79 @@ mod tests {
             neck_length: 0.0,
             neck_radius: radius,
             bottom: BottomShape::Flat,
+        }
+    }
+
+    // --- V-groove width (engraving) ---
+
+    #[test]
+    fn sharp_vtip_groove_is_the_naive_cone_width() {
+        // 90° included → α=45°, tan α = 1, so half-width == depth at any depth.
+        let a = std::f64::consts::FRAC_PI_4;
+        for d in [0.1, 0.5, 1.0, 3.0] {
+            assert!((vtip_half_width(a, 0.0, d) - d).abs() < 1e-12);
+        }
+        // 60° included → α=30°: half-width = d·tan30.
+        let a30 = std::f64::consts::FRAC_PI_6;
+        assert!((vtip_half_width(a30, 0.0, 2.0) - 2.0 * a30.tan()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn tipped_vtip_is_continuous_across_the_ball_cone_tangent() {
+        // At the tangent point both branches must give rt·cos α — this is what proves
+        // the piecewise split is placed correctly, not merely plausible.
+        for &(deg, rt) in &[(90.0, 0.2), (60.0, 0.5), (30.0, 0.1), (120.0, 0.3)] {
+            let a = (deg * 0.5_f64).to_radians();
+            let z_t = rt * (1.0 - a.sin());
+            let expect = rt * a.cos();
+            let below = vtip_half_width(a, rt, z_t - 1e-9);
+            let at = vtip_half_width(a, rt, z_t);
+            let above = vtip_half_width(a, rt, z_t + 1e-9);
+            assert!((at - expect).abs() < 1e-9, "deg={deg} at={at} want={expect}");
+            assert!((below - at).abs() < 1e-6, "deg={deg} ball side jumps");
+            assert!((above - at).abs() < 1e-6, "deg={deg} cone side jumps");
+        }
+    }
+
+    #[test]
+    fn a_tipped_vtip_cuts_wider_than_the_naive_formula_when_shallow() {
+        // The bug this guards: using depth·tanα for a tipped bit understates the
+        // groove badly at engraving depths, because the ball term grows as √depth.
+        let a = std::f64::consts::FRAC_PI_6; // 60° included
+        let rt = 0.3;
+        let d = 0.02; // a shallow engraving pass, well inside the ball
+        let naive = d * a.tan();
+        let real = vtip_half_width(a, rt, d);
+        assert!(real > 3.0 * naive, "real={real} naive={naive}");
+        // And it is exactly the circle: √(2·rt·d − d²).
+        assert!((real - (2.0 * rt * d - d * d).sqrt()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn vtip_width_is_monotonic_in_depth_and_zero_at_the_surface() {
+        let a = (30.0_f64).to_radians();
+        assert_eq!(vtip_half_width(a, 0.25, 0.0), 0.0);
+        assert_eq!(vtip_half_width(a, 0.25, -1.0), 0.0);
+        let mut prev = 0.0;
+        for i in 1..400 {
+            let d = i as f64 * 0.01;
+            let w = vtip_half_width(a, 0.25, d);
+            assert!(w > prev, "not monotonic at d={d}");
+            prev = w;
+        }
+    }
+
+    #[test]
+    fn vtip_max_depth_agrees_with_the_generatrix_flank_top() {
+        // The gate must equal the profile's own height at the cutting radius.
+        for &(deg, rt, r) in &[(60.0, 0.0, 3.0), (90.0, 0.2, 3.0), (30.0, 0.5, 6.0)] {
+            let a = (deg * 0.5_f64).to_radians();
+            let dmax = vtip_max_depth(a, rt, r);
+            // At the limit the groove half-width is exactly the cutting radius.
+            assert!(
+                (vtip_half_width(a, rt, dmax) - r).abs() < 1e-9,
+                "deg={deg} rt={rt} dmax={dmax}"
+            );
         }
     }
 

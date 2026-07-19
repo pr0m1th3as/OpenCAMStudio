@@ -595,6 +595,56 @@ pub struct ChamferOp {
     pub lead_overlap: f64,
 }
 
+/// A **V-carve engraving** operation: run a V-bit along a path with its tip *in* the
+/// material, so the cone ploughs a V-section groove.
+///
+/// Distinct from [`ChamferOp`] in three ways that matter:
+///
+/// - **The tool must be a V-bit** ([`crate::ToolKind::VBit`]), never a chamfer mill —
+///   a chamfer mill's bottom is a *non-cutting* flat, so engraving with one would rub
+///   rather than cut. The strategy rejects it outright.
+/// - **No side offset.** A chamfer runs beside an edge (offset to the air side); an
+///   engraving groove is centred *on* the path, so the tool axis follows the chain
+///   exactly, with no radius compensation.
+/// - **The path may be open.** Lettering and decorative strokes are open polylines,
+///   not closed regions — see `closed`.
+///
+/// The groove's width follows from `depth` and the tool's geometry
+/// ([`cam_geo::vtip_half_width`]); it is not specified independently.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EngraveOp {
+    /// Operation id.
+    pub id: u32,
+    /// Tool number — must select a V-bit (the strategy reads its angle and tip radius).
+    pub tool: u32,
+    /// The path to engrave, in the part/WCS frame. The tool centre follows it exactly.
+    pub chain: Contour,
+    /// Whether `chain` is a closed loop (the last vertex joins back to the first) or an
+    /// **open** stroke that stops at the last vertex. [`Contour`] is implicitly closed,
+    /// so open strokes — the common case for lettering — are carried by this flag.
+    /// Defaults to `false`: an engraved chain is a stroke unless said otherwise.
+    #[serde(default)]
+    pub closed: bool,
+    /// Absolute Z of the surface being engraved (usually the stock top).
+    pub top: f64,
+    /// Engraving depth below `top`, mm (> 0), as a positive magnitude. The groove
+    /// width follows from this and the tool's V angle and tip radius.
+    pub depth: f64,
+    /// Maximum depth per pass, mm. `0` (the default) cuts the full `depth` in one
+    /// pass — normal for shallow engraving; a deeper groove steps down.
+    #[serde(default)]
+    pub stepdown: f64,
+    /// Cutting feed, mm/min.
+    pub feed: f64,
+    /// Plunge feed for the approach in Z, mm/min.
+    pub plunge_feed: f64,
+    /// Preferred start location (part XY) for a **closed** path: the loop begins at the
+    /// vertex nearest here. Ignored for an open stroke, which must start at its own
+    /// first vertex. `None` starts at the chain's first vertex.
+    #[serde(default)]
+    pub start: Option<[f64; 2]>,
+}
+
 /// An operation in a setup. An enum so a setup holds a heterogeneous, ordered
 /// list.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -611,6 +661,8 @@ pub enum Operation {
     Chamfer(ChamferOp),
     /// A thread-milling operation.
     Thread(ThreadOp),
+    /// A V-carve engraving operation.
+    Engrave(EngraveOp),
 }
 
 impl Operation {
@@ -623,6 +675,7 @@ impl Operation {
             Operation::Face(op) => op.id,
             Operation::Chamfer(op) => op.id,
             Operation::Thread(op) => op.id,
+            Operation::Engrave(op) => op.id,
         }
     }
 
@@ -635,6 +688,7 @@ impl Operation {
             Operation::Face(op) => op.tool,
             Operation::Chamfer(op) => op.tool,
             Operation::Thread(op) => op.tool,
+            Operation::Engrave(op) => op.tool,
         }
     }
 
@@ -647,6 +701,7 @@ impl Operation {
             Operation::Face(op) => op.id = id,
             Operation::Chamfer(op) => op.id = id,
             Operation::Thread(op) => op.id = id,
+            Operation::Engrave(op) => op.id = id,
         }
     }
 
@@ -661,6 +716,7 @@ impl Operation {
             Operation::Face(op) => op.tool = tool,
             Operation::Chamfer(op) => op.tool = tool,
             Operation::Thread(op) => op.tool = tool,
+            Operation::Engrave(op) => op.tool = tool,
         }
     }
 

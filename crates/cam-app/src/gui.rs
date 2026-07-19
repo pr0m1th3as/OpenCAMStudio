@@ -89,6 +89,7 @@ enum Icon {
     Drill,
     Thread,
     Chamfer,
+    Engrave,
     Face,
     NewTool,
     Renumber,
@@ -120,6 +121,7 @@ impl Icon {
             Icon::Drill => include_bytes!("../assets/icons/drill.svg"),
             Icon::Thread => include_bytes!("../assets/icons/thread.svg"),
             Icon::Chamfer => include_bytes!("../assets/icons/chamfer.svg"),
+            Icon::Engrave => include_bytes!("../assets/icons/engrave.svg"),
             Icon::Face => include_bytes!("../assets/icons/face.svg"),
             Icon::NewTool => include_bytes!("../assets/icons/endmill.svg"),
             Icon::Renumber => include_bytes!("../assets/icons/renumber.svg"),
@@ -154,6 +156,9 @@ impl Icon {
             Icon::Drill => "Add a Drill operation — peck/drill the selected hole circles.",
             Icon::Thread => "Add a Thread-milling operation on a bore or boss.",
             Icon::Chamfer => "Add a Chamfer operation — break an edge with a V/chamfer tool.",
+            Icon::Engrave => "Add an Engrave operation — plough a V-groove along a path with a V-bit. \
+                              Groove width follows from the depth and the bit's angle; a chamfer mill \
+                              will not do (its tip does not cut).",
             Icon::Face => "Add a Face operation — skim the top of the stock flat.",
             Icon::NewTool => "Add a new tool to the library.",
             Icon::Renumber => {
@@ -1422,7 +1427,10 @@ const SNAP_MARK_SCALE: f32 = 1.2;
 /// Whether an operation kind uses a start/lead-in point, and so honours object
 /// snaps. Face/Drill/Thread have no start, so snaps are inert (and hidden) there.
 fn op_uses_snaps(kind: OpKind) -> bool {
-    matches!(kind, OpKind::Profile | OpKind::Chamfer | OpKind::Pocket)
+    matches!(
+        kind,
+        OpKind::Profile | OpKind::Chamfer | OpKind::Pocket | OpKind::Engrave
+    )
 }
 
 /// The axis index (0=X, 1=Y, 2=Z) a start-point offset field addresses.
@@ -3510,6 +3518,14 @@ impl App {
                     fields.push(Field::LeadOverlap);
                     fields
                 }
+                Some(Operation::Engrave(_)) => {
+                    vec![
+                        Field::Depth,
+                        Field::Stepdown,
+                        Field::Feed,
+                        Field::PlungeFeed,
+                    ]
+                }
                 Some(Operation::Thread(t)) => {
                     let mut fields = vec![
                         Field::MajorDia,
@@ -4064,6 +4080,7 @@ impl App {
                     cmd(Icon::Drill, "Drill", begin(OpKind::Drill)),
                     cmd(Icon::Thread, "Thread", begin(OpKind::Thread)),
                     cmd(Icon::Chamfer, "Chamfer", begin(OpKind::Chamfer)),
+                    cmd(Icon::Engrave, "Engrave", begin(OpKind::Engrave)),
                     cmd(Icon::Face, "Face", begin(OpKind::Face)),
                 ],
             }],
@@ -4506,6 +4523,7 @@ impl App {
             OpKind::Face => "Face",
             OpKind::Chamfer => "Chamfer",
             OpKind::Thread => "Thread",
+            OpKind::Engrave => "Engrave",
         };
         // The tool is picked from the cross-project library; picking embeds a copy
         // into the setup (see `use_tool`). The current selection is the library entry
@@ -5554,6 +5572,7 @@ fn op_kind(op: &Operation) -> &'static str {
         Operation::Face(_) => "Face",
         Operation::Chamfer(_) => "Chamfer",
         Operation::Thread(_) => "Thread",
+        Operation::Engrave(_) => "Engrave",
     }
 }
 
@@ -5596,6 +5615,10 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Drill(o), Field::Peck) => Some(o.peck.unwrap_or(0.0)),
         (Operation::Drill(o), Field::Dwell) => Some(o.dwell.unwrap_or(0.0)),
         (Operation::Drill(o), Field::Feed) => Some(o.feed),
+        (Operation::Engrave(o), Field::Depth) => Some(o.depth),
+        (Operation::Engrave(o), Field::Stepdown) => Some(o.stepdown),
+        (Operation::Engrave(o), Field::Feed) => Some(o.feed),
+        (Operation::Engrave(o), Field::PlungeFeed) => Some(o.plunge_feed),
         (Operation::Chamfer(o), Field::ChamferWidth) => Some(o.width),
         (Operation::Chamfer(o), Field::ChamferDepth) => Some(o.depth),
         (Operation::Chamfer(o), Field::ChamferStep) => Some(o.step),
@@ -5787,6 +5810,20 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
             }
             if let Some(v) = get(Field::ThreadBlindAllowance) {
                 o.blind_allowance = v.max(0.0);
+            }
+            if let Some(v) = get(Field::Feed) {
+                o.feed = v;
+            }
+            if let Some(v) = get(Field::PlungeFeed) {
+                o.plunge_feed = v;
+            }
+        }
+        Operation::Engrave(o) => {
+            if let Some(v) = get(Field::Depth) {
+                o.depth = v;
+            }
+            if let Some(v) = get(Field::Stepdown) {
+                o.stepdown = v.max(0.0);
             }
             if let Some(v) = get(Field::Feed) {
                 o.feed = v;

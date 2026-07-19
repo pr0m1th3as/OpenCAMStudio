@@ -53,6 +53,17 @@ pub enum ProfileShape {
         /// Radius of the flat tip, mm (0 for a sharp point / drill).
         flat_radius: f64,
     },
+    /// Carving **V-bit**: a cone of half-angle `α` rising from a *rounded* tip — a
+    /// ball of `tip_radius` centred on the axis at height `tip_radius`, tangent to
+    /// the cone. Distinct from [`ProfileShape::Cone`], whose tip is a **flat**: the
+    /// ball leaves a rounded groove root and, at the shallow depths engraving works
+    /// at, a *wider* groove than the cone alone would give.
+    VTip {
+        /// Half of the included V angle, measured from the axis (radians).
+        half_angle_rad: f64,
+        /// Radius of the rounded tip, mm (0 for a sharp point).
+        tip_radius: f64,
+    },
 }
 
 /// The cutting profile of a tool: its radius and bottom shape. [`offset`] gives
@@ -110,6 +121,28 @@ impl ToolProfile {
                     } else {
                         (d - flat_radius) / t
                     }
+                }
+            }
+            ProfileShape::VTip {
+                half_angle_rad,
+                tip_radius,
+            } => {
+                let a = half_angle_rad;
+                let rt = tip_radius.clamp(0.0, self.radius);
+                let t = a.tan();
+                if t <= 1e-9 {
+                    return 0.0;
+                }
+                if rt <= 1e-9 {
+                    return d / t;
+                }
+                // Tangent point between the ball and the cone flank.
+                let r_t = rt * a.cos();
+                if d <= r_t {
+                    // On the ball: a circle of radius rt centred at height rt.
+                    rt - (rt * rt - d * d).max(0.0).sqrt()
+                } else {
+                    rt * (1.0 - a.sin()) + (d - r_t) / t
                 }
             }
         }
@@ -465,6 +498,59 @@ mod tests {
             sim.field.sample(20.0, 20.0) > -0.1,
             "between holes untouched"
         );
+    }
+
+    #[test]
+    fn vtip_offset_is_the_inverse_of_the_toolpath_width_function() {
+        // The sim's surface and the engraving strategy's groove width must be the
+        // *same* geometry seen from two sides: if the cutting surface stands `z`
+        // above the tip at radius `d`, then engraving `z` deep cuts a groove of
+        // half-width `d`. Disagreement here means the backplot lies about the cut.
+        for &(deg, rt) in &[(60.0, 0.0), (60.0, 0.2), (90.0, 0.5), (30.0, 0.1)] {
+            let a = (deg * 0.5_f64).to_radians();
+            let p = ToolProfile {
+                radius: 3.0,
+                shape: ProfileShape::VTip {
+                    half_angle_rad: a,
+                    tip_radius: rt,
+                },
+            };
+            for step in 1..30 {
+                let d = step as f64 * 0.1;
+                let z = p.offset(d);
+                let back = cam_geo::vtip_half_width(a, rt, z);
+                assert!(
+                    (back - d).abs() < 1e-9,
+                    "deg={deg} rt={rt} d={d} z={z} back={back}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_vtip_is_not_the_same_surface_as_a_flat_tipped_cone() {
+        // Guards the approximation this replaced: modelling a V-bit as a cone with a
+        // flat of the tip radius. Near the tip the two differ materially.
+        let a = (30.0_f64).to_radians();
+        let rt = 0.4;
+        let vtip = ToolProfile {
+            radius: 3.0,
+            shape: ProfileShape::VTip {
+                half_angle_rad: a,
+                tip_radius: rt,
+            },
+        };
+        let flat = ToolProfile {
+            radius: 3.0,
+            shape: ProfileShape::Cone {
+                half_angle_rad: a,
+                flat_radius: rt,
+            },
+        };
+        // The old model says the tool is flat out to rt; the real one is already
+        // climbing, so it removes less material there.
+        assert_eq!(flat.offset(0.3), 0.0);
+        assert!(vtip.offset(0.3) > 0.05, "{}", vtip.offset(0.3));
     }
 
     #[test]

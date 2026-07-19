@@ -15,6 +15,7 @@ use cam_import::{read_cad_file, read_dxf_str, ImportError, ImportOptions};
 
 use crate::project::{OcamFile, Project};
 use cam_model::{
+    EngraveOp,
     reconcile_tool_numbers, Axis, ChamferOp, Comp, Document, DrillOp, FaceOp, Hand, Heights,
     History, Lead, Machine, Operation, Plunge, PocketOp, ProfileOp, ReconcileReport, Setup, Side,
     Stock, ThreadOp, Tool, ToolKind,
@@ -71,6 +72,7 @@ pub enum OpKind {
     Face,
     Chamfer,
     Thread,
+    Engrave,
 }
 
 /// Whether an operation kind restricts geometry selection to **circular** loops.
@@ -911,6 +913,22 @@ impl AppController {
                     plunge_feed: p.plunge_feed,
                 })
             }
+            OpKind::Engrave => Operation::Engrave(EngraveOp {
+                id: 0,
+                tool,
+                chain,
+                // A picked loop is a closed boundary; open strokes arrive from
+                // imported lettering, which the picker cannot express yet.
+                closed: true,
+                top: p.top_of_stock,
+                // A shallow default: engraving is a surface mark, not a cut. One
+                // pass (stepdown 0) — normal at this depth.
+                depth: 0.3,
+                stepdown: 0.0,
+                feed: p.feed,
+                plunge_feed: p.plunge_feed,
+                start,
+            }),
         };
         Some(op)
     }
@@ -1435,7 +1453,16 @@ impl AppController {
         // cheap and a small one stays crisp. (A modest, 2.5D-cosmetic bump from
         // 200 to sharpen curved-feature silhouettes; dial back if a rerun lags.)
         let span = (max[0] - min[0]).max(max[1] - min[1]);
-        let resolution = (span / 300.0).clamp(0.15, 2.0);
+        // …but a part-sized grid can be blind to a *narrow* feature: an engraved
+        // V-groove is often under a millimetre wide, so at the span-derived cell size
+        // it would simply not appear and the backplot would read as a failed
+        // toolpath. Refine until the narrowest cut spans a few cells, capped by a
+        // cell budget so refining never turns a preview into a hang.
+        let feature = narrowest_cut_width(program, setup_tools, max[2]);
+        let by_span = span / 300.0;
+        let by_feature = feature / 3.0;
+        let budget = span / MAX_SIM_CELLS_ACROSS;
+        let resolution = by_span.min(by_feature).max(budget).clamp(0.02, 2.0);
         let sim = simulate(
             program,
             min,
@@ -1770,6 +1797,84 @@ fn same_tool_geometry(a: &Tool, b: &Tool) -> bool {
     a.diameter == b.diameter && a.length == b.length && a.flutes == b.flutes && a.kind == b.kind
 }
 
+/// The most cells the material-removal sim may use across the part's larger side.
+/// A hard ceiling on [`narrowest_cut_width`]-driven refinement: cost grows as the
+/// square, so this bounds a fine-groove job to ~1.4 M cells rather than letting a
+/// 0.1 mm feature on a 300 mm plate ask for nine billion.
+const MAX_SIM_CELLS_ACROSS: f64 = 1200.0;
+
+/// The width of the **narrowest cut** `program` makes, in mm — the feature size the
+/// removal sim has to resolve.
+///
+/// For a tool whose footprint is its full diameter (end/ball/bull/face mill, drill)
+/// that is simply the diameter. For a **pointed** tool it is not: a V-bit or chamfer
+/// mill cuts a groove whose width depends on how deep it goes, and at engraving
+/// depths that is far narrower than the tool. Those are measured from the program's
+/// actual deepest cut with that tool, against `surface_z`.
+///
+/// Returns [`f64::INFINITY`] when nothing is cut, so callers fall back to their
+/// span-derived resolution.
+fn narrowest_cut_width(program: &Program, tools: &[Tool], surface_z: f64) -> f64 {
+    use cam_cldata::{MoveKind, Step};
+    use std::collections::BTreeMap;
+
+    // The deepest cutting Z reached under each tool number, walking the tool changes.
+    let mut current: Option<u32> = None;
+    let mut deepest: BTreeMap<u32, f64> = BTreeMap::new();
+    for step in program.steps() {
+        match step {
+            Step::ToolChange { tool } => current = Some(*tool),
+            Step::Linear { to, tag, .. } if tag.kind == MoveKind::Cutting => {
+                if let Some(n) = current {
+                    let e = deepest.entry(n).or_insert(f64::INFINITY);
+                    *e = e.min(to.z);
+                }
+            }
+            Step::Arc { end, tag, .. } if tag.kind == MoveKind::Cutting => {
+                if let Some(n) = current {
+                    let e = deepest.entry(n).or_insert(f64::INFINITY);
+                    *e = e.min(end.z);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut narrowest = f64::INFINITY;
+    for (number, min_z) in deepest {
+        let Some(tool) = tools.iter().find(|t| t.number == number) else {
+            continue;
+        };
+        let depth = (surface_z - min_z).max(0.0);
+        let width = match tool.kind {
+            // Pointed tools: the groove is as wide as the cone has opened at depth.
+            ToolKind::VBit {
+                included_angle_deg,
+                tip_radius,
+            } => {
+                let a = 0.5 * included_angle_deg.to_radians();
+                2.0 * cam_geo::vtip_half_width(a, tip_radius, depth)
+            }
+            ToolKind::ChamferMill {
+                included_angle_deg,
+                tip_diameter,
+            } => {
+                let a = 0.5 * included_angle_deg.to_radians();
+                tip_diameter + 2.0 * depth * a.tan()
+            }
+            // Everything else cuts its full width as soon as it is in the material.
+            _ => tool.diameter,
+        };
+        // A tool never cuts wider than itself, and a zero-depth "cut" is not a
+        // feature to resolve.
+        let width = width.min(tool.diameter);
+        if width > 1e-9 {
+            narrowest = narrowest.min(width);
+        }
+    }
+    narrowest
+}
+
 /// Translate a document [`Tool`] into the simulator's [`ToolProfile`] — how its
 /// bottom removes material (flat, ball, bull-nose corner, or a chamfer/drill cone).
 fn sim_profile(tool: &Tool) -> ToolProfile {
@@ -1791,14 +1896,15 @@ fn sim_profile(tool: &Tool) -> ToolProfile {
             half_angle_rad: point_angle_deg.to_radians() / 2.0,
             flat_radius: 0.0,
         },
-        // A V-bit's removal is its cone; the rounded tip is approximated as a flat of
-        // the tip radius (a close-enough footprint for the height-field sim).
+        // A V-bit's tip is a ball tangent to the cone, not a flat — the sim models it
+        // exactly (`ProfileShape::VTip`), so an engraved groove simulates at its true
+        // width rather than the narrower one a flat-tipped cone would leave.
         ToolKind::VBit {
             included_angle_deg,
             tip_radius,
-        } => ProfileShape::Cone {
+        } => ProfileShape::VTip {
             half_angle_rad: included_angle_deg.to_radians() / 2.0,
-            flat_radius: tip_radius.clamp(0.0, radius),
+            tip_radius: tip_radius.clamp(0.0, radius),
         },
         // A thread mill's material removal is approximated by its footprint.
         ToolKind::ThreadMill { .. } => ProfileShape::Flat,
@@ -1866,6 +1972,100 @@ mod tests {
         }
     }
 
+    fn cutting_program(tool: u32, z: f64) -> Program {
+        use cam_cldata::{MoveKind, Point3, Step, Tag};
+        let mut p = Program::new();
+        p.push(Step::ToolChange { tool });
+        p.push(Step::Linear {
+            to: Point3::new(10.0, 0.0, z),
+            feed: 300.0,
+            tag: Tag::new(0, MoveKind::Cutting),
+        });
+        p
+    }
+
+    fn tool_of(number: u32, diameter: f64, kind: ToolKind) -> Tool {
+        Tool {
+            number,
+            diameter,
+            length: 30.0,
+            flutes: 2,
+            kind,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn narrowest_cut_is_the_diameter_for_a_flat_tool() {
+        let tools = [tool_of(1, 6.0, ToolKind::EndMill)];
+        let w = narrowest_cut_width(&cutting_program(1, -3.0), &tools, 0.0);
+        assert!((w - 6.0).abs() < 1e-9, "{w}");
+    }
+
+    #[test]
+    fn narrowest_cut_for_a_vbit_is_the_groove_not_the_tool() {
+        // The whole point of the refinement: a ⌀6 V-bit engraving 0.3 mm deep cuts a
+        // groove far narrower than 6 mm, and the sim must resolve the groove.
+        let tools = [tool_of(
+            1,
+            6.0,
+            ToolKind::VBit {
+                included_angle_deg: 60.0,
+                tip_radius: 0.0,
+            },
+        )];
+        let w = narrowest_cut_width(&cutting_program(1, -0.3), &tools, 0.0);
+        let want = 2.0 * 0.3 * (30.0_f64).to_radians().tan();
+        assert!((w - want).abs() < 1e-9, "{w} want {want}");
+        assert!(w < 0.4, "a groove, not the tool: {w}");
+    }
+
+    #[test]
+    fn narrowest_cut_never_exceeds_the_tool_diameter() {
+        // A V-bit driven deep would open past its own ⌀ by the formula; clamp it.
+        let tools = [tool_of(
+            1,
+            6.0,
+            ToolKind::VBit {
+                included_angle_deg: 120.0,
+                tip_radius: 0.0,
+            },
+        )];
+        let w = narrowest_cut_width(&cutting_program(1, -50.0), &tools, 0.0);
+        assert!((w - 6.0).abs() < 1e-9, "{w}");
+    }
+
+    #[test]
+    fn narrowest_cut_takes_the_minimum_across_tools() {
+        use cam_cldata::{MoveKind, Point3, Step, Tag};
+        let tools = [
+            tool_of(1, 6.0, ToolKind::EndMill),
+            tool_of(
+                2,
+                6.0,
+                ToolKind::VBit {
+                    included_angle_deg: 60.0,
+                    tip_radius: 0.0,
+                },
+            ),
+        ];
+        let mut p = cutting_program(1, -3.0);
+        p.push(Step::ToolChange { tool: 2 });
+        p.push(Step::Linear {
+            to: Point3::new(20.0, 0.0, -0.3),
+            feed: 300.0,
+            tag: Tag::new(1, MoveKind::Cutting),
+        });
+        let w = narrowest_cut_width(&p, &tools, 0.0);
+        assert!(w < 0.4, "the engraving groove must win: {w}");
+    }
+
+    #[test]
+    fn narrowest_cut_is_infinite_when_nothing_cuts() {
+        let tools = [tool_of(1, 6.0, ToolKind::EndMill)];
+        assert!(narrowest_cut_width(&Program::new(), &tools, 0.0).is_infinite());
+    }
+
     fn depth_of(op: &Operation) -> f64 {
         match op {
             Operation::Profile(o) => o.depth,
@@ -1874,6 +2074,7 @@ mod tests {
             Operation::Drill(o) => o.depth,
             Operation::Thread(o) => o.z_bottom,
             Operation::Chamfer(o) => o.top,
+            Operation::Engrave(o) => o.depth,
         }
     }
 
@@ -2115,6 +2316,23 @@ mod tests {
                 assert!((fmax(&ys) - bmax[1]).abs() < 1e-9);
             }
             other => panic!("expected face, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_engrave_seeds_a_shallow_closed_groove() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        app.new_operation(OpKind::Engrave);
+        match app.selected_operation() {
+            Some(Operation::Engrave(o)) => {
+                assert!(o.depth > 0.0, "a default engraving depth");
+                assert!(o.depth < 1.0, "engraving is a surface mark, not a cut");
+                assert!(o.closed, "a picked loop is a closed boundary");
+                assert_eq!(o.stepdown, 0.0, "one pass at this depth");
+                assert!(o.chain.len() >= 3);
+            }
+            other => panic!("expected engrave, got {other:?}"),
         }
     }
 
