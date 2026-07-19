@@ -220,7 +220,10 @@ pub fn op_accepts_open_paths(kind: OpKind) -> bool {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PendingOp {
     pub kind: OpKind,
-    pub tool: u32,
+    /// The chosen tool, or `None` until one is picked. Nothing is committed until
+    /// [`AppController::confirm_operation`], so tool and geometry may be chosen in
+    /// **either order** and either may be changed until then.
+    pub tool: Option<u32>,
     /// The boundary/path loop, set on the first pick. `None` while awaiting it.
     pub boundary: Option<LoopRef>,
     /// Loops toggled as excluded islands (pocket island mode).
@@ -271,9 +274,10 @@ pub struct SnapHit {
 /// The result of a viewport pick during the wizard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PickResult {
-    /// An operation was created (finalised).
-    Created,
-    /// A loop was selected/toggled; the wizard is still active (pocket island mode).
+    /// Geometry was recorded — the boundary was set (or an island toggled) and the
+    /// wizard is still active. Picking never finalises: creation happens only in
+    /// [`AppController::confirm_operation`], so the tool and the geometry can be
+    /// chosen in either order and either can be changed until Confirm.
     Selecting,
     /// The pick missed every boundary line.
     Missed,
@@ -1099,7 +1103,7 @@ impl AppController {
         }
         self.pending_op = Some(PendingOp {
             kind,
-            tool: self.first_tool_number(),
+            tool: None,
             boundary: None,
             islands: Vec::new(),
             start: None,
@@ -1124,7 +1128,7 @@ impl AppController {
         };
         self.pending_op = Some(PendingOp {
             kind,
-            tool: self.first_tool_number(),
+            tool: None,
             boundary: None,
             islands: Vec::new(),
             start: None,
@@ -1134,10 +1138,18 @@ impl AppController {
         true
     }
 
+    /// Forget the pending operation's tool — used when the wizard's family changes,
+    /// since the chosen tool belonged to the previous family.
+    pub fn clear_pending_tool(&mut self) {
+        if let Some(pending) = self.pending_op.as_mut() {
+            pending.tool = None;
+        }
+    }
+
     /// Change the tool of the pending operation. A no-op unless the wizard is active.
     pub fn set_pending_tool(&mut self, number: u32) {
         if let Some(pending) = self.pending_op.as_mut() {
-            pending.tool = number;
+            pending.tool = Some(number);
         }
     }
 
@@ -1328,13 +1340,14 @@ impl AppController {
         })
     }
 
-    /// Complete or advance the pending operation from a viewport pick at `world`
-    /// with a pickbox of `aperture` world-mm.
-    /// - The **first** pick selects the boundary/path loop under the box. For every
-    ///   kind except Pocket the operation is created immediately.
-    /// - For a **Pocket**, the first pick sets the boundary and the wizard stays in
-    ///   island mode; each further pick toggles that loop as an excluded island
-    ///   (the boundary loop itself is ignored). [`confirm_operation`] finalises it.
+    /// Record a viewport pick into the pending operation at `world`, with a pickbox
+    /// of `aperture` world-mm.
+    ///
+    /// **Nothing is committed here.** The pick sets (or replaces) the boundary; for a
+    /// **Pocket** that already has a boundary, further picks toggle islands. The
+    /// operation is created only by [`confirm_operation`], so the tool and the
+    /// geometry may be chosen in **either order**, and either may be changed until
+    /// Confirm. Re-picking before Confirm simply moves the boundary.
     pub fn pick_operation_geometry(
         &mut self,
         world: [f64; 2],
@@ -1355,62 +1368,58 @@ impl AppController {
                 None => return PickResult::Missed,
             },
         };
-        match pending.boundary {
-            None => {
-                if pending.kind == OpKind::Pocket {
-                    let p = self.pending_op.as_mut().unwrap();
-                    p.boundary = Some(picked);
-                    p.start = Some(start); // remembered for Confirm's lead-in
-                    PickResult::Selecting
-                } else if let Some(op) =
-                    self.build_op(pending.kind, picked, &[], pending.tool, Some(start))
-                {
-                    match pending.replacing {
-                        Some(old) => self.replace_operation(old, op),
-                        None => self.add_operation(op),
-                    }
-                    self.pending_op = None;
-                    PickResult::Created
-                } else {
-                    PickResult::Missed
-                }
+        // Islands are a pocket-only second stage, and only once a boundary exists.
+        let island_mode = pending.kind == OpKind::Pocket && pending.boundary.is_some();
+        let p = self.pending_op.as_mut().unwrap();
+        if island_mode {
+            if Some(picked) == p.boundary {
+                return PickResult::Selecting; // the boundary is not an island
             }
-            Some(boundary) => {
-                // Pocket island mode: toggle the clicked loop (not the boundary).
-                if picked == boundary {
-                    return PickResult::Selecting;
+            match p.islands.iter().position(|l| *l == picked) {
+                Some(pos) => {
+                    p.islands.remove(pos);
                 }
-                let islands = &mut self.pending_op.as_mut().unwrap().islands;
-                if let Some(pos) = islands.iter().position(|l| *l == picked) {
-                    islands.remove(pos);
-                } else {
-                    islands.push(picked);
-                }
-                PickResult::Selecting
+                None => p.islands.push(picked),
             }
+        } else {
+            p.boundary = Some(picked);
+            p.start = Some(start);
         }
+        PickResult::Selecting
     }
 
-    /// Finalise a pending operation from its picked boundary + islands (used by the
-    /// Pocket wizard's Confirm). Returns `true` if an operation was created.
+    /// Finalise the pending operation — the **single commit point** for every kind.
+    /// Requires both a chosen tool and a picked boundary; [`Self::pending_ready`]
+    /// reports whether those hold, so the UI can gate its Confirm button on the same
+    /// condition. Returns `true` if an operation was created.
     pub fn confirm_operation(&mut self) -> bool {
         let Some(pending) = self.pending_op.clone() else {
             return false;
         };
-        let Some(boundary) = pending.boundary else {
+        let (Some(boundary), Some(tool)) = (pending.boundary, pending.tool) else {
             return false;
         };
         if let Some(op) =
-            self.build_op(pending.kind, boundary, &pending.islands, pending.tool, pending.start)
+            self.build_op(pending.kind, boundary, &pending.islands, tool, pending.start)
         {
             match pending.replacing {
                 Some(old) => self.replace_operation(old, op),
                 None => self.add_operation(op),
             }
             self.pending_op = None;
+            // Switching tools mid-wizard embeds each one; drop any left unreferenced.
+            self.prune_unused_tools();
             return true;
         }
         false
+    }
+
+    /// Whether the pending operation has everything it needs to be confirmed: a tool
+    /// **and** a boundary. Either may be chosen first.
+    pub fn pending_ready(&self) -> bool {
+        self.pending_op
+            .as_ref()
+            .is_some_and(|p| p.tool.is_some() && p.boundary.is_some())
     }
 
     /// Delete the selected operation, selecting a neighbour (or the setup). A
@@ -3271,11 +3280,15 @@ mod tests {
         );
         assert!(app.pending_op().is_some());
 
-        // Near the (70,50) corner → a profile on the outer loop, tool 2, start there.
+        // Near the (70,50) corner selects the outer loop — but nothing is created
+        // until Confirm, so the wizard stays live and the pick can still be redone.
         assert_eq!(
             app.pick_operation_geometry([69.6, 49.6], 2.0, &[SnapKind::End]),
-            PickResult::Created
+            PickResult::Selecting
         );
+        assert!(app.pending_op().is_some(), "still pending until Confirm");
+        assert!(app.pending_ready(), "tool + boundary are both set");
+        assert!(app.confirm_operation());
         assert!(app.pending_op().is_none());
         match app.selected_operation() {
             Some(Operation::Profile(o)) => {
@@ -3292,11 +3305,13 @@ mod tests {
         let mut app = AppController::new(machine());
         app.open_dxf(PART_DXF, "part.dxf").unwrap();
         app.begin_operation(OpKind::Profile);
+        app.set_pending_tool(1);
         // Click on the circle edge (centre 40,30, r5) → the profile follows the hole.
         assert_eq!(
             app.pick_operation_geometry([45.4, 30.0], 2.0, &[SnapKind::End]),
-            PickResult::Created
+            PickResult::Selecting
         );
+        assert!(app.confirm_operation());
         let hole = app.regions()[0].holes()[0].clone();
         match app.selected_operation() {
             Some(Operation::Profile(o)) => assert_eq!(o.chain, hole, "chain is the circle"),
@@ -3305,10 +3320,64 @@ mod tests {
     }
 
     #[test]
+    fn nothing_is_created_until_confirm_whatever_the_order() {
+        // The annoyance this fixes: picking geometry first used to create the
+        // operation immediately with a default tool. Now either order works and the
+        // choice stays editable until Confirm.
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        let before = op_ids(&app).len();
+
+        // Geometry FIRST, no tool yet.
+        app.begin_operation(OpKind::Profile);
+        app.pick_operation_geometry([69.6, 49.6], 2.0, &[SnapKind::End]);
+        assert!(app.pending_op().unwrap().boundary.is_some());
+        assert!(app.pending_op().unwrap().tool.is_none());
+        assert!(!app.pending_ready(), "no tool yet");
+        assert!(!app.confirm_operation(), "must refuse without a tool");
+        assert_eq!(op_ids(&app).len(), before, "nothing created");
+
+        // Tool second → now ready.
+        app.set_pending_tool(1);
+        assert!(app.pending_ready());
+        assert!(app.confirm_operation());
+        assert_eq!(op_ids(&app).len(), before + 1);
+    }
+
+    #[test]
+    fn the_geometry_pick_can_be_changed_before_confirm() {
+        // Re-picking moves the boundary rather than being ignored or treated as a
+        // second selection.
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        app.begin_operation(OpKind::Profile);
+        app.set_pending_tool(1);
+        app.pick_operation_geometry([10.4, 25.0], 2.0, &[SnapKind::End]);
+        let first = app.pending_op().unwrap().boundary.unwrap();
+        assert_eq!(first.part, LoopPart::Outer);
+        // Now click the circle instead.
+        app.pick_operation_geometry([45.4, 30.0], 2.0, &[SnapKind::End]);
+        let second = app.pending_op().unwrap().boundary.unwrap();
+        assert_ne!(second, first, "the pick must move, not stick");
+        assert!(app.confirm_operation());
+    }
+
+    #[test]
+    fn a_tool_alone_is_not_enough_to_confirm() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        app.begin_operation(OpKind::Profile);
+        app.set_pending_tool(1);
+        assert!(!app.pending_ready(), "no geometry yet");
+        assert!(!app.confirm_operation());
+    }
+
+    #[test]
     fn pocket_wizard_picks_a_boundary_then_toggles_islands() {
         let mut app = AppController::new(machine());
         app.open_dxf(PART_DXF, "part.dxf").unwrap();
         app.begin_operation(OpKind::Pocket);
+        app.set_pending_tool(1);
 
         // First pick = the boundary (outer). Stays in island mode.
         assert_eq!(
@@ -3391,6 +3460,7 @@ mod tests {
         let mut app = AppController::new(machine());
         app.open_dxf(PART_DXF, "part.dxf").unwrap();
         app.begin_operation(OpKind::Drill);
+        app.set_pending_tool(1);
         // The rectangle edge is not a hole ⇒ a drill pick there misses.
         assert_eq!(
             app.pick_operation_geometry([10.4, 25.0], 2.0, &[]),
@@ -3400,8 +3470,9 @@ mod tests {
         // The circle hole is selectable ⇒ a drill at its centre.
         assert_eq!(
             app.pick_operation_geometry([45.4, 30.0], 2.0, &[]),
-            PickResult::Created
+            PickResult::Selecting
         );
+        assert!(app.confirm_operation());
         match app.selected_operation() {
             Some(Operation::Drill(o)) => {
                 assert_eq!(o.points.len(), 1);
@@ -3417,10 +3488,12 @@ mod tests {
         let mut app = AppController::new(machine());
         app.open_dxf(PART_DXF, "part.dxf").unwrap();
         app.begin_operation(OpKind::Profile);
+        app.set_pending_tool(1);
         assert_eq!(
             app.pick_operation_geometry([69.5, 30.0], 1.5, &[SnapKind::Mid]),
-            PickResult::Created
+            PickResult::Selecting
         );
+        assert!(app.confirm_operation());
         match app.selected_operation() {
             Some(Operation::Profile(o)) => {
                 let s = o.start.expect("mid snap sets a start");

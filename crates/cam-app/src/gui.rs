@@ -650,6 +650,35 @@ impl ToolKindPick {
     }
 }
 
+/// The tool families offered for an operation, in the order shown.
+///
+/// A *family* is exactly a group in the Tool Library (the eight [`ToolKind`] classes),
+/// so the wizard and the library speak the same vocabulary. Bounding the list by
+/// operation is what keeps a library of hundreds usable: a pocket has no business
+/// listing drills or chamfer mills.
+///
+/// The strategy guards are the hard floor — anything here that could still not cut
+/// would be refused at Run time anyway — but this list is deliberately **narrower**
+/// than "whatever would not error", agreed with Andreas: no ball-nose for facing (it
+/// would leave a scalloped floor), no face mill for profiling or pocketing, and no end
+/// mill for drilling. Those remain *possible* if a tool is set another way; they are
+/// simply not offered.
+fn families_for(kind: OpKind) -> &'static [ToolKindPick] {
+    use ToolKindPick as F;
+    match kind {
+        // Side-milling a vertical wall: the end-mill family only.
+        OpKind::Profile | OpKind::Pocket => &[F::EndMill, F::BallMill, F::BullNose],
+        // A flat floor: flat-bottomed tools (a bull-nose floor is still flat).
+        OpKind::Face => &[F::EndMill, F::BullNose, F::FaceMill],
+        OpKind::Drill => &[F::Drill],
+        OpKind::Thread => &[F::ThreadMill],
+        // A chamfer is cut by the flank, which both of these have.
+        OpKind::Chamfer => &[F::ChamferMill, F::VBit],
+        // Engraving cuts with the tip; a chamfer mill's flat does not cut.
+        OpKind::Engrave => &[F::VBit],
+    }
+}
+
 impl std::fmt::Display for ToolKindPick {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.to_kind().to_string().as_str())
@@ -1267,12 +1296,6 @@ mod help {
     pub const THREAD_CUT: &str =
         "Climb vs conventional milling for the threading orbit — climb usually finishes \
          cleaner.";
-    pub const OP_TOOL: &str =
-        "The tool this operation cuts with. Changing it re-runs the toolpath, so a \
-         tool picked in error at the start of the wizard can be swapped here without \
-         re-picking the geometry. The strategy guards what the tool can actually cut \
-         (a chamfer mill cannot engrave, a V-bit cannot cut a vertical wall).";
-
     pub const POST: &str =
         "The machine controller/dialect the exported G-code is written for (grbl, Fanuc, \
          …). Pick the one your control speaks.";
@@ -1401,6 +1424,8 @@ struct App {
     tool_edit: Option<cam_model::Tool>,
     /// Which internal tab the Tool Library pane shows (Serial / Family).
     library_view: LibraryView,
+    /// The tool family chosen in the operation wizard, narrowing its Tool list.
+    wizard_family: Option<ToolKindPick>,
     /// The operation whose right-click context menu is open, and where to anchor it
     /// (window-absolute coords, captured from `window_cursor` at right-click time).
     open_op_menu: Option<u32>,
@@ -1853,12 +1878,10 @@ enum Message {
     /// Show (`true`) or hide (`false`) a pane.
     SetPaneVisible(Pane, bool),
     /// Pick a library tool (by index) for the pending op — embeds it into the setup.
+    /// Choose the tool **family** in the operation wizard, narrowing the tool list.
+    /// Clears any tool already picked, since it belongs to the previous family.
+    SetPendingFamily(ToolKindPick),
     SetPendingLibraryTool(usize),
-    /// Change the tool of the **already-created** operation `u32` to the library tool
-    /// at this index. Without this the tool chosen at the start of the creation
-    /// wizard was final — a wrong pick meant deleting the operation and re-picking
-    /// its geometry.
-    SetOpLibraryTool(u32, usize),
     /// Select a library tool for editing in the Tooling-tab library editor.
     SelectLibraryTool(usize),
     /// Open the right-click context menu for operation `id` (anchored under the
@@ -1947,6 +1970,7 @@ impl App {
             lib_sel: 0,
             tool_edit: None,
             library_view: LibraryView::Ordered,
+            wizard_family: None,
             open_op_menu: None,
             op_menu_pos: iced::Point::ORIGIN,
             open_tool_menu: None,
@@ -2297,34 +2321,40 @@ impl App {
                 // Seed the op with a sensible default tool so it always has a valid
                 // one; the user can change it in the wizard picker. Face prefers the
                 // largest flat end/face mill (see `ToolLibrary::default_tool_for`).
+                // Pre-fill family + tool from the by-kind default, but only when that
+                // default is in a family this operation actually offers — otherwise
+                // leave both blank rather than seed something the wizard forbids.
+                self.wizard_family = None;
                 if self.controller.pending_op().is_some() {
                     if let Some(tool) = self.library.default_tool_for(kind) {
-                        let number = self.controller.use_tool(tool);
-                        self.controller.set_pending_tool(number);
+                        let family = ToolKindPick::of(tool.kind);
+                        if families_for(kind).contains(&family) {
+                            self.wizard_family = Some(family);
+                            let number = self.controller.use_tool(tool);
+                            self.controller.set_pending_tool(number);
+                        }
                     }
                 }
                 self.refresh_fields();
                 self.status = if self.controller.pending_op().is_some() {
                     if op_accepts_open_paths(kind) && !self.controller.open_paths().is_empty() {
-                        "Click a boundary line or an open stroke in the viewport \
-                         (or Cancel in the Inspector)."
+                        "Choose a tool and click a boundary or an open stroke — in \
+                         either order, then Confirm."
                             .to_string()
                     } else {
-                        "Click a boundary line in the viewport (or Cancel in the Inspector)."
+                        "Choose a tool and click the geometry — in either order, then Confirm."
                             .to_string()
                     }
                 } else {
                     "Open a part first.".to_string()
                 };
             }
-            Message::SetOpLibraryTool(id, i) => {
-                if let Some(&tool) = self.library.tools.get(i) {
-                    let number = self.controller.use_tool(tool);
-                    self.controller.edit_operation(id, |op| op.set_tool(number));
-                    self.controller.prune_unused_tools();
-                    self.refresh_fields();
-                    self.rerun();
-                }
+            Message::SetPendingFamily(f) => {
+                self.wizard_family = Some(f);
+                // The previously picked tool is from another family — drop it, and
+                // with it the Confirm gate, rather than leave a stale selection.
+                self.controller.clear_pending_tool();
+                self.controller.prune_unused_tools();
             }
             Message::SetPendingLibraryTool(i) => {
                 if let Some(&tool) = self.library.tools.get(i) {
@@ -2362,18 +2392,18 @@ impl App {
                     aperture as f64,
                     snaps,
                 ) {
-                    PickResult::Created => {
-                        self.cursor = None;
-                        self.snap_hover = None;
-                        self.hover_loop = None;
-                        self.refresh_fields();
-                        self.rerun();
-                        self.status = "Operation created.".to_string();
-                    }
                     PickResult::Selecting => {
-                        let n = self.controller.pending_op().map_or(0, |p| p.islands.len());
-                        self.status =
-                            format!("Boundary set — click areas to exclude ({n}), then Confirm.");
+                        let pending = self.controller.pending_op();
+                        let has_tool = pending.as_ref().is_some_and(|p| p.tool.is_some());
+                        let pocket = pending.as_ref().is_some_and(|p| p.kind == OpKind::Pocket);
+                        let n = pending.map_or(0, |p| p.islands.len());
+                        self.status = if pocket {
+                            format!("Boundary set — click areas to exclude ({n}), then Confirm.")
+                        } else if has_tool {
+                            "Geometry set — Confirm to create the operation.".to_string()
+                        } else {
+                            "Geometry set — now choose a tool, then Confirm.".to_string()
+                        };
                     }
                     PickResult::Missed => {
                         // Word the miss to match what is actually pickable for this
@@ -2439,6 +2469,19 @@ impl App {
                 let id = self.open_op_menu.take();
                 if let Some(id) = id {
                     if self.controller.reinitialize_operation(id) {
+                        // Same two-step tool choice as a fresh operation; seed the
+                        // family from the op's own kind default where it is offered.
+                        self.wizard_family = None;
+                        if let Some(kind) = self.controller.pending_op().map(|p| p.kind) {
+                            if let Some(tool) = self.library.default_tool_for(kind) {
+                                let family = ToolKindPick::of(tool.kind);
+                                if families_for(kind).contains(&family) {
+                                    self.wizard_family = Some(family);
+                                    let number = self.controller.use_tool(tool);
+                                    self.controller.set_pending_tool(number);
+                                }
+                            }
+                        }
                         self.refresh_fields();
                         self.status = "Reinitialising: pick a tool, then the geometry \
                                        (the operation keeps its place)."
@@ -4679,29 +4722,44 @@ impl App {
             OpKind::Thread => "Thread",
             OpKind::Engrave => "Engrave",
         };
-        // The tool is picked from the cross-project library; picking embeds a copy
-        // into the setup (see `use_tool`). The current selection is the library entry
-        // whose geometry matches the pending op's embedded tool.
-        let tools: Vec<ToolChoice> = self
-            .library
-            .tools
-            .iter()
-            .enumerate()
-            .map(|(index, t)| ToolChoice {
-                index,
-                number: t.number,
-                diameter: t.diameter,
-                kind: t.kind,
-            })
-            .collect();
-        let embedded = self
-            .controller
-            .document()
-            .setup
-            .tools
-            .iter()
-            .find(|t| t.number == pending.tool)
-            .copied();
+        // The tool is chosen in two steps — **family**, then a tool within it — so a
+        // library of hundreds does not have to be scrolled for every operation. The
+        // families offered are bounded by the operation (see `families_for`).
+        let families = families_for(pending.kind);
+        let family = self.wizard_family.filter(|f| families.contains(f));
+        let family_picker = pick_list(families.to_vec(), family, Message::SetPendingFamily)
+            .placeholder("Choose a family")
+            .text_size(13)
+            .width(Length::Fill);
+
+        // Tools of the chosen family only. Nothing is listed until a family is picked.
+        let tools: Vec<ToolChoice> = match family {
+            Some(f) => self
+                .library
+                .tools
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| ToolKindPick::of(t.kind) == f)
+                .map(|(index, t)| ToolChoice {
+                    index,
+                    number: t.number,
+                    diameter: t.diameter,
+                    kind: t.kind,
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        // The current selection is the library entry matching the pending op's
+        // embedded tool (picking embeds a copy into the setup — see `use_tool`).
+        let embedded = pending.tool.and_then(|n| {
+            self.controller
+                .document()
+                .setup
+                .tools
+                .iter()
+                .find(|t| t.number == n)
+                .copied()
+        });
         let selected = embedded
             .and_then(|e| {
                 self.library.tools.iter().position(|l| {
@@ -4711,22 +4769,46 @@ impl App {
                         && l.kind == e.kind
                 })
             })
-            .and_then(|i| tools.get(i).copied());
-        let picker = pick_list(tools, selected, |c| Message::SetPendingLibraryTool(c.index))
-            .text_size(13)
-            .width(Length::Fill);
+            .and_then(|i| tools.iter().find(|c| c.index == i).copied());
+        let tool_picker = pick_list(tools.clone(), selected, |c| {
+            Message::SetPendingLibraryTool(c.index)
+        })
+        .placeholder(if family.is_some() {
+            "Choose a tool"
+        } else {
+            "Choose a family first"
+        })
+        .text_size(13)
+        .width(Length::Fill);
+
+        let verb = if pending.replacing.is_some() {
+            "Reinitialize"
+        } else {
+            "New"
+        };
         let mut col = column![
-            text(format!("New {kind} operation")).size(15),
+            text(format!("{verb} {kind} operation")).size(15),
+            text("Tool family").size(12),
+            family_picker,
             text("Tool").size(12),
-            row![
-                picker,
-                button(text("＋ New").size(13)).on_press(Message::NewTool),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center),
+            tool_picker,
         ]
-        .spacing(10)
+        .spacing(6)
         .padding(8);
+
+        // A family with nothing in it is a dead end now that the wizard has no
+        // "New tool" shortcut — say where to go rather than leaving an empty list.
+        if let Some(f) = family {
+            if tools.is_empty() {
+                col = col.push(
+                    text(format!(
+                        "No {f} in the library — add one in the Tooling tab."
+                    ))
+                    .size(12)
+                    .color(palette::WARN),
+                );
+            }
+        }
 
         // Object snaps govern where the start/lead-in lands; show them for the
         // kinds that carry a start, while still awaiting that (boundary) pick.
@@ -4734,26 +4816,29 @@ impl App {
             col = col.push(self.snap_toolbar());
         }
 
-        // Pocket island mode begins once the boundary is picked.
-        if pending.kind == OpKind::Pocket && pending.boundary.is_some() {
-            col = col.push(
-                text(format!(
+        // Progress, then the one commit point. Tool and geometry may be chosen in
+        // either order; Confirm stays disabled until both are settled.
+        col = col.push(
+            text(match (pending.tool.is_some(), pending.boundary.is_some()) {
+                (false, false) => "Choose a tool and click the geometry in the viewport.".to_string(),
+                (true, false) => "Now click the geometry in the viewport.".to_string(),
+                (false, true) => "Geometry selected — now choose a tool.".to_string(),
+                (true, true) if pending.kind == OpKind::Pocket => format!(
                     "Click enclosed areas to exclude ({} selected), then Confirm.",
                     pending.islands.len()
-                ))
-                .size(12),
-            );
-            col = col.push(
-                row![
-                    button(text("Confirm").size(13)).on_press(Message::ConfirmOp),
-                    button(text("Cancel").size(13)).on_press(Message::CancelOp),
-                ]
-                .spacing(8),
-            );
-        } else {
-            col = col.push(text("Click a boundary line in the viewport.").size(12));
-            col = col.push(button(text("Cancel").size(13)).on_press(Message::CancelOp));
-        }
+                ),
+                (true, true) => "Ready — Confirm to create the operation.".to_string(),
+            })
+            .size(12),
+        );
+        col = col.push(
+            row![
+                button(text("Confirm").size(13))
+                    .on_press_maybe(self.controller.pending_ready().then_some(Message::ConfirmOp)),
+                button(text("Cancel").size(13)).on_press(Message::CancelOp),
+            ]
+            .spacing(8),
+        );
         col.into()
     }
 
@@ -5020,56 +5105,10 @@ impl App {
 
         let mut list = column![text(heading).size(15)].spacing(8).padding(8);
 
-        // An operation's tool, changeable after creation. The wizard picks a tool
-        // *before* the geometry, so without this a wrong pick could only be undone by
-        // deleting the operation and re-picking its contour.
-        if let Selection::Operation(id) = self.controller.selection() {
-            if let Some(op) = self.controller.operation(id) {
-                let choices: Vec<ToolChoice> = self
-                    .library
-                    .tools
-                    .iter()
-                    .enumerate()
-                    .map(|(index, t)| ToolChoice {
-                        index,
-                        number: t.number,
-                        diameter: t.diameter,
-                        kind: t.kind,
-                    })
-                    .collect();
-                let current = self
-                    .controller
-                    .document()
-                    .setup
-                    .tools
-                    .iter()
-                    .find(|t| t.number == op.tool())
-                    .copied();
-                let selected = current
-                    .and_then(|e| {
-                        self.library.tools.iter().position(|l| {
-                            l.diameter == e.diameter
-                                && l.length == e.length
-                                && l.flutes == e.flutes
-                                && l.kind == e.kind
-                        })
-                    })
-                    .and_then(|i| choices.get(i).copied());
-                list = list.push(
-                    row![
-                        label_help("Tool", help::OP_TOOL, self.tooltips),
-                        pick_list(choices, selected, move |c| Message::SetOpLibraryTool(
-                            id, c.index
-                        ))
-                        .text_size(13)
-                        .width(Length::Fill),
-                    ]
-                    .spacing(8)
-                    .align_y(Alignment::Center),
-                );
-            }
-        }
-
+        // An operation's tool is fixed once created: it is chosen in the creation
+        // wizard alongside the geometry, and changing it afterwards is done by
+        // right-click -> Reinitialize in the Project pane, which re-runs the whole
+        // pick. No tool control belongs in the inspector.
         if let Selection::Stock = self.controller.selection() {
             // The concrete block the offsets/heights resolve to, as read-only
             // context above the editable fields.
@@ -7387,6 +7426,54 @@ mod inspector_field_tests {
 #[cfg(test)]
 mod ribbon_tests {
     use super::*;
+
+    #[test]
+    fn families_offered_match_what_each_operation_can_actually_cut() {
+        use ToolKindPick as F;
+        // The agreed table. Narrower than "whatever the guards would not reject":
+        // no ball-nose for facing, no face mill for profile/pocket, no end mill for
+        // drilling — those are possible but deliberately not offered.
+        assert_eq!(families_for(OpKind::Profile), &[F::EndMill, F::BallMill, F::BullNose]);
+        assert_eq!(families_for(OpKind::Pocket), &[F::EndMill, F::BallMill, F::BullNose]);
+        assert_eq!(families_for(OpKind::Face), &[F::EndMill, F::BullNose, F::FaceMill]);
+        assert_eq!(families_for(OpKind::Drill), &[F::Drill]);
+        assert_eq!(families_for(OpKind::Thread), &[F::ThreadMill]);
+        assert_eq!(families_for(OpKind::Chamfer), &[F::ChamferMill, F::VBit]);
+        assert_eq!(families_for(OpKind::Engrave), &[F::VBit]);
+    }
+
+    #[test]
+    fn no_operation_offers_a_family_its_strategy_would_reject() {
+        use ToolKindPick as F;
+        // The hard floor: engraving needs a cutting tip, threading needs a thread
+        // mill, and side-milling needs a cylindrical flank. Offering any of these
+        // would hand the user a combination that cannot produce G-code.
+        assert!(!families_for(OpKind::Engrave).contains(&F::ChamferMill));
+        for op in [OpKind::Profile, OpKind::Pocket] {
+            assert!(!families_for(op).contains(&F::VBit), "{op:?}");
+            assert!(!families_for(op).contains(&F::ChamferMill), "{op:?}");
+            assert!(!families_for(op).contains(&F::Drill), "{op:?}");
+            assert!(!families_for(op).contains(&F::ThreadMill), "{op:?}");
+        }
+        assert_eq!(families_for(OpKind::Thread), &[F::ThreadMill]);
+        // Facing must not offer a tool whose tip does not cut.
+        assert!(!families_for(OpKind::Face).contains(&F::ChamferMill));
+    }
+
+    #[test]
+    fn every_operation_offers_at_least_one_family() {
+        for op in [
+            OpKind::Profile,
+            OpKind::Pocket,
+            OpKind::Face,
+            OpKind::Drill,
+            OpKind::Thread,
+            OpKind::Chamfer,
+            OpKind::Engrave,
+        ] {
+            assert!(!families_for(op).is_empty(), "{op:?} offers nothing");
+        }
+    }
 
     #[test]
     fn tabs_read_left_to_right_in_workflow_order() {
