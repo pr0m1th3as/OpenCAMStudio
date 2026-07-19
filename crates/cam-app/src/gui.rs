@@ -333,6 +333,17 @@ impl Pane {
         }
     }
 
+    /// The short label this pane uses in the ribbon's **Panes** group. Only the tool
+    /// library differs: it compacts to "Tools" so the group stays narrow in a band
+    /// that already carries five commands and the cube slider. The pane's own title
+    /// bar keeps the full name from [`name`](Self::name).
+    fn ribbon_label(self) -> &'static str {
+        match self {
+            Pane::Library => "Tools",
+            other => other.name(),
+        }
+    }
+
     /// This pane's minimum size (px) along whichever axis it is split — enforced
     /// individually while resizing (see `App::clamp_resize`).
     fn min_size(self) -> f32 {
@@ -394,18 +405,16 @@ enum RibbonTab {
     Edit,
     Tooling,
     View,
-    Windows,
 }
 
 impl RibbonTab {
     /// The tabs shown in the strip, left to right.
-    const ALL: [RibbonTab; 6] = [
+    const ALL: [RibbonTab; 5] = [
         RibbonTab::Home,
-        RibbonTab::Operations,
         RibbonTab::Edit,
+        RibbonTab::Operations,
         RibbonTab::Tooling,
         RibbonTab::View,
-        RibbonTab::Windows,
     ];
 
     fn label(self) -> &'static str {
@@ -415,7 +424,6 @@ impl RibbonTab {
             RibbonTab::Edit => "Edit",
             RibbonTab::Tooling => "Tooling",
             RibbonTab::View => "View",
-            RibbonTab::Windows => "Windows",
         }
     }
 }
@@ -4121,15 +4129,16 @@ impl App {
         column![strip, band].into()
     }
 
-    /// The command groups for the active tab, or `None` for the Windows tab (which
-    /// is a pane-toggle list, not icon commands).
-    fn ribbon_specs(&self) -> Option<Vec<GroupSpec>> {
+    /// The icon-command groups for the active tab. Always non-empty — the pane
+    /// toggles and the cube slider are appended separately by [`Self::ribbon_body`],
+    /// since neither is an icon command the density solver can size.
+    fn ribbon_specs(&self) -> Vec<GroupSpec> {
         let has_geo = self.controller.has_geometry();
         // A new op needs geometry to pick; its tool is drawn from the library, so the
         // library must have at least one tool (it seeds defaults, so it always does).
         let can_create = has_geo && !self.library.tools.is_empty();
         let begin = |kind: OpKind| can_create.then_some(Message::BeginOp(kind));
-        let specs = match self.active_tab {
+        match self.active_tab {
             RibbonTab::Home => vec![
                 GroupSpec {
                     title: "Project",
@@ -4249,13 +4258,11 @@ impl App {
                     ),
                 ],
             }],
-            RibbonTab::Windows => return None,
-        };
-        Some(specs)
+        }
     }
 
     /// The densities the active tab's groups should render at, given the window
-    /// width. Empty for the Windows tab.
+    /// width.
     fn ribbon_densities(&self, specs: &[GroupSpec]) -> Vec<Density> {
         let counts: Vec<usize> = specs.iter().map(|g| g.commands.len()).collect();
         let available = (self.window.width - RIBBON_CHROME).max(0.0);
@@ -4264,9 +4271,7 @@ impl App {
 
     /// The groups shown for the active ribbon tab, each at its solved density.
     fn ribbon_body(&self) -> Element<'_, Message> {
-        let Some(specs) = self.ribbon_specs() else {
-            return self.windows_body();
-        };
+        let specs = self.ribbon_specs();
         let densities = self.ribbon_densities(&specs);
         let mut band = row![].spacing(GROUP_GAP).align_y(Alignment::Start);
         for (i, (spec, &density)) in specs.iter().zip(&densities).enumerate() {
@@ -4274,8 +4279,11 @@ impl App {
         }
         // The View tab gets a live orientation-cube size control (a slider has no
         // place in the icon-command band, so it is appended as its own group).
+        // The View tab gets the cube-size slider, then the pane-visibility toggles —
+        // both sit outside the density solver, which sizes icon-command groups only.
         if self.active_tab == RibbonTab::View {
             band = band.push(self.cube_size_group());
+            band = band.push(self.panes_group());
         }
         band.into()
     }
@@ -4311,23 +4319,42 @@ impl App {
     }
 
     /// The Windows tab: a checkbox per pane (naturally narrow, no collapse).
-    fn windows_body(&self) -> Element<'_, Message> {
-        let mut panes = column![].spacing(4);
-        // The Viewport is always visible and has no toggle.
-        for pane in ALL_PANES.into_iter().filter(|p| *p != Pane::Viewport) {
+    /// The pane-visibility toggles, appended to the **View** tab as a compact block
+    /// captioned "Panes". Laid out in two balanced columns: the ribbon band is only
+    /// ~70 px tall, so a single stacked column of four would overflow it.
+    ///
+    /// The Viewport is always visible and has no toggle. Labels come from
+    /// [`Pane::ribbon_label`], so the tool library reads "Tools" here while its own
+    /// title bar keeps the full name.
+    fn panes_group(&self) -> Element<'_, Message> {
+        let toggle = |pane: Pane| -> Element<'_, Message> {
             let shown = self.pane_handle(pane).is_some();
-            panes = panes.push(
-                row![
-                    checkbox(shown)
-                        .size(15)
-                        .on_toggle(move |v| Message::SetPaneVisible(pane, v)),
-                    text(pane.name()).size(13),
-                ]
-                .spacing(6)
-                .align_y(Alignment::Center),
-            );
+            row![
+                checkbox(shown)
+                    .size(15)
+                    .on_toggle(move |v| Message::SetPaneVisible(pane, v)),
+                text(pane.ribbon_label()).size(12),
+            ]
+            .spacing(5)
+            .align_y(Alignment::Center)
+            .into()
+        };
+        // Derived from ALL_PANES rather than listed, so a pane added later appears
+        // here automatically instead of silently going missing.
+        let toggles: Vec<Pane> = ALL_PANES
+            .into_iter()
+            .filter(|p| *p != Pane::Viewport)
+            .collect();
+        let split = toggles.len().div_ceil(2);
+        let mut grid = row![].spacing(12).align_y(Alignment::Start);
+        for chunk in toggles.chunks(split) {
+            let mut col = column![].spacing(4);
+            for &pane in chunk {
+                col = col.push(toggle(pane));
+            }
+            grid = grid.push(col);
         }
-        row![ribbon_group("Panes", panes)].into()
+        ribbon_group("Panes", grid)
     }
 
     /// The floating panel for an open collapsed-group popup, positioned under its
@@ -4336,7 +4363,7 @@ impl App {
     /// widths — the analytic layout doubles as popup positioning.
     fn ribbon_popup(&self) -> Option<Element<'_, Message>> {
         let index = self.open_group?;
-        let specs = self.ribbon_specs()?;
+        let specs = self.ribbon_specs();
         let spec = specs.get(index)?;
         let densities = self.ribbon_densities(&specs);
         if !densities.get(index)?.is_popup() {
@@ -7360,6 +7387,44 @@ mod inspector_field_tests {
 #[cfg(test)]
 mod ribbon_tests {
     use super::*;
+
+    #[test]
+    fn tabs_read_left_to_right_in_workflow_order() {
+        // Home -> Edit -> Operations -> Tooling -> View: set up, then edit, then cut,
+        // then tools, then look. Windows is gone — its pane toggles live in View.
+        let labels: Vec<&str> = RibbonTab::ALL.iter().map(|t| t.label()).collect();
+        assert_eq!(
+            labels,
+            vec!["Home", "Edit", "Operations", "Tooling", "View"]
+        );
+    }
+
+    #[test]
+    fn the_tool_library_compacts_to_tools_in_the_ribbon_only() {
+        // The ribbon band is tight, so the label is shortened there — but the pane's
+        // own identity (its title bar, and anything keyed on the name) is unchanged.
+        assert_eq!(Pane::Library.ribbon_label(), "Tools");
+        assert_eq!(Pane::Library.name(), "Tool Library");
+        // Every other pane reads the same in both places.
+        for pane in ALL_PANES.into_iter().filter(|p| *p != Pane::Library) {
+            assert_eq!(pane.ribbon_label(), pane.name(), "{pane:?}");
+        }
+    }
+
+    #[test]
+    fn the_panes_group_covers_every_pane_except_the_viewport() {
+        // The viewport is always visible and deliberately has no toggle; everything
+        // else must be reachable, so a pane added later cannot go missing.
+        let toggled: Vec<Pane> = ALL_PANES
+            .into_iter()
+            .filter(|p| *p != Pane::Viewport)
+            .collect();
+        assert_eq!(toggled.len(), ALL_PANES.len() - 1);
+        assert!(!toggled.contains(&Pane::Viewport));
+        // Two balanced columns, so the block stays inside the ~70 px band.
+        let split = toggled.len().div_ceil(2);
+        assert_eq!(toggled.chunks(split).count(), 2, "must be two columns");
+    }
 
     // Home tab shape: File(2) + Edit(3).
     const HOME: [usize; 2] = [2, 3];
