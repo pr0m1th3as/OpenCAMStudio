@@ -1003,6 +1003,8 @@ enum Field {
     ClearPlungeB,
     /// Carve clearing pass: allowance left off the carved surface for the V-bit (mm).
     ClearOffset,
+    /// Carve: target ridge height left on the flat floor (mm); 0 = auto.
+    Scallop,
 }
 
 impl Field {
@@ -1077,6 +1079,7 @@ impl Field {
             Field::ClearPlungeA => "Clear plunge A",
             Field::ClearPlungeB => "Clear plunge B",
             Field::ClearOffset => "Clear allowance (mm)",
+            Field::Scallop => "Floor scallop (mm, 0=auto)",
             Field::PlungeA => "Plunge angle/radius",
             Field::PlungeB => "Plunge length/pitch",
         }
@@ -1302,9 +1305,17 @@ impl Field {
                  depending on the plunge type. Unused for a straight plunge."
             }
             Field::RingStep => {
-                "How far apart the carve rings step inward (mm). A finish control, like a \
-                 scallop tolerance: finer rings give a smoother carved surface and a \
-                 longer program. 0 = choose automatically."
+                "How far apart the WALL rings step inward (mm) -- a roughing control, not \
+                 a finish one. The finished wall is cut by the deepest ring alone, whose \
+                 flank spans from the boundary to its tip; the shallower rings limit how \
+                 much one pass takes and reach into corners. Coarser costs tool load, not \
+                 surface quality. 0 = choose automatically."
+            }
+            Field::Scallop => {
+                "The ridge you will accept on the flat FLOOR (mm) -- the real finish \
+                 control. A cone cannot leave a flat floor, so adjacent passes leave a \
+                 ridge between them; asking for a height rather than a spacing lets the \
+                 spacing open up where the tool's geometry allows. 0 = a fine default."
             }
             Field::ClearStepdown => {
                 "Maximum depth the clearing tool removes per pass (mm). 0 takes the whole \
@@ -3948,6 +3959,7 @@ impl App {
                         Field::Depth,
                         Field::ProfileOffset,
                         Field::RingStep,
+                        Field::Scallop,
                         Field::Feed,
                         Field::PlungeFeed,
                     ];
@@ -6355,6 +6367,7 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Carve(o), Field::Depth) => Some(o.depth),
         (Operation::Carve(o), Field::ProfileOffset) => Some(o.offset),
         (Operation::Carve(o), Field::RingStep) => Some(o.ring_step),
+        (Operation::Carve(o), Field::Scallop) => Some(o.scallop),
         (Operation::Carve(o), Field::Feed) => Some(o.feed),
         (Operation::Carve(o), Field::PlungeFeed) => Some(o.plunge_feed),
         (Operation::Carve(o), Field::ClearStepdown) => Some(o.clear?.params.stepdown),
@@ -6655,6 +6668,9 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
             }
             if let Some(v) = get(Field::RingStep) {
                 o.ring_step = v.max(0.0);
+            }
+            if let Some(v) = get(Field::Scallop) {
+                o.scallop = v.max(0.0);
             }
             if let Some(v) = get(Field::Feed) {
                 o.feed = v;

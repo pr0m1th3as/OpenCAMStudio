@@ -1075,6 +1075,7 @@ impl AppController {
                     depth: 1.0,
                     offset: 0.0,
                     ring_step: 0.0,
+                    scallop: 0.0,
                     feed: p.feed,
                     plunge_feed: p.plunge_feed,
                     // On by default: a carve is hundreds of rings, and every link is

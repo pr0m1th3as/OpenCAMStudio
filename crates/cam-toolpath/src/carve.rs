@@ -30,9 +30,22 @@
 //! contour-parallel V-carving, and it reuses the integer-grid-robust offsetter rather
 //! than introducing a new algorithm.
 //!
-//! **The honest trade-off:** the carved surface is a staircase of rings rather than a
-//! continuous ruled surface, so `ring_step` is a *finish* control, exactly like a scallop
-//! tolerance. A finer step costs path length, not correctness.
+//! ## What the ring spacing actually controls
+//!
+//! Not the wall's finish, which is the trap. A ring at inward distance `w` puts the tool
+//! tip at depth `f(w)`, and *by construction* the tool's half-width at the surface is
+//! then exactly `w` — its flank lands on the boundary. So the **deepest ring alone cuts
+//! the whole wall**, from the boundary down to its tip, and every shallower ring cuts a
+//! narrower V entirely inside it. On a straight wall the intermediate rings change the
+//! finished surface not at all; they are a **roughing** schedule, limiting how much one
+//! pass takes. (They do earn their keep at a convex corner, where the deepest ring's
+//! cone cannot reach the apex — the corner is the one place all of them contribute.)
+//!
+//! Where spacing *does* set the finish is the **floor**: there the surface is flat but
+//! the tool is a cone, so adjacent passes leave a ridge of `f(spacing/2)` between them.
+//! That is why the floor pass is spaced from a **scallop height** rather than from
+//! `ring_step` — and why a rounded tip may take a far wider step than a sharp one for the
+//! same ridge.
 //!
 //! ## Linking the rings: why staying down is safe
 //!
@@ -91,6 +104,13 @@ const DEFAULT_RING_STEP_MM: f64 = 0.2;
 /// Absolute floor on the ring spacing, mm — below this the ring count explodes for no
 /// visible gain, and the offsetter's integer grid stops resolving the difference.
 const MIN_RING_STEP_MM: f64 = 0.01;
+
+/// Default target ridge height on the flat floor, mm, when `scallop` is `0`.
+///
+/// Fine enough not to be felt with a thumbnail, and — because the spacing it implies is
+/// read back through the tool's own profile — automatically generous on a rounded tip
+/// and tight on a sharp one.
+const DEFAULT_SCALLOP_MM: f64 = 0.05;
 
 /// Carves a region with a V-bit. Construct from a [`CarveOp`].
 #[derive(Clone, Debug)]
@@ -205,6 +225,16 @@ impl Strategy for CarveStrategy {
         // the V would be deeper than allowed.
         let w_max = vtip_half_width(alpha, tip_radius, op.depth);
         let step = ring_step(op.ring_step, w_max);
+        // The floor's spacing comes from the ridge the operator will accept, not from the
+        // wall's roughing step: a ridge of `h` sits midway between two passes, so the
+        // spacing that leaves it is twice the tool's half-width at `h`.
+        let scallop = if op.scallop > 0.0 {
+            op.scallop
+        } else {
+            DEFAULT_SCALLOP_MM
+        };
+        let floor_step =
+            (2.0 * vtip_half_width(alpha, tip_radius, scallop)).max(MIN_RING_STEP_MM);
         let widths = ring_widths(w_max, step);
 
         let link = Tag::new(op.id, MoveKind::Link);
@@ -291,13 +321,12 @@ impl Strategy for CarveStrategy {
                 // adjacent passes leave uncut material between them — so say so.
                 diagnostics.push(Diagnostic::warning(format!(
                     "operation {}: {} at full depth with no clearing tool. The V-bit \
-                     cuts them in {:.3} mm rings, but a cone cannot leave a flat floor, \
-                     so they come out ridged by about {:.3} mm. Set a clearing end mill, \
-                     or deepen to {full_depth:.3} mm{reach}.",
+                     cuts them in {floor_step:.3} mm passes, but a cone cannot leave a \
+                     flat floor, so they come out ridged by about {:.3} mm. Set a \
+                     clearing end mill, or deepen to {full_depth:.3} mm{reach}.",
                     op.id,
                     areas_phrase(flat.len()),
-                    step,
-                    vtip_depth_for_half_width(alpha, tip_radius, 0.5 * step),
+                    vtip_depth_for_half_width(alpha, tip_radius, 0.5 * floor_step),
                 )));
             }
         } else {
@@ -548,7 +577,7 @@ impl Strategy for CarveStrategy {
         // With no clearing tool the flat land's own boundary was already cut as pass 1's
         // innermost ring, so start one step in. A rest region has its own boundary, which
         // nothing has cut, so start on it.
-        let mut d = if swept.is_empty() { step } else { 0.0 };
+        let mut d = if swept.is_empty() { floor_step } else { 0.0 };
         let mut floor_rings = 0usize;
         loop {
             if cancel.is_cancelled() {
@@ -580,13 +609,13 @@ impl Strategy for CarveStrategy {
                 op,
                 &env.heights,
                 tags,
-                step,
+                floor_step,
             );
             floor_rings += 1;
             if floor_rings > 0 {
                 deepest = deepest.max(op.depth);
             }
-            d += step;
+            d += floor_step;
         }
 
         // Whatever happened, come home to clearance.
@@ -619,8 +648,8 @@ impl Strategy for CarveStrategy {
             program.push(Step::ToolChange { tool: op.tool });
         }
         program.push(Step::Comment(format!(
-            "Carve: {} rings at {step:.3} mm, to {deepest:.3} mm deep with a \
-             {included_angle_deg} deg V-bit, {} lifts",
+            "Carve: {} rings at {step:.3} mm wall / {floor_step:.3} mm floor, to \
+             {deepest:.3} mm deep with a {included_angle_deg} deg V-bit, {} lifts",
             st.rings_cut,
             st.lifts
         )));
@@ -1087,6 +1116,7 @@ mod tests {
             depth,
             offset: 0.0,
             ring_step: 0.5,
+            scallop: 0.0,
             feed: 200.0,
             plunge_feed: 100.0,
             stay_down: false,
@@ -2327,6 +2357,90 @@ mod tests {
             a * 4.0 < b,
             "the rest pass should be a small fraction of the full floor: {a:.1} vs {b:.1} mm"
         );
+    }
+
+    #[test]
+    fn the_floor_spacing_comes_from_the_scallop_not_the_wall_step() {
+        // The finish control the operator actually has. A tighter ridge must give a
+        // tighter spacing, and the reported numbers must be the two different things.
+        let comment_of = |scallop: f64, ring_step: f64, tip: f64| {
+            let mut o = op(1.0);
+            o.ring_step = ring_step;
+            o.scallop = scallop;
+            let r = run(o, vbit(90.0, tip));
+            assert!(errors(&r).is_empty(), "{:?}", errors(&r));
+            r.program
+                .steps()
+                .iter()
+                .find_map(|s| match s {
+                    Step::Comment(c) if c.starts_with("Carve:") => Some(c.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        // 90 deg sharp bit: f(u) == u, so a 0.05 mm ridge wants a 0.100 mm spacing.
+        let c = comment_of(0.05, 0.5, 0.0);
+        assert!(c.contains("0.500 mm wall"), "{c}");
+        assert!(c.contains("0.100 mm floor"), "{c}");
+        // Halve the ridge, halve the spacing — and the wall step is untouched.
+        let c = comment_of(0.025, 0.5, 0.0);
+        assert!(c.contains("0.500 mm wall") && c.contains("0.050 mm floor"), "{c}");
+    }
+
+    #[test]
+    fn a_rounded_tip_earns_a_wider_floor_step_at_the_same_ridge() {
+        // The whole point of asking for a ridge height instead of a spacing: the tool's
+        // own geometry decides how far it may step. Inside the tip ball the profile
+        // widens as sqrt(depth), so a rounded tip clears a far wider band per pass than
+        // a sharp one for the same ridge -- free speed, at equal finish.
+        let floor_step_of = |tip: f64| {
+            let mut o = op(1.0);
+            o.scallop = 0.05;
+            let r = run(o, vbit(90.0, tip));
+            let c = r
+                .program
+                .steps()
+                .iter()
+                .find_map(|s| match s {
+                    Step::Comment(c) if c.starts_with("Carve:") => Some(c.clone()),
+                    _ => None,
+                })
+                .unwrap();
+            let at = c.find("mm wall / ").unwrap() + "mm wall / ".len();
+            c[at..at + 5].parse::<f64>().unwrap()
+        };
+        let sharp = floor_step_of(0.0);
+        let rounded = floor_step_of(0.3);
+        assert!(
+            rounded > sharp * 2.0,
+            "a 0.3 mm tip should step far wider than a sharp one: {rounded:.3} vs {sharp:.3}"
+        );
+        // And it is exactly 2*sqrt(2*rt*h - h^2), the tip circle's own half-width.
+        let want = 2.0 * (2.0 * 0.3 * 0.05 - 0.05 * 0.05_f64).sqrt();
+        assert!((rounded - want).abs() < 1e-3, "{rounded} vs {want}");
+    }
+
+    #[test]
+    fn the_deepest_wall_ring_alone_cuts_the_whole_wall() {
+        // Why the wall step is a *roughing* control: a ring at w puts the tip at f(w),
+        // and the tool's half-width at the surface is then exactly w -- so its flank
+        // runs from the boundary right down to the tip. Every shallower ring cuts a
+        // narrower V wholly inside it. Pinned because the docs used to claim the
+        // opposite, and it is the reason a coarser wall step costs load, not finish.
+        for &(deg, rt) in &[(90.0, 0.0), (60.0, 0.0), (120.0, 0.0)] {
+            let a = (deg * 0.5_f64).to_radians();
+            let w_max = 1.0;
+            let tip = vtip_depth_for_half_width(a, rt, w_max);
+            for i in 1..20 {
+                let x = w_max * i as f64 / 20.0;
+                let cut = tip - vtip_depth_for_half_width(a, rt, w_max - x);
+                let nominal = vtip_depth_for_half_width(a, rt, x);
+                assert!(
+                    (cut - nominal).abs() < 1e-9,
+                    "deg={deg} x={x}: one pass gives {cut}, nominal {nominal}"
+                );
+            }
+        }
     }
 
     // --- the ring schedule ---

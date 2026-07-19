@@ -236,6 +236,7 @@ fn carve_doc() -> Document {
         depth: 1.0,
         offset: 0.0,
         ring_step: 0.5,
+        scallop: 0.0,
         feed: 300.0,
         plunge_feed: 100.0,
         stay_down: true,

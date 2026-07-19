@@ -770,11 +770,25 @@ pub struct CarveOp {
     /// [`ProfileOp::offset`]), shrinking the carved region.
     #[serde(default)]
     pub offset: f64,
-    /// Radial spacing of the carve rings, mm — the finish control, exactly like a
-    /// scallop tolerance: the carved surface is a staircase of rings, and a finer step
-    /// buys smoothness with path length. `0` (the default) derives one.
+    /// Radial spacing of the **wall** rings, mm — a *roughing* control, not a finish
+    /// one.
+    ///
+    /// The finished wall is cut by the deepest ring alone: that pass's flank spans from
+    /// the boundary down to its tip, so every shallower ring cuts a narrower V entirely
+    /// inside it. They exist to limit how much material one pass takes, and to reach
+    /// into convex corners, which the deepest ring cannot. A coarser step therefore
+    /// costs tool load, not surface quality. `0` (the default) derives one.
     #[serde(default)]
     pub ring_step: f64,
+    /// Target ridge height left on the **flat floor**, mm — the true finish control.
+    ///
+    /// Where the floor is flat but the tool is a cone, adjacent passes leave a ridge of
+    /// `vtip_depth_for_half_width(half the spacing)` between them. Asking for a ridge
+    /// height instead of a spacing lets the spacing open up wherever the tool's geometry
+    /// allows: a rounded tip clears a much wider band at the same ridge than a sharp one
+    /// does. `0` (the default) uses a sensible fine value.
+    #[serde(default)]
+    pub scallop: f64,
     /// Cutting feed, mm/min.
     pub feed: f64,
     /// Plunge feed for the approach in Z, mm/min.
@@ -1022,6 +1036,7 @@ mod tests {
             depth: 1.0,
             offset: 0.0,
             ring_step: 0.0,
+            scallop: 0.0,
             feed: 300.0,
             plunge_feed: 100.0,
             stay_down: false,
