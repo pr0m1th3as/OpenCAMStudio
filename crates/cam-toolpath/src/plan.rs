@@ -9,8 +9,9 @@ use cam_cldata::{Coolant, MoveKind, Point3, Program, SpindleDir, Step, Tag};
 use cam_model::{Document, Operation};
 
 use crate::{
-    CancelToken, ChamferStrategy, Diagnostic, DrillStrategy, EngraveStrategy, FaceStrategy, JobEnv,
-    PocketStrategy, ProfileStrategy, Strategy, StrategyResult, ThreadStrategy,
+    CancelToken, CarveStrategy, ChamferStrategy, Diagnostic, DrillStrategy, EngraveStrategy,
+    FaceStrategy, JobEnv, PocketStrategy, ProfileStrategy, Strategy, StrategyResult,
+    ThreadStrategy,
 };
 
 /// Assemble a whole-job [`Program`] from a [`Document`].
@@ -72,8 +73,10 @@ pub fn build_job(
             continue;
         }
 
-        // Tool change when the tool differs from the one in the spindle.
-        let tool = operation_tool(operation);
+        // Tool change when the operation's *first* tool differs from the one in the
+        // spindle. A multi-tool operation orders its own subsequent changes — see the
+        // resync after the fragment is appended.
+        let tool = operation.tools()[0];
         if current_tool != Some(tool) {
             program.push(Step::ToolChange { tool });
             current_tool = Some(tool);
@@ -89,7 +92,18 @@ pub fn build_job(
             spindle_started = true;
         }
 
+        // A multi-tool operation (Carve) emits its own tool change mid-fragment, because
+        // only it knows the order its tools must run in. Whatever it left in the spindle
+        // is what the *next* operation compares against — read it back rather than
+        // assuming, or the next operation would be handed a stale tool number and its
+        // change silently omitted.
+        let ends_with = last_tool_change(&fragment);
+
         program.extend(fragment);
+
+        if let Some(t) = ends_with {
+            current_tool = Some(t);
+        }
     }
 
     if spindle_started {
@@ -110,17 +124,15 @@ fn compute(operation: &Operation, env: &JobEnv, cancel: &CancelToken) -> Strateg
         Operation::Chamfer(op) => ChamferStrategy::new(op.clone()).compute(env, cancel),
         Operation::Thread(op) => ThreadStrategy::new(op.clone()).compute(env, cancel),
         Operation::Engrave(op) => EngraveStrategy::new(op.clone()).compute(env, cancel),
+        Operation::Carve(op) => CarveStrategy::new(op.clone()).compute(env, cancel),
     }
 }
 
-fn operation_tool(operation: &Operation) -> u32 {
-    match operation {
-        Operation::Profile(op) => op.tool,
-        Operation::Drill(op) => op.tool,
-        Operation::Pocket(op) => op.tool,
-        Operation::Face(op) => op.tool,
-        Operation::Chamfer(op) => op.tool,
-        Operation::Thread(op) => op.tool,
-        Operation::Engrave(op) => op.tool,
-    }
+/// The tool left in the spindle by `fragment` — the last [`Step::ToolChange`] it emits,
+/// or `None` if it emits none (the single-tool case, which is every operation but Carve).
+fn last_tool_change(fragment: &Program) -> Option<u32> {
+    fragment.steps().iter().rev().find_map(|s| match s {
+        Step::ToolChange { tool } => Some(*tool),
+        _ => None,
+    })
 }

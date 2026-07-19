@@ -15,7 +15,7 @@ use cam_import::{read_cad_file, read_dxf_str, ImportError, ImportOptions};
 
 use crate::project::{OcamFile, Project};
 use cam_model::{
-    EngraveOp,
+    CarveOp, EngraveOp,
     reconcile_tool_numbers, Axis, ChamferOp, Comp, Document, DrillOp, FaceOp, Hand, Heights,
     History, Lead, Machine, Operation, Plunge, PocketOp, ProfileOp, ReconcileReport, Setup, Side,
     Stock, ThreadOp, Tool, ToolKind,
@@ -73,6 +73,7 @@ pub enum OpKind {
     Chamfer,
     Thread,
     Engrave,
+    Carve,
 }
 
 /// Whether an operation kind restricts geometry selection to **circular** loops.
@@ -1030,6 +1031,40 @@ impl AppController {
                     blind_allowance: 0.0,
                     feed: p.feed,
                     plunge_feed: p.plunge_feed,
+                })
+            }
+            OpKind::Carve => {
+                // Islands are carved around, exactly as a pocket leaves them — the
+                // counters of letters are the everyday case.
+                let island_contours = islands
+                    .iter()
+                    .filter_map(|l| self.loop_contour(*l).cloned())
+                    .collect();
+                Operation::Carve(CarveOp {
+                    id: 0,
+                    tool,
+                    // No clearing tool by default: the V-bit alone is the simple case,
+                    // and the inspector offers the second tool only once the shape is
+                    // known to leave a flat land.
+                    clear_tool: None,
+                    boundary: chain,
+                    islands: island_contours,
+                    top: p.top_of_stock,
+                    // A cap, not a command: the shape decides the actual depth. Deeper
+                    // than an engraving default, since a carve is meant to be seen.
+                    depth: 1.0,
+                    offset: 0.0,
+                    ring_step: 0.0,
+                    feed: p.feed,
+                    plunge_feed: p.plunge_feed,
+                    // On by default: a carve is hundreds of rings, and every link is
+                    // verified before it is taken (the ones that would gouge still lift).
+                    stay_down: true,
+                    clear_stepover: 0.0,
+                    clear_stepdown: 0.0,
+                    clear_feed: 0.0,
+                    clear_plunge_feed: 0.0,
+                    start,
                 })
             }
             OpKind::Engrave => Operation::Engrave(EngraveOp {
@@ -2156,6 +2191,7 @@ fn op_kind_of(op: &Operation) -> OpKind {
         Operation::Chamfer(_) => OpKind::Chamfer,
         Operation::Thread(_) => OpKind::Thread,
         Operation::Engrave(_) => OpKind::Engrave,
+        Operation::Carve(_) => OpKind::Carve,
     }
 }
 
@@ -2333,6 +2369,7 @@ mod tests {
             Operation::Thread(o) => o.z_bottom,
             Operation::Chamfer(o) => o.top,
             Operation::Engrave(o) => o.depth,
+            Operation::Carve(o) => o.depth,
         }
     }
 

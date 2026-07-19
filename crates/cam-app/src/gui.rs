@@ -675,7 +675,8 @@ fn families_for(kind: OpKind) -> &'static [ToolKindPick] {
         // A chamfer is cut by the flank, which both of these have.
         OpKind::Chamfer => &[F::ChamferMill, F::VBit],
         // Engraving cuts with the tip; a chamfer mill's flat does not cut.
-        OpKind::Engrave => &[F::VBit],
+        // Carving cuts with the tip too, and its geometry comes from the cone.
+        OpKind::Engrave | OpKind::Carve => &[F::VBit],
     }
 }
 
@@ -935,6 +936,8 @@ enum Field {
     PlungeA,
     /// Plunge parameter B: zig-zag length, or helix pitch.
     PlungeB,
+    /// Carve: radial spacing of the carve rings (mm); 0 = auto.
+    RingStep,
 }
 
 impl Field {
@@ -997,6 +1000,7 @@ impl Field {
             Field::Overlap => "Overlap (%)",
             Field::FaceOvershoot => "Overshoot (mm)",
             Field::Engagement => "Engagement (mm, 0=off)",
+            Field::RingStep => "Ring step (mm, 0=auto)",
             Field::PlungeA => "Plunge angle/radius",
             Field::PlungeB => "Plunge length/pitch",
         }
@@ -1221,6 +1225,11 @@ impl Field {
                 "Second plunge parameter: the zig-zag length, or the helix pitch (mm) — \
                  depending on the plunge type. Unused for a straight plunge."
             }
+            Field::RingStep => {
+                "How far apart the carve rings step inward (mm). A finish control, like a \
+                 scallop tolerance: finer rings give a smoother carved surface and a \
+                 longer program. 0 = choose automatically."
+            }
         }
     }
 }
@@ -1281,6 +1290,11 @@ mod help {
         "Milling direction. Climb (recommended) gives a cleaner finish and is required for \
          adaptive clearing; unticking it is conventional milling, which reverses the pass \
          direction.";
+    pub const CARVE_STAY_DOWN: &str =
+        "Link the carve rings without lifting where it is safe to do so, instead of \
+         retracting to clearance for each. A carve can run to hundreds of rings, so this \
+         saves most of the cycle time; each link is checked individually, and any that \
+         would gouge still lifts.";
     pub const FACE_DIRECTION: &str =
         "The axis the facing passes sweep along. Defaults to the boundary edge you picked; \
          otherwise the longest edge.";
@@ -1770,6 +1784,8 @@ enum Message {
     ThreadHandChanged(Hand),
     /// Change the selected thread between climb and conventional milling.
     ThreadClimbChanged(bool),
+    /// Toggle whether the selected carve links its rings without lifting.
+    CarveStayDownToggled(bool),
     /// A world `(x, y)` picked in the viewport plus the pickbox aperture in world
     /// mm (completes a pending operation).
     PickWorld([f32; 2], f32),
@@ -2737,6 +2753,14 @@ impl App {
                 });
                 self.rerun();
             }
+            Message::CarveStayDownToggled(on) => {
+                self.controller.edit_selected_operation(|op| {
+                    if let Operation::Carve(c) = op {
+                        c.stay_down = on;
+                    }
+                });
+                self.rerun();
+            }
             Message::NewTool => {
                 // Add a tool to the library and select it for editing. Its **type**
                 // seeds from the currently-selected tool (a chamfer mill begets a
@@ -3657,6 +3681,18 @@ impl App {
                     vec![
                         Field::Depth,
                         Field::Stepdown,
+                        Field::Feed,
+                        Field::PlungeFeed,
+                    ]
+                }
+                // Carve has no stepdown (single-pass, deferred) and no stepover: its
+                // ring spacing plays that role, and `Depth` is a *cap* the shape may
+                // not reach.
+                Some(Operation::Carve(_)) => {
+                    vec![
+                        Field::Depth,
+                        Field::ProfileOffset,
+                        Field::RingStep,
                         Field::Feed,
                         Field::PlungeFeed,
                     ]
@@ -4721,6 +4757,7 @@ impl App {
             OpKind::Chamfer => "Chamfer",
             OpKind::Thread => "Thread",
             OpKind::Engrave => "Engrave",
+            OpKind::Carve => "Carve",
         };
         // The tool is chosen in two steps — **family**, then a tool within it — so a
         // library of hundreds does not have to be scrolled for every operation. The
@@ -5354,6 +5391,18 @@ impl App {
                         |c| Message::ThreadClimbChanged(c == CutStyle::Climb),
                     ));
                 }
+                Some(Operation::Carve(c)) => {
+                    list = list.push(
+                        row![
+                            label_help("Stay down", help::CARVE_STAY_DOWN, self.tooltips),
+                            checkbox(c.stay_down)
+                                .size(15)
+                                .on_toggle(Message::CarveStayDownToggled),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                    );
+                }
                 _ => {}
             }
         }
@@ -5816,6 +5865,7 @@ fn op_kind(op: &Operation) -> &'static str {
         Operation::Chamfer(_) => "Chamfer",
         Operation::Thread(_) => "Thread",
         Operation::Engrave(_) => "Engrave",
+        Operation::Carve(_) => "Carve",
     }
 }
 
@@ -5831,6 +5881,11 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Profile(o), Field::LeadInSize) => Some(lead_size(o.lead_in)),
         (Operation::Profile(o), Field::LeadOutSize) => Some(lead_size(o.lead_out)),
         (Operation::Profile(o), Field::LeadOverlap) => Some(o.lead_overlap),
+        (Operation::Carve(o), Field::Depth) => Some(o.depth),
+        (Operation::Carve(o), Field::ProfileOffset) => Some(o.offset),
+        (Operation::Carve(o), Field::RingStep) => Some(o.ring_step),
+        (Operation::Carve(o), Field::Feed) => Some(o.feed),
+        (Operation::Carve(o), Field::PlungeFeed) => Some(o.plunge_feed),
         (Operation::Profile(o), Field::Engagement) => Some(o.clearing.engagement),
         (Operation::Profile(o), Field::PlungeA) => Some(plunge_params(o.plunge).0),
         (Operation::Profile(o), Field::PlungeB) => Some(plunge_params(o.plunge).1),
@@ -6067,6 +6122,23 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
             }
             if let Some(v) = get(Field::Stepdown) {
                 o.stepdown = v.max(0.0);
+            }
+            if let Some(v) = get(Field::Feed) {
+                o.feed = v;
+            }
+            if let Some(v) = get(Field::PlungeFeed) {
+                o.plunge_feed = v;
+            }
+        }
+        Operation::Carve(o) => {
+            if let Some(v) = get(Field::Depth) {
+                o.depth = v;
+            }
+            if let Some(v) = get(Field::ProfileOffset) {
+                o.offset = v;
+            }
+            if let Some(v) = get(Field::RingStep) {
+                o.ring_step = v.max(0.0);
             }
             if let Some(v) = get(Field::Feed) {
                 o.feed = v;

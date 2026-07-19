@@ -219,10 +219,9 @@ pub fn reconcile_tool_numbers(setup: &mut Setup, shop: &[Tool]) -> ReconcileRepo
         }
     }
     for op in &mut setup.operations {
-        let old = op.tool();
-        if let Some(&n) = mapping.get(&old) {
-            op.set_tool(n);
-        }
+        // Every reference, not just the defining tool: a multi-tool operation's
+        // secondary tool must be renumbered too or it dangles.
+        op.map_tools(|old| mapping.get(&old).copied().unwrap_or(old));
     }
     report
 }

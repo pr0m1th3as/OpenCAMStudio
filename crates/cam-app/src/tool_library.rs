@@ -148,7 +148,9 @@ impl ToolLibrary {
             OpKind::Chamfer => first(|k| matches!(k, ToolKind::ChamferMill { .. })),
             // Engraving *requires* a V-bit (a chamfer mill's tip does not cut), so
             // this is the one default that matches the strategy's hard gate.
-            OpKind::Engrave => first(|k| matches!(k, ToolKind::VBit { .. })),
+            // Carving *requires* a V-bit too — it is the same gate, for the same
+            // reason: the tool's own cone is what shapes the cut.
+            OpKind::Engrave | OpKind::Carve => first(|k| matches!(k, ToolKind::VBit { .. })),
         };
         preferred.or_else(|| self.tools.first()).copied()
     }

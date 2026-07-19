@@ -645,6 +645,88 @@ pub struct EngraveOp {
     pub start: Option<[f64; 2]>,
 }
 
+/// A **V-carving** operation: the boundary outlines an *area* to carve, and the V-bit's
+/// flanks land on that boundary rather than its tip running along it.
+///
+/// The relation to [`EngraveOp`] is exactly Profile → Pocket: an engraving *is* the path
+/// it follows, a carving *consumes* the region a path encloses.
+///
+/// - **The tool never touches the boundary.** It follows inward offsets of it, and at
+///   inward distance `w` it sits at the depth where its groove is `2·w` wide
+///   ([`cam_geo::vtip_depth_for_half_width`]). So the carved wall meets the boundary at
+///   the surface, and the depth *varies* with the shape.
+/// - **Depth is derived, not dictated.** `depth` is a **cap**: the carve reaches it only
+///   where the region is wide enough. Where the region is wider still, a flat land
+///   remains at `depth` — which is what `clear_tool` is for.
+/// - **The path must be closed.** There is no interior to consume otherwise.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CarveOp {
+    /// Operation id.
+    pub id: u32,
+    /// The V-bit — the defining tool, chosen in the creation wizard. The strategy reads
+    /// its half-angle and tip radius; the carve's shape follows from them.
+    pub tool: u32,
+    /// An end mill that clears the flat land at full depth **before** the V-bit runs.
+    /// `None` means the V-bit does the lot, which cuts but leaves a **ridged** floor —
+    /// a cone cannot leave a flat one — and is warned about, not rejected.
+    #[serde(default)]
+    pub clear_tool: Option<u32>,
+    /// The closed boundary of the region to carve, in the part/WCS frame.
+    pub boundary: Contour,
+    /// Closed islands left uncut — holes, and the counters of letters. Auto-populated
+    /// from the picked region's nesting.
+    #[serde(default)]
+    pub islands: Vec<Contour>,
+    /// Absolute Z of the surface being carved (usually the stock top).
+    pub top: f64,
+    /// **Maximum** depth below `top`, mm (> 0), as a positive magnitude. The shape sets
+    /// the actual depth everywhere; this caps it.
+    pub depth: f64,
+    /// Hold-off from the boundary, mm. Positive leaves material (same sign convention as
+    /// [`ProfileOp::offset`]), shrinking the carved region.
+    #[serde(default)]
+    pub offset: f64,
+    /// Radial spacing of the carve rings, mm — the finish control, exactly like a
+    /// scallop tolerance: the carved surface is a staircase of rings, and a finer step
+    /// buys smoothness with path length. `0` (the default) derives one.
+    #[serde(default)]
+    pub ring_step: f64,
+    /// Cutting feed, mm/min.
+    pub feed: f64,
+    /// Plunge feed for the approach in Z, mm/min.
+    pub plunge_feed: f64,
+    /// Link the rings **without lifting** where it is safe to do so, instead of
+    /// retracting to clearance and plunging afresh for every ring.
+    ///
+    /// A carve can run to hundreds of rings, and a retract cycle each costs far more
+    /// time than the cut. Staying down is safe because the tool at a ring's own depth
+    /// never cuts below the intended surface anywhere at or beyond that ring's inward
+    /// distance — see the strategy's module docs for why — and the strategy verifies
+    /// each individual link against that region, retracting for the ones that fail.
+    ///
+    /// `false` (the serde default, the conservative reading of an absent field) lifts
+    /// between every ring.
+    #[serde(default)]
+    pub stay_down: bool,
+    /// Stepover of the clearing pass, mm. `0` derives `0.5·⌀`. Only meaningful with
+    /// `clear_tool`.
+    #[serde(default)]
+    pub clear_stepover: f64,
+    /// Maximum depth per clearing pass, mm. `0` clears the full depth in one pass.
+    #[serde(default)]
+    pub clear_stepdown: f64,
+    /// Clearing feed, mm/min. `0` inherits `feed`.
+    #[serde(default)]
+    pub clear_feed: f64,
+    /// Clearing plunge feed, mm/min. `0` inherits `plunge_feed`.
+    #[serde(default)]
+    pub clear_plunge_feed: f64,
+    /// Preferred start location (part XY): each ring begins at the point nearest here.
+    /// `None` uses the strategy's default entry.
+    #[serde(default)]
+    pub start: Option<[f64; 2]>,
+}
+
 /// An operation in a setup. An enum so a setup holds a heterogeneous, ordered
 /// list.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -663,6 +745,8 @@ pub enum Operation {
     Thread(ThreadOp),
     /// A V-carve engraving operation.
     Engrave(EngraveOp),
+    /// A V-carving operation over a region.
+    Carve(CarveOp),
 }
 
 impl Operation {
@@ -676,10 +760,12 @@ impl Operation {
             Operation::Chamfer(op) => op.id,
             Operation::Thread(op) => op.id,
             Operation::Engrave(op) => op.id,
+            Operation::Carve(op) => op.id,
         }
     }
 
-    /// The number of the tool this operation cuts with.
+    /// The number of the operation's **defining** tool — the one that does the work the
+    /// operation is named for. An operation may use more than one; see [`tools`](Self::tools).
     pub fn tool(&self) -> u32 {
         match self {
             Operation::Profile(op) => op.tool,
@@ -689,6 +775,25 @@ impl Operation {
             Operation::Chamfer(op) => op.tool,
             Operation::Thread(op) => op.tool,
             Operation::Engrave(op) => op.tool,
+            Operation::Carve(op) => op.tool,
+        }
+    }
+
+    /// Every tool the operation uses, **in cutting order** — so `tools()[0]` is the tool
+    /// that must be in the spindle when the operation's fragment begins, and the last is
+    /// the one left there when it ends.
+    ///
+    /// All single-tool operations return just [`tool`](Self::tool). Only [`CarveOp`]
+    /// returns two, and only when its clearing tool is set: the end mill clears the flat
+    /// land *first*, then the V-bit carves. The operation's own strategy emits the
+    /// intervening [`cam_cldata::Step::ToolChange`], since it alone knows the order.
+    pub fn tools(&self) -> Vec<u32> {
+        match self {
+            Operation::Carve(op) => match op.clear_tool {
+                Some(clear) if clear != op.tool => vec![clear, op.tool],
+                _ => vec![op.tool],
+            },
+            other => vec![other.tool()],
         }
     }
 
@@ -702,12 +807,13 @@ impl Operation {
             Operation::Chamfer(op) => op.id = id,
             Operation::Thread(op) => op.id = id,
             Operation::Engrave(op) => op.id = id,
+            Operation::Carve(op) => op.id = id,
         }
     }
 
-    /// Overwrite the number of the tool this operation cuts with, whatever its kind.
-    /// Used by tool-number reconciliation (see [`crate::reconcile`]) to rewrite every
-    /// reference when a setup adopts the shop's canonical numbering.
+    /// Overwrite the number of the operation's **defining** tool, whatever its kind.
+    /// Secondary tools are untouched — to rewrite *every* reference (renumbering), use
+    /// [`map_tools`](Self::map_tools).
     pub fn set_tool(&mut self, tool: u32) {
         match self {
             Operation::Profile(op) => op.tool = tool,
@@ -717,6 +823,20 @@ impl Operation {
             Operation::Chamfer(op) => op.tool = tool,
             Operation::Thread(op) => op.tool = tool,
             Operation::Engrave(op) => op.tool = tool,
+            Operation::Carve(op) => op.tool = tool,
+        }
+    }
+
+    /// Rewrite **every** tool reference the operation holds through `f` — the defining
+    /// tool and any secondary one. Used by tool-number reconciliation (see
+    /// [`crate::reconcile`]) when a setup adopts the shop's canonical numbering; a
+    /// secondary reference left behind would dangle or, worse, silently point at a
+    /// different tool that inherited the old number.
+    pub fn map_tools(&mut self, f: impl Fn(u32) -> u32) {
+        let t = f(self.tool());
+        self.set_tool(t);
+        if let Operation::Carve(op) = self {
+            op.clear_tool = op.clear_tool.map(&f);
         }
     }
 
@@ -812,6 +932,63 @@ mod tests {
             lead_overlap: 0.0,
             plunge: Plunge::Straight,
         })
+    }
+
+    fn carve(clear_tool: Option<u32>) -> Operation {
+        Operation::Carve(CarveOp {
+            id: 3,
+            tool: 4,
+            clear_tool,
+            boundary: Contour::new(vec![
+                Point::new(0.0, 0.0),
+                Point::new(10.0, 0.0),
+                Point::new(10.0, 10.0),
+            ]),
+            islands: Vec::new(),
+            top: 0.0,
+            depth: 1.0,
+            offset: 0.0,
+            ring_step: 0.0,
+            feed: 300.0,
+            plunge_feed: 100.0,
+            stay_down: false,
+            clear_stepover: 0.0,
+            clear_stepdown: 0.0,
+            clear_feed: 0.0,
+            clear_plunge_feed: 0.0,
+            start: None,
+        })
+    }
+
+    #[test]
+    fn a_single_tool_operation_reports_exactly_one_tool() {
+        assert_eq!(profile(1).tools(), vec![1]);
+    }
+
+    #[test]
+    fn a_carve_reports_the_clearing_tool_first() {
+        // Cutting order, not declaration order: the end mill takes the bulk out of the
+        // flat land before the fine V-bit ever touches it. `tools()[0]` is what must be
+        // in the spindle when the operation's fragment begins, so the order is load
+        // bearing, not cosmetic.
+        assert_eq!(carve(Some(7)).tools(), vec![7, 4]);
+        assert_eq!(carve(None).tools(), vec![4]);
+        // A clearing tool that *is* the carving tool is one tool, not two — no change
+        // should be emitted between the passes.
+        assert_eq!(carve(Some(4)).tools(), vec![4]);
+    }
+
+    #[test]
+    fn map_tools_rewrites_the_secondary_reference_too() {
+        // A renumbering that missed `clear_tool` would leave it pointing at whatever
+        // tool inherited the old number — silently machining with the wrong cutter.
+        let mut op = carve(Some(7));
+        op.map_tools(|t| t + 10);
+        assert_eq!(op.tools(), vec![17, 14]);
+        // set_tool, by contrast, is deliberately narrow: the defining tool only.
+        let mut op = carve(Some(7));
+        op.set_tool(9);
+        assert_eq!(op.tools(), vec![7, 9]);
     }
 
     #[test]
