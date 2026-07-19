@@ -62,8 +62,8 @@ pub use point::Point;
 pub use polygon::{Containment, Polygon};
 pub use polyline::Polyline;
 pub use toolprofile::{
-    generatrix, vtip_half_width, vtip_max_depth, BottomShape, GeneratrixSpec, Profile2D, ProfileSeg,
-    SegShape,
+    generatrix, vtip_depth_for_half_width, vtip_half_width, vtip_max_depth, BottomShape,
+    GeneratrixSpec, Profile2D, ProfileSeg, SegShape,
 };
 pub use stroke::{stroke_path, CapStyle};
 

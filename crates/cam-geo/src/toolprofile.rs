@@ -419,6 +419,43 @@ pub fn vtip_half_width(half_angle_rad: f64, tip_radius: f64, depth: f64) -> f64 
     }
 }
 
+/// The depth at which a **V-bit**'s groove is `half_width` wide — the exact inverse of
+/// [`vtip_half_width`] in its second argument, piecewise on the same ball/flank split.
+///
+/// This is what V-**carving** needs: the carve holds the tool's flanks against the
+/// region boundary, so the inward distance `w` from that boundary *dictates* the depth
+/// rather than the other way round.
+///
+/// - in the ball (`half_width ≤ tip_radius·cos α`): `rt − √(rt² − w²)`
+/// - on the flank: `rt·(1 − sin α) + (w − rt·cos α)/tan α`
+///
+/// A non-positive `half_width` gives `0`. A degenerate cone (`α ≈ 0`, a zero-taper
+/// "V-bit") cuts no width at any depth, so there is no inverse: it gives `0` as well.
+/// The result is **not** clamped to the tool's usable depth — callers gate on
+/// [`vtip_max_depth`].
+pub fn vtip_depth_for_half_width(half_angle_rad: f64, tip_radius: f64, half_width: f64) -> f64 {
+    if half_width <= 0.0 {
+        return 0.0;
+    }
+    let a = half_angle_rad;
+    let rt = tip_radius.max(0.0);
+    if a <= EPS {
+        // No flare: the profile never reaches a positive width. Degenerate.
+        return 0.0;
+    }
+    if rt <= EPS {
+        // Sharp cone: w = d·tan α.
+        return half_width / a.tan();
+    }
+    let r_t = rt * a.cos(); // tangent radius, ball → cone
+    if half_width <= r_t {
+        // On the ball: invert w = √(2·rt·d − d²), taking the lower root (d ≤ rt).
+        rt - (rt * rt - half_width * half_width).max(0.0).sqrt()
+    } else {
+        rt * (1.0 - a.sin()) + (half_width - r_t) / a.tan()
+    }
+}
+
 /// The greatest depth a **V-bit** of cutting radius `radius` can engrave before the
 /// cone flares past its cutting edge into the shank — the height of the
 /// [`BottomShape::VTip`] profile at the full cutting radius.
@@ -611,6 +648,102 @@ mod tests {
                 (vtip_half_width(a, rt, dmax) - r).abs() < 1e-9,
                 "deg={deg} rt={rt} dmax={dmax}"
             );
+        }
+    }
+
+    // --- V-groove depth ↔ width round trip (carving) ---
+
+    /// The cases below sweep a realistic V-bit spread: sharp and tipped, narrow and
+    /// wide included angles.
+    const VBITS: &[(f64, f64)] = &[
+        (90.0, 0.0),
+        (90.0, 0.2),
+        (60.0, 0.5),
+        (30.0, 0.1),
+        (120.0, 0.3),
+        (150.0, 0.05),
+    ];
+
+    #[test]
+    fn vtip_depth_for_half_width_round_trips_from_depth() {
+        // depth → width → depth, over both branches (the tangent for these bits sits
+        // well below 0.5 mm, so the sweep crosses it).
+        for &(deg, rt) in VBITS {
+            let a = (deg * 0.5_f64).to_radians();
+            for i in 1..=200 {
+                let d = i as f64 * 0.02;
+                let w = vtip_half_width(a, rt, d);
+                let back = vtip_depth_for_half_width(a, rt, w);
+                assert!(
+                    (back - d).abs() < 1e-9,
+                    "deg={deg} rt={rt} d={d} w={w} back={back}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vtip_depth_for_half_width_round_trips_from_width() {
+        // width → depth → width, the other direction.
+        for &(deg, rt) in VBITS {
+            let a = (deg * 0.5_f64).to_radians();
+            for i in 1..=200 {
+                let w = i as f64 * 0.02;
+                let d = vtip_depth_for_half_width(a, rt, w);
+                let back = vtip_half_width(a, rt, d);
+                assert!(
+                    (back - w).abs() < 1e-9,
+                    "deg={deg} rt={rt} w={w} d={d} back={back}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vtip_depth_matches_the_closed_forms_on_each_branch() {
+        // Round-tripping alone would pass even if *both* functions shared a wrong
+        // model, so pin the inverse against hand-derived geometry too.
+        let a = (60.0_f64 * 0.5).to_radians(); // α = 30°
+        let rt = 0.4;
+        let r_t = rt * a.cos(); // ≈ 0.3464 — end of the ball
+        // Ball: the half-width is a chord of the tip circle, so depth is the sagitta.
+        let w = 0.2;
+        let expect = rt - (rt * rt - w * w).sqrt();
+        assert!((vtip_depth_for_half_width(a, rt, w) - expect).abs() < 1e-12);
+        // Flank: tangent height plus a straight-line run at the cone's slope.
+        let w = 2.0;
+        let expect = rt * (1.0 - a.sin()) + (w - r_t) / a.tan();
+        assert!((vtip_depth_for_half_width(a, rt, w) - expect).abs() < 1e-12);
+        // Sharp bit: the naive cone.
+        assert!((vtip_depth_for_half_width(a, 0.0, 1.0) - 1.0 / a.tan()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn vtip_depth_is_monotonic_and_degenerate_where_it_should_be() {
+        let a = (30.0_f64).to_radians();
+        assert_eq!(vtip_depth_for_half_width(a, 0.25, 0.0), 0.0);
+        assert_eq!(vtip_depth_for_half_width(a, 0.25, -1.0), 0.0);
+        // A zero-taper "V-bit" cuts no width at any depth: no inverse exists.
+        assert_eq!(vtip_depth_for_half_width(0.0, 0.25, 1.0), 0.0);
+        let mut prev = 0.0;
+        for i in 1..400 {
+            let w = i as f64 * 0.01;
+            let d = vtip_depth_for_half_width(a, 0.25, w);
+            assert!(d > prev, "not monotonic at w={w}");
+            prev = d;
+        }
+    }
+
+    #[test]
+    fn vtip_depth_at_the_cutting_radius_is_the_max_depth_gate() {
+        // The carve's depth cap and the engraving gate must be the same number, or a
+        // carve could ask for a depth the bit cannot reach.
+        for &(deg, rt) in VBITS {
+            let a = (deg * 0.5_f64).to_radians();
+            let r = 3.0;
+            let dmax = vtip_max_depth(a, rt, r);
+            let d = vtip_depth_for_half_width(a, rt, r);
+            assert!((d - dmax).abs() < 1e-9, "deg={deg} rt={rt} d={d} max={dmax}");
         }
     }
 
