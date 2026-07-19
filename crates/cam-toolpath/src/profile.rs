@@ -351,13 +351,16 @@ fn emit_loop(
     let cut = Tag::new(op.id, MoveKind::Cutting);
     let retract = Tag::new(op.id, MoveKind::Retract);
 
-    // Approach: rapid over the start at clearance, then down to the stock top.
+    // Approach: rapid over the start at clearance, then down to the **retract
+    // plane** — not to the stock top, where a rapid would end with no margin and
+    // slightly proud stock or a small Z-zero error would mean rapiding into material.
+    // The `max` keeps it never lower than the old stock-top approach.
     prog.push(Step::Rapid {
         to: Point3::new(start.x, start.y, h.clearance),
         tag: link,
     });
     prog.push(Step::Rapid {
-        to: Point3::new(start.x, start.y, h.top_of_stock),
+        to: Point3::new(start.x, start.y, h.retract.max(h.top_of_stock)),
         tag: link,
     });
 
@@ -441,7 +444,12 @@ fn emit_loop_rich(
     let entry = crate::leads::lead_start_point(start, tan_in, out, lead_in);
     let exit = crate::leads::lead_end_point(exit_on, tan_out, out_exit, lead_out);
 
-    let mut prev_z = h.top_of_stock;
+    // The first pass rapids down to the **retract plane**, not to the stock top:
+    // ending a rapid exactly on the surface leaves no margin, so slightly proud
+    // stock or a small Z-zero error means rapiding into material. Taking the higher
+    // of the two is never lower than the old behaviour. Later passes still rapid to
+    // the previous depth — that is through air the tool has already cut.
+    let mut prev_z = h.retract.max(h.top_of_stock);
     for &z in levels {
         prog.push(Step::Rapid {
             to: Point3::new(entry.x, entry.y, h.clearance),

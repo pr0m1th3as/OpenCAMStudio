@@ -231,10 +231,10 @@ impl Strategy for ChamferStrategy {
 
         let mut program = Program::new();
         program.push(Step::Comment(format!(
-            "Chamfer: {:.3} mm wide at {}\u{00b0} in {} pass(es)",
+            "Chamfer: {:.3} mm wide at {}\u{00b0} in {}",
             op.width,
             included_angle_deg,
-            widths.len()
+            crate::passes_phrase(widths.len())
         )));
 
         for poly in &loops {
@@ -291,7 +291,12 @@ impl Strategy for ChamferStrategy {
             // One pass per cumulative width, shallow to deep. Each: rapid over the
             // entry at clearance and down through the already-cut air, plunge to the
             // pass depth, lead on, cut the loop (+ overlap), lead off, retract.
-            let mut prev_z = op.top;
+            // The first pass rapids down to the **retract plane**, not to the stock top:
+    // ending a rapid exactly on the surface leaves no margin, so slightly proud
+    // stock or a small Z-zero error means rapiding into material. Taking the higher
+    // of the two is never lower than the old behaviour. Later passes still rapid to
+    // the previous depth — that is through air the tool has already cut.
+            let mut prev_z = env.heights.retract.max(op.top);
             for &wk in &widths {
                 let z = op.top - (wk / tan_a + delta);
                 program.push(Step::Rapid {

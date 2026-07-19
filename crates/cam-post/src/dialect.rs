@@ -112,9 +112,26 @@ pub(crate) fn emit(
     w.line(dialect.preamble.to_string());
     w.line(options.work_offset.code().to_string());
 
+    // The job's first comment is the setup name, which the app usually derives from
+    // the same source file as the program name — so it would repeat the header
+    // verbatim and say nothing. Emit it only when it differs.
+    let header_name = options.program_name.as_deref().map(sanitize);
+    // Only the *first* comment is eligible, so a later one that happens to match is
+    // still emitted rather than silently disappearing.
+    let mut header_dedupe = header_name.is_some();
+
     for step in program.steps() {
         match step {
-            Step::Comment(text) => w.line(format!("({})", sanitize(text))),
+            Step::Comment(text) => {
+                let text = sanitize(text);
+                if header_dedupe {
+                    header_dedupe = false;
+                    if header_name.as_deref() == Some(text.as_str()) {
+                        continue;
+                    }
+                }
+                w.line(format!("({text})"))
+            }
             Step::Spindle { rpm, dir } => {
                 w.check_spindle(*rpm)?;
                 let m = match dir {

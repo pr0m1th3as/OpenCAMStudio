@@ -49,6 +49,19 @@ pub use pocket::PocketStrategy;
 pub use profile::ProfileStrategy;
 pub use thread::ThreadStrategy;
 
+/// `"1 pass"` / `"3 passes"` — correct pluralisation for a program comment.
+///
+/// Written out rather than `pass(es)`: the post strips parentheses from comments
+/// (they delimit the comment, so a nested pair would end it early), which turned
+/// `pass(es)` into the ungrammatical `passes` for every count.
+pub(crate) fn passes_phrase(n: usize) -> String {
+    if n == 1 {
+        "1 pass".to_string()
+    } else {
+        format!("{n} passes")
+    }
+}
+
 /// Severity of a [`Diagnostic`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {

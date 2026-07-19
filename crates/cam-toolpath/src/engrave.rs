@@ -159,11 +159,11 @@ impl Strategy for EngraveStrategy {
 
         let mut program = Program::new();
         program.push(Step::Comment(format!(
-            "Engrave: {:.3} mm deep, {:.3} mm wide groove at {}\u{00b0} in {} pass(es)",
+            "Engrave: {:.3} mm deep, {:.3} mm wide groove at {}\u{00b0} in {}",
             op.depth,
             2.0 * half_width,
             included_angle_deg,
-            depths.len()
+            crate::passes_phrase(depths.len())
         )));
 
         // The path the tool centre follows. A closed loop may be rotated to begin at
@@ -178,7 +178,12 @@ impl Strategy for EngraveStrategy {
         };
         let start = pts[0];
 
-        let mut prev_z = op.top;
+        // The first pass rapids down to the **retract plane**, not to the stock top:
+    // ending a rapid exactly on the surface leaves no margin, so slightly proud
+    // stock or a small Z-zero error means rapiding into material. Taking the higher
+    // of the two is never lower than the old behaviour. Later passes still rapid to
+    // the previous depth — that is through air the tool has already cut.
+        let mut prev_z = env.heights.retract.max(op.top);
         for &d in &depths {
             if cancel.is_cancelled() {
                 return StrategyResult {
@@ -501,6 +506,64 @@ mod tests {
         o.top = -2.0; // engraving a already-faced surface
         let r = run(o, vbit(90.0, 0.0));
         assert_eq!(cut_zs(&r.program), vec![-2.5]);
+    }
+
+    #[test]
+    fn the_first_rapid_stops_at_the_retract_plane_not_the_surface() {
+        // Ending a rapid exactly on the stock top leaves no margin: slightly proud
+        // stock or a small Z-zero error means rapiding into material.
+        let r = run(op(0.5), vbit(90.0, 0.1));
+        let rapid_zs: Vec<f64> = r
+            .program
+            .steps()
+            .iter()
+            .filter_map(|s| match s {
+                Step::Rapid { to, tag } if tag.kind == MoveKind::Link => Some(to.z),
+                _ => None,
+            })
+            .collect();
+        // clearance 5.0, then down to retract 2.0 — never to the 0.0 surface.
+        assert_eq!(rapid_zs, vec![5.0, 2.0], "{rapid_zs:?}");
+    }
+
+    #[test]
+    fn later_passes_still_rapid_down_through_already_cut_air() {
+        // The retract-plane rule applies to the *first* approach only; afterwards
+        // rapiding to the previous depth is through air the tool has already cut.
+        let mut o = op(1.0);
+        o.stepdown = 0.4;
+        let r = run(o, vbit(90.0, 0.1));
+        let rapid_zs: Vec<f64> = r
+            .program
+            .steps()
+            .iter()
+            .filter_map(|s| match s {
+                Step::Rapid { to, tag } if tag.kind == MoveKind::Link => Some(to.z),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rapid_zs, vec![5.0, 2.0, 5.0, -0.4, 5.0, -0.8], "{rapid_zs:?}");
+    }
+
+    #[test]
+    fn the_comment_pluralises_passes_properly() {
+        // The post strips parentheses from comments, so "pass(es)" came out "passes"
+        // even for a single pass.
+        let comment_of = |o: EngraveOp| {
+            run(o, vbit(90.0, 0.1))
+                .program
+                .steps()
+                .iter()
+                .find_map(|s| match s {
+                    Step::Comment(c) => Some(c.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert!(comment_of(op(0.5)).ends_with("in 1 pass"));
+        let mut multi = op(1.0);
+        multi.stepdown = 0.4;
+        assert!(comment_of(multi).ends_with("in 3 passes"));
     }
 
     #[test]

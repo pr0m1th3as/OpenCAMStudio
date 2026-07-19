@@ -19,6 +19,18 @@ fn machine() -> Machine {
     }
 }
 
+/// Post `program` through grbl with an explicit program name (what puts the header
+/// comment in play).
+fn post_with_name(program: &Program, name: &str) -> String {
+    let options = PostOptions {
+        program_name: Some(name.to_string()),
+        ..Default::default()
+    };
+    PostKind::Grbl
+        .post(program, &machine(), &options)
+        .expect("posts")
+}
+
 fn drill_program() -> Program {
     ProgramBuilder::new()
         .comment("drill demo")
@@ -181,4 +193,34 @@ fn reference_dump() {
         );
         println!("\n----- {kind}  [{sig}] -----\n{g}");
     }
+}
+
+/// The setup name usually derives from the same source file as the program name, so
+/// it would repeat the header verbatim and say nothing. It is emitted only when it
+/// differs — and only the *first* comment is eligible, so a later match still prints.
+#[test]
+fn a_setup_comment_matching_the_program_name_is_not_repeated() {
+    use cam_cldata::{Program, Step};
+    let mut program = Program::new();
+    program.push(Step::Comment("part.dxf".into()));
+    program.push(Step::Comment("second op".into()));
+    program.push(Step::Comment("part.dxf".into()));
+
+    let nc = post_with_name(&program, "part.dxf");
+    let header_hits = nc.lines().filter(|l| l.trim() == "(part.dxf)").count();
+    assert_eq!(
+        header_hits, 2,
+        "one header + the later (non-first) match, not three:\n{nc}"
+    );
+    assert!(nc.contains("(second op)"));
+}
+
+#[test]
+fn a_setup_comment_that_differs_is_kept() {
+    use cam_cldata::{Program, Step};
+    let mut program = Program::new();
+    program.push(Step::Comment("Setup 1".into()));
+    let nc = post_with_name(&program, "part.dxf");
+    assert!(nc.contains("(part.dxf)"), "{nc}");
+    assert!(nc.contains("(Setup 1)"), "{nc}");
 }
