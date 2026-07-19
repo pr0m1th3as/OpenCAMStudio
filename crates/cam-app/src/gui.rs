@@ -202,7 +202,8 @@ use cam_render::{MeshVertex, OrbitCamera, Scene, Vertex, PART};
 use cam_toolpath::{CancelToken, Severity};
 
 use crate::{
-    op_selects_circles, AppController, LoopRef, OpKind, PendingOp, PickResult, Selection, SnapHit,
+    op_accepts_open_paths, op_selects_circles, AppController, LoopRef, OpKind, PendingOp,
+    PickResult, Selection, SnapHit,
     SnapKind,
 };
 
@@ -2256,8 +2257,14 @@ impl App {
                 }
                 self.refresh_fields();
                 self.status = if self.controller.pending_op().is_some() {
-                    "Click a boundary line in the viewport (or Cancel in the Inspector)."
-                        .to_string()
+                    if op_accepts_open_paths(kind) && !self.controller.open_paths().is_empty() {
+                        "Click a boundary line or an open stroke in the viewport \
+                         (or Cancel in the Inspector)."
+                            .to_string()
+                    } else {
+                        "Click a boundary line in the viewport (or Cancel in the Inspector)."
+                            .to_string()
+                    }
                 } else {
                     "Open a part first.".to_string()
                 };

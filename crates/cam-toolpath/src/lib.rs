@@ -18,6 +18,7 @@
 
 mod chamfer;
 mod engrave;
+mod guards;
 mod clearing;
 mod adaptive;
 mod clearsim;

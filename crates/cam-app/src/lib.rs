@@ -17,8 +17,9 @@ mod project;
 mod tool_library;
 
 pub use controller::{
-    op_selects_circles, AppController, ExportError, ExportToError, JobParams, LoopPart, LoopRef,
-    OpKind, PendingOp, PickResult, ProjectError, RunOutcome, Selection, SnapHit, SnapKind,
+    op_accepts_open_paths, op_selects_circles, AppController, ExportError, ExportToError,
+    JobParams, LoopPart, LoopRef, OpKind, PendingOp, PickResult, ProjectError, RunOutcome,
+    Selection, SnapHit, SnapKind,
 };
 pub use project::{OcamFile, Project};
 pub use tool_library::ToolLibrary;

@@ -245,6 +245,75 @@ impl Profile2D {
             .fold(self.start.y, f64::max)
     }
 
+    /// How far up the tool's **full-radius flank** the surface still cuts, in mm above
+    /// the tip — the deepest *vertical wall* it can cut before a non-cutting surface
+    /// (neck, shank) would rub against the work.
+    ///
+    /// Measured as the highest `z` reachable by walking the boundary from the tip
+    /// through **contiguously cutting** segments, counting only the part at the full
+    /// [`max_radius`](Self::max_radius). A tool with no vertical flank at all — a
+    /// V-bit or chamfer mill, whose cone flares straight into the shank — returns `0`:
+    /// it cannot cut a vertical wall at any depth.
+    pub fn cutting_flank_height(&self) -> f64 {
+        let r = self.max_radius();
+        if r <= EPS {
+            return 0.0;
+        }
+        let mut prev = self.start;
+        let mut best = 0.0_f64;
+        let mut started = false;
+        for s in &self.segs {
+            if !s.cutting {
+                // A *leading* non-cutting surface is skipped — a chamfer mill's flat
+                // tip does not cut, yet the cone above it does. Once cutting has
+                // begun, though, the first non-cutting surface ends the usable flank:
+                // anything above it is only reachable by burying the shank.
+                if started {
+                    break;
+                }
+                prev = s.end;
+                continue;
+            }
+            started = true;
+            // Only a segment standing at the full radius is flank; a bottom or a
+            // flare-out contributes no vertical wall.
+            if (prev.x - r).abs() <= 1e-9 && (s.end.x - r).abs() <= 1e-9 {
+                best = best.max(prev.y.max(s.end.y));
+            }
+            prev = s.end;
+        }
+        best
+    }
+
+    /// Whether the tool's bottom is a **flat, cutting** face spanning out from the axis
+    /// — what a flat floor (facing, a pocket floor) needs.
+    ///
+    /// True for a square end mill or face mill. False for a ball nose or V-bit (they
+    /// cut, but leave a curved/grooved floor) and false for a **chamfer mill**, whose
+    /// flat tip is explicitly *non-cutting* and would leave an uncut ridge.
+    pub fn cuts_flat_bottom(&self) -> bool {
+        let Some(first) = self.segs.first() else {
+            return false;
+        };
+        first.cutting
+            && matches!(first.shape, SegShape::Line)
+            && (first.end.y - self.start.y).abs() <= 1e-9
+            && first.end.x > self.start.x + EPS
+    }
+
+    /// Whether the surface **at the tool's axis** cuts — i.e. whether the tool can
+    /// plunge straight down into solid material.
+    ///
+    /// False for a chamfer mill (its tip flat is non-cutting) — plunging one rubs
+    /// rather than cuts. True for an end mill, ball nose, drill or V-bit.
+    pub fn has_cutting_tip(&self) -> bool {
+        // The tip is where the boundary leaves the axis; the segment that starts
+        // there carries the tag.
+        self.segs
+            .first()
+            .is_some_and(|s| s.cutting && self.start.x <= EPS)
+    }
+
     /// The boundary as per-segment tessellated polylines paired with their cutting flag —
     /// `(points, cutting)`, each sub-polyline sharing endpoints with its neighbours. Lets
     /// the preview style cutting vs non-cutting **per segment** (solid vs dashed).
@@ -389,6 +458,87 @@ mod tests {
             neck_radius: radius,
             bottom: BottomShape::Flat,
         }
+    }
+
+    // --- derived cutting-surface properties (operation guards) ---
+
+    fn spec_of(bottom: BottomShape, radius: f64, flute_length: f64, shank_radius: f64) -> GeneratrixSpec {
+        GeneratrixSpec {
+            radius,
+            flute_length,
+            shank_radius,
+            length: 40.0,
+            neck_length: 0.0,
+            neck_radius: radius,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn flank_height_is_the_flute_length_for_a_plain_end_mill() {
+        let p = generatrix(&spec_of(BottomShape::Flat, 3.0, 12.0, 3.0));
+        assert!((p.cutting_flank_height() - 12.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_vbit_has_no_vertical_flank_at_all() {
+        // The cone flares straight into the shank — there is no cylindrical cutting
+        // surface, so it can never cut a vertical wall. This is what stops a V-bit
+        // being accepted for profiling/pocketing.
+        let p = generatrix(&spec_of(
+            BottomShape::VTip { half_angle_rad: (30.0_f64).to_radians(), tip_radius: 0.0 },
+            3.0,
+            0.0,
+            3.0,
+        ));
+        assert_eq!(p.cutting_flank_height(), 0.0);
+        let c = generatrix(&spec_of(
+            BottomShape::Cone { half_angle_rad: (45.0_f64).to_radians(), flat_radius: 0.5 },
+            3.0,
+            0.0,
+            3.0,
+        ));
+        assert_eq!(c.cutting_flank_height(), 0.0);
+    }
+
+    #[test]
+    fn flank_height_stops_at_the_first_non_cutting_surface() {
+        // Flute 8 of an overall 40 tool: the shank above it must not count, or a
+        // depth guard would happily bury the shank in the work.
+        let p = generatrix(&spec_of(BottomShape::Flat, 3.0, 8.0, 3.0));
+        assert!((p.cutting_flank_height() - 8.0).abs() < 1e-9);
+        assert!(p.height() > 8.0, "the tool is longer than its flutes");
+    }
+
+    #[test]
+    fn only_a_flat_cutting_bottom_counts_as_flat_bottomed() {
+        assert!(generatrix(&spec_of(BottomShape::Flat, 3.0, 10.0, 3.0)).cuts_flat_bottom());
+        assert!(!generatrix(&spec_of(BottomShape::Ball, 3.0, 10.0, 3.0)).cuts_flat_bottom());
+        assert!(!generatrix(&spec_of(
+            BottomShape::VTip { half_angle_rad: 0.5, tip_radius: 0.0 }, 3.0, 0.0, 3.0
+        )).cuts_flat_bottom());
+        // A chamfer mill's flat IS flat but is tagged non-cutting — it would leave an
+        // uncut ridge, so it must not pass as a flat-bottomed tool.
+        let cham = generatrix(&spec_of(
+            BottomShape::Cone { half_angle_rad: (45.0_f64).to_radians(), flat_radius: 0.5 },
+            3.0, 0.0, 3.0,
+        ));
+        assert!(!cham.cuts_flat_bottom());
+    }
+
+    #[test]
+    fn a_chamfer_mill_has_no_cutting_tip_but_a_vbit_does() {
+        let cham = generatrix(&spec_of(
+            BottomShape::Cone { half_angle_rad: (45.0_f64).to_radians(), flat_radius: 0.5 },
+            3.0, 0.0, 3.0,
+        ));
+        assert!(!cham.has_cutting_tip(), "the flat tip does not cut");
+        let vbit = generatrix(&spec_of(
+            BottomShape::VTip { half_angle_rad: (30.0_f64).to_radians(), tip_radius: 0.1 },
+            3.0, 0.0, 3.0,
+        ));
+        assert!(vbit.has_cutting_tip());
+        assert!(generatrix(&spec_of(BottomShape::Flat, 3.0, 10.0, 3.0)).has_cutting_tip());
     }
 
     // --- V-groove width (engraving) ---

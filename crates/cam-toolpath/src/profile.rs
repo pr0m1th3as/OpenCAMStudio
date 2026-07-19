@@ -41,6 +41,23 @@ impl Strategy for ProfileStrategy {
             };
         };
 
+        // The tool must be able to cut a vertical wall to the requested depth with a
+        // *cutting* surface (see `guards`): a pointed tool has no cylindrical flank,
+        // and a cut past the flute length drags the shank along the wall.
+        if !crate::guards::check_side_milling(op.id, "profile", tool, op.depth, &mut diagnostics) {
+            return StrategyResult {
+                diagnostics,
+                ..Default::default()
+            };
+        }
+        // Each pass enters with a plunge, so the tip must cut.
+        if !crate::guards::check_plunge(op.id, "profile", tool, &mut diagnostics) {
+            return StrategyResult {
+                diagnostics,
+                ..Default::default()
+            };
+        }
+
         // Validate the geometry and parameters.
         if !op.chain.is_valid() {
             diagnostics.push(Diagnostic::error(format!(

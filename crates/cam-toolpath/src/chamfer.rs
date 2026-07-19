@@ -164,6 +164,14 @@ impl Strategy for ChamferStrategy {
             )));
         }
 
+        // The bevel is cut by the flank between the tip and `tip_depth` above it, so
+        // that whole section must still be cutting surface. This is the upper bound on
+        // tip depth that was previously missing (there was no flank-length geometry to
+        // check against); the generatrix now supplies it.
+        if !crate::guards::check_axial_reach(op.id, "chamfer", tool, tip_depth, &mut diagnostics) {
+            bail!();
+        }
+
         let region = match Polygon::new(op.chain.clone()) {
             Ok(p) => p,
             Err(e) => {

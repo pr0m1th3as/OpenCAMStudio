@@ -45,6 +45,16 @@ impl Strategy for PocketStrategy {
         let Some(tool) = env.tool(op.tool) else {
             fail!("operation {}: tool {} is not in the setup", op.id, op.tool);
         };
+        if !crate::guards::check_side_milling(op.id, "pocket", tool, op.depth, &mut diagnostics) {
+            return StrategyResult { diagnostics, ..Default::default() };
+        }
+        if !crate::guards::check_plunge(op.id, "pocket", tool, &mut diagnostics) {
+            return StrategyResult { diagnostics, ..Default::default() };
+        }
+        // A pocket has a floor as well as walls; a non-flat tool only warns.
+        if !crate::guards::check_flat_floor(op.id, "pocket", tool, &mut diagnostics) {
+            return StrategyResult { diagnostics, ..Default::default() };
+        }
         if !op.boundary.is_valid() {
             fail!("operation {}: pocket boundary is not a closed area", op.id);
         }

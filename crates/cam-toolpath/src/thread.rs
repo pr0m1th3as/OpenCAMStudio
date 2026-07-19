@@ -110,6 +110,17 @@ impl Strategy for ThreadStrategy {
             bail!();
         }
 
+        // Gate 0 — the tool must be a thread mill. Gates 1–3 below reason about
+        // diameter/neck/reach and would pass an end mill happily, which would helix a
+        // plain groove instead of a thread form: valid-looking G-code, no thread.
+        if !matches!(tool.kind, ToolKind::ThreadMill { .. }) {
+            diagnostics.push(Diagnostic::error(format!(
+                "operation {}: tool {} is a {}; thread milling needs a thread mill —                  the thread form is ground into the tool, so anything else would cut a                  plain helical groove.",
+                op.id, op.tool, tool.kind
+            )));
+            bail!();
+        }
+
         let major_r = 0.5 * op.major_dia;
         // Radial depth of a 60° thread form: an internal thread engages to the tap-drill
         // minor (major − 1.0825·pitch ⇒ 0.5413·pitch radial); an external thread's root

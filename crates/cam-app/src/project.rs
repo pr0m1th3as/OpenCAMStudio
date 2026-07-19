@@ -4,7 +4,7 @@
 //! sniffing the contents. A pre-tag project (a bare [`Project`] object) still loads via
 //! the legacy fallback in [`OcamFile::from_json`].
 
-use cam_geo::Polygon;
+use cam_geo::{Polygon, Polyline};
 use cam_model::Document;
 
 use crate::tool_library::ToolLibrary;
@@ -58,6 +58,10 @@ pub struct Project {
     pub document: Document,
     /// The imported regions — for the viewport and for creating new operations.
     pub regions: Vec<Polygon>,
+    /// The imported **open** paths (engravable strokes the importer could not close).
+    /// `#[serde(default)]` so projects saved before open-path import still load.
+    #[serde(default)]
+    pub open_paths: Vec<Polyline>,
     /// Seed defaults for newly generated operations.
     pub defaults: JobParams,
     /// The source CAD file name the geometry came from (display only).

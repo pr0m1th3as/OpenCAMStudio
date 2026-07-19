@@ -100,6 +100,16 @@ impl Scene {
         }
     }
 
+    /// Add an **open** imported path — drawn as-is, *not* closed back to its start,
+    /// so a lettering stroke reads as a stroke rather than a spurious loop.
+    pub fn add_open_path(&mut self, pts: &[Point], color: Color) {
+        if pts.len() < 2 {
+            return;
+        }
+        let strip: Vec<[f32; 3]> = pts.iter().map(|p| [p.x as f32, p.y as f32, 0.0]).collect();
+        self.add_strip(strip, color);
+    }
+
     fn add_ring(&mut self, pts: &[Point], color: Color) {
         if pts.len() < 3 {
             return;

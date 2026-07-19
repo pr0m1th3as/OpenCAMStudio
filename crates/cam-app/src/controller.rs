@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use cam_geo::{Contour, Point, Polygon};
+use cam_geo::{Contour, Point, Polygon, Polyline};
 use cam_import::{read_cad_file, read_dxf_str, ImportError, ImportOptions};
 
 use crate::project::{OcamFile, Project};
@@ -154,6 +154,8 @@ pub struct AppController {
     /// The selected post/controller dialect for export.
     post_kind: PostKind,
     regions: Vec<Polygon>,
+    /// Open imported chains the importer could not close — engravable strokes.
+    open_paths: Vec<Polyline>,
     document: History<Document>,
     defaults: JobParams,
     selection: Selection,
@@ -175,13 +177,41 @@ pub enum LoopPart {
     Outer,
     /// The region's `n`-th hole.
     Hole(usize),
+    /// An **open** imported path — a chain the importer could not close (lettering,
+    /// a decorative stroke). These are not regions, so [`LoopRef::region`] indexes
+    /// [`AppController::open_paths`] instead. Only operations that can machine an
+    /// open path (engraving) may reference one.
+    Open,
 }
 
 /// A reference to one closed loop (outer or a hole) of one region.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoopRef {
+    /// Index into the regions — or, when `part` is [`LoopPart::Open`], into the
+    /// open paths.
     pub region: usize,
     pub part: LoopPart,
+}
+
+impl LoopRef {
+    /// A reference to the `i`-th **open** imported path.
+    pub fn open(i: usize) -> Self {
+        Self {
+            region: i,
+            part: LoopPart::Open,
+        }
+    }
+
+    /// Whether this refers to an open path rather than a closed loop.
+    pub fn is_open(self) -> bool {
+        matches!(self.part, LoopPart::Open)
+    }
+}
+
+/// Whether an operation kind can machine an **open** path. Only engraving can: every
+/// other strategy needs a closed region to offset, clear, or bound.
+pub fn op_accepts_open_paths(kind: OpKind) -> bool {
+    matches!(kind, OpKind::Engrave)
 }
 
 /// An operation being created via the pick wizard: the kind, the tool, the picked
@@ -298,6 +328,7 @@ impl AppController {
             machine,
             post_kind: PostKind::default(),
             regions: Vec::new(),
+            open_paths: Vec::new(),
             document: History::new(empty_document(&defaults)),
             defaults,
             selection: Selection::default(),
@@ -366,6 +397,12 @@ impl AppController {
         &self.regions
     }
 
+    /// The imported **open** paths — chains that could not be closed, machinable by
+    /// engraving.
+    pub fn open_paths(&self) -> &[Polyline] {
+        &self.open_paths
+    }
+
     /// The name of the loaded drawing.
     pub fn source_name(&self) -> &str {
         &self.source_name
@@ -403,7 +440,7 @@ impl AppController {
     /// bundled sample and tests). Returns the number of regions.
     pub fn open_dxf(&mut self, text: &str, name: impl Into<String>) -> Result<usize, ImportError> {
         let import = read_dxf_str(text, &ImportOptions::default())?;
-        self.install_import(import.regions, name.into(), true);
+        self.install_import(import.regions, import.open_chains, name.into(), true);
         Ok(self.regions.len())
     }
 
@@ -420,7 +457,7 @@ impl AppController {
             .and_then(|n| n.to_str())
             .unwrap_or("imported")
             .to_string();
-        self.install_import(import.regions, name, false);
+        self.install_import(import.regions, import.open_chains, name, false);
         Ok(self.regions.len())
     }
 
@@ -428,8 +465,15 @@ impl AppController {
     /// operation (or the Setup when none is seeded), and reset derived state.
     /// Shared by every import path. `seed_ops` seeds a profile per boundary/hole
     /// (the bundled sample demo) versus bringing in bare geometry (real imports).
-    fn install_import(&mut self, regions: Vec<Polygon>, name: String, seed_ops: bool) {
+    fn install_import(
+        &mut self,
+        regions: Vec<Polygon>,
+        open_paths: Vec<Polyline>,
+        name: String,
+        seed_ops: bool,
+    ) {
         self.regions = regions;
+        self.open_paths = open_paths;
         self.source_name = name;
         let document = self.generate_document(seed_ops);
         self.document = History::new(document);
@@ -450,6 +494,7 @@ impl AppController {
     /// Reset to a fresh, empty "Untitled" project.
     pub fn new_project(&mut self) {
         self.regions.clear();
+        self.open_paths.clear();
         self.document = History::new(empty_document(&self.defaults));
         self.excluded.clear();
         self.source_name.clear();
@@ -471,6 +516,7 @@ impl AppController {
             schema_version: cam_model::SCHEMA_VERSION,
             document: self.document.current().clone(),
             regions: self.regions.clone(),
+            open_paths: self.open_paths.clone(),
             defaults: self.defaults,
             source_name: self.source_name.clone(),
         };
@@ -495,6 +541,7 @@ impl AppController {
             OcamFile::Library(_) => return Err(ProjectError::NotAProject),
         };
         self.regions = project.regions;
+        self.open_paths = project.open_paths;
         self.defaults = project.defaults;
         self.source_name = project.source_name;
         self.document = History::new(project.document);
@@ -777,7 +824,14 @@ impl AppController {
         tool: u32,
         start: Option<[f64; 2]>,
     ) -> Option<Operation> {
-        let chain = self.loop_contour(boundary)?.clone();
+        // An open imported path can only feed an operation that machines one; every
+        // other strategy needs a closed region to offset, clear or bound. Refusing
+        // here keeps a mis-picked stroke from becoming a nonsense profile.
+        if boundary.is_open() && !op_accepts_open_paths(kind) {
+            return None;
+        }
+        let (points, closed) = self.loop_points(boundary)?;
+        let chain = Contour::new(points);
         let p = self.defaults;
         // id 0 is a placeholder — add_operation renumbers with a fresh id.
         let op = match kind {
@@ -917,9 +971,8 @@ impl AppController {
                 id: 0,
                 tool,
                 chain,
-                // A picked loop is a closed boundary; open strokes arrive from
-                // imported lettering, which the picker cannot express yet.
-                closed: true,
+                // Closed for a picked region loop; open for an imported stroke.
+                closed,
                 top: p.top_of_stock,
                 // A shallow default: engraving is a surface mark, not a cut. One
                 // pass (stepdown 0) — normal at this depth.
@@ -953,11 +1006,25 @@ impl AppController {
     }
 
     /// The contour of a loop reference, if it resolves.
+    /// The points of a picked loop **or open path**, with whether they form a closed
+    /// loop. Open paths are the only case where `false` comes back, and only
+    /// engraving may consume one.
+    pub fn loop_points(&self, l: LoopRef) -> Option<(Vec<Point>, bool)> {
+        if l.is_open() {
+            let path = self.open_paths.get(l.region)?;
+            return Some((path.points().to_vec(), false));
+        }
+        Some((self.loop_contour(l)?.points().to_vec(), true))
+    }
+
     pub fn loop_contour(&self, l: LoopRef) -> Option<&Contour> {
         let region = self.regions.get(l.region)?;
         match l.part {
             LoopPart::Outer => Some(region.outer()),
             LoopPart::Hole(i) => region.holes().get(i),
+            // An open path is not a closed contour; callers that can machine one go
+            // through `loop_points`, which reports the open-ness.
+            LoopPart::Open => None,
         }
     }
 
@@ -1040,11 +1107,12 @@ impl AppController {
     ) -> Option<(LoopRef, [f64; 2])> {
         let w = Point::new(world[0], world[1]);
         let mut best: Option<(LoopRef, [f64; 2], f64)> = None;
-        for (loop_ref, contour) in self.iter_loops() {
-            if circles_only && fit_circle(contour.points()).is_none() {
+        for (loop_ref, pts, closed) in self.iter_pickable() {
+            // Drill/thread target holes: an open stroke is never a hole.
+            if circles_only && (!closed || fit_circle(pts).is_none()) {
                 continue;
             }
-            let (pt, d2) = nearest_point_on_contour(contour.points(), w);
+            let (pt, d2) = nearest_point_on_path(pts, w, closed);
             if best.is_none_or(|(_, _, bd2)| d2 < bd2) {
                 best = Some((loop_ref, pt, d2));
             }
@@ -1077,9 +1145,23 @@ impl AppController {
                 best = Some((prio, d2, SnapHit { loop_ref, point, kind }));
             }
         };
-        for (loop_ref, contour) in self.iter_loops() {
-            let pts = contour.points();
+        for (loop_ref, pts, closed) in self.iter_pickable() {
             if pts.len() < 2 {
+                continue;
+            }
+            // An open stroke has no corner *loop*: its two free ends are the snaps a
+            // machinist wants (that is where the groove starts and stops), and the
+            // mid/quadrant analyses assume a closed ring, so they are skipped.
+            if !closed {
+                if enabled.contains(&SnapKind::End) {
+                    for p in [pts[0], pts[pts.len() - 1]] {
+                        consider(SnapKind::End, [p.x, p.y], loop_ref);
+                    }
+                }
+                if enabled.contains(&SnapKind::Nearest) {
+                    let (q, _) = nearest_point_on_path(pts, w, false);
+                    consider(SnapKind::Nearest, q, loop_ref);
+                }
                 continue;
             }
             let corners = loop_corners(pts);
@@ -1108,6 +1190,31 @@ impl AppController {
             }
         }
         best.map(|(_, _, hit)| hit)
+    }
+
+    /// Whether open imported paths are currently pickable — true exactly when the
+    /// operation being created can machine one, so hover preview and click agree.
+    fn open_paths_pickable(&self) -> bool {
+        self.pending_op
+            .as_ref()
+            .is_some_and(|p| op_accepts_open_paths(p.kind))
+    }
+
+    /// Every pickable path: the closed region loops, plus the open imported paths
+    /// when the pending operation can machine them. Yields `(ref, points, closed)`.
+    fn iter_pickable(&self) -> impl Iterator<Item = (LoopRef, &[Point], bool)> {
+        let open = if self.open_paths_pickable() {
+            &self.open_paths[..]
+        } else {
+            &[][..]
+        };
+        self.iter_loops()
+            .map(|(r, c)| (r, c.points(), true))
+            .chain(
+                open.iter()
+                    .enumerate()
+                    .map(|(i, p)| (LoopRef::open(i), p.points(), false)),
+            )
     }
 
     /// Every closed loop across all regions as `(ref, contour)`.
@@ -1382,6 +1489,9 @@ impl AppController {
         for region in &self.regions {
             scene.add_region(region, PART);
         }
+        for path in &self.open_paths {
+            scene.add_open_path(path.points(), PART);
+        }
 
         let (stock_vertices, stock_indices, collisions) = self.simulate_stock(&program);
 
@@ -1604,6 +1714,16 @@ impl AppController {
                 max[1] = max[1].max(pt.y);
             }
         }
+        // Open paths count too: a drawing that is *only* engraving strokes would
+        // otherwise report no bounds, leaving the stock and the framed view empty.
+        for path in &self.open_paths {
+            for pt in path.points() {
+                min[0] = min[0].min(pt.x);
+                min[1] = min[1].min(pt.y);
+                max[0] = max[0].max(pt.x);
+                max[1] = max[1].max(pt.y);
+            }
+        }
         if min[0] > max[0] {
             ([0.0, 0.0], [0.0, 0.0])
         } else {
@@ -1771,9 +1891,17 @@ fn fit_circle(pts: &[Point]) -> Option<([f64; 2], f64)> {
 
 /// The nearest point on a closed contour to `w`, and its squared distance.
 fn nearest_point_on_contour(pts: &[Point], w: Point) -> ([f64; 2], f64) {
+    nearest_point_on_path(pts, w, true)
+}
+
+/// Nearest point on a polyline. With `closed`, the last→first segment is included;
+/// for an **open** path it is not — otherwise a stroke would be pickable along a
+/// phantom segment joining its two ends.
+fn nearest_point_on_path(pts: &[Point], w: Point, closed: bool) -> ([f64; 2], f64) {
     let n = pts.len();
     let mut best = ([pts.first().map_or(0.0, |p| p.x), pts.first().map_or(0.0, |p| p.y)], f64::MAX);
-    for k in 0..n {
+    let last = if closed { n } else { n.saturating_sub(1) };
+    for k in 0..last {
         let (a, b) = (pts[k], pts[(k + 1) % n]);
         let (abx, aby) = (b.x - a.x, b.y - a.y);
         let len2 = abx * abx + aby * aby;
@@ -1955,6 +2083,18 @@ mod tests {
 0\nLINE\n10\n70.0\n20\n50.0\n11\n10.0\n21\n50.0\n\
 0\nLINE\n10\n10.0\n20\n50.0\n11\n10.0\n21\n10.0\n\
 0\nCIRCLE\n10\n40.0\n20\n30.0\n40\n5.0\n\
+0\nENDSEC\n0\nEOF\n";
+
+    /// The same part plus two disconnected LINEs forming an open "V" stroke — the
+    /// lettering-like geometry the importer keeps as an open chain.
+    const PART_WITH_STROKE_DXF: &str = "\
+0\nSECTION\n2\nENTITIES\n\
+0\nLINE\n10\n10.0\n20\n10.0\n11\n70.0\n21\n10.0\n\
+0\nLINE\n10\n70.0\n20\n10.0\n11\n70.0\n21\n50.0\n\
+0\nLINE\n10\n70.0\n20\n50.0\n11\n10.0\n21\n50.0\n\
+0\nLINE\n10\n10.0\n20\n50.0\n11\n10.0\n21\n10.0\n\
+0\nLINE\n10\n20.0\n20\n20.0\n11\n30.0\n21\n40.0\n\
+0\nLINE\n10\n30.0\n20\n40.0\n11\n40.0\n21\n20.0\n\
 0\nENDSEC\n0\nEOF\n";
 
     fn machine() -> Machine {
@@ -2320,6 +2460,138 @@ mod tests {
     }
 
     #[test]
+    fn an_open_chain_is_imported_and_kept_as_an_open_path() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_WITH_STROKE_DXF, "part.dxf").unwrap();
+        assert_eq!(app.open_paths().len(), 1, "the V stroke stays open");
+        assert_eq!(app.regions().len(), 1, "the rectangle still closes");
+        // Three vertices, ends free.
+        let pts = app.open_paths()[0].points();
+        assert_eq!(pts.len(), 3, "{pts:?}");
+        assert!(pts.first() != pts.last(), "an open path must not close");
+    }
+
+    #[test]
+    fn an_open_path_engraves_as_an_open_stroke() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_WITH_STROKE_DXF, "part.dxf").unwrap();
+        let op = app
+            .build_op(OpKind::Engrave, LoopRef::open(0), &[], 1, None)
+            .expect("engraving accepts an open path");
+        match op {
+            Operation::Engrave(o) => {
+                assert!(!o.closed, "an imported stroke must engrave open");
+                assert_eq!(o.chain.len(), 3);
+            }
+            other => panic!("expected engrave, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_picked_region_loop_still_engraves_closed() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_WITH_STROKE_DXF, "part.dxf").unwrap();
+        let op = app
+            .build_op(
+                OpKind::Engrave,
+                LoopRef {
+                    region: 0,
+                    part: LoopPart::Outer,
+                },
+                &[],
+                1,
+                None,
+            )
+            .expect("engraving accepts a closed loop too");
+        match op {
+            Operation::Engrave(o) => assert!(o.closed),
+            other => panic!("expected engrave, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_open_path_cannot_become_a_closed_region_operation() {
+        // The guard that stops a mis-picked stroke turning into a nonsense profile
+        // or pocket — those strategies need a closed area to offset and clear.
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_WITH_STROKE_DXF, "part.dxf").unwrap();
+        for kind in [
+            OpKind::Profile,
+            OpKind::Pocket,
+            OpKind::Face,
+            OpKind::Drill,
+            OpKind::Thread,
+            OpKind::Chamfer,
+        ] {
+            assert!(
+                app.build_op(kind, LoopRef::open(0), &[], 1, None).is_none(),
+                "{kind:?} must refuse an open path"
+            );
+        }
+    }
+
+    #[test]
+    fn open_paths_are_only_pickable_for_operations_that_accept_them() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_WITH_STROKE_DXF, "part.dxf").unwrap();
+        // A point on the stroke, far from the rectangle.
+        let on_stroke = [25.0, 30.0];
+        assert!(!app.open_paths_pickable(), "no pending op, no open picking");
+
+        app.begin_operation(OpKind::Profile);
+        assert!(!app.open_paths_pickable());
+        let hit = app.nearest_loop_point(on_stroke, 2.0, false);
+        assert!(
+            hit.is_none_or(|(l, _)| !l.is_open()),
+            "profile must not pick the stroke"
+        );
+
+        app.begin_operation(OpKind::Engrave);
+        assert!(app.open_paths_pickable());
+        let (l, _) = app
+            .nearest_loop_point(on_stroke, 2.0, false)
+            .expect("the stroke is pickable for engraving");
+        assert!(l.is_open(), "expected the open stroke, got {l:?}");
+    }
+
+    #[test]
+    fn open_paths_survive_a_project_round_trip() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_WITH_STROKE_DXF, "part.dxf").unwrap();
+        let project = Project {
+            schema_version: cam_model::SCHEMA_VERSION,
+            document: app.document().clone(),
+            regions: app.regions().to_vec(),
+            open_paths: app.open_paths().to_vec(),
+            defaults: *app.defaults(),
+            source_name: app.source_name().to_string(),
+        };
+        let json = project.to_json().unwrap();
+        let back = Project::from_json(&json).unwrap();
+        assert_eq!(back.open_paths, project.open_paths);
+        assert_eq!(back.open_paths.len(), 1);
+    }
+
+    #[test]
+    fn a_project_saved_before_open_paths_still_loads() {
+        // #[serde(default)] back-compat: the field simply is not in older files.
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        let project = Project {
+            schema_version: cam_model::SCHEMA_VERSION,
+            document: app.document().clone(),
+            regions: app.regions().to_vec(),
+            open_paths: Vec::new(),
+            defaults: *app.defaults(),
+            source_name: app.source_name().to_string(),
+        };
+        let mut v: serde_json::Value = serde_json::from_str(&project.to_json().unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("open_paths");
+        let back = Project::from_json(&v.to_string()).expect("legacy project loads");
+        assert!(back.open_paths.is_empty());
+    }
+
+    #[test]
     fn new_engrave_seeds_a_shallow_closed_groove() {
         let mut app = AppController::new(machine());
         app.open_dxf(PART_DXF, "part.dxf").unwrap();
@@ -2355,6 +2627,21 @@ mod tests {
         let mut app = AppController::new(machine());
         app.open_dxf(PART_DXF, "part.dxf").unwrap();
         app.new_operation(OpKind::Thread);
+
+        // Thread milling requires an actual thread mill (guarded in the strategy —
+        // an end mill would helix a plain groove, not a thread form). The starter
+        // library holds only end mills, so put one in and point the op at it.
+        let tm = app.use_tool(Tool {
+            number: 9,
+            diameter: 4.0,
+            flute_length: 20.0,
+            length: 50.0,
+            flutes: 3,
+            kind: ToolKind::ThreadMill { pitch: None },
+            neck_diameter: 2.0,
+            ..Default::default()
+        });
+        app.edit_selected_operation(|op| op.set_tool(tm));
 
         let id = match app.selection() {
             Selection::Operation(i) => i,
@@ -2570,6 +2857,7 @@ mod tests {
             schema_version: cam_model::SCHEMA_VERSION,
             document: app.document().clone(),
             regions: app.regions().to_vec(),
+            open_paths: app.open_paths().to_vec(),
             defaults: *app.defaults(),
             source_name: app.source_name().to_string(),
         };
@@ -2604,6 +2892,7 @@ mod tests {
             schema_version: cam_model::SCHEMA_VERSION,
             document: app.document().clone(),
             regions: app.regions().to_vec(),
+            open_paths: app.open_paths().to_vec(),
             defaults: *app.defaults(),
             source_name: app.source_name().to_string(),
         };

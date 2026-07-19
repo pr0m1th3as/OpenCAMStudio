@@ -29,7 +29,7 @@ impl Strategy for DrillStrategy {
         let op = &self.op;
         let mut diagnostics = Vec::new();
 
-        if env.tool(op.tool).is_none() {
+        let Some(tool) = env.tool(op.tool) else {
             diagnostics.push(Diagnostic::error(format!(
                 "operation {} references tool {} which is not in the setup",
                 op.id, op.tool
@@ -38,6 +38,24 @@ impl Strategy for DrillStrategy {
                 diagnostics,
                 ..Default::default()
             };
+        };
+        // Drilling is a pure plunge: the surface on the axis must cut, and the hole
+        // must not run deeper than the cutting edge.
+        if !crate::guards::check_plunge(op.id, "drill", tool, &mut diagnostics)
+            || !crate::guards::check_axial_reach(op.id, "drill", tool, op.depth, &mut diagnostics)
+        {
+            return StrategyResult {
+                diagnostics,
+                ..Default::default()
+            };
+        }
+        // A centre-cutting mill *can* be plunged, but it is not a drill: no point
+        // geometry to centre the hole, and full-diameter engagement all the way.
+        if !matches!(tool.kind, cam_model::ToolKind::Drill { .. }) {
+            diagnostics.push(Diagnostic::warning(format!(
+                "operation {}: tool {} is a {} being plunged as a drill — it will cut,                  but without a drill point the hole may wander and the full diameter                  engages at once.",
+                op.id, op.tool, tool.kind
+            )));
         }
         if op.points.is_empty() {
             diagnostics.push(Diagnostic::warning(format!(
