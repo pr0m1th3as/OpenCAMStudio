@@ -165,11 +165,17 @@ fn map_acad_entities(doc: &acadrust::CadDocument) -> (Vec<dxf::Entity>, Vec<Stri
                 center: (c.center.x, c.center.y),
                 radius: c.radius,
             }),
+            // **acadrust reports arc angles in radians**, while [`dxf::Entity::Arc`]
+            // carries degrees (as the DXF file itself stores them, group codes 50/51)
+            // and every downstream consumer converts from degrees. Without this
+            // conversion a 30°→330° arc arrives as 0.52°→5.76° — a 5° sliver instead
+            // of a 300° sweep — silently mangling every arc that comes through the
+            // real file-open path.
             EntityType::Arc(a) => entities.push(dxf::Entity::Arc {
                 center: (a.center.x, a.center.y),
                 radius: a.radius,
-                start_deg: a.start_angle,
-                end_deg: a.end_angle,
+                start_deg: a.start_angle.to_degrees(),
+                end_deg: a.end_angle.to_degrees(),
             }),
             EntityType::LwPolyline(p) => entities.push(dxf::Entity::LwPolyline {
                 closed: p.is_closed,
