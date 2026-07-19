@@ -317,10 +317,12 @@ pub struct ClearParams {
     pub overlap: f64,
     /// Finishing allowance left on the walls, mm.
     ///
-    /// **A carve must leave this at `0`.** In a pocket the skin is removed later by a
-    /// finishing profile; a carve has no such pass. The V-bit's innermost ring runs
-    /// *along* the flat land's boundary, it does not clear beside it, so an allowance
-    /// would leave an uncut full-depth ridge exactly at the wall/floor junction.
+    /// In a pocket this skin is taken off later by a finishing profile. In a **carve**
+    /// it is how far the end mill stays off the carved surface, leaving that skin for
+    /// the V-bit — which finishes it better, with the flank of its cone rather than the
+    /// corner of a cylinder. Nothing is left behind: the V-bit's floor pass is computed
+    /// against what the clearing tool *actually swept*, so a larger allowance simply
+    /// hands more of the work back to it.
     #[serde(default)]
     pub offset: f64,
     /// Cutting feed, mm/min.

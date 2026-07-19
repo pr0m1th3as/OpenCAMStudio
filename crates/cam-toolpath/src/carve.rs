@@ -401,60 +401,87 @@ impl Strategy for CarveStrategy {
                     op.plunge_feed
                 };
                 let levels = crate::profile::depth_levels(op.top, op.top - op.depth, stepdown);
-                // A finishing allowance would leave a full-depth ridge exactly where the
-                // carved wall meets the floor: the V-bit's innermost ring runs *along*
-                // the flat land's boundary, it never clears beside it. So the clearing
-                // pass goes right to the edge, and `offset` is not offered for a carve.
-                let first = r + cp.offset.max(0.0);
+                // `offset` is a real finishing allowance here: how far the end mill stays
+                // off the carved surface, leaving that skin for the V-bit — which cuts it
+                // better, with the flank of its cone rather than a corner. Nothing is left
+                // behind by it, because the V-bit's own passes are computed against what
+                // the end mill actually swept.
+                let finish = cp.offset.max(0.0);
+                let first = r + finish;
 
+                // **Each level clears to its own depth's V-width, not the bottom's.**
+                // At depth d the carved surface stands `vtip_half_width(d)` in from the
+                // boundary, so everything beyond that is waste *at that level*, and the
+                // higher the level the more of it there is. Clearing every level to the
+                // bottom's width would leave the whole taper for the V-bit.
+                //
+                // It cannot gouge: the tool's edge reaches only `w(d) + finish`, where the
+                // intended depth is `f(w(d) + finish) >= f(w(d)) = d`. So a cut to depth
+                // `d` there is always at or above the surface the carve wants.
                 let mut cleared = 0usize;
                 let mut too_small = 0usize;
-                for area in &flat {
-                    // Region the wall leads must stay inside, as a pocket computes it.
-                    let guards = offset(
-                        std::slice::from_ref(area),
-                        -first,
+                let mut bottom_start = 0usize;
+                for (li, &z) in levels.iter().enumerate() {
+                    let d = op.top - z;
+                    let w = vtip_half_width(alpha, tip_radius, d);
+                    let at_level = match offset(
+                        std::slice::from_ref(&region),
+                        -(op.offset + w + finish),
                         JoinStyle::Round,
-                    )
-                    .unwrap_or_default();
-                    // `first = r` puts the outermost ring's *edge* on the flat land's
-                    // boundary, so the floor is cleared right out to where the carved
-                    // wall meets it. No finishing allowance: the V-bit is the finish.
-                    let job = crate::clearing::ClearJob {
-                        id: op.id,
-                        radius: r,
-                        finish: cp.offset.max(0.0),
-                        first,
-                        spacing,
-                        clearing: cp.clearing,
-                        plunge: cp.plunge,
-                        feed,
-                        plunge_feed,
-                        lead_overlap: cp.lead_overlap,
-                        lead_in: cp.lead_in,
-                        lead_out: cp.lead_out,
-                        start: op.start,
-                        guard: &guards,
-                    };
-                    match crate::clearing::clear(
-                        &mut clear_body,
-                        area,
-                        &job,
-                        &env.heights,
-                        &levels,
-                        cancel,
                     ) {
-                        Ok(0) => too_small += 1,
-                        Ok(_) => cleared += 1,
-                        Err(crate::rings::RingsError::Cancelled) => {
-                            return StrategyResult {
-                                diagnostics,
-                                cancelled: true,
-                                ..Default::default()
-                            };
-                        }
-                        Err(crate::rings::RingsError::Offset(e)) => {
-                            fail!("operation {}: clearing offset failed: {e}", op.id)
+                        Ok(a) => a,
+                        Err(e) => fail!("operation {}: clearing offset failed: {e}", op.id),
+                    };
+                    // The floor's rest region is judged against what the *bottom* level
+                    // swept; the shallower levels cover more ground and would overstate it.
+                    if li + 1 == levels.len() {
+                        bottom_start = clear_body.len();
+                    }
+                    for area in &at_level {
+                        // Region the wall leads must stay inside, as a pocket computes it.
+                        let guards =
+                            offset(std::slice::from_ref(area), -first, JoinStyle::Round)
+                                .unwrap_or_default();
+                        let job = crate::clearing::ClearJob {
+                            id: op.id,
+                            radius: r,
+                            finish,
+                            first,
+                            spacing,
+                            clearing: cp.clearing,
+                            plunge: cp.plunge,
+                            feed,
+                            plunge_feed,
+                            lead_overlap: cp.lead_overlap,
+                            lead_in: cp.lead_in,
+                            lead_out: cp.lead_out,
+                            start: op.start,
+                            guard: &guards,
+                        };
+                        match crate::clearing::clear(
+                            &mut clear_body,
+                            area,
+                            &job,
+                            &env.heights,
+                            &[z],
+                            cancel,
+                        ) {
+                            Ok(0) => {
+                                if li + 1 == levels.len() {
+                                    too_small += 1;
+                                }
+                            }
+                            Ok(_) => cleared += 1,
+                            Err(crate::rings::RingsError::Cancelled) => {
+                                return StrategyResult {
+                                    diagnostics,
+                                    cancelled: true,
+                                    ..Default::default()
+                                };
+                            }
+                            Err(crate::rings::RingsError::Offset(e)) => {
+                                fail!("operation {}: clearing offset failed: {e}", op.id)
+                            }
                         }
                     }
                 }
@@ -478,7 +505,7 @@ impl Strategy for CarveStrategy {
                         areas_phrase(flat.len())
                     )));
                 }
-                swept = swept_by(&clear_body, r);
+                swept = swept_by(&clear_body.steps()[bottom_start..], r);
                 clear_comment = Some(format!(
                     "Carve clearing: {} at {:.3} mm deep with tool {ct} dia {:.3}, \
                      {:.3} mm stepover, {}",
@@ -749,7 +776,7 @@ fn perimeter(c: &cam_geo::Contour) -> f64 {
 /// This is what makes the V-bit's floor pass a *rest* pass: it is sent only where the
 /// end mill could not reach, which for a flat-bottomed round cutter is every concave
 /// corner of the flat land.
-fn swept_by(clear_body: &Program, radius: f64) -> Vec<Polygon> {
+fn swept_by(steps: &[Step], radius: f64) -> Vec<Polygon> {
     let mut out = Vec::new();
     let mut run: Vec<cam_geo::Point> = Vec::new();
     let mut flush = |run: &mut Vec<cam_geo::Point>| {
@@ -763,7 +790,7 @@ fn swept_by(clear_body: &Program, radius: f64) -> Vec<Polygon> {
             run.clear();
         }
     };
-    for step in clear_body.steps() {
+    for step in steps {
         match step {
             Step::Linear { to, tag, .. } if tag.kind == MoveKind::Cutting => {
                 run.push(cam_geo::Point::new(to.x, to.y));
@@ -1643,6 +1670,141 @@ mod tests {
             );
         }
         assert!(saw, "the clearing pass emitted no cutting");
+    }
+
+    #[test]
+    fn each_clearing_level_follows_the_taper_rather_than_the_bottom() {
+        // The point of stepping down at all: at depth d the carved surface stands
+        // vtip_half_width(d) in from the boundary, so a shallow level has far more waste
+        // to take than the bottom does. Clearing every level to the bottom's width would
+        // hand the whole taper to the V-bit for no reason.
+        let mut o = op(2.0);
+        o.clear = Some(cam_model::CarveClearing {
+            tool: 2,
+            params: cam_model::ClearParams {
+                stepdown: 0.5,
+                ..Default::default()
+            },
+        });
+        let r = run_with(o, &[vbit(90.0, 0.0), endmill(2, 4.0)]);
+        assert!(errors(&r).is_empty(), "{:?}", errors(&r));
+        let steps = r.program.steps();
+        let change = steps
+            .iter()
+            .position(|s| matches!(s, Step::ToolChange { .. }))
+            .unwrap();
+        // For each clearing level, how far out from the 20 mm square's wall the cutter
+        // reached: the tool's edge is its radius beyond the ring it rides.
+        let mut reach: std::collections::BTreeMap<i64, f64> = std::collections::BTreeMap::new();
+        for s in &steps[..change] {
+            let (x, y, z) = match s {
+                Step::Linear { to, tag, .. } if tag.kind == MoveKind::Cutting => (to.x, to.y, to.z),
+                Step::Arc { end, tag, .. } if tag.kind == MoveKind::Cutting => {
+                    (end.x, end.y, end.z)
+                }
+                _ => continue,
+            };
+            let inset = x.min(y).min(20.0 - x).min(20.0 - y);
+            let e = reach.entry((z * 1000.0).round() as i64).or_insert(f64::MAX);
+            *e = e.min(inset - 2.0); // tool radius 2
+        }
+        assert!(reach.len() >= 4, "expected several levels, got {reach:?}");
+        // A 90 deg sharp bit: the surface at depth d is d in from the wall, so each
+        // level's cutter edge must land on its own depth, not the bottom's.
+        for (&zk, &edge) in &reach {
+            let d = -(zk as f64) / 1000.0;
+            assert!(
+                (edge - d).abs() < 0.05,
+                "level at depth {d:.3} reached {edge:.3} from the wall, not {d:.3}"
+            );
+        }
+        // And they really do differ: the shallowest level reaches much further out.
+        let shallow = *reach.values().next_back().unwrap();
+        let deep = *reach.values().next().unwrap();
+        assert!(shallow < deep - 1.0, "shallow={shallow:.3} deep={deep:.3}");
+    }
+
+    #[test]
+    fn the_clearing_offset_holds_the_end_mill_off_the_carved_surface() {
+        // A finishing allowance for the V-bit: the end mill must stop that much short of
+        // the surface at *every* level, not just the floor.
+        let mut o = op(2.0);
+        o.clear = Some(cam_model::CarveClearing {
+            tool: 2,
+            params: cam_model::ClearParams {
+                stepdown: 0.5,
+                offset: 0.4,
+                ..Default::default()
+            },
+        });
+        let r = run_with(o, &[vbit(90.0, 0.0), endmill(2, 4.0)]);
+        assert!(errors(&r).is_empty(), "{:?}", errors(&r));
+        let steps = r.program.steps();
+        let change = steps
+            .iter()
+            .position(|s| matches!(s, Step::ToolChange { .. }))
+            .unwrap();
+        for s in &steps[..change] {
+            let (x, y, z) = match s {
+                Step::Linear { to, tag, .. } if tag.kind == MoveKind::Cutting => (to.x, to.y, to.z),
+                Step::Arc { end, tag, .. } if tag.kind == MoveKind::Cutting => {
+                    (end.x, end.y, end.z)
+                }
+                _ => continue,
+            };
+            let inset = x.min(y).min(20.0 - x).min(20.0 - y);
+            let d = -z;
+            // Edge of the cutter = inset - radius; it must stay at d + offset or beyond.
+            assert!(
+                inset - 2.0 >= d + 0.4 - 0.05,
+                "at depth {d:.3} the cutter edge reached {:.3}, inside the {:.3} allowance",
+                inset - 2.0,
+                d + 0.4
+            );
+        }
+    }
+
+    #[test]
+    fn what_the_clearing_offset_leaves_is_handed_back_to_the_v_bit() {
+        // The allowance is not abandoned material: the floor pass is computed from what
+        // the end mill actually swept, so a bigger allowance simply gives the V-bit more
+        // to do. Measured as the length of V-bit cutting at full depth.
+        let floor_len = |offset: f64| {
+            let mut o = op(1.0);
+            o.ring_step = 0.25;
+            o.clear = Some(cam_model::CarveClearing {
+                tool: 2,
+                params: cam_model::ClearParams {
+                    offset,
+                    ..Default::default()
+                },
+            });
+            let r = run_with(o, &[vbit(90.0, 0.0), endmill(2, 4.0)]);
+            assert!(errors(&r).is_empty(), "{:?}", errors(&r));
+            let mut total = 0.0;
+            let mut prev: Option<(f64, f64)> = None;
+            for s in r.program.steps() {
+                match s {
+                    Step::Rapid { to, .. } => prev = Some((to.x, to.y)),
+                    Step::Linear { to, tag, .. } | Step::Arc { end: to, tag, .. } => {
+                        if tag.kind == MoveKind::Cutting && (to.z + 1.0).abs() < 1e-9 {
+                            if let Some(q) = prev {
+                                total += ((to.x - q.0).powi(2) + (to.y - q.1).powi(2)).sqrt();
+                            }
+                        }
+                        prev = Some((to.x, to.y));
+                    }
+                    _ => {}
+                }
+            }
+            total
+        };
+        let tight = floor_len(0.0);
+        let generous = floor_len(0.5);
+        assert!(
+            generous > tight * 1.2,
+            "a 0.5 mm allowance should hand the V-bit visibly more floor: {generous:.1} vs {tight:.1} mm"
+        );
     }
 
     #[test]

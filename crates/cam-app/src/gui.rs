@@ -1001,6 +1001,8 @@ enum Field {
     ClearPlungeA,
     /// Carve clearing pass: plunge parameter B (zig-zag length, or helix pitch).
     ClearPlungeB,
+    /// Carve clearing pass: allowance left off the carved surface for the V-bit (mm).
+    ClearOffset,
 }
 
 impl Field {
@@ -1074,6 +1076,7 @@ impl Field {
             Field::ClearLeadOutSize => "Clear lead-out size (mm)",
             Field::ClearPlungeA => "Clear plunge A",
             Field::ClearPlungeB => "Clear plunge B",
+            Field::ClearOffset => "Clear allowance (mm)",
             Field::PlungeA => "Plunge angle/radius",
             Field::PlungeB => "Plunge length/pitch",
         }
@@ -1339,6 +1342,12 @@ impl Field {
             Field::ClearPlungeB => {
                 "Second clearing-plunge parameter: the zig-zag length, or the helix pitch \
                  (mm). Unused for a straight plunge."
+            }
+            Field::ClearOffset => {
+                "How far the end mill stays off the carved surface (mm), leaving that skin \
+                 for the V-bit -- which finishes it better, with the flank of its cone \
+                 rather than the corner of a cylinder. Nothing is abandoned: the V-bit's \
+                 own passes are computed from what the end mill actually swept."
             }
         }
     }
@@ -1640,6 +1649,26 @@ fn start_axis(field: Field) -> usize {
 /// generic Setup field loop).
 fn is_start_field(field: Field) -> bool {
     matches!(field, Field::StartOffX | Field::StartOffY | Field::StartOffZ)
+}
+
+/// Whether a field belongs to a carve's **clearing pass** rather than to the carve
+/// itself. These render in their own section under the clearing tool, not mixed in with
+/// the V-bit's own numbers — two tools, two blocks.
+fn is_clear_field(field: Field) -> bool {
+    matches!(
+        field,
+        Field::ClearStepdown
+            | Field::ClearOverlap
+            | Field::ClearOffset
+            | Field::ClearEngagement
+            | Field::ClearFeed
+            | Field::ClearPlungeFeed
+            | Field::ClearLeadOverlap
+            | Field::ClearLeadInSize
+            | Field::ClearLeadOutSize
+            | Field::ClearPlungeA
+            | Field::ClearPlungeB
+    )
 }
 
 /// Orientation-cube on-screen size (logical px): default and the slider's range.
@@ -3931,6 +3960,7 @@ impl App {
                         fields.extend([
                             Field::ClearStepdown,
                             Field::ClearOverlap,
+                            Field::ClearOffset,
                             Field::ClearEngagement,
                             Field::ClearFeed,
                             Field::ClearPlungeFeed,
@@ -5463,8 +5493,9 @@ impl App {
             list = list.push(text("Nothing to edit here yet.").size(12));
         }
         for field in ordered {
-            // Start-point fields render in their own section (below), not here.
-            if is_start_field(field) {
+            // Start-point and clearing-pass fields render in their own sections
+            // (below), not mixed in here.
+            if is_start_field(field) || is_clear_field(field) {
                 continue;
             }
             let value = self.fields.get(&field).cloned().unwrap_or_default();
@@ -5712,6 +5743,15 @@ impl App {
                         // The clearing tool is offered only when there is something for
                         // it to clear — otherwise it buys a tool change and nothing else.
                         if sh.flat_areas > 0 {
+                            // Everything below this line belongs to the *other* tool.
+                            // Two tools in one operation is unusual enough that the
+                            // inspector has to say where one ends and the next begins.
+                            list = list.push(iced::widget::rule::horizontal(1));
+                            list = list.push(
+                                text("Clearing pass (end mill)")
+                                    .size(12)
+                                    .color(palette::GROUP_LABEL),
+                            );
                             list = list.push(
                                 row![
                                     label_help(
@@ -5778,9 +5818,24 @@ impl App {
                                     .spacing(8)
                                     .align_y(Alignment::Center),
                                 );
-                                // A pocket's controls, because that is what this pass
-                                // is. The numeric fields come through the normal field
-                                // list; these are the pickers and the toggle.
+                                // A pocket's controls, because that is what this pass is
+                                // — held back from the main field block above so they sit
+                                // under the tool they belong to.
+                                for f in self.inspector_fields() {
+                                    if !is_clear_field(f) {
+                                        continue;
+                                    }
+                                    let value =
+                                        self.fields.get(&f).cloned().unwrap_or_default();
+                                    list = list.push(field_row_labeled(
+                                        f,
+                                        self.field_label(f),
+                                        self.field_help(f),
+                                        &value,
+                                        self.tooltips,
+                                        self.field_invalid(f),
+                                    ));
+                                }
                                 list = list.push(profile_picker(
                                     "Clearing plunge",
                                     help::CARVE_CLEAR_PLUNGE,
@@ -6304,6 +6359,7 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Carve(o), Field::PlungeFeed) => Some(o.plunge_feed),
         (Operation::Carve(o), Field::ClearStepdown) => Some(o.clear?.params.stepdown),
         (Operation::Carve(o), Field::ClearOverlap) => Some(o.clear?.params.overlap * 100.0),
+        (Operation::Carve(o), Field::ClearOffset) => Some(o.clear?.params.offset),
         (Operation::Carve(o), Field::ClearEngagement) => Some(o.clear?.params.clearing.engagement),
         (Operation::Carve(o), Field::ClearFeed) => Some(o.clear?.params.feed),
         (Operation::Carve(o), Field::ClearPlungeFeed) => Some(o.clear?.params.plunge_feed),
@@ -6564,6 +6620,9 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
                 }
                 if let Some(v) = get(Field::ClearOverlap) {
                     p.overlap = (v / 100.0).clamp(0.0, 0.99);
+                }
+                if let Some(v) = get(Field::ClearOffset) {
+                    p.offset = v.max(0.0);
                 }
                 if let Some(v) = get(Field::ClearEngagement) {
                     p.clearing.engagement = v.max(0.0);
