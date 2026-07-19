@@ -153,6 +153,63 @@ impl Heightfield {
         max
     }
 
+    /// How far remaining stock rises **into the tool** along the swept XY path `a→b`
+    /// with the tool tip at `tip_z` — the profile-aware companion to
+    /// [`max_height_along`](Self::max_height_along), and the mirror of
+    /// [`cut_segment_profile`](Self::cut_segment_profile)'s removal rule.
+    ///
+    /// A cell at radial distance `d` from the path is cleared up to
+    /// `tip_z + offset(d)`; anything above that is material the tool body would hit.
+    /// Returns `(intrusion, stock_height)` for the worst cell — a positive
+    /// `intrusion` means a collision — or `None` if the path covers no cells.
+    ///
+    /// Why this matters over a plain radius test: a **pointed** tool is only as wide
+    /// as its cone has opened at the depth it sits. A ⌀6 V-bit 0.15 mm below the
+    /// surface is a 0.3 mm sliver, not a 6 mm cylinder, so testing its full radius
+    /// against the *uncut surface alongside* the groove reports a collision for a
+    /// move that physically fits in the groove the tool just cut.
+    ///
+    /// **Resolution-limited.** The test samples cell centres, so a feature narrower
+    /// than a cell is invisible to it: at 0.5 mm cells the nearest sample to the path
+    /// is 0.25 mm off-axis, where a 60° cone has already climbed 0.33 mm — enough to
+    /// miss a tip sitting 0.3 mm into solid stock. The caller is responsible for
+    /// sizing the grid to the narrowest cut (`cam-app`'s `narrowest_cut_width` does
+    /// this), and with a grid so sized the test is accurate in both directions.
+    ///
+    /// `tip_z` is the **lowest** tip height over the move, not an interpolation:
+    /// `G0` is not guaranteed to travel a straight line (axes may run at
+    /// independent rates, so Z can arrive before XY), and assuming the worst is the
+    /// safe reading for a rapid.
+    pub fn max_intrusion_along(
+        &self,
+        a: [f64; 2],
+        b: [f64; 2],
+        tip_z: f64,
+        tool: &ToolProfile,
+    ) -> Option<(f32, f32)> {
+        let radius = tool.radius;
+        let (ix0, ix1) = self.index_range(a[0].min(b[0]) - radius, a[0].max(b[0]) + radius, 0);
+        let (iy0, iy1) = self.index_range(a[1].min(b[1]) - radius, a[1].max(b[1]) + radius, 1);
+        let r2 = radius * radius;
+        let mut worst: Option<(f32, f32)> = None;
+        for iy in iy0..=iy1 {
+            for ix in ix0..=ix1 {
+                let (cx, cy) = self.center(ix, iy);
+                let dist2 = project(cx, cy, a, b).1;
+                if dist2 > r2 {
+                    continue;
+                }
+                let height = self.z[iy * self.nx + ix];
+                let tool_bottom = (tip_z + tool.offset(dist2.sqrt())) as f32;
+                let intrusion = height - tool_bottom;
+                if worst.is_none_or(|(w, _)| intrusion > w) {
+                    worst = Some((intrusion, height));
+                }
+            }
+        }
+        worst
+    }
+
     /// Volume of material removed so far, mm³.
     pub fn removed_volume(&self) -> f64 {
         let cell = self.res * self.res;

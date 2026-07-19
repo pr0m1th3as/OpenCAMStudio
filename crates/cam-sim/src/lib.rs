@@ -240,17 +240,25 @@ pub fn simulate(
                     let lateral = (a.x - to.x).hypot(a.y - to.y) > 1e-9;
                     let vertical_lift = !lateral && to.z >= a.z;
                     if !vertical_lift {
-                        let clearance = a.z.min(to.z) as f32;
-                        let stock = field.max_height_along([a.x, a.y], [to.x, to.y], tool.radius);
-                        if stock > clearance + CLEARANCE_EPS {
-                            collisions.push(Collision {
-                                kind: CollisionKind::RapidThroughStock,
-                                at: [to.x, to.y, to.z],
-                                message: format!(
-                                    "rapid at Z {:.3} passes through stock standing at Z {:.3}",
-                                    to.z, stock
-                                ),
-                            });
+                        // Profile-aware: the tool is only as wide as its own shape at
+                        // the depth it sits, so a pointed tool descending into the
+                        // narrow groove it just cut is not stopped by the uncut
+                        // surface alongside it. For a flat tool `offset` is zero
+                        // everywhere, so this reduces exactly to the old radius test.
+                        let tip_z = a.z.min(to.z);
+                        if let Some((intrusion, stock)) =
+                            field.max_intrusion_along([a.x, a.y], [to.x, to.y], tip_z, &tool)
+                        {
+                            if intrusion > CLEARANCE_EPS {
+                                collisions.push(Collision {
+                                    kind: CollisionKind::RapidThroughStock,
+                                    at: [to.x, to.y, to.z],
+                                    message: format!(
+                                        "rapid at Z {:.3} passes through stock standing at Z {:.3}",
+                                        to.z, stock
+                                    ),
+                                });
+                            }
                         }
                     }
                 }
@@ -372,6 +380,103 @@ mod tests {
             .build();
         let sim = simulate(&prog, STOCK_MIN, STOCK_MAX, &opts(), &[]);
         assert!(!sim.is_clean(), "should flag the rapid");
+        assert_eq!(sim.collisions[0].kind, CollisionKind::RapidThroughStock);
+    }
+
+    /// Options sized to a *pointed* tool's actual cut, as `cam-app`'s
+    /// `narrowest_cut_width` does: a 60° V-bit engraving ~0.4 mm deep cuts a ~0.58 mm
+    /// groove, so cells must be a fraction of that. The module default (0.5 mm) is
+    /// coarser than the whole groove and cannot resolve it in either direction.
+    fn fine_opts() -> SimOptions {
+        SimOptions {
+            resolution: 0.19,
+            tool_radius: 3.0,
+        }
+    }
+
+    fn vbit(number: u32, radius: f64, half_angle_rad: f64) -> SimTool {
+        SimTool {
+            number,
+            profile: ToolProfile {
+                radius,
+                shape: ProfileShape::VTip {
+                    half_angle_rad,
+                    tip_radius: 0.1,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn a_pointed_tool_may_descend_into_the_groove_it_just_cut() {
+        // Multi-pass engraving: pass 2 rapids down to pass 1's depth before feeding
+        // deeper. The tool is only as wide as its cone has opened at that depth — a
+        // ⌀6 V-bit 0.15 mm down is a 0.3 mm sliver — so the uncut surface 3 mm away
+        // must not stop it. Regression for a RapidThroughStock that blocked export of
+        // every multi-pass engrave.
+        let tool = vbit(1, 3.0, (30.0_f64).to_radians());
+        let prog = ProgramBuilder::new()
+            .op(0)
+            .feed(300.0)
+            .tool_change(1)
+            .rapid(Point3::new(5.0, 20.0, 5.0), MoveKind::Link)
+            .linear(Point3::new(5.0, 20.0, -0.15), MoveKind::Plunge)
+            .linear(Point3::new(35.0, 20.0, -0.15), MoveKind::Cutting)
+            .rapid(Point3::new(35.0, 20.0, 5.0), MoveKind::Retract)
+            // Pass 2: back to the start, down into the groove just cut.
+            .rapid(Point3::new(5.0, 20.0, 5.0), MoveKind::Link)
+            .rapid(Point3::new(5.0, 20.0, -0.15), MoveKind::Link)
+            .linear(Point3::new(5.0, 20.0, -0.3), MoveKind::Plunge)
+            .linear(Point3::new(35.0, 20.0, -0.3), MoveKind::Cutting)
+            .rapid(Point3::new(35.0, 20.0, 5.0), MoveKind::Retract)
+            .build();
+        let sim = simulate(&prog, STOCK_MIN, STOCK_MAX, &fine_opts(), &[tool]);
+        assert!(sim.is_clean(), "collisions: {:?}", sim.collisions);
+    }
+
+    #[test]
+    fn a_pointed_tool_diving_into_uncut_stock_is_still_flagged() {
+        // The other side of the same coin — the check must not have been disabled for
+        // pointed tools. Same tool, same depth, but descending where nothing was cut.
+        let tool = vbit(1, 3.0, (30.0_f64).to_radians());
+        let prog = ProgramBuilder::new()
+            .op(0)
+            .tool_change(1)
+            .rapid(Point3::new(5.0, 20.0, 5.0), MoveKind::Link)
+            .rapid(Point3::new(20.0, 20.0, -0.3), MoveKind::Link)
+            .build();
+        let sim = simulate(&prog, STOCK_MIN, STOCK_MAX, &fine_opts(), &[tool]);
+        assert!(!sim.is_clean(), "a dive into virgin stock is a crash");
+        assert_eq!(sim.collisions[0].kind, CollisionKind::RapidThroughStock);
+    }
+
+    #[test]
+    fn a_pointed_tool_dragged_sideways_below_the_surface_is_still_flagged() {
+        // A lateral rapid at depth across uncut stock: the classic crash, and the
+        // case the profile-aware test must never soften.
+        let tool = vbit(1, 3.0, (30.0_f64).to_radians());
+        let prog = ProgramBuilder::new()
+            .op(0)
+            .tool_change(1)
+            .rapid(Point3::new(2.0, 20.0, -1.0), MoveKind::Link)
+            .rapid(Point3::new(38.0, 20.0, -1.0), MoveKind::Link)
+            .build();
+        let sim = simulate(&prog, STOCK_MIN, STOCK_MAX, &fine_opts(), &[tool]);
+        assert!(!sim.is_clean(), "should flag the lateral rapid");
+        assert_eq!(sim.collisions[0].kind, CollisionKind::RapidThroughStock);
+    }
+
+    #[test]
+    fn a_flat_tool_is_unaffected_by_the_profile_aware_test() {
+        // A flat tool's `offset` is zero at every radius, so the new test reduces
+        // exactly to the old one: an honest crash still reports.
+        let prog = ProgramBuilder::new()
+            .op(0)
+            .rapid(Point3::new(2.0, 20.0, -2.0), MoveKind::Link)
+            .rapid(Point3::new(38.0, 20.0, -2.0), MoveKind::Link)
+            .build();
+        let sim = simulate(&prog, STOCK_MIN, STOCK_MAX, &opts(), &[]);
+        assert_eq!(sim.collisions.len(), 1);
         assert_eq!(sim.collisions[0].kind, CollisionKind::RapidThroughStock);
     }
 
