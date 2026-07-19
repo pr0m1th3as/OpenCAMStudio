@@ -338,6 +338,43 @@ impl Tool {
                 segs,
             };
         }
+        // Full-form thread mill: the threads *are* the cutting surface, so the boundary is
+        // a 60° saw-tooth up the side (crest = cutting ⌀, root = crest − depth, depth =
+        // 0.866·pitch for a 60° form). The bottom face and shank are non-cutting.
+        if let ToolKind::ThreadMill { pitch: Some(pitch) } = self.kind {
+            use cam_geo::{Point, Profile2D, ProfileSeg, SegShape};
+            let r = self.radius(); // crest / cutting ⌀
+            let r_shank = self.shank_dia() * 0.5;
+            let tl = self.flute_len().max(1e-3); // thread length
+            let oal = self.length.max(tl);
+            let p = pitch.max(0.05);
+            let depth = (0.866_025_4 * p).min(r * 0.7);
+            let r_root = (r - depth).max(0.0);
+            let count = ((tl / p).floor() as usize).max(1);
+            let line = |r: f64, z: f64, cutting| ProfileSeg {
+                shape: SegShape::Line,
+                end: Point::new(r, z),
+                cutting,
+            };
+            // Bottom face (non-cutting) out to the minor ⌀, then the toothed side rising
+            // root → crest → root at each half-pitch (cutting).
+            let mut segs = vec![line(r_root, 0.0, false)];
+            for k in 1..=2 * count {
+                let z = (k as f64) * (p * 0.5);
+                let rr = if k % 2 == 1 { r } else { r_root };
+                segs.push(line(rr, z, true));
+            }
+            let z_top = (count as f64) * p;
+            segs.push(line(r_shank, z_top, false)); // step to the shank
+            segs.push(line(r_shank, oal, false)); // shank to the overall length
+            if r_shank > 1e-9 {
+                segs.push(line(0.0, oal, false)); // top face back to the axis
+            }
+            return Profile2D {
+                start: Point::new(0.0, 0.0),
+                segs,
+            };
+        }
         // A V-bit's cutting is the whole cone (no separate flute length); passing
         // flute_length 0 clamps the flute top to the cone top, so the cone is cutting
         // and the shaft above is non-cutting.

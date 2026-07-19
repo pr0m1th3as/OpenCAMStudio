@@ -6640,10 +6640,6 @@ struct ToolCanvas {
     /// Draw a row of 90° square inserts seated at the bottom of the body (face mills),
     /// so the silhouette reads as a real shell mill rather than a bare inverted-T.
     draw_face_inserts: bool,
-    /// Full-form thread-mill teeth: `Some(pitch)` overlays a stacked-tooth band at that
-    /// pitch. `None` for everything else — a single-point mill's one tooth is already part
-    /// of its profile, so it needs no overlay.
-    thread_teeth: Option<f64>,
 }
 
 impl ToolCanvas {
@@ -6684,10 +6680,6 @@ impl ToolCanvas {
                 if matches!(tool.kind, ToolKind::Drill { .. }) { -base } else { base }
             },
             draw_face_inserts: matches!(tool.kind, ToolKind::FaceMill),
-            thread_teeth: match tool.kind {
-                ToolKind::ThreadMill { pitch: Some(p) } => Some(p),
-                _ => None,
-            },
             profile,
         }
     }
@@ -6792,40 +6784,9 @@ impl canvas::Program<Message> for ToolCanvas {
             }
         }
 
-        // Thread-mill teeth: a saw-tooth profile over the cutting band, at the periphery,
-        // mirrored both sides. A full-form mill (Some pitch) repeats teeth at that pitch;
-        // a single-point mill (None) shows one representative tooth. The envelope profile
-        // itself stays a flat cylinder — these teeth are a legibility overlay, not the
-        // true 60° cutting form (that fidelity is deferred).
-        if let Some(pitch) = self.thread_teeth {
-            // Full-form mill: a stacked-tooth band at the thread pitch, on the cutting ⌀.
-            let r = (self.diameter * 0.5).max(1e-3);
-            let fl = self.flute_length.max(1e-3); // threaded band (thread length)
-            let spacing = pitch.max(0.05);
-            // Standard 60° thread: a sharp V of included angle 60° has crest→root depth =
-            // (spacing/2) / tan(30°) = 0.866·spacing (capped so a coarse pitch can't eat
-            // the whole tool). Each flank then sits 30° off the radial ⇒ 60° included.
-            let depth = (0.866_025_4 * spacing).min(r * 0.7);
-            let count = ((fl / spacing).floor() as usize).max(1);
-            // Triangular wave along the periphery: crest (r) at the tip, alternating to a
-            // root (r−depth) every half-spacing.
-            let steps = 2 * count;
-            let mut wave: Vec<(f64, f64)> = Vec::with_capacity(steps + 1);
-            for k in 0..=steps {
-                let z = (k as f64) * (spacing / 2.0);
-                let x = if k % 2 == 0 { r } else { r - depth };
-                wave.push((x, z));
-            }
-            for sign in [1.0_f32, -1.0] {
-                let path = canvas::Path::new(|b| {
-                    b.move_to(map(wave[0].0, wave[0].1, sign));
-                    for &(x, z) in &wave[1..] {
-                        b.line_to(map(x, z, sign));
-                    }
-                });
-                frame.stroke(&path, canvas::Stroke::default().with_color(fg).with_width(2.0));
-            }
-        }
+        // (Thread-mill teeth are part of the generatrix now — the saw-tooth is the cutting
+        // boundary itself — so there is no separate overlay: the profile loop above draws
+        // the threads solid and the non-cutting bottom/shank dashed.)
 
         // Flutes + cutting direction. Each flute is projected onto the side view, drawn
         // only where it faces the viewer, and **tapered to the tool's actual radius at
