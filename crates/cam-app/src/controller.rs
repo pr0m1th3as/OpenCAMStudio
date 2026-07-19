@@ -227,6 +227,11 @@ pub struct PendingOp {
     pub islands: Vec<LoopRef>,
     /// The snapped start/lead-in point (part XY) captured with the boundary pick.
     pub start: Option<[f64; 2]>,
+    /// When set, this wizard is **reinitialising** an existing operation: on
+    /// completion the new operation takes that one's place in the order rather than
+    /// being appended. Lets a wrong pick be redone without losing the operation's
+    /// position in the job.
+    pub replacing: Option<u32>,
 }
 
 /// A viewport object-snap: which kind of point on the geometry the cursor
@@ -728,6 +733,22 @@ impl AppController {
 
     /// Edit the selected operation as one undoable change. A no-op unless an
     /// operation is selected.
+    /// Edit operation `id` in place (undoable). Used where the target is explicit
+    /// rather than whatever is selected — e.g. changing an operation's tool from the
+    /// inspector.
+    pub fn edit_operation(&mut self, id: u32, f: impl FnOnce(&mut Operation)) {
+        let mut edited = false;
+        self.document.edit(|doc| {
+            if let Some(op) = doc.setup.operations.iter_mut().find(|o| o.id() == id) {
+                f(op);
+                edited = true;
+            }
+        });
+        if edited {
+            self.invalidate();
+        }
+    }
+
     pub fn edit_selected_operation(&mut self, f: impl FnOnce(&mut Operation)) {
         let Selection::Operation(id) = self.selection else {
             return;
@@ -763,6 +784,30 @@ impl AppController {
         set_op_id(&mut op, id);
         self.document.edit(move |doc| doc.setup.operations.push(op));
         self.selection = Selection::Operation(id);
+        self.invalidate();
+    }
+
+    /// Replace operation `replaced` with `op`, keeping the original's **position** in
+    /// the order and its id, so a reinitialised operation stays where it was in the
+    /// job. Falls back to appending if the original has gone.
+    fn replace_operation(&mut self, replaced: u32, mut op: Operation) {
+        let exists = self.operation(replaced).is_some();
+        if !exists {
+            self.add_operation(op);
+            return;
+        }
+        set_op_id(&mut op, replaced);
+        self.document.edit(move |doc| {
+            if let Some(slot) = doc
+                .setup
+                .operations
+                .iter_mut()
+                .find(|o| o.id() == replaced)
+            {
+                *slot = op;
+            }
+        });
+        self.selection = Selection::Operation(replaced);
         self.invalidate();
     }
 
@@ -1042,7 +1087,35 @@ impl AppController {
             boundary: None,
             islands: Vec::new(),
             start: None,
+            replacing: None,
         });
+    }
+
+    /// Restart the creation wizard for an existing operation, **replacing it in
+    /// place**: the same kind, a fresh tool and geometry pick, and on completion the
+    /// result keeps the original's position in the operation order.
+    ///
+    /// The wizard chooses the tool *before* the geometry, so without this a tool
+    /// picked in error could only be undone by deleting the operation and re-picking
+    /// its contour — losing its place in the job. (To change only the tool, edit it
+    /// on the operation directly; this is for redoing the pick as a whole.)
+    pub fn reinitialize_operation(&mut self, id: u32) -> bool {
+        if self.regions.is_empty() && self.open_paths.is_empty() {
+            return false;
+        }
+        let Some(kind) = self.operation(id).map(op_kind_of) else {
+            return false;
+        };
+        self.pending_op = Some(PendingOp {
+            kind,
+            tool: self.first_tool_number(),
+            boundary: None,
+            islands: Vec::new(),
+            start: None,
+            replacing: Some(id),
+        });
+        self.selection = Selection::Operation(id);
+        true
     }
 
     /// Change the tool of the pending operation. A no-op unless the wizard is active.
@@ -1276,7 +1349,10 @@ impl AppController {
                 } else if let Some(op) =
                     self.build_op(pending.kind, picked, &[], pending.tool, Some(start))
                 {
-                    self.add_operation(op);
+                    match pending.replacing {
+                        Some(old) => self.replace_operation(old, op),
+                        None => self.add_operation(op),
+                    }
                     self.pending_op = None;
                     PickResult::Created
                 } else {
@@ -1311,7 +1387,10 @@ impl AppController {
         if let Some(op) =
             self.build_op(pending.kind, boundary, &pending.islands, pending.tool, pending.start)
         {
-            self.add_operation(op);
+            match pending.replacing {
+                Some(old) => self.replace_operation(old, op),
+                None => self.add_operation(op),
+            }
             self.pending_op = None;
             return true;
         }
@@ -2041,6 +2120,20 @@ fn sim_profile(tool: &Tool) -> ToolProfile {
 }
 
 /// Set an operation's id, whatever its kind.
+/// The [`OpKind`] an existing operation was built as — so reinitialising it offers
+/// the same kind of pick.
+fn op_kind_of(op: &Operation) -> OpKind {
+    match op {
+        Operation::Profile(_) => OpKind::Profile,
+        Operation::Drill(_) => OpKind::Drill,
+        Operation::Pocket(_) => OpKind::Pocket,
+        Operation::Face(_) => OpKind::Face,
+        Operation::Chamfer(_) => OpKind::Chamfer,
+        Operation::Thread(_) => OpKind::Thread,
+        Operation::Engrave(_) => OpKind::Engrave,
+    }
+}
+
 fn set_op_id(op: &mut Operation, id: u32) {
     op.set_id(id);
 }
@@ -2589,6 +2682,117 @@ mod tests {
         v.as_object_mut().unwrap().remove("open_paths");
         let back = Project::from_json(&v.to_string()).expect("legacy project loads");
         assert!(back.open_paths.is_empty());
+    }
+
+    #[test]
+    fn reinitialize_replaces_in_place_keeping_id_and_position() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        // Three ops so position is observable.
+        app.new_operation(OpKind::Face);
+        let ids_before: Vec<u32> = op_ids(&app);
+        assert!(ids_before.len() >= 3, "{ids_before:?}");
+        let target = ids_before[1];
+        let pos_before = ids_before.iter().position(|&x| x == target).unwrap();
+
+        assert!(app.reinitialize_operation(target));
+        assert_eq!(
+            app.pending_op().unwrap().replacing,
+            Some(target),
+            "the wizard must know it is replacing"
+        );
+        // Completing the pick replaces rather than appends.
+        let picked = LoopRef {
+            region: 0,
+            part: LoopPart::Outer,
+        };
+        let op = app.build_op(OpKind::Profile, picked, &[], 1, None).unwrap();
+        app.replace_operation(target, op);
+
+        let ids_after = op_ids(&app);
+        assert_eq!(ids_after.len(), ids_before.len(), "no operation added or lost");
+        assert_eq!(
+            ids_after.iter().position(|&x| x == target),
+            Some(pos_before),
+            "the replacement keeps its place in the order"
+        );
+    }
+
+    #[test]
+    fn reinitialize_offers_the_same_operation_kind() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        app.new_operation(OpKind::Face);
+        let id = match app.selection() {
+            Selection::Operation(i) => i,
+            other => panic!("{other:?}"),
+        };
+        assert!(app.reinitialize_operation(id));
+        assert_eq!(app.pending_op().unwrap().kind, OpKind::Face);
+    }
+
+    #[test]
+    fn an_operations_tool_can_be_changed_after_creation() {
+        // The gap this closes: the wizard picks the tool before the geometry, so a
+        // wrong pick previously meant deleting the op and re-picking its contour.
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        let id = match app.selection() {
+            Selection::Operation(i) => i,
+            other => panic!("{other:?}"),
+        };
+        let before = app.operation(id).unwrap().tool();
+        let n = app.use_tool(Tool {
+            number: 77,
+            diameter: 4.0,
+            flute_length: 15.0,
+            length: 40.0,
+            flutes: 3,
+            kind: ToolKind::EndMill,
+            ..Default::default()
+        });
+        assert_ne!(n, before);
+        app.edit_operation(id, |op| op.set_tool(n));
+        assert_eq!(app.operation(id).unwrap().tool(), n);
+        // And it is undoable, like every other document edit.
+        assert!(app.undo());
+        assert_eq!(app.operation(id).unwrap().tool(), before);
+    }
+
+    #[test]
+    fn diagnostics_name_the_operation_they_came_from() {
+        // What lets the project tree mark *which* operation failed.
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        let id = match app.selection() {
+            Selection::Operation(i) => i,
+            other => panic!("{other:?}"),
+        };
+        // Force a guard error: profile with a V-bit (no cylindrical cutting flank).
+        let n = app.use_tool(Tool {
+            number: 55,
+            diameter: 6.0,
+            flute_length: 12.0,
+            length: 40.0,
+            flutes: 2,
+            kind: ToolKind::VBit {
+                included_angle_deg: 60.0,
+                tip_radius: 0.1,
+            },
+            ..Default::default()
+        });
+        app.edit_operation(id, |op| op.set_tool(n));
+        let out = app.run(&CancelToken::new());
+        let errors: Vec<&Diagnostic> = out
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert!(!errors.is_empty(), "the V-bit profile must error");
+        assert!(
+            errors.iter().all(|d| d.op == Some(id)),
+            "every error must name its operation: {errors:?}"
+        );
     }
 
     #[test]

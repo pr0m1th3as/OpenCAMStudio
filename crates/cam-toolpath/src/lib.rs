@@ -70,6 +70,11 @@ pub struct Diagnostic {
     pub severity: Severity,
     /// Human-readable description.
     pub message: String,
+    /// The operation this diagnostic belongs to, when known. Strategies do not set
+    /// it — [`build_job`] stamps it as it collects each operation's result, since the
+    /// planner is what knows the ownership. Lets the UI mark *which* operation failed
+    /// instead of only reporting a count.
+    pub op: Option<u32>,
 }
 
 impl Diagnostic {
@@ -78,7 +83,14 @@ impl Diagnostic {
         Self {
             severity: Severity::Error,
             message: message.into(),
+            op: None,
         }
+    }
+
+    /// Attach the operation this diagnostic came from.
+    pub fn for_op(mut self, id: u32) -> Self {
+        self.op = Some(id);
+        self
     }
 
     /// A warning diagnostic.
@@ -86,6 +98,7 @@ impl Diagnostic {
         Self {
             severity: Severity::Warning,
             message: message.into(),
+            op: None,
         }
     }
 
@@ -94,6 +107,7 @@ impl Diagnostic {
         Self {
             severity: Severity::Info,
             message: message.into(),
+            op: None,
         }
     }
 }

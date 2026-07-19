@@ -64,7 +64,10 @@ pub fn build_job(
 
         let result = compute(operation, &env, cancel);
         let fragment = result.program;
-        diagnostics.extend(result.diagnostics);
+        // Stamp ownership here: the planner knows which operation produced these,
+        // the strategy does not need to.
+        let op_id = operation.id();
+        diagnostics.extend(result.diagnostics.into_iter().map(|d| d.for_op(op_id)));
         if fragment.is_empty() {
             continue;
         }

@@ -340,7 +340,7 @@ mod tests {
                 mk(3, 6.0, ToolKind::Drill { point_angle_deg: 135.0 }),
                 mk(4, 8.0, ToolKind::ChamferMill {
                     included_angle_deg: 90.0,
-                    tip_diameter: 0.0,
+                    tip_diameter: 0.2,
                 }),
                 mk(5, 12.0, ToolKind::ThreadMill { pitch: None }),
             ],
@@ -449,7 +449,7 @@ mod tests {
             tools: vec![
                 mk(1, 6.0, ToolKind::ChamferMill {
                     included_angle_deg: 90.0,
-                    tip_diameter: 0.0,
+                    tip_diameter: 0.2,
                 }),
                 mk(2, 6.0, ToolKind::VBit {
                     included_angle_deg: 60.0,

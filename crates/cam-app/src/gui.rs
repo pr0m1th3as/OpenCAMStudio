@@ -70,6 +70,18 @@ mod palette {
     pub const ERROR: Color = rgb(0.92, 0.30, 0.28);
 }
 
+/// The smallest tip **radius** a ground pointed tool can physically have, in mm.
+///
+/// Neither a chamfer mill nor a V-bit has a true `r = 0` point — it cannot be ground
+/// and would not survive contact. 50 µm is the practical floor for a ground tip; below
+/// it the number is fiction and the geometry degenerates (a V-bit's tip arc collapses,
+/// and a chamfer mill's non-cutting flat — the very thing that distinguishes it from a
+/// V-bit — disappears).
+///
+/// Applied as a **radius** to both, so the two are held to the same physical size: a
+/// V-bit's tip radius directly, a chamfer mill's tip *diameter* at twice this.
+pub const MIN_TIP_RADIUS_MM: f64 = 0.05;
+
 /// Ribbon command icons. Each variant is a small embedded SVG (see
 /// `assets/icons/CREDITS.md` — most reused from OpenCADStudio, GPL-3.0; the
 /// CAM-specific ones drawn to match). The SVGs carry their own colours, so we
@@ -609,18 +621,22 @@ impl ToolKindPick {
             ToolKindPick::EndMill => ToolKind::EndMill,
             ToolKindPick::BallMill => ToolKind::BallMill,
             ToolKindPick::BullNose => ToolKind::BullNose { corner_radius: 1.0 },
+            // A chamfer mill is always ground with a flat tip; 0 would make it a
+            // V-bit. 0.2 mm is a typical small flat.
             ToolKindPick::ChamferMill => ToolKind::ChamferMill {
                 included_angle_deg: 90.0,
-                tip_diameter: 0.0,
+                tip_diameter: 0.2,
             },
             ToolKindPick::Drill => ToolKind::Drill {
                 point_angle_deg: 118.0,
             },
             ToolKindPick::FaceMill => ToolKind::FaceMill,
             ToolKindPick::ThreadMill => ToolKind::ThreadMill { pitch: None },
+            // A V-bit's point is always ground to a radius; 0 is unmakeable. 0.1 mm
+            // is a typical carving tip.
             ToolKindPick::VBit => ToolKind::VBit {
                 included_angle_deg: 60.0,
-                tip_radius: 0.0,
+                tip_radius: 0.1,
             },
         }
     }
@@ -1036,11 +1052,16 @@ impl Field {
                  90° for a 45° chamfer). Sets how cut depth maps to chamfer width."
             }
             Field::TipDiameter => {
-                "Diameter of the flat, non-cutting tip of a chamfer mill (0 = a sharp \
-                 point). Only the angled flank cuts."
+                "Diameter of the flat, non-cutting tip of a chamfer mill (min 0.10 mm — \
+                 a chamfer mill is always ground with a flat, and one cannot be ground \
+                 sharper). Only the angled flank cuts, which is why a chamfer mill \
+                 cannot engrave: use a V-bit."
             }
             Field::TipRadius => {
-                "Rounded-tip radius of a carving V-bit (0 = a sharp point)."
+                "Rounded-tip radius of a carving V-bit (min 0.05 mm — a point is always \
+                 ground to a radius, and one cannot be ground sharper). Unlike a \
+                 chamfer mill's flat, this rounded tip cuts, which is what lets a V-bit \
+                 engrave."
             }
             Field::PointAngle => {
                 "Included angle of the tool's point (the full cone angle) — e.g. a \
@@ -1238,6 +1259,12 @@ mod help {
     pub const THREAD_CUT: &str =
         "Climb vs conventional milling for the threading orbit — climb usually finishes \
          cleaner.";
+    pub const OP_TOOL: &str =
+        "The tool this operation cuts with. Changing it re-runs the toolpath, so a \
+         tool picked in error at the start of the wizard can be swapped here without \
+         re-picking the geometry. The strategy guards what the tool can actually cut \
+         (a chamfer mill cannot engrave, a V-bit cannot cut a vertical wall).";
+
     pub const POST: &str =
         "The machine controller/dialect the exported G-code is written for (grbl, Fanuc, \
          …). Pick the one your control speaks.";
@@ -1732,6 +1759,9 @@ enum Message {
     /// Structural edits to the selected operation.
     DuplicateOp,
     DeleteOp,
+    /// Restart the creation wizard for the context-menu operation, replacing it in
+    /// place (same kind, same position in the order).
+    ReinitOp,
     /// Move operation `id` one step earlier (`true`) or later.
     MoveOp(u32, bool),
     /// Include (`false`) or exclude (`true`) an operation from toolpath output.
@@ -1811,6 +1841,11 @@ enum Message {
     SetPaneVisible(Pane, bool),
     /// Pick a library tool (by index) for the pending op — embeds it into the setup.
     SetPendingLibraryTool(usize),
+    /// Change the tool of the **already-created** operation `u32` to the library tool
+    /// at this index. Without this the tool chosen at the start of the creation
+    /// wizard was final — a wrong pick meant deleting the operation and re-picking
+    /// its geometry.
+    SetOpLibraryTool(u32, usize),
     /// Select a library tool for editing in the Tooling-tab library editor.
     SelectLibraryTool(usize),
     /// Open the right-click context menu for operation `id` (anchored under the
@@ -2269,6 +2304,15 @@ impl App {
                     "Open a part first.".to_string()
                 };
             }
+            Message::SetOpLibraryTool(id, i) => {
+                if let Some(&tool) = self.library.tools.get(i) {
+                    let number = self.controller.use_tool(tool);
+                    self.controller.edit_operation(id, |op| op.set_tool(number));
+                    self.controller.prune_unused_tools();
+                    self.refresh_fields();
+                    self.rerun();
+                }
+            }
             Message::SetPendingLibraryTool(i) => {
                 if let Some(&tool) = self.library.tools.get(i) {
                     let number = self.controller.use_tool(tool);
@@ -2376,6 +2420,19 @@ impl App {
                     self.snaps.remove(pos);
                 } else {
                     self.snaps.push(kind);
+                }
+            }
+            Message::ReinitOp => {
+                let id = self.open_op_menu.take();
+                if let Some(id) = id {
+                    if self.controller.reinitialize_operation(id) {
+                        self.refresh_fields();
+                        self.status = "Reinitialising: pick a tool, then the geometry \
+                                       (the operation keeps its place)."
+                            .to_string();
+                    } else {
+                        self.status = "Open a part first.".to_string();
+                    }
                 }
             }
             Message::DuplicateOp => {
@@ -3173,9 +3230,16 @@ impl App {
                 }
             }
             Field::TipRadius => {
-                // A V-bit's tip radius cannot exceed the shaft radius (⌀/2).
-                matches!((buf(Field::TipRadius), buf(Field::ToolDiameter)),
-                    (Some(tr), Some(d)) if tr > d * 0.5 + 1e-9)
+                // Physically a V-bit's point is always *rounded* — a true r=0 edge
+                // cannot be ground and would not survive contact. The rounded tip is
+                // also what makes a V-bit cut at its centre (and so engrave), which is
+                // exactly what distinguishes it from a chamfer mill's flat. So the
+                // radius must be positive, and cannot exceed the shaft radius (⌀/2).
+                match (buf(Field::TipRadius), buf(Field::ToolDiameter)) {
+                    (Some(tr), _) if tr < MIN_TIP_RADIUS_MM - 1e-9 => true,
+                    (Some(tr), Some(d)) => tr > d * 0.5 + 1e-9,
+                    _ => false,
+                }
             }
             Field::ChamferAngle => {
                 // A chamfer mill's included angle just has to be a valid cone.
@@ -3185,9 +3249,17 @@ impl App {
                 !(0.0 < a && a < 180.0)
             }
             Field::TipDiameter => {
-                // The flat tip must be narrower than the shaft ⌀, else there is no cone.
-                matches!((buf(Field::TipDiameter), buf(Field::ToolDiameter)),
-                    (Some(tip), Some(d)) if tip >= d - 1e-9)
+                // Physically a chamfer mill always has a *flat* at its point — it is
+                // ground that way, and that flat is precisely why it does not cut at
+                // its centre (and so cannot engrave). A zero flat would make it a
+                // V-bit, not a chamfer mill, so it must be positive; and it must stay
+                // narrower than the shaft ⌀, else there is no cone at all.
+                match (buf(Field::TipDiameter), buf(Field::ToolDiameter)) {
+                    // Held to the same physical radius as a V-bit's tip, hence 2×.
+                    (Some(tip), _) if tip < 2.0 * MIN_TIP_RADIUS_MM - 1e-9 => true,
+                    (Some(tip), Some(d)) => tip >= d - 1e-9,
+                    _ => false,
+                }
             }
             Field::ShankDiameter => {
                 // A face mill's arbor cannot be wider than its cutting body (⌀), else the
@@ -3853,6 +3925,7 @@ impl App {
             column![
                 item(Icon::Delete, "Delete", Message::DeleteOp),
                 item(Icon::Duplicate, "Duplicate", Message::DuplicateOp),
+                item(Icon::Redo, "Reinitialize", Message::ReinitOp),
             ]
             .spacing(2),
         )
@@ -4427,6 +4500,28 @@ impl App {
         // Exact-duplicate operations (identical bar their id, both included),
         // computed once: `twins[id]` is the ids of the other ops it duplicates.
         let dup_groups = self.controller.duplicate_operation_groups();
+        // Operations whose last run produced an error, so the tree can say *which*
+        // one failed instead of leaving the status bar's count to be hunted down.
+        // Errors do not delete the operation — it stays editable so the offending
+        // field (or tool) can be corrected in place — and export is blocked while any
+        // remain, so a marked row can never reach the machine.
+        let failed: BTreeMap<u32, String> = self
+            .controller
+            .outcome()
+            .map(|o| {
+                let mut m: BTreeMap<u32, String> = BTreeMap::new();
+                for d in o
+                    .diagnostics
+                    .iter()
+                    .filter(|d| d.severity == Severity::Error)
+                {
+                    if let Some(id) = d.op {
+                        m.entry(id).or_insert_with(|| d.message.clone());
+                    }
+                }
+                m
+            })
+            .unwrap_or_default();
         let mut twins: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
         for group in &dup_groups {
             for &id in group {
@@ -4479,6 +4574,26 @@ impl App {
             // On an exact duplicate, mark it ⚠ and name its twin(s) by id — both
             // would post the same toolpath.
             let mut controls = row![include, name].spacing(4).align_y(Alignment::Center);
+            // An operation that failed its last run: ⚠ in the error colour, with the
+            // message on hover. Glyph + colour together, so it survives colour-vision
+            // deficiency.
+            if let Some(msg) = failed.get(&id) {
+                let mark = text("⚠").size(12).color(palette::ERROR);
+                let marker: Element<'_, Message> = if self.tooltips {
+                    tooltip(
+                        mark,
+                        container(text(msg.clone()).size(12))
+                            .padding(8)
+                            .max_width(360.0)
+                            .style(container::rounded_box),
+                        tooltip::Position::Left,
+                    )
+                    .into()
+                } else {
+                    mark.into()
+                };
+                controls = controls.push(marker);
+            }
             if let Some(t) = twins.get(&id) {
                 let ids = t
                     .iter()
@@ -4872,6 +4987,56 @@ impl App {
         };
 
         let mut list = column![text(heading).size(15)].spacing(8).padding(8);
+
+        // An operation's tool, changeable after creation. The wizard picks a tool
+        // *before* the geometry, so without this a wrong pick could only be undone by
+        // deleting the operation and re-picking its contour.
+        if let Selection::Operation(id) = self.controller.selection() {
+            if let Some(op) = self.controller.operation(id) {
+                let choices: Vec<ToolChoice> = self
+                    .library
+                    .tools
+                    .iter()
+                    .enumerate()
+                    .map(|(index, t)| ToolChoice {
+                        index,
+                        number: t.number,
+                        diameter: t.diameter,
+                        kind: t.kind,
+                    })
+                    .collect();
+                let current = self
+                    .controller
+                    .document()
+                    .setup
+                    .tools
+                    .iter()
+                    .find(|t| t.number == op.tool())
+                    .copied();
+                let selected = current
+                    .and_then(|e| {
+                        self.library.tools.iter().position(|l| {
+                            l.diameter == e.diameter
+                                && l.length == e.length
+                                && l.flutes == e.flutes
+                                && l.kind == e.kind
+                        })
+                    })
+                    .and_then(|i| choices.get(i).copied());
+                list = list.push(
+                    row![
+                        label_help("Tool", help::OP_TOOL, self.tooltips),
+                        pick_list(choices, selected, move |c| Message::SetOpLibraryTool(
+                            id, c.index
+                        ))
+                        .text_size(13)
+                        .width(Length::Fill),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                );
+            }
+        }
 
         if let Selection::Stock = self.controller.selection() {
             // The concrete block the offsets/heights resolve to, as read-only
@@ -7010,7 +7175,53 @@ impl canvas::Program<Message> for ToolCanvas {
 #[cfg(test)]
 mod inspector_field_tests {
     use super::*;
-    use cam_model::DrillOp;
+    use cam_model::{DrillOp, Tool};
+
+    #[test]
+    fn new_pointed_tools_seed_a_physically_real_tip() {
+        // Ground truth: neither tool has a true r=0 point — one cannot be ground and
+        // would not survive contact. The kinds differ by what the tip *is*: a chamfer
+        // mill's flat does not cut (so it cannot engrave), a V-bit's rounded tip does.
+        // A zero on either would collapse them into the same geometry.
+        match ToolKindPick::ChamferMill.to_kind() {
+            ToolKind::ChamferMill { tip_diameter, .. } => {
+                assert!(
+                    tip_diameter >= 2.0 * MIN_TIP_RADIUS_MM,
+                    "a chamfer mill is ground with a flat, at the physical floor"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        match ToolKindPick::VBit.to_kind() {
+            ToolKind::VBit { tip_radius, .. } => {
+                assert!(
+                    tip_radius >= MIN_TIP_RADIUS_MM,
+                    "a V-bit's point is ground to a radius, at the physical floor"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_seeded_chamfer_mill_cannot_engrave_but_a_seeded_vbit_can() {
+        // The seeds must land on the right side of the engraving guard: this is the
+        // whole practical consequence of flat-vs-rounded.
+        let cham = Tool {
+            number: 1,
+            diameter: 6.0,
+            length: 40.0,
+            flutes: 2,
+            kind: ToolKindPick::ChamferMill.to_kind(),
+            ..Default::default()
+        };
+        let vbit = Tool {
+            kind: ToolKindPick::VBit.to_kind(),
+            ..cham
+        };
+        assert!(!cham.profile().has_cutting_tip(), "flat tip must not cut");
+        assert!(vbit.profile().has_cutting_tip(), "rounded tip must cut");
+    }
 
     fn drill(peck: Option<f64>, dwell: Option<f64>) -> Operation {
         Operation::Drill(DrillOp {
