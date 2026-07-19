@@ -352,6 +352,56 @@ impl Strategy for CarveStrategy {
             );
         }
 
+        // --- what the shape itself allows, and what the cap left behind ---
+        //
+        // One bisection answers both questions. The inward distance at which the region's
+        // offsets vanish is the widest half-width the shape can hold, and so — through
+        // the tool's own profile — its *natural full depth*: the depth at which the V
+        // exactly reaches the widest inscribed point and no flat floor remains. If that
+        // distance lies beyond `w_max`, the depth cap has stopped the V short and left a
+        // flat land behind.
+        let w_full = vanishing_width(&region, op.offset);
+        let full_depth = vtip_depth_for_half_width(alpha, tip_radius, w_full);
+        let reach = if full_depth > max_depth + 1e-9 {
+            format!(", though tool {} reaches only {max_depth:.3} mm", op.tool)
+        } else {
+            String::new()
+        };
+
+        if w_full > w_max + FLAT_LAND_TOL_MM {
+            let flat = offset(
+                std::slice::from_ref(&region),
+                -(op.offset + w_max),
+                JoinStyle::Round,
+            )
+            .unwrap_or_default();
+            diagnostics.push(Diagnostic::info(format!(
+                "operation {}: full depth for this shape is {full_depth:.3} mm{reach}; \
+                 the {:.3} mm cap leaves {}",
+                op.id,
+                op.depth,
+                areas_phrase(flat.len())
+            )));
+            if op.clear_tool.is_none() {
+                // Not an error: it does cut. But a cone cannot leave a flat floor —
+                // adjacent passes leave uncut material between them — so say so.
+                diagnostics.push(Diagnostic::warning(format!(
+                    "operation {}: {} left at full depth with no clearing tool. The \
+                     V-bit will cut them, but a cone cannot leave a flat floor, so they \
+                     will be ridged. Set a clearing end mill, or deepen to \
+                     {full_depth:.3} mm{reach}.",
+                    op.id,
+                    areas_phrase(flat.len()),
+                )));
+            }
+        } else {
+            diagnostics.push(Diagnostic::info(format!(
+                "operation {}: the shape carves out at {full_depth:.3} mm{reach}, within \
+                 the {:.3} mm cap — no flat areas remain",
+                op.id, op.depth
+            )));
+        }
+
         let mut program = Program::new();
         program.push(Step::Comment(format!(
             "Carve: {rings_cut} rings at {step:.3} mm, to {deepest:.3} mm deep with a \
@@ -364,6 +414,68 @@ impl Strategy for CarveStrategy {
             diagnostics,
             cancelled: false,
         }
+    }
+}
+
+/// How far past `w_max` the offsets must survive before a flat land is called real, mm.
+///
+/// Where the V exactly reaches the shape's widest inscribed point, the offsets vanish
+/// *at* `w_max` and what remains is the medial axis — a curve of zero area, not a floor.
+/// This keeps that case, and the bisection's own resolution, from being reported as a
+/// flat land the operator should do something about.
+const FLAT_LAND_TOL_MM: f64 = 2.0 * VANISH_TOL_MM;
+
+/// Resolution of the vanishing-width bisection, mm. The reported full depth is this
+/// precise divided by `tan α`, so ~0.002 mm on a 90° bit — far under what is machined.
+const VANISH_TOL_MM: f64 = 1e-3;
+
+/// The inward distance at which `region`'s offsets vanish, measured from `base`.
+///
+/// This is the widest half-width the shape can hold — the radius of its largest
+/// inscribed circle — and so, read through the tool's profile, the depth at which a
+/// V-carve exactly consumes it. It is found by bisection on emptiness rather than by
+/// constructing a medial axis: emptiness is **monotone** in the offset distance, which
+/// is all a bisection needs.
+fn vanishing_width(region: &Polygon, base: f64) -> f64 {
+    let empty_at = |w: f64| {
+        offset(std::slice::from_ref(region), -(base + w), JoinStyle::Round)
+            .map(|r| r.is_empty())
+            .unwrap_or(true)
+    };
+    // An upper bound that must be empty: no inscribed circle can be wider than the
+    // region's own bounding box.
+    let pts = region.outer().points();
+    let (mut lo_x, mut hi_x, mut lo_y, mut hi_y) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+    for p in pts {
+        lo_x = lo_x.min(p.x);
+        hi_x = hi_x.max(p.x);
+        lo_y = lo_y.min(p.y);
+        hi_y = hi_y.max(p.y);
+    }
+    let mut hi = ((hi_x - lo_x).max(hi_y - lo_y)).max(VANISH_TOL_MM);
+    if !empty_at(hi) {
+        // Should not happen for a sane region; do not loop forever if it does.
+        return hi;
+    }
+    let mut lo = 0.0;
+    while hi - lo > VANISH_TOL_MM {
+        let mid = 0.5 * (lo + hi);
+        if empty_at(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    hi
+}
+
+/// `"1 flat area"` / `"3 flat areas"` — written out because the post strips parentheses
+/// from comments, and the same phrasing reads correctly in a diagnostic.
+fn areas_phrase(n: usize) -> String {
+    if n == 1 {
+        "1 flat area".to_string()
+    } else {
+        format!("{n} flat areas")
     }
 }
 
@@ -914,6 +1026,145 @@ mod tests {
         assert!(!link_is_safe(&region, Point::new(10.0, 4.0), Point::new(4.0, 10.0)));
         // An empty region can never be traversed.
         assert!(!link_is_safe(&[], Point::new(0.0, 0.0), Point::new(1.0, 1.0)));
+    }
+
+    // --- flat lands and the shape's own full depth ---
+
+    fn warnings(r: &StrategyResult) -> Vec<String> {
+        r.diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .map(|d| d.message.clone())
+            .collect()
+    }
+
+    fn infos(r: &StrategyResult) -> Vec<String> {
+        r.diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Info)
+            .map(|d| d.message.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_vanishing_width_is_the_largest_inscribed_circle() {
+        // Not "it returns something": the number has a closed form. A 20 mm square's
+        // largest inscribed circle has radius 10; a 20x6 rectangle's has radius 3.
+        let sq = Polygon::new(square(20.0)).unwrap();
+        assert!((vanishing_width(&sq, 0.0) - 10.0).abs() < 2e-3);
+        // A hold-off shrinks the shape, and so its inscribed circle, one for one.
+        assert!((vanishing_width(&sq, 2.0) - 8.0).abs() < 2e-3);
+        let rect = Polygon::new(Contour::new(vec![
+            Point::new(0.0, 0.0),
+            Point::new(20.0, 0.0),
+            Point::new(20.0, 6.0),
+            Point::new(0.0, 6.0),
+        ]))
+        .unwrap();
+        assert!((vanishing_width(&rect, 0.0) - 3.0).abs() < 2e-3);
+        // An island eats into it — and the answer is *not* half the frame width, which
+        // is the trap. A 20 mm square with a 10 mm island centred in it leaves a 5 mm
+        // frame, but the biggest circle sits in a corner, touching two outer walls and
+        // the island's corner: centred at (c, c) with radius c, needing
+        // sqrt(2)*(5 - c) >= c, so c = 5*sqrt(2)/(1 + sqrt(2)) ~ 2.929 — appreciably
+        // more than the 2.5 the straight frame would suggest.
+        let framed = Polygon::with_holes(
+            square(20.0),
+            vec![Contour::new(vec![
+                Point::new(5.0, 5.0),
+                Point::new(15.0, 5.0),
+                Point::new(15.0, 15.0),
+                Point::new(5.0, 15.0),
+            ])],
+        )
+        .unwrap();
+        let corner = 5.0 * std::f64::consts::SQRT_2 / (1.0 + std::f64::consts::SQRT_2);
+        assert!((vanishing_width(&framed, 0.0) - corner).abs() < 2e-3);
+    }
+
+    #[test]
+    fn a_cap_short_of_the_shape_reports_the_flat_land_it_leaves() {
+        // A 20 mm square wants 10 mm of depth to carve out; a 1 mm cap cannot, so a
+        // flat land is left and the operator is told the number that would clear it.
+        let r = run(op(1.0), vbit(90.0, 0.0));
+        let i = infos(&r);
+        assert_eq!(i.len(), 1, "{i:?}");
+        assert!(i[0].contains("full depth for this shape is 10.0"), "{i:?}");
+        assert!(i[0].contains("1 flat area"), "{i:?}");
+        // …and that the bit itself could not reach that depth even if asked.
+        assert!(i[0].contains("reaches only 3.000 mm"), "{i:?}");
+    }
+
+    #[test]
+    fn a_flat_land_with_no_clearing_tool_warns_about_a_ridged_floor() {
+        // A warning, not an error: it does cut, just worse. Refusing would be wrong.
+        let r = run(op(1.0), vbit(90.0, 0.0));
+        assert!(errors(&r).is_empty(), "{:?}", errors(&r));
+        let w = warnings(&r);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("ridged"), "{w:?}");
+        assert!(!r.program.steps().is_empty(), "the carve must still be emitted");
+    }
+
+    #[test]
+    fn setting_a_clearing_tool_silences_the_ridged_floor_warning() {
+        let mut o = op(1.0);
+        o.clear_tool = Some(2);
+        let r = run(o, vbit(90.0, 0.0));
+        assert!(warnings(&r).is_empty(), "{:?}", warnings(&r));
+    }
+
+    #[test]
+    fn a_shape_the_carve_consumes_leaves_no_flat_land_and_no_warning() {
+        // A 3 mm square carves out at 1.5 mm, well inside a 2.9 mm cap.
+        let mut o = op(2.9);
+        o.boundary = square(3.0);
+        o.ring_step = 0.5;
+        let r = run(o, vbit(90.0, 0.0));
+        assert!(warnings(&r).is_empty(), "{:?}", warnings(&r));
+        let i = infos(&r);
+        assert_eq!(i.len(), 1, "{i:?}");
+        assert!(i[0].contains("carves out at 1.5"), "{i:?}");
+        assert!(i[0].contains("no flat areas remain"), "{i:?}");
+    }
+
+    #[test]
+    fn a_cap_exactly_at_the_shapes_full_depth_leaves_no_flat_land() {
+        // The boundary case the tolerance exists for: the V reaching the widest
+        // inscribed point exactly. What remains is the medial axis — a curve of zero
+        // area — and calling that a flat land would send the operator hunting for a
+        // clearing tool that has nothing to clear.
+        let mut o = op(1.5); // 90° sharp bit: w_max = 1.5, and a 3 mm square vanishes at 1.5
+        o.boundary = square(3.0);
+        o.ring_step = 0.25;
+        let r = run(o, vbit(90.0, 0.0));
+        assert!(warnings(&r).is_empty(), "{:?}", warnings(&r));
+        assert!(infos(&r)[0].contains("no flat areas remain"), "{:?}", infos(&r));
+    }
+
+    #[test]
+    fn separate_flat_lands_are_counted_separately() {
+        // Two wide lobes joined by a narrow bar: the bar carves out entirely, so the
+        // flat land is two disjoint areas, and the operator should be told so.
+        let mut o = op(0.5);
+        o.ring_step = 0.25;
+        o.boundary = Contour::new(vec![
+            Point::new(0.0, 0.0),
+            Point::new(6.0, 0.0),
+            Point::new(6.0, 2.6),
+            Point::new(14.0, 2.6),
+            Point::new(14.0, 0.0),
+            Point::new(20.0, 0.0),
+            Point::new(20.0, 6.0),
+            Point::new(14.0, 6.0),
+            Point::new(14.0, 3.4),
+            Point::new(6.0, 3.4),
+            Point::new(6.0, 6.0),
+            Point::new(0.0, 6.0),
+        ]);
+        let r = run(o, vbit(90.0, 0.0));
+        let i = infos(&r);
+        assert!(i[0].contains("2 flat areas"), "{i:?}");
     }
 
     // --- the ring schedule ---
