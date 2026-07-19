@@ -302,6 +302,42 @@ impl Tool {
     /// the true tooth form is a later refinement; see the build log.)
     pub fn profile(&self) -> cam_geo::Profile2D {
         use cam_geo::BottomShape;
+        // Single-profile (single-point) thread mill: one 60° tooth at the tip, a sharply
+        // reduced neck over the length of cut (its reach), then the shank. The neck ⌀ sets
+        // the max thread depth = (min cutting ⌀ − neck ⌀)/2. Built directly, since the
+        // generatrix has no single-tooth bottom.
+        if let ToolKind::ThreadMill { pitch: None } = self.kind {
+            use cam_geo::{Point, Profile2D, ProfileSeg, SegShape};
+            let r_min = self.radius(); // min cutting ⌀ = tooth crest
+            let r_neck = (self.neck_dia() * 0.5).min(r_min);
+            let r_shank = self.shank_dia() * 0.5;
+            let l_cut = self.flute_len().max(1e-3); // length of cut (reach)
+            let oal = self.length.max(l_cut);
+            // Symmetric 60° tooth (crest r_min, roots r_neck): height 2·depth·tan30°.
+            let h = (2.0 * (r_min - r_neck) * (30.0_f64).to_radians().tan()).min(l_cut);
+            let line = |r: f64, z: f64, cutting| ProfileSeg {
+                shape: SegShape::Line,
+                end: Point::new(r, z),
+                cutting,
+            };
+            let mut segs = vec![
+                line(r_neck, 0.0, false),   // tip flat at the neck radius
+                line(r_min, h * 0.5, true), // rising flank to the crest (cutting)
+                line(r_neck, h, true),      // falling flank back to the neck (cutting)
+                line(r_neck, l_cut, false), // reduced neck up to the length of cut
+            ];
+            if (r_shank - r_neck).abs() > 1e-9 {
+                segs.push(line(r_shank, l_cut, false)); // step to the shank
+            }
+            segs.push(line(r_shank, oal, false)); // shank to the overall length
+            if r_shank > 1e-9 {
+                segs.push(line(0.0, oal, false)); // top face back to the axis
+            }
+            return Profile2D {
+                start: Point::new(0.0, 0.0),
+                segs,
+            };
+        }
         // A V-bit's cutting is the whole cone (no separate flute length); passing
         // flute_length 0 clamps the flute top to the cone top, so the cone is cutting
         // and the shaft above is non-cutting.
