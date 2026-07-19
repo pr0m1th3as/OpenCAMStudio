@@ -903,6 +903,10 @@ impl AppController {
                     z_top: p.top_of_stock,
                     z_bottom: p.top_of_stock - p.depth,
                     climb: true,
+                    passes: 1,
+                    spring_passes: 0,
+                    drill_clearance: 0.0,
+                    blind_allowance: 0.0,
                     feed: p.feed,
                     plunge_feed: p.plunge_feed,
                 })

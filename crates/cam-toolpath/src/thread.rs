@@ -1,8 +1,16 @@
 //! The thread-milling strategy: cut a thread at each hole/boss centre by
 //! **helically interpolating** a single-form thread mill — one continuous helix
-//! of `length / pitch` turns, advancing exactly `pitch` in Z per revolution. The
-//! tool centre orbits at `major_radius ∓ tool_radius` so the cutting edge lands
-//! on the major diameter.
+//! of `length / pitch` turns, advancing exactly `pitch` in Z per revolution.
+//!
+//! ## Depth and passes
+//!
+//! The full radial depth of a 60° form (0.5413·pitch internal, 0.6134·pitch external)
+//! is reached in `passes` equal radial steps, each a full helix, stepping the tool-
+//! centre orbit outward (internal) or inward (external) so the crest lands from the
+//! grazing surface to the root, deepest last; `spring_passes` add full-depth repeats.
+//! The tool geometry is enforced up front by three hard gates (min cutting ⌀ vs. the
+//! pre-drilled minor bore, max thread depth from the reduced neck, reach vs. length of
+//! cut) plus a blind-hole allowance that validates the drilled depth.
 //!
 //! ## Direction (the correctness-critical part)
 //!
@@ -103,30 +111,105 @@ impl Strategy for ThreadStrategy {
         }
 
         let major_r = 0.5 * op.major_dia;
-        // Tool-centre orbit radius: inside the major diameter for an internal
-        // thread, outside it for an external one.
-        let orbit_r = if op.internal {
-            major_r - tool_r
+        // Radial depth of a 60° thread form: an internal thread engages to the tap-drill
+        // minor (major − 1.0825·pitch ⇒ 0.5413·pitch radial); an external thread's root
+        // is truncated a little deeper (0.6134·pitch). This is how far the crest travels,
+        // radially, from grazing the pre-drilled bore / boss OD to full depth.
+        let radial_depth = if op.internal {
+            0.541_265 * op.pitch
         } else {
-            major_r + tool_r
+            0.613_435 * op.pitch
         };
-        if orbit_r <= 0.0 {
+
+        // Gate 1 — min cutting ⌀: the tool's crest (its cutting diameter, the smallest
+        // hole it can enter) must clear the pre-drilled minor bore of an internal thread.
+        if op.internal {
+            let minor = op.major_dia - 2.0 * radial_depth; // = major − 1.0825·pitch
+            if tool.diameter >= minor {
+                diagnostics.push(Diagnostic::error(format!(
+                    "operation {}: tool ⌀{:.3} cannot enter the ~⌀{:.3} pre-drilled minor bore of an M{:.3}×{:.3} thread",
+                    op.id, tool.diameter, minor, op.major_dia, op.pitch
+                )));
+                bail!();
+            }
+        }
+
+        // Gate 2 — max thread depth: a single-form mill can cut a radial depth of at most
+        // (Dmin − Dneck)/2 = r_min − r_neck; a fatter neck rubs the fresh crest before the
+        // tooth reaches full depth. (A full-profile mill's depth is ground into its comb,
+        // so this gate does not apply to it.)
+        if let ToolKind::ThreadMill { pitch: None } = tool.kind {
+            let max_depth = tool.radius() - 0.5 * tool.neck_dia();
+            if max_depth + 1e-9 < radial_depth {
+                diagnostics.push(Diagnostic::error(format!(
+                    "operation {}: single-form mill max thread depth {:.3} (neck ⌀{:.3}) is less than the {:.3} this thread needs — specify a smaller neck ⌀",
+                    op.id, max_depth, tool.neck_dia(), radial_depth
+                )));
+                bail!();
+            }
+        }
+
+        // Gate 3 — reach: the threaded length must fit inside the tool's length of cut.
+        let thread_length = op.z_top - op.z_bottom;
+        if thread_length > tool.flute_len() + 1e-9 {
             diagnostics.push(Diagnostic::error(format!(
-                "operation {}: tool diameter {} is too large to mill an internal thread of major diameter {}",
+                "operation {}: threaded length {:.3} exceeds the tool's length of cut (reach) {:.3}",
+                op.id, thread_length, tool.flute_len()
+            )));
+            bail!();
+        }
+
+        // Blind-hole allowance: a positive `drill_clearance` marks a blind hole; the
+        // pre-drill must leave at least the allowance (auto = one pitch) below the thread,
+        // since the tool cannot thread flush to a blind bottom.
+        if op.internal && op.drill_clearance > 0.0 {
+            let allowance = if op.blind_allowance > 0.0 {
+                op.blind_allowance
+            } else {
+                op.pitch
+            };
+            if op.drill_clearance + 1e-9 < allowance {
+                diagnostics.push(Diagnostic::error(format!(
+                    "operation {}: blind-hole drill clearance {:.3} below the thread is less than the required allowance {:.3}",
+                    op.id, op.drill_clearance, allowance
+                )));
+                bail!();
+            }
+        }
+
+        // Cut-edge radius from grazing to full depth, and the tool-centre orbit placing
+        // the crest there: inside the cut for an internal thread, outside for external.
+        let (cut_start, cut_final) = if op.internal {
+            (major_r - radial_depth, major_r)
+        } else {
+            (major_r, major_r - radial_depth)
+        };
+        let orbit_of = |cut_r: f64| {
+            if op.internal {
+                cut_r - tool_r
+            } else {
+                cut_r + tool_r
+            }
+        };
+        if orbit_of(cut_final) <= 0.0 {
+            diagnostics.push(Diagnostic::error(format!(
+                "operation {}: tool diameter {} is too large to mill a thread of major diameter {}",
                 op.id, tool.diameter, op.major_dia
             )));
             bail!();
         }
-        // Approximate 60° minor diameter; a tool wider than this cannot enter the
-        // pre-drilled hole. Advisory (thread form/angle is not modelled yet).
-        if op.internal {
-            let minor_approx = op.major_dia - 1.0825 * op.pitch;
-            if tool.diameter > minor_approx {
-                diagnostics.push(Diagnostic::warning(format!(
-                    "operation {}: tool diameter {:.3} may not clear the ~{:.3} minor diameter of the pre-drilled hole",
-                    op.id, tool.diameter, minor_approx
-                )));
-            }
+        // Radial infeed passes (equal steps to full depth), then any spring passes at
+        // full depth. Each entry is a tool-centre orbit radius; the emitter cuts a full
+        // helix at each, deepest last.
+        let npass = op.passes.max(1);
+        let mut orbits: Vec<f64> = (1..=npass)
+            .map(|i| {
+                let f = i as f64 / npass as f64;
+                orbit_of(cut_start + f * (cut_final - cut_start))
+            })
+            .collect();
+        for _ in 0..op.spring_passes {
+            orbits.push(orbit_of(cut_final));
         }
 
         // Orbit direction (climb vs conventional under an M3 spindle) and, from
@@ -191,7 +274,7 @@ impl Strategy for ThreadStrategy {
 
         let params = HoleParams {
             op_id: op.id,
-            orbit_r,
+            orbits,
             internal: op.internal,
             arc_dir,
             z_start,
@@ -226,7 +309,8 @@ impl Strategy for ThreadStrategy {
 /// Everything shared across the holes of one thread operation.
 struct HoleParams {
     op_id: u32,
-    orbit_r: f64,
+    /// Tool-centre orbit radius per pass, deepest last (incl. spring passes).
+    orbits: Vec<f64>,
     internal: bool,
     arc_dir: ArcDir,
     z_start: f64,
@@ -240,8 +324,17 @@ struct HoleParams {
     retract: f64,
 }
 
-/// Emit the full motion for one threaded hole/boss centred at `(cx, cy)`.
+/// Emit the full motion for one threaded hole/boss centred at `(cx, cy)`: one radial
+/// infeed pass per orbit radius (deepest last), each retracting to clearance so the
+/// re-approach is unambiguously safe.
 fn emit_hole(prog: &mut Program, p: &HoleParams, cx: f64, cy: f64) {
+    for &orbit_r in &p.orbits {
+        emit_pass(prog, p, cx, cy, orbit_r);
+    }
+}
+
+/// Emit one radial pass: approach, lead-in, helix, lead-out, retract, at `orbit_r`.
+fn emit_pass(prog: &mut Program, p: &HoleParams, cx: f64, cy: f64, orbit_r: f64) {
     let link = Tag::new(p.op_id, MoveKind::Link);
     let plunge = Tag::new(p.op_id, MoveKind::Plunge);
     let lead = Tag::new(p.op_id, MoveKind::LeadIn);
@@ -254,11 +347,11 @@ fn emit_hole(prog: &mut Program, p: &HoleParams, cx: f64, cy: f64) {
     };
 
     // Entry point on the orbit, at angle 0 (the +X side of the centre).
-    let p0 = orbit_point(cx, cy, p.orbit_r, 0.0);
+    let p0 = orbit_point(cx, cy, orbit_r, 0.0);
     // Approach anchor: the hole centre (internal) or an outside staging point
     // radially aligned with the entry (external), where the tool can safely
     // plunge in free air.
-    let a0 = anchor(cx, cy, p.orbit_r, 0.0, p.internal);
+    let a0 = anchor(cx, cy, orbit_r, 0.0, p.internal);
     // Tangent semicircle from anchor to entry: same sense as the orbit for an
     // internal thread, opposite for an external one (derived from tangency).
     let lead_dir = if p.internal {
@@ -297,7 +390,7 @@ fn emit_hole(prog: &mut Program, p: &HoleParams, cx: f64, cy: f64) {
         let frac = k as f64 / p.nseg as f64;
         let theta = sign * p.sweep_total * frac;
         let z = p.z_start + (p.z_end - p.z_start) * frac;
-        let pt = orbit_point(cx, cy, p.orbit_r, theta);
+        let pt = orbit_point(cx, cy, orbit_r, theta);
         prog.push(Step::Arc {
             end: Point3::new(pt.0, pt.1, z),
             center: Point3::new(cx, cy, z),
@@ -309,8 +402,8 @@ fn emit_hole(prog: &mut Program, p: &HoleParams, cx: f64, cy: f64) {
 
     // Lead-out arc off the orbit back to an anchor at the final Z, then retract.
     let theta_end = sign * p.sweep_total;
-    let pend = orbit_point(cx, cy, p.orbit_r, theta_end);
-    let a_end = anchor(cx, cy, p.orbit_r, theta_end, p.internal);
+    let pend = orbit_point(cx, cy, orbit_r, theta_end);
+    let a_end = anchor(cx, cy, orbit_r, theta_end, p.internal);
     let lc_out = midpoint(pend, a_end);
     prog.push(Step::Arc {
         end: Point3::new(a_end.0, a_end.1, p.z_end),
@@ -363,6 +456,9 @@ mod tests {
             number: 1,
             diameter: dia,
             length: 30.0,
+            // A real single-form mill needs a reduced neck behind the tooth; ⌀3 leaves a
+            // 1.0 mm max thread depth on a ⌀5 mill (clears an M10×1.5's 0.92 mm form).
+            neck_diameter: 3.0,
             flutes: 3,
             kind: ToolKind::ThreadMill { pitch: None },
             ..Default::default()
@@ -382,6 +478,10 @@ mod tests {
             z_top: 0.0,
             z_bottom: -6.0,
             climb,
+            passes: 1,
+            spring_passes: 0,
+            drill_clearance: 0.0,
+            blind_allowance: 0.0,
             feed: 200.0,
             plunge_feed: 100.0,
         }
@@ -408,6 +508,20 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Distinct tool-centre orbit radii among the cutting arcs, in first-seen order
+    /// (consecutive-dedup: each pass has a constant radius, adjacent passes differ,
+    /// so a spring pass at the same radius collapses into its infeed pass).
+    fn pass_radii(prog: &Program) -> Vec<f64> {
+        let mut out: Vec<f64> = Vec::new();
+        for (end, center, _) in cutting_arcs(prog) {
+            let r = ((end.x - center.x).powi(2) + (end.y - center.y).powi(2)).sqrt();
+            if out.last().is_none_or(|last| (last - r).abs() > 1e-6) {
+                out.push(r);
+            }
+        }
+        out
     }
 
     /// The hand is set by the helix chirality; climb by the orbit sense. This
@@ -553,5 +667,130 @@ mod tests {
         o.z_bottom = 0.0;
         let r = run(o, tool(5.0));
         assert!(r.has_errors());
+    }
+
+    /// Gate 1: the tool's cutting ⌀ must clear the pre-drilled minor bore.
+    #[test]
+    fn min_cut_diameter_gate_errors_when_tool_wont_fit_the_bore() {
+        // M6×1.0 internal: minor ≈ 6 − 1.0825 = 4.92; a ⌀5 tool cannot enter.
+        let mut o = op(true, Hand::Right, true);
+        o.major_dia = 6.0;
+        o.pitch = 1.0;
+        let r = run(o, tool(5.0));
+        assert!(r.has_errors());
+        assert!(r
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("pre-drilled minor bore")));
+        assert!(r.program.is_empty());
+    }
+
+    /// Gate 2: a single-form mill whose neck nearly equals its cutting ⌀ cannot reach
+    /// the thread's radial depth.
+    #[test]
+    fn fat_neck_depth_gate_errors() {
+        let mut t = tool(5.0);
+        t.neck_diameter = 4.8; // max depth (5−4.8)/2 = 0.1 ≪ 0.81 needed for M10×1.5
+        let r = run(op(true, Hand::Right, true), t);
+        assert!(r.has_errors());
+        assert!(r
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("max thread depth")));
+    }
+
+    /// Gate 3: the threaded length cannot exceed the tool's length of cut (reach).
+    #[test]
+    fn reach_gate_errors_when_thread_is_longer_than_length_of_cut() {
+        let mut t = tool(5.0);
+        t.flute_length = 4.0; // reach 4 mm
+        let mut o = op(true, Hand::Right, true);
+        o.z_top = 0.0;
+        o.z_bottom = -6.0; // 6 mm thread > 4 mm reach
+        let r = run(o, t);
+        assert!(r.has_errors());
+        assert!(r
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("length of cut")));
+    }
+
+    /// The blind-hole allowance validates the drilled depth: too shallow errors, deep
+    /// enough passes. Auto allowance for M10×1.5 = one pitch = 1.5 mm.
+    #[test]
+    fn blind_hole_allowance_validates_drilled_depth() {
+        let mut shallow = op(true, Hand::Right, true);
+        shallow.drill_clearance = 1.0; // < 1.5
+        let r = run(shallow, tool(5.0));
+        assert!(r.has_errors());
+        assert!(r.diagnostics.iter().any(|d| d.message.contains("allowance")));
+
+        let mut deep = op(true, Hand::Right, true);
+        deep.drill_clearance = 2.0; // ≥ 1.5
+        let r2 = run(deep, tool(5.0));
+        assert!(!r2.has_errors(), "{:?}", r2.diagnostics);
+    }
+
+    /// An explicit blind allowance overrides the one-pitch auto default.
+    #[test]
+    fn explicit_blind_allowance_overrides_the_auto_pitch() {
+        let mut o = op(true, Hand::Right, true);
+        o.drill_clearance = 1.2;
+        o.blind_allowance = 1.0; // 1.2 ≥ 1.0 → ok (would fail against the 1.5 auto)
+        let r = run(o, tool(5.0));
+        assert!(!r.has_errors(), "{:?}", r.diagnostics);
+    }
+
+    /// Multiple radial passes step the orbit outward (internal), deepest last at the
+    /// full-depth orbit major_r − tool_r.
+    #[test]
+    fn radial_passes_step_out_to_full_depth() {
+        let mut o = op(true, Hand::Right, true);
+        o.passes = 3;
+        let r = run(o, tool(5.0));
+        assert!(!r.has_errors(), "{:?}", r.diagnostics);
+        let radii = pass_radii(&r.program);
+        assert_eq!(radii.len(), 3, "three radial passes: {radii:?}");
+        assert!(
+            radii.windows(2).all(|w| w[1] > w[0] + 1e-9),
+            "passes deepen: {radii:?}"
+        );
+        assert!((radii.last().unwrap() - (5.0 - 2.5)).abs() < 1e-9);
+    }
+
+    /// A spring pass adds one extra full-depth helix (8 half-turns here) at the final
+    /// radius, without deepening further.
+    #[test]
+    fn spring_pass_adds_a_full_depth_repeat() {
+        let base = {
+            let mut o = op(true, Hand::Right, true);
+            o.passes = 2;
+            run(o, tool(5.0))
+        };
+        let sprung = {
+            let mut o = op(true, Hand::Right, true);
+            o.passes = 2;
+            o.spring_passes = 1;
+            run(o, tool(5.0))
+        };
+        let n_base = cutting_arcs(&base.program).len();
+        let n_sprung = cutting_arcs(&sprung.program).len();
+        assert_eq!(n_sprung, n_base + 8, "one spring pass = one extra full helix");
+        let radii = pass_radii(&sprung.program);
+        assert!((radii.last().unwrap() - (5.0 - 2.5)).abs() < 1e-9, "spring at full depth");
+    }
+
+    /// The final external orbit places the crest at the thread root (major − radial),
+    /// not merely grazing the OD — the flat-cylinder baseline cut no depth externally.
+    #[test]
+    fn external_thread_cuts_to_root_depth() {
+        let r = run(op(false, Hand::Right, true), tool(5.0));
+        assert!(!r.has_errors(), "{:?}", r.diagnostics);
+        let radii = pass_radii(&r.program);
+        let (major_r, tool_r) = (5.0, 2.5);
+        let expect = (major_r - 0.613_435 * 1.5) + tool_r;
+        assert!((radii.last().unwrap() - expect).abs() < 1e-6, "got {radii:?}, want {expect}");
+        // Not the old grazing radius major_r + tool_r.
+        assert!((radii.last().unwrap() - (major_r + tool_r)).abs() > 1e-3);
     }
 }

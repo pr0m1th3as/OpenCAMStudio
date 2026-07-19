@@ -842,6 +842,14 @@ enum Field {
     ThreadTop,
     /// Absolute Z of the bottom of a threaded length (mm).
     ThreadBottom,
+    /// Thread radial infeed passes (count, ≥1).
+    ThreadPasses,
+    /// Thread spring passes at full depth (count, 0 = none).
+    ThreadSpringPasses,
+    /// Thread blind-hole drill clearance below the thread bottom (mm); 0 = through hole.
+    ThreadDrillClearance,
+    /// Thread blind-hole required allowance (mm); 0 = auto (one pitch).
+    ThreadBlindAllowance,
     /// Chamfer width (mm).
     ChamferWidth,
     /// Chamfer tip depth below the top edge (mm); selects the flank section.
@@ -916,6 +924,10 @@ impl Field {
             Field::Pitch => "Pitch (mm)",
             Field::ThreadTop => "Thread top (mm)",
             Field::ThreadBottom => "Thread bottom (mm)",
+            Field::ThreadPasses => "Passes",
+            Field::ThreadSpringPasses => "Spring passes",
+            Field::ThreadDrillClearance => "Drill clearance (mm, 0=through)",
+            Field::ThreadBlindAllowance => "Blind allowance (mm, 0=auto)",
             Field::ChamferWidth => "Chamfer width (mm)",
             Field::ChamferDepth => "Tip depth (mm, 0=tip)",
             Field::ChamferStep => "Step (mm, 0=one pass)",
@@ -1081,6 +1093,24 @@ impl Field {
             }
             Field::ThreadTop => "Absolute Z of the top of the threaded length (mm).",
             Field::ThreadBottom => "Absolute Z of the bottom of the threaded length (mm).",
+            Field::ThreadPasses => {
+                "Radial infeed passes: cut the thread to full depth in this many equal \
+                 radial steps (each a full helix). More passes lighten the cut for hard \
+                 material. 1 = single full-depth pass."
+            }
+            Field::ThreadSpringPasses => {
+                "Extra spring passes at full depth to clean up elastic spring-back after \
+                 the last cutting pass. 0 = none."
+            }
+            Field::ThreadDrillClearance => {
+                "For a blind hole: how far the pre-drilled hole extends below the thread \
+                 bottom (mm). Must be at least the blind allowance. 0 = through hole (no \
+                 check)."
+            }
+            Field::ThreadBlindAllowance => {
+                "Required clearance between the last thread and the bottom of a blind hole \
+                 (mm) — the tool cannot thread flush to a blind bottom. 0 = auto (one pitch)."
+            }
             Field::ChamferWidth => {
                 "Width of the chamfer face measured along the slope (mm). With the tool \
                  angle this sets how deep the tool drops."
@@ -3480,14 +3510,26 @@ impl App {
                     fields.push(Field::LeadOverlap);
                     fields
                 }
-                Some(Operation::Thread(_)) => vec![
-                    Field::MajorDia,
-                    Field::Pitch,
-                    Field::ThreadTop,
-                    Field::ThreadBottom,
-                    Field::Feed,
-                    Field::PlungeFeed,
-                ],
+                Some(Operation::Thread(t)) => {
+                    let mut fields = vec![
+                        Field::MajorDia,
+                        Field::Pitch,
+                        Field::ThreadTop,
+                        Field::ThreadBottom,
+                        Field::ThreadPasses,
+                        Field::ThreadSpringPasses,
+                    ];
+                    // Blind-hole fields only for internal threads (a boss has no bore).
+                    if t.internal {
+                        fields.push(Field::ThreadDrillClearance);
+                        if t.drill_clearance > 0.0 {
+                            fields.push(Field::ThreadBlindAllowance);
+                        }
+                    }
+                    fields.push(Field::Feed);
+                    fields.push(Field::PlungeFeed);
+                    fields
+                }
                 None => Vec::new(),
             },
         }
@@ -5566,6 +5608,10 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Thread(o), Field::Pitch) => Some(o.pitch),
         (Operation::Thread(o), Field::ThreadTop) => Some(o.z_top),
         (Operation::Thread(o), Field::ThreadBottom) => Some(o.z_bottom),
+        (Operation::Thread(o), Field::ThreadPasses) => Some(o.passes as f64),
+        (Operation::Thread(o), Field::ThreadSpringPasses) => Some(o.spring_passes as f64),
+        (Operation::Thread(o), Field::ThreadDrillClearance) => Some(o.drill_clearance),
+        (Operation::Thread(o), Field::ThreadBlindAllowance) => Some(o.blind_allowance),
         (Operation::Thread(o), Field::Feed) => Some(o.feed),
         (Operation::Thread(o), Field::PlungeFeed) => Some(o.plunge_feed),
         _ => None,
@@ -5729,6 +5775,18 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
             }
             if let Some(v) = get(Field::ThreadBottom) {
                 o.z_bottom = v;
+            }
+            if let Some(v) = get(Field::ThreadPasses) {
+                o.passes = (v.round() as u32).max(1);
+            }
+            if let Some(v) = get(Field::ThreadSpringPasses) {
+                o.spring_passes = v.round().max(0.0) as u32;
+            }
+            if let Some(v) = get(Field::ThreadDrillClearance) {
+                o.drill_clearance = v.max(0.0);
+            }
+            if let Some(v) = get(Field::ThreadBlindAllowance) {
+                o.blind_allowance = v.max(0.0);
             }
             if let Some(v) = get(Field::Feed) {
                 o.feed = v;

@@ -506,6 +506,28 @@ pub struct ThreadOp {
     /// Climb-mill when `true`, conventional when `false` — together with `hand`
     /// and `internal` this fixes the helix direction and travel sense.
     pub climb: bool,
+    /// Number of **radial infeed passes**: the thread is cut to full depth in this
+    /// many equal radial steps (each a full helix, stepping the orbit outward for an
+    /// internal thread / inward for an external one). `1` (the default) cuts the whole
+    /// depth in a single pass; more passes lighten the cut for hard material.
+    #[serde(default)]
+    pub passes: u32,
+    /// Extra **spring passes** at the final (full) depth, to clean up elastic spring-back
+    /// after the last cutting pass. `0` (the default) adds none.
+    #[serde(default)]
+    pub spring_passes: u32,
+    /// For an internal **blind** hole: how far (mm) the pre-drilled hole extends *below*
+    /// the thread bottom (`z_bottom`). `0` (the default) means a **through hole** — no
+    /// blind-bottom check. When positive it must be at least [`blind_allowance`](Self::
+    /// blind_allowance), else the operation errors (the tool cannot thread flush to a
+    /// blind bottom).
+    #[serde(default)]
+    pub drill_clearance: f64,
+    /// Required standoff (mm) between the last thread and the bottom of a blind hole; the
+    /// [`drill_clearance`](Self::drill_clearance) is validated against it. `0` (the
+    /// default) means *auto* — one thread pitch.
+    #[serde(default)]
+    pub blind_allowance: f64,
     /// Cutting feed, mm/min.
     pub feed: f64,
     /// Plunge feed for the approach in Z, mm/min.
