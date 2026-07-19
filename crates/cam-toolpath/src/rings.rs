@@ -238,7 +238,7 @@ pub(crate) fn emit_stay_down(
     let retract = Tag::new(id, MoveKind::Retract);
     let leaded = lead_in != Lead::None || lead_out != Lead::None;
 
-    let mut from_z = h.top_of_stock;
+    let mut from_z = h.retract.max(h.top_of_stock);
     for &z in levels {
         // Enter at the innermost ring (a boundary loop, so the plunge strategy's
         // helix/ramp is placed on the inward, cleared side), per the operator's

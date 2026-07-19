@@ -195,7 +195,7 @@ fn emit_adaptive(prog: &mut Program, tc: &[Point], job: &ClearJob, h: &Heights, 
     let tan = crate::profile::unit(tc[1].x - start.x, tc[1].y - start.y);
     let out = (-tan.1, tan.0);
 
-    let mut from_z = h.top_of_stock;
+    let mut from_z = h.retract.max(h.top_of_stock);
     for &z in levels {
         prog.push(Step::Rapid {
             to: Point3::new(start.x, start.y, h.clearance),
@@ -267,7 +267,7 @@ fn emit_adaptive_moves(
         (1.0, 0.0)
     };
 
-    let mut from_z = h.top_of_stock;
+    let mut from_z = h.retract.max(h.top_of_stock);
     for &z in levels {
         let start = moves[0].0;
         let tan = tan_at(0);
