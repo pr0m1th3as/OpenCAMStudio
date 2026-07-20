@@ -83,6 +83,27 @@ jobs:
           # --appimage-extract-and-run because CI runners have no FUSE.
           ARCH=x86_64 ./appimagetool-x86_64.AppImage --appimage-extract-and-run \
             $APP "OpenCAMStudio-$V-linux-x86_64.AppImage"
+      # A regression guard, not a formality. The glibc floor is a property of the
+      # BUILDER, so changing `runs-on` silently changes who can run the result --
+      # ubuntu-latest produced GLIBC_2.39, which fails before main on Debian 12.
+      # Nothing in the build output says so; it has to be measured.
+      - name: Verify the AppImage
+        run: |
+          set -euo pipefail
+          ./OpenCAMStudio-*.AppImage --appimage-extract >/dev/null
+          BIN=squashfs-root/usr/bin/opencamstudio
+          FLOOR=$(objdump -T "$BIN" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' \
+                  | sort -uV | tail -1 | cut -d_ -f2)
+          echo "glibc floor: $FLOOR"
+          [ "$(printf '%s\n2.35\n' "$FLOOR" | sort -V | tail -1)" = "2.35" ] \
+            || { echo "::error::glibc floor $FLOOR exceeds 2.35; Debian 12 cannot run this"; exit 1; }
+          # The packaged binary must be the GUI app, not the headless stub that
+          # cam-app builds without --features gui.
+          ! strings -a "$BIN" | grep -q 'headless build' \
+            || { echo "::error::packaged the headless stub, not the desktop app"; exit 1; }
+          test -f squashfs-root/.DirIcon
+          test -f squashfs-root/opencamstudio.desktop
+          rm -rf squashfs-root
       - name: Checksum
         run: .github/scripts/sha256.sh OpenCAMStudio-*.AppImage
       - uses: actions/upload-artifact@v4
@@ -144,6 +165,28 @@ jobs:
           mkdir -p dmg && cp -R "$APP" dmg/ && ln -s /Applications dmg/Applications
           hdiutil create -volname "OpenCAMStudio" -srcfolder dmg -ov -format UDZO \
             "OpenCAMStudio-$V-macos-arm64.dmg"
+      # Neither of us has a Mac, so this is the only verification the .dmg gets
+      # before a user opens it. It proves everything except that a window appears:
+      # the bundle is well-formed, the plist parses, the architecture is right, the
+      # icon is a real icns, the image mounts, and the binary is the GUI build.
+      - name: Verify the bundle and the disk image
+        run: |
+          set -euo pipefail
+          APP="OpenCAMStudio.app"
+          plutil -lint "$APP/Contents/Info.plist"
+          file "$APP/Contents/MacOS/opencamstudio" | grep -q 'arm64' \
+            || { echo "::error::binary is not arm64"; exit 1; }
+          ! strings -a "$APP/Contents/MacOS/opencamstudio" | grep -q 'headless build' \
+            || { echo "::error::packaged the headless stub, not the desktop app"; exit 1; }
+          file "$APP/Contents/Resources/opencamstudio.icns" | grep -qi 'icon' \
+            || { echo "::error::icns is not a Mac OS X icon file"; exit 1; }
+          # Mount it as a user would, confirm the app is inside, then detach.
+          MNT=$(hdiutil attach OpenCAMStudio-*.dmg -nobrowse -readonly \
+                | tail -1 | awk '{ $1=""; $2=""; sub(/^  */,""); print }')
+          echo "mounted at: $MNT"
+          test -x "$MNT/OpenCAMStudio.app/Contents/MacOS/opencamstudio"
+          test -L "$MNT/Applications"
+          hdiutil detach "$MNT" >/dev/null
       - name: Checksum
         run: .github/scripts/sha256.sh OpenCAMStudio-*.dmg
       - uses: actions/upload-artifact@v4
@@ -187,6 +230,19 @@ jobs:
           cargo wix init --force -p cam-app
           cargo wix -p cam-app --no-build --nocapture \
             --output "OpenCAMStudio-$V-windows-x86_64-installer.msi"
+      - name: Verify the artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in OpenCAMStudio-*portable.exe OpenCAMStudio-*.msi; do
+            test -s "$f" || { echo "::error::$f is empty"; exit 1; }
+          done
+          # An MSI is an OLE compound file: it must begin D0 CF 11 E0. A zero-byte or
+          # half-written installer would otherwise sail through as a valid artifact.
+          head -c 8 OpenCAMStudio-*.msi | od -An -tx1 | tr -d ' \n' | grep -qi '^d0cf11e0' \
+            || { echo "::error::MSI is not an OLE compound file"; exit 1; }
+          ! strings -a OpenCAMStudio-*portable.exe | grep -q 'headless build' \
+            || { echo "::error::packaged the headless stub, not the desktop app"; exit 1; }
       - name: Checksums
         shell: bash
         run: .github/scripts/sha256.sh OpenCAMStudio-*.msi OpenCAMStudio-*portable.exe
