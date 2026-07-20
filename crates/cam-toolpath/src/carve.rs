@@ -605,7 +605,15 @@ impl Strategy for CarveStrategy {
         //   travel across the flat land is safe anywhere (above), so the order is free —
         //   and the natural order is the wrong one: it walks every component at one
         //   radius, then walks them all again at the next, criss-crossing the part.
-        let mut floor_loops: Vec<Vec<cam_geo::Point>> = Vec::new();
+        //
+        // Each component keeps its loops together, and each is guarded by **itself**
+        // rather than by the whole flat land. That is what makes the tool lift between
+        // rest regions instead of skimming its tip across the finished floor to reach
+        // the next one: `link_is_safe` refuses a link that leaves the region it is
+        // judged against, and falls back to a retract. Within a region — and across the
+        // whole flat land when no clearing tool ran, which is one region — linking is
+        // still free, so a plain carve stays a single stay-down chain.
+        let mut components: Vec<(Vec<Polygon>, Vec<Vec<cam_geo::Point>>)> = Vec::new();
         for comp in &floor_region {
             if cancel.is_cancelled() {
                 return StrategyResult {
@@ -617,6 +625,7 @@ impl Strategy for CarveStrategy {
             if vanishing_width(comp, 0.0) <= 0.5 * floor_step {
                 continue;
             }
+            let mut loops: Vec<Vec<cam_geo::Point>> = Vec::new();
             let mut d = first_d;
             loop {
                 let rings = if d <= 0.0 {
@@ -633,27 +642,41 @@ impl Strategy for CarveStrategy {
                 for poly in &rings {
                     for contour in std::iter::once(poly.outer()).chain(poly.holes()) {
                         if contour.is_valid() && perimeter(contour) >= floor_step {
-                            floor_loops.push(contour.points().to_vec());
+                            loops.push(contour.points().to_vec());
                         }
                     }
                 }
                 d += floor_step;
             }
+            if !loops.is_empty() {
+                components.push((vec![comp.clone()], loops));
+            }
         }
 
-        if !floor_loops.is_empty() {
+        if !components.is_empty() {
             deepest = deepest.max(op.depth);
-            for pts in order_for_locality(floor_loops, st.at.map(|(q, _)| q)) {
-                emit_loop(
-                    &mut body,
-                    &mut st,
-                    &pts,
-                    &flat,
-                    floor_z,
-                    op,
-                    &env.heights,
-                    tags,
-                );
+            // Regions in nearest-first order, and each region's own loops likewise, so
+            // one place is finished before the tool goes anywhere else.
+            let mut at = st.at.map(|(q, _)| q);
+            while !components.is_empty() {
+                let pick = match at {
+                    None => 0,
+                    Some(p) => nearest_component(&components, p),
+                };
+                let (guard, loops) = components.swap_remove(pick);
+                for pts in order_for_locality(loops, at) {
+                    emit_loop(
+                        &mut body,
+                        &mut st,
+                        &pts,
+                        &guard,
+                        floor_z,
+                        op,
+                        &env.heights,
+                        tags,
+                    );
+                    at = st.at.map(|(q, _)| q);
+                }
             }
         }
 
@@ -839,6 +862,26 @@ fn emit_loop(
     // `cut_loop` closes back to the start, so that is where the tool is.
     st.at = Some((start, z));
     st.guard = guard_next.to_vec();
+}
+
+/// Index of the rest region whose loops start nearest `p`.
+fn nearest_component(
+    components: &[(Vec<Polygon>, Vec<Vec<cam_geo::Point>>)],
+    p: cam_geo::Point,
+) -> usize {
+    let mut best = (f64::MAX, 0usize);
+    for (i, (_, loops)) in components.iter().enumerate() {
+        for l in loops {
+            let stride = (l.len() / 16).max(1);
+            for q in l.iter().step_by(stride) {
+                let d = (q.x - p.x).hypot(q.y - p.y);
+                if d < best.0 {
+                    best = (d, i);
+                }
+            }
+        }
+    }
+    best.1
 }
 
 /// Order same-depth loops so each is followed by whichever is nearest — a greedy
@@ -2690,6 +2733,54 @@ mod tests {
             "{} floor loops cut less than one step: {runts:?}",
             runts.len()
         );
+    }
+
+    #[test]
+    fn the_tool_lifts_between_rest_regions_but_not_within_one() {
+        // Skimming the tip across a finished floor to reach the next rest region marks
+        // it. Each region is guarded by itself, so a link that would leave it is refused
+        // and becomes a retract -- while linking *inside* a region, and across the whole
+        // flat land when no clearing tool ran, stays free.
+        let (outer, islands) = ringed_rect();
+        let mut with = op(1.0);
+        with.boundary = outer.clone();
+        with.islands = islands.clone();
+        with.stay_down = true;
+        with.clear = Some(cam_model::CarveClearing {
+            tool: 2,
+            params: cam_model::ClearParams::default(),
+        });
+        let r = run_with(with, &[vbit(60.0, 0.1), endmill(2, 6.8)]);
+        assert!(errors(&r).is_empty(), "{:?}", errors(&r));
+
+        // The observable is the lift count: with several disjoint rest regions the tool
+        // must come up between them rather than skim across. (Measuring the longest
+        // floor-depth cut was tried and is wrong -- the innermost WALL ring is also at
+        // full depth, and its edges are legitimately the width of the part.)
+        let lifts = r
+            .program
+            .steps()
+            .iter()
+            .filter(|s| matches!(s, Step::Rapid { tag, .. } if tag.kind == MoveKind::Retract))
+            .count();
+        assert!(
+            lifts > 1,
+            "only {lifts} lift: the tip skimmed the finished floor between rest regions"
+        );
+
+        // …but a plain carve, whose flat land is one region, still links throughout.
+        let mut plain = op(1.0);
+        plain.boundary = outer;
+        plain.islands = islands;
+        plain.stay_down = true;
+        let r = run(plain, vbit(60.0, 0.1));
+        let lifts = r
+            .program
+            .steps()
+            .iter()
+            .filter(|s| matches!(s, Step::Rapid { tag, .. } if tag.kind == MoveKind::Retract))
+            .count();
+        assert_eq!(lifts, 1, "a single-region carve should stay down throughout");
     }
 
     #[test]
