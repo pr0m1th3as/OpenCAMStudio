@@ -8,9 +8,19 @@ A CAM application for CNC toolpath generation, built in Rust.
 
 ## What works
 
-- **Operations** — profile, pocket, drill, face, chamfer, **thread milling** and
-  **V-carve engraving**; leads and ramp/helix plunges; engagement-capped area
-  clearing (adaptive front-advance where it certifies, concentric otherwise).
+- **Operations** — profile, pocket, drill, face, chamfer, **thread milling**,
+  **V-carve engraving** and **V-carving**; leads and ramp/helix plunges;
+  engagement-capped area clearing (adaptive front-advance where it certifies,
+  concentric otherwise).
+- **V-carving** — the boundary outlines an *area*, not a path: the tool never
+  touches it, its flanks land on it, and the depth follows from the shape's own
+  width. Built on **inward offset rings, not a medial axis** — the ring at inward
+  distance `w` *is* the locus of points at distance `w`, so the medial axis is
+  simply where the offsets vanish. Optionally **two tools in one operation**: an
+  end mill clears the flat land the depth cap leaves — each level to its own
+  depth's width, so it roughs the taper as a staircase — and then hands over to
+  the V-bit, which finishes the wall and cleans the corners a round cutter
+  cannot reach.
 - **Tool suitability guards** — every operation checks that the surface doing the
   cutting *is* a cutting surface, reading each tool's own profile rather than
   matching on its type. Using a non-cutting surface (engraving with a chamfer
@@ -18,6 +28,8 @@ A CAM application for CNC toolpath generation, built in Rust.
   onto the shank is refused; merely *poor* choices warn and proceed.
 - **Geometry in** — DXF/DWG import with contour chaining and hole nesting,
   including **open paths** (lettering and decorative strokes, for engraving);
+  a carved region's islands (the counters of letters) come from the drawing's own
+  nesting rather than being clicked one by one;
   AutoCAD-style object snaps (end / mid / quadrant / nearest) when picking.
 - **Tooling** — a cross-project tool library with every cutter kind fully
   characterised: square / ball-nose / rounded-edge end mills, drill, V-bit,

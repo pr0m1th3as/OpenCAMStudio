@@ -22,8 +22,9 @@ full 2.5-D operations, material simulation). Additive capability has since lande
 top: **six posts** across three families (grbl / FluidNC / grblHAL, LinuxCNC,
 Fanuc / Haas), engagement-capped area clearing, a **complete tooling subsystem** (a
 cross-project library with every cutter kind fully characterised — per-kind revolve
-geometry + live 2D preview), and two further operations, **thread milling** and
-**V-carve engraving**, bringing the strategy count to seven. The tool generatrix now
+geometry + live 2D preview), and three further operations, **thread milling**,
+**V-carve engraving** and **V-carving**, bringing the strategy count to eight — the
+last of them the first to use **two tools in one operation**. The tool generatrix now
 also drives **operation guards** (a tool must cut with a cutting surface) and a
 **profile-aware simulation** in both removal and collision. **P8** (plugin ABI) is the
 next numbered phase. Live per-crate state lives in `WORKSTATE.md` / `STATUS.md`.
@@ -62,15 +63,19 @@ to public.
 - Feeds & speeds calculator. *(Cross-project tool library with persistence, import/
   export, and full per-kind tool geometry — **done**. Threading operation — **done**:
   hole-fit, neck-depth and reach gates, blind-hole allowance, infeed + spring passes.)*
-- **V-carve engraving, increment 2** — region carving driven by the **medial axis** of
-  the 2D shape, so the flanks touch both boundaries and depth varies along the path.
-  Increment 1 (line/stroke engraving along an open or closed path) is **done**. This is
-  planar `cam-geo` work: a cone on a vertical axis is single-valued in radius, so a
-  V-groove never undercuts and **no solid kernel is required**.
+- *(Region V-carving — **done**, and not via a medial axis after all. It shipped as its
+  own operation, **Carve**, on inward offset rings: the ring at inward distance `w` is
+  exactly the locus of points at distance `w`, so `cam_geo::offset` does the work and
+  the medial axis is simply where the offsets vanish. No new algorithm, no new
+  dependency, and the same reasoning still applies as to why no solid kernel is needed
+  — a cone on a vertical axis is single-valued in radius, so a V-groove never
+  undercuts.)*
 - **Parametric tool importer** — vet-then-annotate custom-tool drawings (LINE+ARC +
   dimension annotations) into `ProfileParams` family templates; a small nonlinear
   DOF/constraint solver bakes instances to concrete tools. (DWG read path proven.)
-- Rest-material awareness between operations.
+- Rest-material awareness between operations. *(Within the Carve operation this
+  exists: the V-bit's floor pass runs only where the clearing tool could not reach.
+  Generalising it across separate operations is the open part.)*
 - 3-axis: Z-level roughing, waterline/scallop finishing (needs `cam-geo` 3D and
   real `Kernel` use).
 - Waveform/trochoidal roughing (constant chip-load).

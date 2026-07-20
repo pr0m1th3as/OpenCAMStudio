@@ -68,8 +68,9 @@ Across the top is a tabbed **icon ribbon**; below it are three docked panes —
 - **Home** — *Project* (New · Open · Save · Save As), *Data* (Import · Export ·
   Sample), *Edit* (Undo · Redo · Run). New/Open/Save/Import/Export use native
   file dialogs; **Sample** loads a built-in rectangle-with-a-hole demo (no dialog).
-- **Operations** — *Create*: Profile · Pocket · Drill · Thread · Chamfer ·
-  **Engrave** · Face. Clicking a kind starts the operation-creation wizard.
+- **Operations** — *Create*: Face · Profile · Pocket · Drill · Thread · Chamfer ·
+  Engrave · **Carve** — roughly the order a part is made. Clicking a kind starts
+  the operation-creation wizard.
 - **Tooling** — the cross-project **tool library** manager (New · Delete ·
   Renumber · Import Library · Export Library). While this tab is active the
   **Tool Library pane** replaces the Project pane, the Inspector becomes the tool
@@ -134,8 +135,11 @@ right-to-left; a collapsed group opens as a popup under its button).
    until you commit: re-picking simply moves the boundary, and changing family clears
    the tool. Nothing is created until **Confirm**, which stays disabled until both are
    settled.
-6. **Pocket** enters **island mode** once a boundary is picked: click enclosed loops
-   to toggle them as excluded islands (highlighted gold), then **Confirm**.
+6. **Pocket and Carve** enter **island mode** once a boundary is picked: click
+   enclosed loops to toggle them as excluded islands (highlighted gold), then
+   **Confirm**. A Carve *starts* with the picked region's own holes already excluded
+   — the counters of letters, which are never wanted — so for most drawings there is
+   nothing to click.
 7. The operation appears in the tree, and its tool under **Tools (in use)**. Choosing
    a tool embeds a copy into the project, so `.ocam` files stay self-contained.
 8. Select the operation and edit its fields / Side / lead / plunge in the Inspector;
@@ -160,6 +164,58 @@ selecting a chamfer mill is refused with that reason.
   lifts at the far end rather than closing back to the start. Closed loops close.
   Note the importer reads **LINE / ARC / CIRCLE / LWPOLYLINE** only: text must be
   exploded to curves in your CAD package, and splines are skipped.
+
+### Carving
+
+Carving is to engraving what a pocket is to a profile: the boundary outlines an
+**area**, not a path. The tool never touches that boundary — it stands back and lets
+its **flanks** land on it — and the depth is not a setting you dial in but a
+consequence of how wide the shape is at each point. It needs a **V-bit**, for the same
+physical reason engraving does, and it needs a **closed** boundary: there is nothing to
+carve without an interior.
+
+- **Depth is a cap, not a command.** The shape reaches it only where it is wide
+  enough. The Inspector says what the shape itself allows, live, before you run:
+  *"Full depth for this shape is 3.80 mm; this cap leaves 3 flat areas."* That one
+  line tells you whether to deepen, accept, or add the second tool.
+- **Islands come from the drawing.** Pick a region and the counters of its letters
+  are excluded automatically, from the geometry's own nesting. Click one to toggle
+  it back.
+- **Ring step** is a **roughing** control, despite appearances. The finished wall is
+  cut by the *deepest* ring alone — its flank spans from the boundary down to its
+  tip — so the shallower rings limit how much one pass takes and reach into corners.
+  Coarser costs tool load, not surface quality.
+- **Floor scallop** is the real finish control, and applies where a cone genuinely
+  cannot do better: a **flat floor**. Adjacent passes leave a ridge between them, so
+  you ask for the ridge height and the spacing follows — which lets a rounded tip
+  step much wider than a sharp one for the same finish.
+- **Stay down** links the rings without lifting wherever that is safe. Each link is
+  checked, and any that would gouge — or that would drag the tip across floor the
+  clearing tool has already finished — lifts instead.
+
+#### Clearing the flat areas (the second tool)
+
+Where the depth cap leaves a flat floor, a cone cannot flatten it: adjacent passes
+leave ridges. Tick **Clear flat areas** and an end mill takes that floor **first**,
+before the V-bit runs — bulk removal with the strong tool, which also spares a fine
+carving tip from full-depth work. The Inspector then shows a second block of controls
+below the clearing tool, which are a pocket's: stepdown, overlap, allowance,
+engagement, feeds, plunge style, climb, leads.
+
+- The clearing tool must be **flat-bottomed** (end mill or bull nose). A ball nose is
+  refused — it cuts, but leaves the same scalloped floor the V-bit already would, so
+  it buys a tool change and nothing else.
+- **Each stepdown level clears to its own depth's width**, not the bottom's, so the
+  end mill roughs the taper as a staircase instead of leaving it all to the V-bit.
+- The **clear allowance** is how far the end mill stays off the carved surface,
+  leaving that skin for the V-bit — which finishes it better, with the flank of its
+  cone rather than the corner of a cylinder. Nothing is abandoned: the V-bit's own
+  passes are computed from what the clearing tool *actually swept*, so a larger
+  allowance simply hands it more to do.
+- A round cutter cannot enter a sharp corner, so it leaves a lens of stock at every
+  concave corner of the flat area. The V-bit cleans those afterwards, and only those.
+- Both tools appear on the operation's row in the Project pane, in cutting order
+  (`3: Carve  T4 + T7`), and both count as in use.
 
 ### Tools must be able to cut
 
@@ -261,7 +317,17 @@ things worth eyeballing:
   circle. Then check the order does not matter: start again, click the geometry
   **first**, and confirm **Confirm** stays disabled until a tool is chosen. Re-pick a
   different loop before confirming and check the selection moves. A Pocket enters
-  island mode (click islands gold, Confirm).
+  island mode (click islands gold, Confirm). A **Carve** should arrive with the
+  region's holes *already* excluded.
+- **Carve:** create one on a region with an island. The Inspector should state what
+  the shape allows before any run ("full depth for this shape is …"), and update as
+  you edit **Max depth**. Tick **Clear flat areas**: a rule and a *Clearing pass
+  (end mill)* heading appear, with the tool picker and then a pocket's worth of
+  fields **below** it — nothing clearing-related mixed in with the V-bit's own
+  numbers above. Deepen the cap until the line says no flat areas remain and the
+  whole block should vanish. The Project row should read `Carve  T… + T…` in cutting
+  order. In the backplot the V-bit should link its rings without lifting, but **lift**
+  rather than skim across floor the end mill has already finished.
 - **Guards:** point an operation at a tool that cannot do the job — face with a
   chamfer mill, profile with a V-bit, thread with an end mill — and confirm the
   Output pane explains why and the operation is marked ⚠ in the tree, while merely

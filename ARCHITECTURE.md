@@ -99,8 +99,18 @@ Document { schema_version, Setup }   (Machine is app state, not saved)
          ├─ ChamferOp { tool (chamfer mill or V-bit), chain, side, width }
          ├─ ThreadOp  { tool (thread mill), points, major_dia, pitch, hand,
          │              passes, spring_passes, blind-hole allowance }
-         └─ EngraveOp { tool (V-bit), chain, closed?, top, depth, stepdown }
-                        no side, no radius comp — the tool centre follows the path
+         ├─ EngraveOp { tool (V-bit), chain, closed?, top, depth, stepdown }
+         │              no side, no radius comp — the tool centre follows the path
+         └─ CarveOp   { tool (V-bit), boundary + islands, top, depth (a CAP),
+                        offset, ring_step (wall roughing), scallop (floor finish),
+                        stay_down, clear: Option<{ tool, ClearParams }> }
+                        the boundary outlines an AREA; depth follows from its width
+
+ClearParams — the parameters of an area-clearing pass, shared so a carve's
+clearing pass is a pocket over a derived region rather than a copy of one:
+{ stepdown, overlap, offset, feeds, plunge, leads, lead_overlap, Clearing }.
+(`PocketOp` still carries these flat; adopting the struct there is a schema
+change with saved projects to migrate.)
 
 Machine (distinct from Post): { rapid rate, max spindle, feed limits,
                                 work envelope, tool-change pos, safe-Z rule }
@@ -137,6 +147,21 @@ Machine (distinct from Post): { rapid rate, max spindle, feed limits,
   operator's judgement. A few rules genuinely are not in the geometry — a twist
   drill's flute side *is* tagged cutting yet must never side-mill — and those are
   stated explicitly, with the reason.
+- **An operation may use more than one tool, and the operation orders them.**
+  `Operation::tools()` lists every tool an operation uses **in cutting order**, so
+  `tools()[0]` is what must be in the spindle when its fragment begins. `build_job`
+  emits the change for that one, then **resyncs from the last `ToolChange` in the
+  appended fragment** — because a multi-tool strategy emits its own changes, being
+  the only thing that knows the order. Anything that rewrites tool numbers must go
+  through `Operation::map_tools`, which touches *every* reference: renaming only
+  the defining tool leaves the second pointing at whatever inherited the old
+  number. The one such operation today is **Carve** (clearing end mill, then
+  V-bit); the seam exists so it is not the last.
+- **A carve's clearing region is derived, which is why it is one operation.** The
+  flat land the depth cap leaves is computed from the carve's boundary, depth,
+  hold-off and V-bit. Split into a separate pocket, it would go **silently** stale
+  the moment the carve is edited — no marker, no error, a floor at the wrong Z.
+  One operation recomputes both from one set of inputs on every run.
 - **Undo/redo via commands.** All document mutations go through commands `cam-app`
   can stack; `cam-model` is never mutated ad hoc.
 - **Determinism.** Same input → same G-code (integer geometry helps) — required
