@@ -4545,7 +4545,10 @@ impl App {
             ],
             RibbonTab::Operations => vec![GroupSpec {
                 title: "Create",
+                // Roughly the order a part is actually made: skim the blank flat,
+                // then cut its shape, then the features, then the decoration.
                 commands: vec![
+                    cmd(Icon::Face, "Face", begin(OpKind::Face)),
                     cmd(Icon::Profile, "Profile", begin(OpKind::Profile)),
                     cmd(Icon::Pocket, "Pocket", begin(OpKind::Pocket)),
                     cmd(Icon::Drill, "Drill", begin(OpKind::Drill)),
@@ -4553,7 +4556,6 @@ impl App {
                     cmd(Icon::Chamfer, "Chamfer", begin(OpKind::Chamfer)),
                     cmd(Icon::Engrave, "Engrave", begin(OpKind::Engrave)),
                     cmd(Icon::Carve, "Carve", begin(OpKind::Carve)),
-                    cmd(Icon::Face, "Face", begin(OpKind::Face)),
                 ],
             }],
             RibbonTab::Edit => vec![
@@ -6828,12 +6830,14 @@ fn field_row_styled<'a>(
 const INSPECTOR_INPUT_W: f32 = 90.0;
 
 /// Width for a picker whose options do not fit [`INSPECTOR_INPUT_W`] — "Conventional",
-/// "Right-hand", a post's name. Widened deliberately, not by content, so it is still a
-/// fixed column rather than one that jumps as the selection changes.
-const INSPECTOR_PICKER_W: f32 = 150.0;
+/// "Right-hand", a post's name. This is the width every picker had before the column was
+/// introduced, kept unchanged for the ones that were already right.
+const INSPECTOR_PICKER_W: f32 = 120.0;
 
-/// Width for a tool picker, whose entries carry a number, a diameter and a kind name.
-const INSPECTOR_TOOL_PICKER_W: f32 = 220.0;
+/// Width for a tool picker. Narrower than its longest entry on purpose: the text wraps,
+/// which costs a line, where sizing to content would move the column every time the
+/// selection changed.
+const INSPECTOR_TOOL_PICKER_W: f32 = 140.0;
 
 /// As [`field_row_styled`], but with an explicit label and tooltip so a field can be
 /// renamed and re-explained per tool kind (e.g. a V-bit's `ToolDiameter` reads "Shank
