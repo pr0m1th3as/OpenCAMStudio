@@ -5485,13 +5485,14 @@ impl App {
                 .align_y(Alignment::Center),
             );
             // The post/controller dialect used on export.
-            list = list.push(profile_picker(
+            list = list.push(profile_picker_w(
                 "Post",
                 help::POST,
                 self.tooltips,
                 self.controller.post_kind(),
                 &PostKind::ALL[..],
                 Message::PostKindChanged,
+                INSPECTOR_PICKER_W,
             ));
             list = list.push(
                 text("Dry-run / air-cut generated code on your control before cutting.")
@@ -5686,21 +5687,23 @@ impl App {
                         &Bore::ALL[..],
                         |b| Message::ThreadInternalChanged(b == Bore::Internal),
                     ));
-                    list = list.push(profile_picker(
+                    list = list.push(profile_picker_w(
                         "Hand",
                         help::HAND,
                         self.tooltips,
                         t.hand,
                         &Hand::ALL[..],
                         Message::ThreadHandChanged,
+                        INSPECTOR_PICKER_W,
                     ));
-                    list = list.push(profile_picker(
+                    list = list.push(profile_picker_w(
                         "Cut",
                         help::THREAD_CUT,
                         self.tooltips,
                         CutStyle::of(t.climb),
                         &CutStyle::ALL[..],
                         |c| Message::ThreadClimbChanged(c == CutStyle::Climb),
+                        INSPECTOR_PICKER_W,
                     ));
                 }
                 Some(Operation::Carve(c)) => {
@@ -5825,7 +5828,7 @@ impl App {
                                         })
                                         .placeholder("Choose an end mill")
                                         .text_size(13)
-                                        .width(Length::Fill),
+                                        .width(Length::Fixed(INSPECTOR_TOOL_PICKER_W)),
                                     ]
                                     .spacing(8)
                                     .align_y(Alignment::Center),
@@ -6818,6 +6821,20 @@ fn field_row_styled<'a>(
     field_row_labeled(field, field.label(), field.help(), value, show, invalid)
 }
 
+/// Width of an inspector's editable control, logical px.
+///
+/// Numeric inputs and pickers share it so their right edges line up down the column —
+/// with a carve's two tools stacked in one inspector, a ragged edge reads as disorder.
+const INSPECTOR_INPUT_W: f32 = 90.0;
+
+/// Width for a picker whose options do not fit [`INSPECTOR_INPUT_W`] — "Conventional",
+/// "Right-hand", a post's name. Widened deliberately, not by content, so it is still a
+/// fixed column rather than one that jumps as the selection changes.
+const INSPECTOR_PICKER_W: f32 = 150.0;
+
+/// Width for a tool picker, whose entries carry a number, a diameter and a kind name.
+const INSPECTOR_TOOL_PICKER_W: f32 = 220.0;
+
 /// As [`field_row_styled`], but with an explicit label and tooltip so a field can be
 /// renamed and re-explained per tool kind (e.g. a V-bit's `ToolDiameter` reads "Shank
 /// diameter" with matching help).
@@ -6832,7 +6849,7 @@ fn field_row_labeled<'a>(
     let mut input = text_input("", value)
         .on_input(move |v| Message::FieldChanged(field, v))
         .on_submit(Message::Apply)
-        .width(Length::Fixed(90.0));
+        .width(Length::Fixed(INSPECTOR_INPUT_W));
     if invalid {
         input = input.style(|theme, status| {
             let mut s = iced::widget::text_input::default(theme, status);
@@ -6861,11 +6878,29 @@ fn profile_picker<T>(
 where
     T: ToString + PartialEq + Clone + 'static,
 {
+    profile_picker_w(label, help, show, selected, options, on_select, INSPECTOR_INPUT_W)
+}
+
+/// [`profile_picker`] at an explicit width, for the few whose option text does not fit
+/// the shared column.
+#[allow(clippy::too_many_arguments)]
+fn profile_picker_w<T>(
+    label: &str,
+    help: &'static str,
+    show: bool,
+    selected: T,
+    options: &'static [T],
+    on_select: impl Fn(T) -> Message + 'static,
+    width: f32,
+) -> Element<'static, Message>
+where
+    T: ToString + PartialEq + Clone + 'static,
+{
     row![
         label_help(label.to_string(), help, show),
         pick_list(options, Some(selected), on_select)
             .text_size(13)
-            .width(Length::Fixed(120.0)),
+            .width(Length::Fixed(width)),
     ]
     .spacing(8)
     .align_y(Alignment::Center)
