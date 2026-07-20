@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags: [ "v*" ]
-  # Build the three platforms without tagging, to prove the pipeline before a real
+  # Build all three platforms without tagging, to prove the pipeline before a real
   # release. No Release is published on this path -- see the `release` job's `if`.
   workflow_dispatch:
 
@@ -11,80 +11,194 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: ${{ matrix.target }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # 22.04 deliberately, NOT ubuntu-latest: the binary's glibc floor is
-          # whatever the builder has, and 24.04 produced a GLIBC_2.39 requirement
-          # that will not start on Ubuntu 22.04 (2.35) or Debian 12 (2.36) -- i.e.
-          # most shop machines. 22.04 drops the floor to 2.35. (OpenCADStudio's
-          # own AppImage measures at 2.35, so this matches a shipping reference.)
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-    runs-on: ${{ matrix.os }}
+  linux:
+    name: linux x86_64 (AppImage)
+    # 22.04 deliberately, NOT ubuntu-latest: a dynamically linked binary's glibc floor
+    # is whatever the builder has, and 24.04 produced a GLIBC_2.39 requirement that
+    # will not start on Ubuntu 22.04 (2.35) or Debian 12 (2.36) -- most shop machines.
+    # 22.04 drops the floor to 2.35, which is also where OpenCADStudio's own shipping
+    # AppImage measures, so this matches a known-good reference rather than a guess.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      # Deliberately NO build cache here (ci.yml keeps one, where speed matters and
-      # the output is thrown away). A shipped binary is built from a clean tree, so
-      # what we hand a user is a function of the commit and nothing else.
-      # This is not hypothetical: rust-cache keys on job name + runner.os + host
-      # triple, none of which distinguish ubuntu-22.04 from ubuntu-latest, so the
-      # 22.04 job restored the 24.04 job's target tree and the build then failed
-      # with "can't find crate for iced" -- having compiled our nine crates and not
-      # one dependency.
-      # Only Linux needs these; macOS and Windows carry their own window/GL stack.
-      # Kept in step with the `gui build` job in ci.yml.
-      - name: "System libraries (Linux: X11/Wayland/GL/font)"
-        if: startsWith(matrix.os, 'ubuntu')
+      # Deliberately NO build cache in the release path (ci.yml keeps one, where speed
+      # matters and the output is discarded). A shipped binary should be a function of
+      # the commit and nothing else. This is not hypothetical: rust-cache keys on job
+      # name + runner.os + host triple, none of which separate 22.04 from 24.04, and a
+      # restored 24.04 target tree failed here with "can't find crate for iced".
+      - name: System libraries (X11/Wayland/GL/font)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config libx11-dev libxkbcommon-dev libwayland-dev \
             libxcursor-dev libxrandr-dev libxi-dev \
             libgl1-mesa-dev libegl1-mesa-dev libfontconfig1-dev
+      - name: Version
+        id: ver
+        run: .github/scripts/version.sh
       # `--features gui` is the whole point: cam-app's `default = []`, so without it
-      # the shipped binary is the headless stub, which prints a line telling the user
-      # to go and build it themselves. That is what this workflow used to package.
+      # the packaged binary is the headless stub that prints "run cargo run" and exits.
+      - name: Build the desktop app
+        run: cargo build --release -p cam-app --features gui --bin opencamstudio
+      - name: Build the AppImage
+        run: |
+          set -euo pipefail
+          V=${{ steps.ver.outputs.v }}
+          APP=AppDir
+          mkdir -p $APP/usr/bin \
+                   $APP/usr/share/applications \
+                   $APP/usr/share/icons/hicolor/256x256/apps
+          cp target/release/opencamstudio $APP/usr/bin/
+          cp crates/cam-app/assets/opencamstudio-256.png \
+             $APP/usr/share/icons/hicolor/256x256/apps/opencamstudio.png
+          cat > $APP/usr/share/applications/opencamstudio.desktop <<'DESKTOP'
+          [Desktop Entry]
+          Type=Application
+          Name=OpenCAMStudio
+          Comment=CAM application for CNC toolpath generation
+          Exec=opencamstudio %f
+          Icon=opencamstudio
+          Terminal=false
+          Categories=Graphics;Engineering;Development;
+          MimeType=application/x-ocam;image/vnd.dxf;image/vnd.dwg;
+          Keywords=CAM;CNC;G-code;milling;toolpath;DXF;DWG;
+          StartupWMClass=opencamstudio
+          DESKTOP
+          # appimagetool wants the desktop file and icon at the AppDir root too.
+          cp $APP/usr/share/applications/opencamstudio.desktop $APP/
+          cp crates/cam-app/assets/opencamstudio-256.png $APP/opencamstudio.png
+          cp crates/cam-app/assets/opencamstudio-256.png $APP/.DirIcon
+          cat > $APP/AppRun <<'APPRUN'
+          #!/bin/sh
+          HERE=$(dirname "$(readlink -f "$0")")
+          exec "$HERE/usr/bin/opencamstudio" "$@"
+          APPRUN
+          chmod +x $APP/AppRun
+          # No library bundling: the binary NEEDs only libc/libm/libgcc, because winit
+          # and wgpu dlopen the X11/Wayland/GL stack at runtime. Verified by objdump on
+          # a real artifact -- OpenCADStudio's AppImage bundles nothing either.
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+          # --appimage-extract-and-run because CI runners have no FUSE.
+          ARCH=x86_64 ./appimagetool-x86_64.AppImage --appimage-extract-and-run \
+            $APP "opencamstudio-$V-linux-x86_64.AppImage"
+      - name: Checksum
+        run: .github/scripts/sha256.sh opencamstudio-*.AppImage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: opencamstudio-*.AppImage*
+          if-no-files-found: error
+
+  macos:
+    name: macos arm64 (dmg)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - name: Version
+        id: ver
+        run: .github/scripts/version.sh
       - name: Build the desktop app
         run: >
-          cargo build --release
-          -p cam-app --features gui
-          --bin opencamstudio
-          --target ${{ matrix.target }}
-      - name: Package
+          cargo build --release -p cam-app --features gui --bin opencamstudio
+          --target aarch64-apple-darwin
+      - name: Build the .app bundle and .dmg
+        run: |
+          set -euo pipefail
+          V=${{ steps.ver.outputs.v }}
+          APP="OpenCAMStudio.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp target/aarch64-apple-darwin/release/opencamstudio "$APP/Contents/MacOS/"
+          # .icns from the committed 1024 PNG. sips and iconutil are part of macOS, so
+          # this needs no rasteriser and no third-party tool.
+          ICONSET=opencamstudio.iconset
+          mkdir -p $ICONSET
+          SRC=crates/cam-app/assets/opencamstudio-1024.png
+          for s in 16 32 128 256 512; do
+            sips -z $s $s     "$SRC" --out "$ICONSET/icon_${s}x${s}.png"    >/dev/null
+            sips -z $((s*2)) $((s*2)) "$SRC" --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
+          done
+          iconutil -c icns $ICONSET -o "$APP/Contents/Resources/opencamstudio.icns"
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>              <string>OpenCAMStudio</string>
+            <key>CFBundleDisplayName</key>       <string>OpenCAMStudio</string>
+            <key>CFBundleIdentifier</key>        <string>io.github.pr0m1th3as.OpenCAMStudio</string>
+            <key>CFBundleVersion</key>           <string>${V#v}</string>
+            <key>CFBundleShortVersionString</key><string>${V#v}</string>
+            <key>CFBundleExecutable</key>        <string>opencamstudio</string>
+            <key>CFBundleIconFile</key>          <string>opencamstudio</string>
+            <key>CFBundlePackageType</key>       <string>APPL</string>
+            <key>LSMinimumSystemVersion</key>    <string>11.0</string>
+            <key>NSHighResolutionCapable</key>   <true/>
+          </dict>
+          </plist>
+          PLIST
+          mkdir -p dmg && cp -R "$APP" dmg/ && ln -s /Applications dmg/Applications
+          hdiutil create -volname "OpenCAMStudio" -srcfolder dmg -ov -format UDZO \
+            "opencamstudio-$V-macos-arm64.dmg"
+      - name: Checksum
+        run: .github/scripts/sha256.sh opencamstudio-*.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: opencamstudio-*.dmg*
+          if-no-files-found: error
+
+  windows:
+    name: windows x86_64 (msi + zip)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Version
+        id: ver
+        shell: bash
+        run: .github/scripts/version.sh
+      - name: Build the desktop app
+        run: cargo build --release -p cam-app --features gui --bin opencamstudio
+      # The portable .zip is built first and unconditionally: it is the artifact that
+      # cannot fail, so a Windows download exists even if the installer does not.
+      - name: Portable zip
         shell: bash
         run: |
           set -euo pipefail
+          V=${{ steps.ver.outputs.v }}
           mkdir -p dist
-          cp README.md LICENSE dist/
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            cp "target/${{ matrix.target }}/release/opencamstudio.exe" dist/
-            # A .zip, not a tarball: Explorer opens one natively.
-            7z a "opencamstudio-${{ matrix.target }}.zip" ./dist/*
-          else
-            cp "target/${{ matrix.target }}/release/opencamstudio" dist/
-            tar -czf "opencamstudio-${{ matrix.target }}.tar.gz" -C dist .
-          fi
+          cp target/release/opencamstudio.exe README.md LICENSE dist/
+          7z a "opencamstudio-$V-windows-x86_64-portable.zip" ./dist/*
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --locked
+      - name: Build the MSI
+        shell: bash
+        run: |
+          set -euo pipefail
+          V=${{ steps.ver.outputs.v }}
+          cargo wix init --force -p cam-app
+          cargo wix -p cam-app --no-build --nocapture \
+            --output "opencamstudio-$V-windows-x86_64-installer.msi"
+      - name: Checksums
+        shell: bash
+        run: .github/scripts/sha256.sh opencamstudio-*.msi opencamstudio-*.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: opencamstudio-${{ matrix.target }}
-          path: opencamstudio-${{ matrix.target }}.*
+          name: windows
+          path: |
+            opencamstudio-*.msi*
+            opencamstudio-*.zip*
           if-no-files-found: error
 
   release:
     name: publish the GitHub Release
-    needs: build
-    # Tags only. A `workflow_dispatch` run is a build rehearsal and publishes nothing.
+    needs: [linux, macos, windows]
+    # Tags only. A workflow_dispatch run is a rehearsal and publishes nothing.
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -97,8 +211,8 @@ jobs:
           merge-multiple: true
       # Uploading to the Release itself, not just as workflow artifacts -- those expire
       # in 90 days and cannot be fetched without a GitHub login, so they are useless as
-      # a download for anyone but us. The `gh` CLI is preinstalled on the runner, which
-      # keeps a third-party action out of the release path.
+      # a download for anyone but us. `gh` is preinstalled, which keeps a third-party
+      # action out of the release path.
       - name: Publish the Release and attach the platform builds
         env:
           GH_TOKEN: ${{ github.token }}
@@ -111,5 +225,7 @@ jobs:
             --generate-notes \
             artifacts/*
 
-# NOTE: a Linux AppImage and macOS/Windows code signing are still to come; the
-# platform archives above are unsigned, so both OSes will warn on first launch.
+# NOTE: none of these are code-signed. macOS will refuse the .dmg on first open until
+# the user right-clicks Open (or clears the quarantine attribute), and Windows
+# SmartScreen will warn on the MSI. Signing needs a paid Apple Developer ID and an
+# Authenticode certificate; documented rather than pretended away.
