@@ -5950,6 +5950,18 @@ impl App {
         list = list.push(
             button("Apply").on_press_maybe((!self.any_field_invalid() && self.inspector_dirty()).then_some(Message::Apply)),
         );
+        // Two classes of control live in this inspector and they commit differently, so
+        // say which is which: a typed number is only a number once you have finished
+        // typing it, but a drop-down or a checkbox has no half-way state and is written
+        // straight to the document (undoably) the moment it changes. Without this the
+        // greyed-out button reads as "your change was ignored" rather than "already done".
+        // The Tooling editor has no such split — everything there waits for Apply — so it
+        // gets no hint.
+        list = list.push(
+            text("Applies typed values. Drop-downs and checkboxes take effect as you set them.")
+                .size(11)
+                .color(palette::GROUP_LABEL),
+        );
 
         scrollable(list)
             .width(Length::Fill)
