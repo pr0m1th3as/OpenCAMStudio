@@ -68,25 +68,175 @@ pub struct ToolLibrary {
 }
 
 impl ToolLibrary {
-    /// The starter library seeded on first run: a few common end mills.
+    /// The starter library seeded on first run.
+    ///
+    /// **Catalogue-grounded, not invented.** A fresh install previously held three end
+    /// mills, which left five of the eight operations — drill, thread, chamfer, engrave,
+    /// carve — impossible to start without hand-building a tool first, since the creation
+    /// wizard bounds its families by what an operation can actually cut. These are
+    /// starter tools that an operator is expected to edit; the point of grounding them in
+    /// real catalogue geometry is that the *proportions* are right, so the guards, the
+    /// cross-section preview and the depth limits all behave as they would on real steel.
+    ///
+    /// Sources (2026-07-20):
+    /// - **Drills** — DIN 338 jobber, 118° point, parallel shank. Flute/overall lengths
+    ///   cross-checked between the Würth DIN 338 datasheet and the Dormer/Farnell twist
+    ///   drill catalogue, which agree exactly on every overlapping row.
+    /// - **End / ball / bull nose** — DIN 6527 bodies (Hepyc 3172 via Coussement); the
+    ///   ⌀6 length of cut is corroborated by DATRON. Ball and bull nose reuse the same
+    ///   bodies, which is how the catalogues supply them.
+    /// - **V-bits** — Amana Tool router-bit catalogue. Note these are **two families**,
+    ///   not one: 30°/45° are fine *engraving* bits whose body equals the ¼″ shank, while
+    ///   60°/90° are *V-groove* bits with a ½″ body on a ¼″ shank. That distinction is
+    ///   load-bearing — `diameter` is what the cone flares to, so it sets
+    ///   `vtip_max_depth`. Each tool's depth limit here reproduces the catalogue's own
+    ///   cutting-height column to within the 0.1 mm tip radius.
+    /// - **Thread mills** — full-profile M5/M6/M8 (Harvey Tool metric); the single-point
+    ///   is dimensioned to Andreas's spec of 2 mm maximum thread depth, which the model
+    ///   reads as `(diameter − neck) / 2`.
+    ///
+    /// Chamfer cone lengths are derived from the angle and tip flat rather than quoted.
     pub fn defaults() -> Self {
-        // flute = 2·⌀, shank = 2.5·flute, overall = flute + shank (the end-mill convention).
-        let em = |number, diameter: f64| {
-            let flute = 2.0 * diameter;
+        let mut n = 0;
+        let mut number = || {
+            n += 1;
+            n
+        };
+        // Milling bodies: (cutting ⌀, length of cut, overall, shank ⌀).
+        let body = |d: f64| -> (f64, f64, f64) {
+            match d as u32 {
+                3 => (8.0, 57.0, 6.0),
+                4 => (11.0, 57.0, 6.0),
+                5 => (13.0, 57.0, 6.0),
+                6 => (13.0, 57.0, 6.0),
+                8 => (19.0, 63.0, 8.0),
+                10 => (22.0, 72.0, 10.0),
+                _ => (26.0, 83.0, 12.0),
+            }
+        };
+        let mill = |number: u32, d: f64, flutes: u32, kind: ToolKind| {
+            let (flute_length, length, shank_diameter) = body(d);
             Tool {
                 number,
-                diameter,
-                flute_length: flute,
-                shank_diameter: diameter,
-                length: flute + 2.5 * flute,
-                flutes: 2,
-                kind: ToolKind::EndMill,
+                diameter: d,
+                flute_length,
+                length,
+                shank_diameter,
+                flutes,
+                kind,
                 ..Default::default()
             }
         };
-        Self {
-            tools: vec![em(1, 3.0), em(2, 6.0), em(3, 10.0)],
+        // A pointed tool's cone flares to its own diameter (`Tool::profile` ignores
+        // `flute_length` and the shank for these), so `diameter` is the cutting ⌀ and it
+        // alone bounds how deep the tool may go.
+        let pointed = |number: u32, d: f64, length: f64, flutes: u32, kind: ToolKind| Tool {
+            number,
+            diameter: d,
+            length,
+            flutes,
+            kind,
+            ..Default::default()
+        };
+
+        let mut tools = Vec::new();
+        for d in [3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0] {
+            tools.push(mill(number(), d, 3, ToolKind::EndMill));
         }
+        for d in [5.0, 6.0, 8.0, 10.0] {
+            tools.push(mill(number(), d, 2, ToolKind::BallMill));
+        }
+        for (d, corner_radius) in [(6.0, 0.5), (8.0, 1.0), (10.0, 1.5), (12.0, 2.0)] {
+            tools.push(mill(number(), d, 4, ToolKind::BullNose { corner_radius }));
+        }
+        // 90° chamfer mills, ¼″ and ½″.
+        for (d, length, tip_diameter) in [(6.35, 50.0, 0.2), (12.7, 63.0, 0.5)] {
+            tools.push(pointed(
+                number(),
+                d,
+                length,
+                4,
+                ToolKind::ChamferMill {
+                    included_angle_deg: 90.0,
+                    tip_diameter,
+                },
+            ));
+        }
+        // DIN 338 jobber drills, ⌀1–10. Shank = ⌀ (parallel shank), so it is left
+        // unspecified and resolves to the diameter.
+        for (d, flute_length, length) in [
+            (1.0, 12.0, 34.0),
+            (2.0, 24.0, 49.0),
+            (3.0, 33.0, 61.0),
+            (4.0, 43.0, 75.0),
+            (5.0, 52.0, 86.0),
+            (6.0, 57.0, 93.0),
+            (7.0, 69.0, 109.0),
+            (8.0, 75.0, 117.0),
+            (9.0, 81.0, 125.0),
+            (10.0, 87.0, 133.0),
+        ] {
+            tools.push(Tool {
+                number: number(),
+                diameter: d,
+                flute_length,
+                length,
+                flutes: 2,
+                kind: ToolKind::Drill {
+                    point_angle_deg: 118.0,
+                },
+                ..Default::default()
+            });
+        }
+        // V-bits. 30°/45° engraving (body = ¼″ shank); 60°/90° V-groove (½″ body).
+        for (included_angle_deg, d, length, flutes) in [
+            (30.0, 6.35, 50.8, 1),
+            (45.0, 6.35, 57.15, 2),
+            (60.0, 12.7, 44.45, 2),
+            (90.0, 12.7, 41.27, 2),
+        ] {
+            tools.push(pointed(
+                number(),
+                d,
+                length,
+                flutes,
+                ToolKind::VBit {
+                    included_angle_deg,
+                    tip_radius: 0.1,
+                },
+            ));
+        }
+        // Full-profile thread mills, then a single-point one good for 2 mm of thread
+        // depth — `(diameter − neck) / 2`, which is what the reach gate reads.
+        for (d, flute_length, length, shank_diameter, pitch) in [
+            (3.5, 10.4, 45.0, 4.0, 0.8),
+            (3.9, 12.0, 45.0, 4.0, 1.0),
+            (5.8, 16.25, 57.0, 6.0, 1.25),
+        ] {
+            tools.push(Tool {
+                number: number(),
+                diameter: d,
+                flute_length,
+                length,
+                shank_diameter,
+                flutes: 3,
+                kind: ToolKind::ThreadMill { pitch: Some(pitch) },
+                ..Default::default()
+            });
+        }
+        tools.push(Tool {
+            number: number(),
+            diameter: 10.0,
+            flute_length: 20.0,
+            length: 60.0,
+            shank_diameter: 10.0,
+            neck_diameter: 6.0,
+            neck_length: 20.0,
+            flutes: 3,
+            kind: ToolKind::ThreadMill { pitch: None },
+            ..Default::default()
+        });
+        Self { tools }
     }
 
     /// Load the library from disk, falling back to (and persisting) the defaults if
@@ -282,6 +432,79 @@ mod tests {
     }
 
     #[test]
+    fn every_operation_is_usable_out_of_the_box() {
+        // The reason the starter library grew. A fresh install used to hold three end
+        // mills, so drill, thread, chamfer, engrave and carve all opened the creation
+        // wizard onto an empty family picker -- five of the eight operations unusable
+        // until the operator hand-built a tool, including the two the README advertises
+        // most. `families_for` bounds the wizard by what an operation can actually cut,
+        // so "usable" means the library holds a tool of one of those families.
+        let lib = ToolLibrary::defaults();
+        for op in [
+            OpKind::Face,
+            OpKind::Profile,
+            OpKind::Pocket,
+            OpKind::Drill,
+            OpKind::Thread,
+            OpKind::Chamfer,
+            OpKind::Engrave,
+            OpKind::Carve,
+        ] {
+            let tool = lib.default_tool_for(op).expect("the library is not empty");
+            let families = crate::gui::families_for(op);
+            assert!(
+                families
+                    .iter()
+                    .any(|f| std::mem::discriminant(&f.to_kind()) == std::mem::discriminant(&tool.kind)),
+                "{op:?} seeds {} ({}), which is not one of the families it can cut: {families:?}",
+                tool.number,
+                tool.kind
+            );
+        }
+    }
+
+    #[test]
+    fn the_starter_v_bits_reach_their_catalogue_cutting_heights() {
+        // A V-bit's `diameter` is what its cone flares to, so it alone bounds how deep
+        // Engrave and Carve will go. These four are Amana router bits, and each must
+        // still reach the depth its catalogue quotes as the cutting height -- within the
+        // 0.1 mm tip radius, which the catalogue's sharp-point figure does not allow for.
+        let lib = ToolLibrary::defaults();
+        for (angle, catalogue_ch) in [(30.0, 11.67), (45.0, 7.52), (60.0, 11.11), (90.0, 6.35)] {
+            let t = lib
+                .tools
+                .iter()
+                .find(|t| matches!(t.kind, ToolKind::VBit { included_angle_deg, .. }
+                                   if (included_angle_deg - angle).abs() < 1e-9))
+                .unwrap_or_else(|| panic!("no {angle}° V-bit in the starter library"));
+            let ToolKind::VBit { tip_radius, .. } = t.kind else {
+                unreachable!()
+            };
+            let depth = cam_geo::vtip_max_depth(
+                (angle * 0.5_f64).to_radians(),
+                tip_radius,
+                t.radius(),
+            );
+            assert!(
+                (depth - catalogue_ch).abs() < 0.25,
+                "{angle}°: reaches {depth:.2} mm, catalogue cutting height {catalogue_ch:.2} mm"
+            );
+        }
+    }
+
+    #[test]
+    fn the_single_point_thread_mill_reaches_two_millimetres_of_thread() {
+        let lib = ToolLibrary::defaults();
+        let t = lib
+            .tools
+            .iter()
+            .find(|t| matches!(t.kind, ToolKind::ThreadMill { pitch: None }))
+            .expect("a single-point thread mill");
+        // The reach gate reads max thread depth as (cutting ⌀ − neck ⌀) / 2.
+        assert!(((t.diameter - t.neck_dia()) / 2.0 - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn json_round_trips() {
         let lib = ToolLibrary::defaults();
         let json = serde_json::to_string(&lib).unwrap();
@@ -291,10 +514,19 @@ mod tests {
 
     #[test]
     fn face_defaults_to_the_largest_flat_tool() {
-        // Starter library is three end mills (⌀3/6/10) — Face should pick ⌀10.
-        let lib = ToolLibrary::defaults();
+        // Facing wants the widest flat tool (fewest passes). Built here rather than
+        // taken from `defaults()`: what the starter library happens to contain is not
+        // what this rule is about, and coupling the two made the test fail the moment
+        // the library grew.
+        let lib = ToolLibrary {
+            tools: vec![
+                mk(1, 6.0, ToolKind::EndMill),
+                mk(2, 12.0, ToolKind::EndMill),
+                mk(3, 8.0, ToolKind::EndMill),
+            ],
+        };
         let t = lib.default_tool_for(OpKind::Face).unwrap();
-        assert_eq!(t.diameter, 10.0);
+        assert_eq!(t.diameter, 12.0);
         assert!(matches!(t.kind, ToolKind::EndMill));
         // A non-Face op keeps the first library tool ( diameter order is the
         // user's own numbering, not a size preference).
@@ -371,8 +603,12 @@ mod tests {
 
     #[test]
     fn kinded_ops_fall_back_to_first_when_no_matching_kind() {
-        // A library of only end mills: every kinded op still gets a (valid) tool.
-        let lib = ToolLibrary::defaults();
+        // A library of only end mills: every kinded op still gets a (valid) tool. The
+        // shipped library now *has* drills, V-bits and thread mills, so this rule has to
+        // be exercised on a library that deliberately lacks them.
+        let lib = ToolLibrary {
+            tools: vec![mk(1, 6.0, ToolKind::EndMill), mk(2, 10.0, ToolKind::EndMill)],
+        };
         for kind in [OpKind::Drill, OpKind::Thread, OpKind::Chamfer] {
             assert_eq!(
                 lib.default_tool_for(kind).unwrap().number,
@@ -393,8 +629,15 @@ mod tests {
 
     #[test]
     fn new_tool_fills_the_lowest_free_number() {
-        // Starter is 1/2/3; delete #2 so there is a gap.
-        let mut lib = ToolLibrary::defaults();
+        // 1/2/3 with #2 deleted, so there is a gap. Built locally: the rule is about
+        // gaps, not about how many tools ship.
+        let mut lib = ToolLibrary {
+            tools: vec![
+                mk(1, 3.0, ToolKind::EndMill),
+                mk(2, 6.0, ToolKind::EndMill),
+                mk(3, 10.0, ToolKind::EndMill),
+            ],
+        };
         lib.tools.retain(|t| t.number != 2);
         let idx = lib.add_default();
         assert_eq!(lib.tools[idx].number, 2, "the freed #2 is reused, not #4");
@@ -405,7 +648,13 @@ mod tests {
 
     #[test]
     fn set_number_swaps_on_collision() {
-        let mut lib = ToolLibrary::defaults(); // #1, #2, #3
+        let mut lib = ToolLibrary {
+            tools: vec![
+                mk(1, 3.0, ToolKind::EndMill),
+                mk(2, 6.0, ToolKind::EndMill),
+                mk(3, 10.0, ToolKind::EndMill),
+            ],
+        };
         // Move #3 (index 2) onto #1 → the two swap.
         lib.set_number(2, 1);
         assert_eq!(lib.tools[2].number, 1, "target adopted");
@@ -420,8 +669,13 @@ mod tests {
 
     #[test]
     fn add_tool_is_idempotent_by_geometry() {
-        // Starter library is ⌀3/6/10 end mills.
-        let mut lib = ToolLibrary::defaults();
+        let mut lib = ToolLibrary {
+            tools: vec![
+                mk(1, 3.0, ToolKind::EndMill),
+                mk(2, 6.0, ToolKind::EndMill),
+                mk(3, 10.0, ToolKind::EndMill),
+            ],
+        };
         let before = lib.tools.len();
 
         // A genuinely new tool gets the next free number and is inserted.

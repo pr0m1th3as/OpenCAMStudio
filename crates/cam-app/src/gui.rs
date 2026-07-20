@@ -630,7 +630,7 @@ impl std::fmt::Display for CutStyle {
 /// The tool-geometry class as a plain discriminant, for the inspector picker
 /// (a friendlier face on the data-carrying [`ToolKind`], mirroring `PlungeKind`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ToolKindPick {
+pub(crate) enum ToolKindPick {
     EndMill,
     BallMill,
     BullNose,
@@ -667,7 +667,7 @@ impl ToolKindPick {
     }
 
     /// A `ToolKind` of this class with sensible default parameters.
-    fn to_kind(self) -> ToolKind {
+    pub(crate) fn to_kind(self) -> ToolKind {
         match self {
             ToolKindPick::EndMill => ToolKind::EndMill,
             ToolKindPick::BallMill => ToolKind::BallMill,
@@ -706,7 +706,7 @@ impl ToolKindPick {
 /// would leave a scalloped floor), no face mill for profiling or pocketing, and no end
 /// mill for drilling. Those remain *possible* if a tool is set another way; they are
 /// simply not offered.
-fn families_for(kind: OpKind) -> &'static [ToolKindPick] {
+pub(crate) fn families_for(kind: OpKind) -> &'static [ToolKindPick] {
     use ToolKindPick as F;
     match kind {
         // Side-milling a vertical wall: the end-mill family only.
