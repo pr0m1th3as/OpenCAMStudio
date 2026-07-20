@@ -65,6 +65,25 @@ cargo run -p cam-app --features gui    # the desktop GUI
 Stable Rust, pinned in `rust-toolchain.toml`. GUI prerequisites and platform
 notes: [RUNNING.md](RUNNING.md).
 
+## Acknowledgements
+
+OpenCAMStudio owes its design outlook to
+**[OpenCADStudio](https://github.com/HakanSeven12/OpenCADStudio)**, created and
+developed by **[HakanSeven12](https://github.com/HakanSeven12)** and its
+contributors — a Rust CAD application built on `wgpu` and `iced` with a native
+plugin ABI and cross-platform CI. That combination is what this project set out to
+follow: the same language and graphics stack, the same small-core-plus-plugins
+shape, and a deliberately familiar ribbon, so that designing in CAD and then
+machining in CAM feels like one workflow rather than two programs.
+
+The two are **independent projects** with no runtime dependency between them. Both
+are GPL-3.0, which is also what makes the borrowing more than skin-deep: several of
+the ribbon icons here are OpenCADStudio's own, reused unmodified under that licence
+and credited individually in
+[`crates/cam-app/assets/icons/CREDITS.md`](crates/cam-app/assets/icons/CREDITS.md).
+
+With thanks for the example, and for licensing it so that others can build on it.
+
 ## License
 
 [GPL-3.0-only](LICENSE). All dependencies must be GPLv3-compatible (enforced in CI

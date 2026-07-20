@@ -1,7 +1,7 @@
 # ARCHITECTURE
 
 Stable design reference for OpenCAMStudio. Changes here are deliberate design
-decisions, logged in `WORKSTATE.md` → archived to `HISTORY.md`.
+decisions, not incidental drift.
 
 ## Guiding principle
 

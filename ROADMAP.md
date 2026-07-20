@@ -1,7 +1,7 @@
 # ROADMAP
 
-North-star scope and the incremental path to it. Slow-changing; the *current*
-step and its state live in `STATUS.md` / `WORKSTATE.md`.
+North-star scope and the incremental path to it. Slow-changing: this file says
+where the project is going, not what it is doing this week.
 
 ## North star
 
@@ -27,7 +27,7 @@ geometry + live 2D preview), and three further operations, **thread milling**,
 last of them the first to use **two tools in one operation**. The tool generatrix now
 also drives **operation guards** (a tool must cut with a cutting surface) and a
 **profile-aware simulation** in both removal and collision. **P8** (plugin ABI) is the
-next numbered phase. Live per-crate state lives in `WORKSTATE.md` / `STATUS.md`.
+next numbered phase.
 
 | Phase | Goal | Crates | Done when |
 |-------|------|--------|-----------|
