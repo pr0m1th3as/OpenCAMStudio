@@ -34,7 +34,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      # Deliberately NO build cache here (ci.yml keeps one, where speed matters and
+      # the output is thrown away). A shipped binary is built from a clean tree, so
+      # what we hand a user is a function of the commit and nothing else.
+      # This is not hypothetical: rust-cache keys on job name + runner.os + host
+      # triple, none of which distinguish ubuntu-22.04 from ubuntu-latest, so the
+      # 22.04 job restored the 24.04 job's target tree and the build then failed
+      # with "can't find crate for iced" -- having compiled our nine crates and not
+      # one dependency.
       # Only Linux needs these; macOS and Windows carry their own window/GL stack.
       # Kept in step with the `gui build` job in ci.yml.
       - name: "System libraries (Linux: X11/Wayland/GL/font)"
