@@ -34,6 +34,18 @@ iced = { version = "0.14", features = ["wgpu", "svg", "canvas"], optional = true
 wgpu = { version = "27", optional = true }
 rfd = { version = "0.17", optional = true }
 
+# No click-through licence page in the installer. The GPL is not an EULA: section 9
+# is explicit that you need not accept it in order to run the program, so gating
+# installation on an "I agree" would misrepresent it. The full text ships inside the
+# application instead (About), and in the repository.
+[package.metadata.wix]
+eula = false
+
+# Windows-only: embeds the icon and VERSIONINFO into the .exe (see build.rs).
+# MIT/Apache-2.0, both already allowed by deny.toml.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
 [dev-dependencies]
 # Test-only: parse the bundled SVG icons so a malformed one fails loudly instead of
 # rendering as nothing. MPL-2.0, so GPL-3.0-compatible (as acadrust already is).

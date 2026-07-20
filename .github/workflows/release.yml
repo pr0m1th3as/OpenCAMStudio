@@ -55,7 +55,7 @@ jobs:
           cat > $APP/usr/share/applications/opencamstudio.desktop <<'DESKTOP'
           [Desktop Entry]
           Type=Application
-          Name=OpenCAMStudio
+          Name=Open CAM Studio
           Comment=CAM application for CNC toolpath generation
           Exec=opencamstudio %f
           Icon=opencamstudio
@@ -131,7 +131,7 @@ jobs:
         run: |
           set -euo pipefail
           V=${{ steps.ver.outputs.v }}
-          APP="OpenCAMStudio.app"
+          APP="Open CAM Studio.app"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp target/aarch64-apple-darwin/release/opencamstudio "$APP/Contents/MacOS/"
           # .icns from the committed 1024 PNG. sips and iconutil are part of macOS, so
@@ -149,8 +149,8 @@ jobs:
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
-            <key>CFBundleName</key>              <string>OpenCAMStudio</string>
-            <key>CFBundleDisplayName</key>       <string>OpenCAMStudio</string>
+            <key>CFBundleName</key>              <string>Open CAM Studio</string>
+            <key>CFBundleDisplayName</key>       <string>Open CAM Studio</string>
             <key>CFBundleIdentifier</key>        <string>io.github.pr0m1th3as.OpenCAMStudio</string>
             <key>CFBundleVersion</key>           <string>${V#v}</string>
             <key>CFBundleShortVersionString</key><string>${V#v}</string>
@@ -163,7 +163,7 @@ jobs:
           </plist>
           PLIST
           mkdir -p dmg && cp -R "$APP" dmg/ && ln -s /Applications dmg/Applications
-          hdiutil create -volname "OpenCAMStudio" -srcfolder dmg -ov -format UDZO \
+          hdiutil create -volname "Open CAM Studio" -srcfolder dmg -ov -format UDZO \
             "OpenCAMStudio-$V-macos-arm64.dmg"
       # Neither of us has a Mac, so this is the only verification the .dmg gets
       # before a user opens it. It proves everything except that a window appears:
@@ -172,7 +172,7 @@ jobs:
       - name: Verify the bundle and the disk image
         run: |
           set -euo pipefail
-          APP="OpenCAMStudio.app"
+          APP="Open CAM Studio.app"
           plutil -lint "$APP/Contents/Info.plist"
           file "$APP/Contents/MacOS/opencamstudio" | grep -q 'arm64' \
             || { echo "::error::binary is not arm64"; exit 1; }
@@ -184,7 +184,7 @@ jobs:
           MNT=$(hdiutil attach OpenCAMStudio-*.dmg -nobrowse -readonly \
                 | tail -1 | awk '{ $1=""; $2=""; sub(/^  */,""); print }')
           echo "mounted at: $MNT"
-          test -x "$MNT/OpenCAMStudio.app/Contents/MacOS/opencamstudio"
+          test -x "$MNT/Open CAM Studio.app/Contents/MacOS/opencamstudio"
           test -L "$MNT/Applications"
           hdiutil detach "$MNT" >/dev/null
       - name: Checksum
@@ -227,7 +227,13 @@ jobs:
         run: |
           set -euo pipefail
           V=${{ steps.ver.outputs.v }}
-          cargo wix init --force -p cam-app
+          # NOT `cargo wix init` -- that regenerates wix/main.wxs, and with it a fresh
+          # random UpgradeCode on every single build. Windows uses the UpgradeCode to
+          # recognise that a new version supersedes the installed one, so a new GUID
+          # each release means every version installs ALONGSIDE the last instead of
+          # upgrading it. The wxs is committed, reviewed, and its UpgradeCode is fixed
+          # for the life of the product.
+          test -f crates/cam-app/wix/main.wxs
           cargo wix -p cam-app --no-build --nocapture \
             --output "OpenCAMStudio-$V-windows-x86_64-installer.msi"
       - name: Verify the artifacts
@@ -280,7 +286,7 @@ jobs:
           ls -l artifacts/
           gh release create "${GITHUB_REF_NAME}" \
             --repo "${GITHUB_REPOSITORY}" \
-            --title "OpenCAMStudio ${GITHUB_REF_NAME}" \
+            --title "Open CAM Studio ${GITHUB_REF_NAME}" \
             --generate-notes \
             artifacts/*
 

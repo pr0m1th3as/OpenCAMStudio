@@ -29,7 +29,7 @@ fn main() -> iced::Result {
 #[cfg(not(feature = "gui"))]
 fn main() {
     println!(
-        "OpenCAMStudio {} — headless build. Launch the desktop app with:\n    \
+        "Open CAM Studio {} — headless build. Launch the desktop app with:\n    \
          cargo run -p cam-app --features gui",
         env!("CARGO_PKG_VERSION")
     );

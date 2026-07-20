@@ -286,7 +286,7 @@ const SAMPLE_DXF: &str = "\
 /// Launch the desktop application.
 pub fn run() -> iced::Result {
     iced::application(App::new, App::update, App::view)
-        .title("OpenCAMStudio")
+        .title("Open CAM Studio")
         .theme(theme)
         .subscription(App::subscription)
         .run()
@@ -4317,7 +4317,7 @@ impl App {
             column![
                 row![
                     iced::widget::svg(Icon::License.handle()).width(30).height(30),
-                    text(format!("OpenCAMStudio {}", env!("CARGO_PKG_VERSION"))).size(20),
+                    text(format!("Open CAM Studio {}", env!("CARGO_PKG_VERSION"))).size(20),
                 ]
                 .spacing(10)
                 .align_y(Alignment::Center),

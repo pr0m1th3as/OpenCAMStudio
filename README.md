@@ -1,4 +1,4 @@
-# OpenCAMStudio
+# Open CAM Studio
 
 A CAM application for CNC toolpath generation, built in Rust.
 

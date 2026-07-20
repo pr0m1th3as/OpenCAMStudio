@@ -417,6 +417,10 @@ impl ToolLibrary {
 /// `<config-dir>/OpenCAMStudio/tools.json`, or `None` if no config dir is known.
 /// A small no-dependency resolver following each platform's convention.
 fn library_path() -> Option<PathBuf> {
+    // NOT "Open CAM Studio". This is a filesystem path, not a display string:
+    // renaming it would orphan every existing user's library, silently, and the
+    // app would seed a fresh default as though they had never had one. The
+    // display name is spaced; identifiers and paths stay concatenated.
     config_dir().map(|d| d.join("OpenCAMStudio").join("tools.json"))
 }
 
