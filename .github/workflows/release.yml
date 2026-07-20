@@ -17,7 +17,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # 22.04 deliberately, NOT ubuntu-latest: the binary's glibc floor is
+          # whatever the builder has, and 24.04 produced a GLIBC_2.39 requirement
+          # that will not start on Ubuntu 22.04 (2.35) or Debian 12 (2.36) -- i.e.
+          # most shop machines. 22.04 drops the floor to 2.35. (OpenCADStudio's
+          # own AppImage measures at 2.35, so this matches a shipping reference.)
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
@@ -33,7 +38,7 @@ jobs:
       # Only Linux needs these; macOS and Windows carry their own window/GL stack.
       # Kept in step with the `gui build` job in ci.yml.
       - name: "System libraries (Linux: X11/Wayland/GL/font)"
-        if: matrix.os == 'ubuntu-latest'
+        if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
