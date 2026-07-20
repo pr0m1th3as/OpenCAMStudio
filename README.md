@@ -62,6 +62,42 @@ to export.*
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and [ROADMAP.md](ROADMAP.md)
 for the phased plan toward an EdgeCAM-class north star.
 
+## Install
+
+Downloads for each release are on the
+[Releases page](https://github.com/pr0m1th3as/OpenCAMStudio/releases).
+
+| Platform | Download | Notes |
+|---|---|---|
+| **Linux** x86‑64 | `OpenCAMStudio-vX.Y.Z-linux-x86_64.AppImage` | `chmod +x` it and run. Needs glibc 2.35 or newer — Ubuntu 22.04, Debian 12 and anything later. |
+| **Windows** x86‑64 | `…-windows-x86_64-installer.msi` | Installs to Program Files with a Start Menu entry. |
+| | `…-windows-x86_64-portable.exe` | A single self-contained executable — no install, run it from anywhere. |
+| **macOS** Apple silicon | `…-macos-arm64.dmg` | Drag to Applications. Apple silicon only; there is no Intel build. |
+
+Every download has a `.sha256` beside it:
+
+```bash
+sha256sum -c OpenCAMStudio-vX.Y.Z-linux-x86_64.AppImage.sha256
+```
+
+### The binaries are not code-signed
+
+They are built in the open by
+[GitHub Actions](https://github.com/pr0m1th3as/OpenCAMStudio/actions) from the
+tagged commit, but they carry no Authenticode or Apple Developer signature —
+those require paid certificates. **Both operating systems will warn you, and the
+warning is expected rather than a sign that something is wrong:**
+
+- **macOS** refuses to open the app on first launch. Right-click it in Finder and
+  choose **Open**, then confirm — after that it launches normally. (Equivalently:
+  `xattr -d com.apple.quarantine "/Applications/Open CAM Studio.app"`.)
+- **Windows** SmartScreen shows *"Windows protected your PC"*. Choose **More
+  info → Run anyway**.
+
+If you would rather not take our word for any of it, the checksums above let you
+confirm you received exactly what CI produced, and the whole thing builds from
+source in one command — see below.
+
 ## Build & run
 
 ```bash

@@ -284,11 +284,26 @@ jobs:
         run: |
           set -euo pipefail
           ls -l artifacts/
-          gh release create "${GITHUB_REF_NAME}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "Open CAM Studio ${GITHUB_REF_NAME}" \
-            --generate-notes \
-            artifacts/*
+          # A written release note if one exists for this tag, GitHub's generated
+          # one otherwise. `--generate-notes` alone would list every commit since the
+          # previous tag -- and with no previous tag, that is the entire history:
+          # ~190 commits dumped as the first thing anyone reads.
+          NOTES="docs/release-notes/${GITHUB_REF_NAME}.md"
+          if [ -f "$NOTES" ]; then
+            echo "using $NOTES"
+            gh release create "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "Open CAM Studio ${GITHUB_REF_NAME}" \
+              --notes-file "$NOTES" \
+              artifacts/*
+          else
+            echo "::warning::no $NOTES; falling back to generated notes"
+            gh release create "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "Open CAM Studio ${GITHUB_REF_NAME}" \
+              --generate-notes \
+              artifacts/*
+          fi
 
 # NOTE: none of these are code-signed. macOS will refuse the .dmg on first open until
 # the user right-clicks Open (or clears the quarantine attribute), and Windows
