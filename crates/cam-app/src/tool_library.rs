@@ -94,6 +94,7 @@ impl ToolLibrary {
     /// - **Thread mills** — full-profile M5/M6/M8 (Harvey Tool metric); the single-point
     ///   is dimensioned to Andreas's spec of 2 mm maximum thread depth, which the model
     ///   reads as `(diameter − neck) / 2`.
+    /// - **Face mill** — a ⌀50 indexable, copied from Andreas's own library.
     ///
     /// Chamfer cone lengths are derived from the angle and tip flat rather than quoted.
     pub fn defaults() -> Self {
@@ -149,6 +150,19 @@ impl ToolLibrary {
         for (d, corner_radius) in [(6.0, 0.5), (8.0, 1.0), (10.0, 1.5), (12.0, 2.0)] {
             tools.push(mill(number(), d, 4, ToolKind::BullNose { corner_radius }));
         }
+        // A ⌀50 indexable face mill, copied from Andreas's own library — the shape of a
+        // real one, so `Face` seeds something that actually faces rather than reaching
+        // for the widest end mill. Its "flutes" are inserts and its "shank" the arbor.
+        tools.push(Tool {
+            number: number(),
+            diameter: 50.0,
+            flute_length: 25.0,
+            length: 60.0,
+            shank_diameter: 16.0,
+            flutes: 4,
+            kind: ToolKind::FaceMill,
+            ..Default::default()
+        });
         // 90° chamfer mills, ¼″ and ½″.
         for (d, length, tip_diameter) in [(6.35, 50.0, 0.2), (12.7, 63.0, 0.5)] {
             tools.push(pointed(
