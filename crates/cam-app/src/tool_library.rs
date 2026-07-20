@@ -297,24 +297,43 @@ impl ToolLibrary {
     /// library tool (order = the user's own numbering). `None` only when the
     /// library is empty.
     pub fn default_tool_for(&self, kind: OpKind) -> Option<Tool> {
-        let first = |pred: fn(&ToolKind) -> bool| self.tools.iter().find(|t| pred(&t.kind));
+        // The middle tool of its kind, by diameter — not the first.
+        //
+        // "First" meant the *smallest*, because a library is naturally kept in size
+        // order: a new user's first click on Drill seeded the ⌀1, the most fragile drill
+        // in the set, and Profile seeded the ⌀3. A median is only a seed, but a seed
+        // should be the tool most jobs would actually start from.
+        //
+        // Median rather than a target size (say "6 mm"), because this runs against the
+        // *operator's* library, which may hold three tools or three hundred, in any
+        // sizes. A median degrades gracefully; a magic number does not. The lower middle
+        // is taken, so an even count leans small — the cheaper mistake, since an
+        // oversized cutter may not fit the feature at all.
+        let middle = |pred: fn(&ToolKind) -> bool| -> Option<&Tool> {
+            let mut of_kind: Vec<&Tool> = self.tools.iter().filter(|t| pred(&t.kind)).collect();
+            if of_kind.is_empty() {
+                return None;
+            }
+            of_kind.sort_by(|a, b| a.diameter.total_cmp(&b.diameter));
+            Some(of_kind[(of_kind.len() - 1) / 2])
+        };
         let preferred = match kind {
-            // Facing wants the *largest* flat tool (fewest passes) — scallop-safe.
+            // Facing is the exception, and deliberately so: it wants the *largest* flat
+            // tool (fewest passes), which is scallop-safe and what a facing pass is for.
             OpKind::Face => self
                 .tools
                 .iter()
                 .filter(|t| matches!(t.kind, ToolKind::EndMill | ToolKind::FaceMill))
                 .max_by(|a, b| a.diameter.total_cmp(&b.diameter)),
-            // The rest take the first tool of their kind (no size preference).
-            OpKind::Profile | OpKind::Pocket => first(|k| matches!(k, ToolKind::EndMill)),
-            OpKind::Drill => first(|k| matches!(k, ToolKind::Drill { .. })),
-            OpKind::Thread => first(|k| matches!(k, ToolKind::ThreadMill { .. })),
-            OpKind::Chamfer => first(|k| matches!(k, ToolKind::ChamferMill { .. })),
+            OpKind::Profile | OpKind::Pocket => middle(|k| matches!(k, ToolKind::EndMill)),
+            OpKind::Drill => middle(|k| matches!(k, ToolKind::Drill { .. })),
+            OpKind::Thread => middle(|k| matches!(k, ToolKind::ThreadMill { .. })),
+            OpKind::Chamfer => middle(|k| matches!(k, ToolKind::ChamferMill { .. })),
             // Engraving *requires* a V-bit (a chamfer mill's tip does not cut), so
             // this is the one default that matches the strategy's hard gate.
             // Carving *requires* a V-bit too — it is the same gate, for the same
             // reason: the tool's own cone is what shapes the cut.
-            OpKind::Engrave | OpKind::Carve => first(|k| matches!(k, ToolKind::VBit { .. })),
+            OpKind::Engrave | OpKind::Carve => middle(|k| matches!(k, ToolKind::VBit { .. })),
         };
         preferred.or_else(|| self.tools.first()).copied()
     }
@@ -542,12 +561,9 @@ mod tests {
         let t = lib.default_tool_for(OpKind::Face).unwrap();
         assert_eq!(t.diameter, 12.0);
         assert!(matches!(t.kind, ToolKind::EndMill));
-        // A non-Face op keeps the first library tool ( diameter order is the
-        // user's own numbering, not a size preference).
-        assert_eq!(
-            lib.default_tool_for(OpKind::Profile).unwrap().number,
-            lib.tools[0].number
-        );
+        // Face is the exception. Every other kinded op takes the *middle* tool by
+        // diameter, so here ⌀8 rather than the widest.
+        assert_eq!(lib.default_tool_for(OpKind::Profile).unwrap().diameter, 8.0);
     }
 
     #[test]
@@ -602,8 +618,9 @@ mod tests {
     }
 
     #[test]
-    fn profile_and_pocket_pick_the_first_end_mill_past_a_leading_drill() {
-        // A drill numbered first must not become the profile/pocket default.
+    fn profile_and_pocket_ignore_a_leading_drill() {
+        // A drill numbered first must not become the profile/pocket default, whatever
+        // the size rule is. Of the two end mills, the lower middle of {4, 8} is ⌀4.
         let lib = ToolLibrary {
             tools: vec![
                 mk(1, 6.0, ToolKind::Drill { point_angle_deg: 118.0 }),
@@ -611,8 +628,51 @@ mod tests {
                 mk(3, 4.0, ToolKind::EndMill),
             ],
         };
-        assert_eq!(lib.default_tool_for(OpKind::Profile).unwrap().number, 2);
-        assert_eq!(lib.default_tool_for(OpKind::Pocket).unwrap().number, 2);
+        for op in [OpKind::Profile, OpKind::Pocket] {
+            let t = lib.default_tool_for(op).unwrap();
+            assert!(matches!(t.kind, ToolKind::EndMill), "{op:?} took the drill");
+            assert_eq!(t.diameter, 4.0);
+        }
+    }
+
+    #[test]
+    fn kinded_ops_seed_the_middle_size_not_the_smallest() {
+        // The change this rule exists for: a library is naturally kept in size order, so
+        // "first of its kind" meant *smallest* -- a new user's first click on Drill
+        // seeded the ⌀1, the most fragile drill in the set.
+        let lib = ToolLibrary::defaults();
+        let dia = |op| lib.default_tool_for(op).unwrap().diameter;
+        assert_eq!(dia(OpKind::Profile), 6.0, "end mills 3..12 -> ⌀6");
+        assert_eq!(dia(OpKind::Pocket), 6.0);
+        assert_eq!(dia(OpKind::Drill), 5.0, "drills 1..10 -> ⌀5");
+        assert_eq!(dia(OpKind::Chamfer), 6.35, "of 6.35/12.7 the lower middle");
+        // Facing keeps its own rule -- widest flat tool, which is the face mill.
+        assert_eq!(dia(OpKind::Face), 50.0);
+        // A V-bit's size is really its angle; the middle by diameter lands on a
+        // general-purpose one rather than the finest.
+        let v = lib.default_tool_for(OpKind::Engrave).unwrap();
+        let ToolKind::VBit { included_angle_deg, .. } = v.kind else {
+            panic!("engrave must seed a V-bit")
+        };
+        assert!(
+            included_angle_deg >= 45.0,
+            "seeded the {included_angle_deg}° V-bit, the finest and slowest"
+        );
+    }
+
+    #[test]
+    fn a_single_tool_of_a_kind_is_still_chosen() {
+        // The median must not misbehave at the edges: one tool, or two.
+        let one = ToolLibrary { tools: vec![mk(1, 6.0, ToolKind::EndMill)] };
+        assert_eq!(one.default_tool_for(OpKind::Profile).unwrap().diameter, 6.0);
+        let two = ToolLibrary {
+            tools: vec![mk(1, 10.0, ToolKind::EndMill), mk(2, 4.0, ToolKind::EndMill)],
+        };
+        assert_eq!(
+            two.default_tool_for(OpKind::Profile).unwrap().diameter,
+            4.0,
+            "an even count leans small -- an oversized cutter may not fit at all"
+        );
     }
 
     #[test]
