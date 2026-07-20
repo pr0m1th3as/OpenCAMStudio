@@ -8148,6 +8148,79 @@ mod ribbon_tests {
     }
 
     #[test]
+    fn every_svg_in_the_assets_tree_is_well_formed() {
+        // The sweep above only covers what `Icon::ALL` names. The application icon is
+        // not a ribbon icon, so it is in no enum and nothing in the code references
+        // it -- it is read by the packaging workflows instead, where a malformed file
+        // would surface as a blank icon on a shipped AppImage rather than as a test
+        // failure. So walk the directory rather than the enum: an asset is checked
+        // because it exists, not because some code happens to mention it.
+        //
+        // NB this proves well-formedness and nothing more. Parsing would not have
+        // caught either of the other two ways this icon's SVG went wrong (rsvg
+        // ignoring `textLength`, and `dominant-baseline` honoured by rsvg but not by
+        // desktop viewers) -- both parse perfectly and simply render differently.
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("assets dir must be readable") {
+                let path = entry.expect("readable entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "svg") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        let mut svgs = Vec::new();
+        walk(&root, &mut svgs);
+        assert!(
+            svgs.len() > Icon::ALL.len(),
+            "expected the ribbon icons plus at least the application icon, found {}",
+            svgs.len()
+        );
+        for path in &svgs {
+            let text = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("{}: unreadable: {e}", path.display()));
+            let doc = roxmltree::Document::parse(&text)
+                .unwrap_or_else(|e| panic!("{}: not well-formed SVG: {e}", path.display()));
+            assert_eq!(
+                doc.root_element().tag_name().name(),
+                "svg",
+                "{}: root element is not <svg>",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn the_application_icon_carries_its_author_and_licence() {
+        // The app icon is the project's one deliberate departure from GPL-3.0-only
+        // (CC BY-SA 4.0, so the mark can live on Wikimedia). That exception is only
+        // worth anything if the claim actually travels with the file, and the file
+        // goes through editors -- Inkscape rewrote it once already -- so pin it.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("opencamstudio.svg");
+        let text = std::fs::read_to_string(&path).expect("the application icon must exist");
+        let doc = roxmltree::Document::parse(&text).expect("well-formed");
+        assert!(
+            text.contains("Andreas Bertsatos"),
+            "the application icon must name its author"
+        );
+        assert!(
+            text.contains("creativecommons.org/licenses/by-sa/4.0/"),
+            "the application icon must declare CC BY-SA 4.0"
+        );
+        // Outlines, not live text: a <text> element would make the rendered icon
+        // depend on whichever font the packaging runner happens to have installed,
+        // and Linux, macOS and Windows would each resolve it differently.
+        assert!(
+            !doc.descendants().any(|n| n.has_tag_name("text")),
+            "the application icon must contain no live <text>; convert glyphs to paths"
+        );
+    }
+
+    #[test]
     fn every_icon_is_listed_in_all() {
         // A cheap guard on the sweep above: if a variant is added without extending
         // ALL, the icon it names goes unchecked.

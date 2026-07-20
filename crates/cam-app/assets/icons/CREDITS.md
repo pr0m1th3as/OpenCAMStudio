@@ -1,6 +1,20 @@
-# Ribbon icon credits
+# Icon credits
 
-All icons here are **GPL-3.0-only**, matching this project.
+All icons **in this directory** are **GPL-3.0-only**, matching this project.
+
+> **The application icon is the one exception, and it is deliberate.**
+> `../opencamstudio.svg` (and the PNGs rendered from it) is **CC BY-SA 4.0
+> International, © Andreas Bertsatos** — not GPL-3.0. It is licensed that way so the
+> mark can be used and attributed on Wikipedia and Wikimedia Commons, whose corpus
+> runs on CC BY-SA 4.0 and where GPL images are second-class. Compatibility is
+> **one-way**: CC BY-SA 4.0 material may be used inside a GPLv3 work, never the
+> reverse, so that file can never be relicensed to match the icons here.
+>
+> Its letterforms are outlines of **DejaVu Sans Bold**, extracted with `fontTools`.
+> DejaVu is distributed under the Bitstream Vera Fonts Copyright, which permits
+> redistribution and modification; the outlines are embedded as path data, so the
+> icon depends on no installed font at render time. Noted here because the file
+> asserts authorship and a licence, and it is not wholly original work.
 
 ## Vendored from OpenCADStudio
 
