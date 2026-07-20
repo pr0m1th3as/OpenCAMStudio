@@ -50,35 +50,45 @@
 //! ## Linking the rings: why staying down is safe
 //!
 //! A carve runs to hundreds of rings, and lifting to clearance for each costs far more
-//! time than the cutting does. [`CarveOp::stay_down`] links them instead — and that is
-//! not a gamble, it is a theorem.
+//! time than the cutting does. [`CarveOp::stay_down`] links them instead, and the licence
+//! for that is one identity plus one monotonicity.
 //!
-//! Write `f(w)` for `vtip_depth_for_half_width` — the tool's own profile height at
-//! radial offset `w`. Put the tool at inward distance `d` with its tip at the depth of
-//! the ring at `w`, i.e. `f(w)`. The material it removes at inward distance `x` is
-//!
-//! ```text
-//! cut(x) = f(w) − f(|x − d|)
-//! ```
-//!
-//! and the surface the carve *intends* at `x` is `f(x)`. So the link gouges only if
-//! `f(w) − f(|x − d|) > f(x)` for some `x`. Take the worst case `d = w` (the tool right
-//! on the ring); the condition for **no** gouge becomes
+//! Write `f(w)` for [`vtip_depth_for_half_width`], the tool's own profile height at radial
+//! offset `w`. A ring at inward distance `w` sinks the tip to `f(w)`, so **at the stock
+//! top the tool is exactly `w` wide on each side** — that is what `f` and
+//! [`vtip_half_width`] being inverses *means*, and it is the defining property of the
+//! whole schedule: the flank lands on the boundary. Hence a tool carried at that depth,
+//! centred at inward distance `d`, occupies exactly
 //!
 //! ```text
-//! f(x) + f(w − x) ≥ f(w)      for all 0 ≤ x ≤ w
+//! [d − w,  d + w]
 //! ```
 //!
-//! which is exactly **superadditivity**, and `f` is convex with `f(0) = 0` — the ball
-//! branch `rt − √(rt² − w²)` is convex, the flank branch is linear, and they join
-//! smoothly — so it holds. Any `d > w` only moves the tool further from the wall, which
-//! is more slack, not less.
+//! in distance-from-the-boundary. So it stays off the boundary **iff `d ≥ w`** — nothing
+//! subtler than that. There is no material above the stock top for the wider part of the
+//! cone to reach.
+//!
+//! It also cannot cut below the finished surface. That surface is the envelope of the
+//! *deepest* ring, and for a fixed `x` the cut a ring at `w` makes,
+//! `f(w) − f(w − x)`, is **increasing in `w`** — its derivative is
+//! `f′(w) − f′(w − x) ≥ 0` because `f` is convex (the ball branch `rt − √(rt² − w²)` is
+//! convex, the flank is linear, and they join smoothly). So no shallower pass ever
+//! reaches deeper than the deepest one, and a link at a shallower ring's depth is
+//! bounded by the surface that ring's own pass already cut.
 //!
 //! The condition to check per link is therefore just **`d ≥ w` all the way along it**:
 //! the traverse must stay inside the inward-offset region the ring itself bounds. That
 //! region is already in hand (it *is* the ring), so each link is verified against it and
 //! the ones that fail — a link that would cut a corner across a concave notch, or hop
 //! between two disjoint components — fall back to a lift.
+//!
+//! **A correction worth keeping**, because the wrong version was written here first: the
+//! no-gouge condition is *not* `f(x) + f(w − x) ≥ f(w)`. That inequality is false — `f`
+//! is convex with `f(0) = 0`, hence **super**additive, so it runs the other way. A single
+//! pass genuinely does cut deeper than the nominal `depth(x) = f(x)` curve near the
+//! boundary, and that is correct rather than a gouge: the nominal curve is the tool's
+//! *profile*, only ever realised at the tip, while the wall a V-bit actually leaves is its
+//! straight flank.
 //!
 //! ## Depth is capped, not commanded
 //!
@@ -561,10 +571,12 @@ impl Strategy for CarveStrategy {
         //   goes there, so those would stand as raised nubs on the finished floor.
         //
         // Either way the V-bit runs concentric rings at **constant** full depth over
-        // whatever is left. That is gouge-free by the same superadditivity argument that
-        // licenses the stay-down links: with the tip at `f(w_max)` anywhere at or beyond
-        // `w_max` from the boundary, `f(s) + f(w_max − s) ≥ f(w_max)` bounds what the cone
-        // can reach back out to the wall.
+        // whatever is left, and it is safe for the same two reasons the stay-down links
+        // are. Its tip sits at `f(w_max)`, so at the stock top it is `w_max` wide on each
+        // side and stays off the boundary anywhere at or beyond `w_max` from it — which
+        // is the whole flat land, by definition. And where its cone reaches back out over
+        // the wall, at distance `x` it cuts to `f(w_max) − f(d − x) <= f(w_max) −
+        // f(w_max − x)`, exactly the surface the deepest wall ring already left.
         let floor_region = if swept.is_empty() {
             flat.clone()
         } else {
@@ -983,9 +995,10 @@ const LINK_SAMPLE_CAP: usize = 256;
 /// computed for, without cutting below the surface the carve intends.
 ///
 /// The whole condition is that the traverse stays at or beyond the ring's own inward
-/// distance from the boundary — that is, inside `region` — which the module docs derive
-/// from the convexity of the tool's profile. Both endpoints sit *on* `region`'s boundary
-/// by construction, so it is the interior of the segment that is interrogated.
+/// distance from the boundary — that is, inside `region`. At the ring's depth the tool is
+/// exactly that distance wide at the stock top (see the module docs), so anywhere inside
+/// `region` it cannot reach the boundary. Both endpoints sit *on* `region`'s boundary by
+/// construction, so it is the interior of the segment that is interrogated.
 ///
 /// A link that crosses between two disjoint components of `region` fails, as it must:
 /// the gap between them is exactly the material the tool must not plough through.
@@ -1070,6 +1083,10 @@ mod tests {
             assert!((g - w).abs() < 1e-9, "got {got:?} want {want:?}");
         }
     }
+
+    /// Bits spanning the useful range, for the geometric safety properties.
+    const VBITS_FOR_SAFETY: &[(f64, f64)] =
+        &[(90.0, 0.0), (90.0, 0.2), (60.0, 0.3), (30.0, 0.05), (120.0, 0.4), (150.0, 0.1)];
 
     fn vbit(included_angle_deg: f64, tip_radius: f64) -> Tool {
         Tool {
@@ -2438,6 +2455,54 @@ mod tests {
                 assert!(
                     (cut - nominal).abs() < 1e-9,
                     "deg={deg} x={x}: one pass gives {cut}, nominal {nominal}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_shallower_ring_never_cuts_deeper_than_the_deepest_one() {
+        // The second leg of the safety argument, and the one that is easy to get
+        // backwards: for a fixed point x, the depth a ring at w reaches there,
+        // f(w) - f(w - x), must be INCREASING in w. That is what makes the finished
+        // surface the envelope of the deepest ring, and what bounds every stay-down
+        // link and every floor pass. It follows from f being convex -- but a comment
+        // saying so is exactly what was wrong here before, so measure it.
+        for &(deg, rt) in VBITS_FOR_SAFETY {
+            let a = (deg * 0.5_f64).to_radians();
+            for i in 1..40 {
+                let x = i as f64 * 0.05;
+                let mut prev = f64::MIN;
+                let mut w = x;
+                while w <= 6.0 {
+                    let cut = vtip_depth_for_half_width(a, rt, w)
+                        - vtip_depth_for_half_width(a, rt, w - x);
+                    assert!(
+                        cut >= prev - 1e-12,
+                        "deg={deg} rt={rt} x={x}: ring at w={w} cuts {cut}, shallower cut {prev}"
+                    );
+                    prev = cut;
+                    w += 0.05;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_ring_is_exactly_its_own_width_at_the_stock_top() {
+        // The first leg: a ring at inward distance w sinks the tip to f(w), and the tool
+        // is then exactly w wide on each side at the surface -- so at inward distance
+        // d >= w it spans [d-w, d+w] and cannot reach the boundary. Everything the
+        // stay-down guard does rests on this one identity.
+        for &(deg, rt) in VBITS_FOR_SAFETY {
+            let a = (deg * 0.5_f64).to_radians();
+            for i in 1..40 {
+                let w = i as f64 * 0.1;
+                let tip = vtip_depth_for_half_width(a, rt, w);
+                let half_width_at_surface = vtip_half_width(a, rt, tip);
+                assert!(
+                    (half_width_at_surface - w).abs() < 1e-9,
+                    "deg={deg} rt={rt}: ring at {w} is {half_width_at_surface} wide at the top"
                 );
             }
         }
