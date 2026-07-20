@@ -1662,6 +1662,35 @@ fn is_start_field(field: Field) -> bool {
     matches!(field, Field::StartOffX | Field::StartOffY | Field::StartOffZ)
 }
 
+/// Whether any of `visible`'s edit buffers has diverged from the model.
+///
+/// Free-standing, and taking the model read as a closure, so the rule can be tested
+/// without standing up a GUI — `inspector_dirty` is otherwise unreachable from a
+/// headless test, and an always-on Apply button is exactly the kind of thing that
+/// goes unnoticed for months.
+///
+/// A buffer that will not parse counts as **dirty**: the operator has typed
+/// something, even if it is not yet a number. Apply stays disabled in that case
+/// anyway, via `any_field_invalid`. A field with no buffer at all counts as clean —
+/// nothing has been typed into it.
+fn fields_are_dirty(
+    visible: &[Field],
+    buffers: &BTreeMap<Field, String>,
+    committed: impl Fn(Field) -> Option<f64>,
+) -> bool {
+    visible.iter().any(|&f| {
+        let Some(model) = committed(f) else {
+            return false;
+        };
+        match buffers.get(&f) {
+            // `fmt_num` round-trips an f64 exactly, so an untouched buffer parses
+            // back to precisely the value it was seeded with.
+            Some(text) => text.parse::<f64>().map(|v| v != model).unwrap_or(true),
+            None => false,
+        }
+    })
+}
+
 /// Whether a field belongs to a carve's **clearing pass** rather than to the carve
 /// itself. These render in their own section under the clearing tool, not mixed in with
 /// the V-bit's own numbers — two tools, two blocks.
@@ -2899,6 +2928,9 @@ impl App {
                     Operation::Chamfer(c) => c.side = side,
                     _ => {}
                 });
+                // The visible field set can change with this choice, so reseed the
+                // buffers -- a newly revealed field would otherwise render blank.
+                self.refresh_fields();
                 self.rerun();
             }
             Message::ThreadInternalChanged(internal) => {
@@ -2964,6 +2996,9 @@ impl App {
                         };
                     }
                 });
+                // The visible field set can change with this choice, so reseed the
+                // buffers -- a newly revealed field would otherwise render blank.
+                self.refresh_fields();
                 self.rerun();
             }
             Message::CarveClearToolChanged(index) => {
@@ -2995,6 +3030,9 @@ impl App {
                         }
                     }
                 });
+                // The visible field set can change with this choice, so reseed the
+                // buffers -- a newly revealed field would otherwise render blank.
+                self.refresh_fields();
                 self.rerun();
             }
             Message::CarveClearClimbToggled(on) => {
@@ -3015,6 +3053,9 @@ impl App {
                         }
                     }
                 });
+                // The visible field set can change with this choice, so reseed the
+                // buffers -- a newly revealed field would otherwise render blank.
+                self.refresh_fields();
                 self.rerun();
             }
             Message::CarveClearLeadOutChanged(kind) => {
@@ -3025,6 +3066,9 @@ impl App {
                         }
                     }
                 });
+                // The visible field set can change with this choice, so reseed the
+                // buffers -- a newly revealed field would otherwise render blank.
+                self.refresh_fields();
                 self.rerun();
             }
             Message::NewTool => {
@@ -3712,7 +3756,14 @@ impl App {
     /// so the Apply button keeps its usual (validity-only) gating.
     fn inspector_dirty(&self) -> bool {
         if !self.library_mode() {
-            return true;
+            // Same promise the Tooling editor makes, everywhere else: Apply is live only
+            // when something is actually pending. The buffers are seeded from the model
+            // by `refresh_fields`, so an untouched inspector compares equal all the way
+            // down and the button stays grey — which is what tells the operator, at a
+            // glance, whether an edit has been committed or is still sitting in the box.
+            return fields_are_dirty(&self.inspector_fields(), &self.fields, |f| {
+                self.field_value(f)
+            });
         }
         match (self.tool_edit, self.library.tools.get(self.lib_sel)) {
             (Some(edit), Some(saved)) => edit != *saved,
@@ -5420,7 +5471,8 @@ impl App {
                 .spacing(8)
                 .align_y(Alignment::Center),
             );
-            // Apply is disabled while any field is invalid.
+            // Apply is live only when an edit is pending and valid — the same rule in
+            // both inspectors, so the button means one thing everywhere.
             list = list.push(
                 button("Apply").on_press_maybe((!self.any_field_invalid() && self.inspector_dirty()).then_some(Message::Apply)),
             );
@@ -7940,6 +7992,81 @@ mod inspector_field_tests {
         };
         assert!(!cham.profile().has_cutting_tip(), "flat tip must not cut");
         assert!(vbit.profile().has_cutting_tip(), "rounded tip must cut");
+    }
+
+    // --- the Apply button's dirty rule ---
+
+    #[test]
+    fn an_untouched_inspector_is_not_dirty() {
+        // The whole point: Apply greys out until something is actually pending, so the
+        // operator can see at a glance what has been committed and what has not.
+        let visible = [Field::Depth, Field::Feed, Field::Stepdown];
+        let model = |f: Field| match f {
+            Field::Depth => Some(4.0),
+            Field::Feed => Some(300.0),
+            Field::Stepdown => Some(2.0),
+            _ => None,
+        };
+        let mut buffers = BTreeMap::new();
+        for f in visible {
+            buffers.insert(f, fmt_num(model(f).unwrap()));
+        }
+        assert!(!fields_are_dirty(&visible, &buffers, model));
+
+        // Retyping the same number in a different but equal form is still not a change.
+        buffers.insert(Field::Depth, "4.000".to_string());
+        assert!(!fields_are_dirty(&visible, &buffers, model));
+    }
+
+    #[test]
+    fn a_changed_field_makes_the_inspector_dirty() {
+        let visible = [Field::Depth, Field::Feed];
+        let model = |f: Field| match f {
+            Field::Depth => Some(4.0),
+            Field::Feed => Some(300.0),
+            _ => None,
+        };
+        let mut buffers = BTreeMap::new();
+        buffers.insert(Field::Depth, "4".to_string());
+        buffers.insert(Field::Feed, "300".to_string());
+        assert!(!fields_are_dirty(&visible, &buffers, model));
+        buffers.insert(Field::Depth, "4.5".to_string());
+        assert!(fields_are_dirty(&visible, &buffers, model));
+    }
+
+    #[test]
+    fn half_typed_counts_as_dirty_but_an_unseeded_field_does_not() {
+        let visible = [Field::Depth, Field::Feed];
+        let model = |f: Field| match f {
+            Field::Depth => Some(4.0),
+            Field::Feed => Some(300.0),
+            _ => None,
+        };
+        // Mid-typing something that is not yet a number ("-", "") is a pending edit.
+        // Apply stays disabled regardless, via `any_field_invalid`.
+        let mut buffers = BTreeMap::new();
+        buffers.insert(Field::Depth, "-".to_string());
+        assert!(fields_are_dirty(&visible, &buffers, model));
+
+        // But "4." is not half-typed, it is four: Rust parses it, and the comparison is
+        // numeric, so it correctly reads as no change at all.
+        buffers.insert(Field::Depth, "4.".to_string());
+        assert!(!fields_are_dirty(&visible, &buffers, model));
+
+        // A field the model exposes but that has no buffer yet -- a control just
+        // revealed by a picker -- is not an edit. Nothing has been typed into it.
+        let buffers = BTreeMap::new();
+        assert!(!fields_are_dirty(&visible, &buffers, model));
+    }
+
+    #[test]
+    fn a_field_the_model_has_no_value_for_is_ignored() {
+        // Start-point offsets read `None` when no start point is set; a stale buffer for
+        // one must not light Apply up forever.
+        let visible = [Field::StartOffX];
+        let mut buffers = BTreeMap::new();
+        buffers.insert(Field::StartOffX, "12".to_string());
+        assert!(!fields_are_dirty(&visible, &buffers, |_| None));
     }
 
     fn drill(peck: Option<f64>, dwell: Option<f64>) -> Operation {
