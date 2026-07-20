@@ -53,6 +53,11 @@ jobs:
         run: cargo clippy -p cam-app --features gui -- -D warnings
       - name: Build (gui + gpu)
         run: cargo build -p cam-app --features gui
+      # The shell's own tests -- ~105 of them -- are behind the `gui` feature, so the
+      # headless job above never runs them. They are pure logic (no window, no adapter:
+      # verified to pass with DISPLAY and WAYLAND_DISPLAY both unset), so this job can.
+      - name: Test (gui + gpu)
+        run: cargo test -p cam-app --features gui
 
   licenses:
     name: license check (GPLv3-compat)
