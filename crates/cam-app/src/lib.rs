@@ -23,7 +23,7 @@ pub use controller::{
     Selection, SnapHit, SnapKind,
 };
 pub use project::{OcamFile, Project};
-pub use tool_library::ToolLibrary;
+pub use tool_library::{families_for, ToolKindPick, ToolLibrary};
 
 #[cfg(feature = "gui")]
 pub mod gui;

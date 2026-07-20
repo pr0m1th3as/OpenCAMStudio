@@ -28,7 +28,10 @@ use cam_model::{
 use cam_post::PostKind;
 
 use crate::project::OcamFile;
-use crate::tool_library::ToolLibrary;
+// `ToolKindPick`/`families_for` are plain data (an operation's tool families), so they
+// live with the library rather than in this shell -- that is what lets the headless
+// tests assert the starter library can start every operation.
+use crate::tool_library::{families_for, ToolKindPick, ToolLibrary};
 
 /// Ribbon palette and metrics, adopted from **OpenCADStudio**'s ribbon
 /// (`HakanSeven12/OpenCADStudio`, GPL-3.0) so users moving CAD → CAM meet a
@@ -624,108 +627,6 @@ impl std::fmt::Display for CutStyle {
             CutStyle::Climb => "Climb",
             CutStyle::Conventional => "Conventional",
         })
-    }
-}
-
-/// The tool-geometry class as a plain discriminant, for the inspector picker
-/// (a friendlier face on the data-carrying [`ToolKind`], mirroring `PlungeKind`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ToolKindPick {
-    EndMill,
-    BallMill,
-    BullNose,
-    ChamferMill,
-    Drill,
-    FaceMill,
-    ThreadMill,
-    VBit,
-}
-
-impl ToolKindPick {
-    const ALL: [ToolKindPick; 8] = [
-        ToolKindPick::EndMill,
-        ToolKindPick::BallMill,
-        ToolKindPick::BullNose,
-        ToolKindPick::ChamferMill,
-        ToolKindPick::Drill,
-        ToolKindPick::FaceMill,
-        ToolKindPick::ThreadMill,
-        ToolKindPick::VBit,
-    ];
-
-    fn of(kind: ToolKind) -> Self {
-        match kind {
-            ToolKind::EndMill => ToolKindPick::EndMill,
-            ToolKind::BallMill => ToolKindPick::BallMill,
-            ToolKind::BullNose { .. } => ToolKindPick::BullNose,
-            ToolKind::ChamferMill { .. } => ToolKindPick::ChamferMill,
-            ToolKind::Drill { .. } => ToolKindPick::Drill,
-            ToolKind::FaceMill => ToolKindPick::FaceMill,
-            ToolKind::ThreadMill { .. } => ToolKindPick::ThreadMill,
-            ToolKind::VBit { .. } => ToolKindPick::VBit,
-        }
-    }
-
-    /// A `ToolKind` of this class with sensible default parameters.
-    pub(crate) fn to_kind(self) -> ToolKind {
-        match self {
-            ToolKindPick::EndMill => ToolKind::EndMill,
-            ToolKindPick::BallMill => ToolKind::BallMill,
-            ToolKindPick::BullNose => ToolKind::BullNose { corner_radius: 1.0 },
-            // A chamfer mill is always ground with a flat tip; 0 would make it a
-            // V-bit. 0.2 mm is a typical small flat.
-            ToolKindPick::ChamferMill => ToolKind::ChamferMill {
-                included_angle_deg: 90.0,
-                tip_diameter: 0.2,
-            },
-            ToolKindPick::Drill => ToolKind::Drill {
-                point_angle_deg: 118.0,
-            },
-            ToolKindPick::FaceMill => ToolKind::FaceMill,
-            ToolKindPick::ThreadMill => ToolKind::ThreadMill { pitch: None },
-            // A V-bit's point is always ground to a radius; 0 is unmakeable. 0.1 mm
-            // is a typical carving tip.
-            ToolKindPick::VBit => ToolKind::VBit {
-                included_angle_deg: 60.0,
-                tip_radius: 0.1,
-            },
-        }
-    }
-}
-
-/// The tool families offered for an operation, in the order shown.
-///
-/// A *family* is exactly a group in the Tool Library (the eight [`ToolKind`] classes),
-/// so the wizard and the library speak the same vocabulary. Bounding the list by
-/// operation is what keeps a library of hundreds usable: a pocket has no business
-/// listing drills or chamfer mills.
-///
-/// The strategy guards are the hard floor — anything here that could still not cut
-/// would be refused at Run time anyway — but this list is deliberately **narrower**
-/// than "whatever would not error", agreed with Andreas: no ball-nose for facing (it
-/// would leave a scalloped floor), no face mill for profiling or pocketing, and no end
-/// mill for drilling. Those remain *possible* if a tool is set another way; they are
-/// simply not offered.
-pub(crate) fn families_for(kind: OpKind) -> &'static [ToolKindPick] {
-    use ToolKindPick as F;
-    match kind {
-        // Side-milling a vertical wall: the end-mill family only.
-        OpKind::Profile | OpKind::Pocket => &[F::EndMill, F::BallMill, F::BullNose],
-        // A flat floor: flat-bottomed tools (a bull-nose floor is still flat).
-        OpKind::Face => &[F::EndMill, F::BullNose, F::FaceMill],
-        OpKind::Drill => &[F::Drill],
-        OpKind::Thread => &[F::ThreadMill],
-        // A chamfer is cut by the flank, which both of these have.
-        OpKind::Chamfer => &[F::ChamferMill, F::VBit],
-        // Engraving cuts with the tip; a chamfer mill's flat does not cut.
-        // Carving cuts with the tip too, and its geometry comes from the cone.
-        OpKind::Engrave | OpKind::Carve => &[F::VBit],
-    }
-}
-
-impl std::fmt::Display for ToolKindPick {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.to_kind().to_string().as_str())
     }
 }
 
