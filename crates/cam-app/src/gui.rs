@@ -4567,13 +4567,27 @@ impl App {
             tabs = tabs.push(tab_btn(tab));
         }
         // `About` is NOT a tab: it opens the licence-and-credits popup instead of
-        // switching the band below. A tab strip promises that every entry changes the
-        // ribbon under it, so this one is pushed to the far right, away from the tabs
-        // and separated by the fill, to signal that it is an action rather than a tab
-        // before it is clicked. (Same reasoning as Office's File tab.) It also does
-        // not belong under View, which means "what the viewport shows".
+        // switching the band below. It sits immediately after View, where a user
+        // looks for it, rather than exiled to the window's right edge. A tab strip
+        // does promise that every entry changes the ribbon under it, so a hairline
+        // divider marks the boundary -- enough to say "different kind of thing"
+        // without separating it from the group it belongs with.
         tabs = tabs
-            .push(Space::new().width(Length::Fill))
+            .push(
+                // The colour goes on the 1px inner container; the padding that spaces
+                // it from its neighbours goes on the outer one. A container paints its
+                // background across its padding as well, so styling the padded
+                // container directly would draw a 15px filled block, not a hairline.
+                container(
+                    container(Space::new().width(1).height(16)).style(|_theme| {
+                        container::Style {
+                            background: Some(Background::Color(palette::BORDER_DARK)),
+                            ..container::Style::default()
+                        }
+                    }),
+                )
+                .padding(Padding::from([0.0, 7.0])),
+            )
             .push(
                 button(text("About").size(12))
                     .padding(Padding::from([5.0, 14.0]))
