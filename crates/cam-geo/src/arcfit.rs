@@ -28,6 +28,21 @@ pub enum PathSeg {
 /// fits a huge circle that is not a meaningful arc).
 const MAX_ARC_RADIUS: f64 = 1.0e5;
 
+/// How large an arc's radius may be relative to the extent of the points it is fitted
+/// through, before the fit is rejected as spurious.
+///
+/// An absolute cap is not enough, and the gap it left was a real one: a **closed** run
+/// has `start == end`, so the near-straight test below — which measures bulge from the
+/// start–end chord — has no chord to measure against and cannot fire. A tiny degenerate
+/// loop then accepted a circumcircle metres across, and was emitted as a `G2/G3` whose
+/// endpoints coincide: a **full circle**, at feed, right across the machine.
+///
+/// Judging the radius against the run's own extent closes it for open and closed runs
+/// alike. A true circle has `radius = extent / 2`; a 10° arc about `5.7 × extent`. Past
+/// this ratio the "arc" is indistinguishable from a straight line over the span it
+/// covers, so emitting lines is both safer and no less accurate.
+const MAX_ARC_RADIUS_PER_EXTENT: f64 = 20.0;
+
 /// Fit arcs to a polyline, returning the reconstructed segments in order.
 pub fn fit_arcs(points: &[Point], tol: f64) -> Vec<PathSeg> {
     let n = points.len();
@@ -39,6 +54,26 @@ pub fn fit_arcs(points: &[Point], tol: f64) -> Vec<PathSeg> {
     let mut i = 0;
     while i + 1 < n {
         if let Some((center, ccw, end_idx)) = grow_arc(points, i, tol) {
+            // Never emit one arc whose endpoints coincide. `G2`/`G3` with equal start and
+            // end means a **full circle** on most controls and a no-op on others — an
+            // ambiguity no post can resolve, and a 360° sweep is not what a closed run
+            // through a handful of points is asking for. Split it in two, which every
+            // dialect reads identically.
+            if points[i].distance(points[end_idx]) <= tol {
+                let mid = i + (end_idx - i) / 2;
+                segs.push(PathSeg::Arc {
+                    end: points[mid],
+                    center,
+                    ccw,
+                });
+                segs.push(PathSeg::Arc {
+                    end: points[end_idx],
+                    center,
+                    ccw,
+                });
+                i = end_idx;
+                continue;
+            }
             segs.push(PathSeg::Arc {
                 end: points[end_idx],
                 center,
@@ -99,16 +134,26 @@ fn grow_arc(points: &[Point], i: usize, tol: f64) -> Option<(Point, bool, usize)
     if end < i + 3 {
         return None;
     }
+    // The radius must be commensurate with the ground the run actually covers. This is
+    // the guard that holds for a *closed* run, where the chord test below is blind.
+    let extent = extent_of(&points[i..=end]);
+    if radius > MAX_ARC_RADIUS_PER_EXTENT * extent {
+        return None;
+    }
     // Reject near-straight runs: a real arc bulges from its start–end chord by
     // much more than the fit tolerance, whereas a straight edge meeting an arc
     // fits a huge, near-flat spurious circle that does not.
     let (a, b) = (points[i], points[end]);
-    let bulge = points[i + 1..end]
-        .iter()
-        .map(|p| perp_distance(a, b, *p))
-        .fold(0.0_f64, f64::max);
-    if bulge <= 2.0 * tol {
-        return None;
+    // Only meaningful when there *is* a chord: a closed run is judged by the extent
+    // test above instead.
+    if a.distance(b) > tol {
+        let bulge = points[i + 1..end]
+            .iter()
+            .map(|p| perp_distance(a, b, *p))
+            .fold(0.0_f64, f64::max);
+        if bulge <= 2.0 * tol {
+            return None;
+        }
     }
     // The circumcircle of the first three points is ill-conditioned: three closely
     // spaced, grid-quantised samples throw the centre off by microns, so the run's
@@ -189,6 +234,20 @@ fn det3(m: [[f64; 3]; 3]) -> f64 {
     m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
         - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
         + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+}
+
+/// The extent of a run of points: the diagonal of their bounding box. A cheap stand-in
+/// for "how much ground does this cover", used to judge whether a fitted radius is
+/// plausible.
+fn extent_of(points: &[Point]) -> f64 {
+    let (mut lo_x, mut hi_x, mut lo_y, mut hi_y) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+    for p in points {
+        lo_x = lo_x.min(p.x);
+        hi_x = hi_x.max(p.x);
+        lo_y = lo_y.min(p.y);
+        hi_y = hi_y.max(p.y);
+    }
+    (hi_x - lo_x).hypot(hi_y - lo_y)
 }
 
 /// The sagitta of a chord of length `chord` on a circle of `radius`: how far the
@@ -374,3 +433,90 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod full_circle_guard_tests {
+    use super::*;
+
+    /// A near-degenerate closed loop: three almost-coincident points closed back to the
+    /// first. Its circumcircle is metres across, and because the run is closed there is
+    /// no start-end chord for the near-straight test to measure, so it used to be
+    /// accepted -- and emitted as a G2/G3 with equal endpoints, which is a FULL CIRCLE
+    /// at feed rate, right across the machine.
+    #[test]
+    fn a_degenerate_closed_loop_never_becomes_a_giant_arc() {
+        let pts = vec![
+            Point::new(40.20, 30.10),
+            Point::new(40.35, 30.14),
+            Point::new(40.50, 30.19),
+            Point::new(40.20, 30.10),
+        ];
+        for seg in fit_arcs(&pts, 0.01) {
+            if let PathSeg::Arc { end, center, .. } = seg {
+                let r = center.distance(end);
+                assert!(r < 5.0, "fitted a {r:.1} mm arc through a 0.3 mm loop");
+            }
+        }
+    }
+
+    #[test]
+    fn a_real_circle_is_split_rather_than_emitted_as_one_full_turn() {
+        // A genuine circular ring must still come out as arcs -- but never as a single
+        // arc whose start and end coincide: that is a full circle on most controls and a
+        // no-op on others, an ambiguity no post can resolve.
+        let n = 64;
+        let mut pts: Vec<Point> = (0..n)
+            .map(|k| {
+                let a = std::f64::consts::TAU * k as f64 / n as f64;
+                Point::new(40.0 + 6.0 * a.cos(), 30.0 + 6.0 * a.sin())
+            })
+            .collect();
+        pts.push(pts[0]);
+        let segs = fit_arcs(&pts, 0.01);
+        let arcs: Vec<_> = segs
+            .iter()
+            .filter_map(|s| match s {
+                PathSeg::Arc { end, center, .. } => Some((*end, *center)),
+                _ => None,
+            })
+            .collect();
+        assert!(arcs.len() >= 2, "a full circle must be split, got {segs:?}");
+        // Still the right circle.
+        for (end, center) in &arcs {
+            assert!(
+                (center.distance(*end) - 6.0).abs() < 0.05,
+                "radius {:.3} is not 6", center.distance(*end)
+            );
+            assert!(center.distance(Point::new(40.0, 30.0)) < 0.05, "centre moved");
+        }
+        // And no single arc closes on itself.
+        let mut cur = pts[0];
+        for s in &segs {
+            let end = match s {
+                PathSeg::Arc { end, .. } | PathSeg::Line { end } => *end,
+            };
+            if matches!(s, PathSeg::Arc { .. }) {
+                assert!(cur.distance(end) > 1e-6, "an arc closed on itself");
+            }
+            cur = end;
+        }
+    }
+
+    #[test]
+    fn a_shallow_but_real_arc_still_fits() {
+        // The extent guard must not swallow legitimate arcs: a 60 degree sweep of a
+        // 6 mm radius is well inside the ratio.
+        let pts: Vec<Point> = (0..=12)
+            .map(|k| {
+                let a = std::f64::consts::FRAC_PI_3 * k as f64 / 12.0;
+                Point::new(6.0 * a.cos(), 6.0 * a.sin())
+            })
+            .collect();
+        assert!(
+            fit_arcs(&pts, 0.01)
+                .iter()
+                .any(|s| matches!(s, PathSeg::Arc { .. })),
+            "a real 60 degree arc was rejected"
+        );
+    }
+}

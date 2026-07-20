@@ -589,9 +589,24 @@ impl Strategy for CarveStrategy {
         // With no clearing tool the flat land's own boundary was already cut as pass 1's
         // innermost ring, so start one step in. A rest region has its own boundary, which
         // nothing has cut, so start on it.
-        let mut d = if swept.is_empty() { floor_step } else { 0.0 };
-        let mut floor_rings = 0usize;
-        loop {
+        let first_d = if swept.is_empty() { floor_step } else { 0.0 };
+
+        // Gather the floor loops before emitting any of them, component by component.
+        // Two things fall out of doing it this way, and both were real defects:
+        //
+        // - **A rest island smaller than the ridge we already accept is dropped.** Around
+        //   a curved island the clearing tool leaves a rash of slivers; cutting one costs
+        //   a full lift/plunge/retract cycle to remove almost nothing. If a component's
+        //   largest inscribed circle is no wider than half a floor step, the material
+        //   standing in it is at most `f(inradius) <= f(floor_step/2)` — the very scallop
+        //   the operator asked for. So it is already within tolerance, by construction.
+        //
+        // - **The loops are then ordered for locality.** The floor is all one depth and
+        //   travel across the flat land is safe anywhere (above), so the order is free —
+        //   and the natural order is the wrong one: it walks every component at one
+        //   radius, then walks them all again at the next, criss-crossing the part.
+        let mut floor_loops: Vec<Vec<cam_geo::Point>> = Vec::new();
+        for comp in &floor_region {
             if cancel.is_cancelled() {
                 return StrategyResult {
                     program: body,
@@ -599,35 +614,47 @@ impl Strategy for CarveStrategy {
                     cancelled: true,
                 };
             }
-            let rings = if d <= 0.0 {
-                floor_region.clone()
-            } else {
-                match offset(&floor_region, -d, JoinStyle::Round) {
-                    Ok(r) => r,
-                    Err(e) => fail!("operation {}: floor offset failed: {e}", op.id),
+            if vanishing_width(comp, 0.0) <= 0.5 * floor_step {
+                continue;
+            }
+            let mut d = first_d;
+            loop {
+                let rings = if d <= 0.0 {
+                    vec![comp.clone()]
+                } else {
+                    match offset(std::slice::from_ref(comp), -d, JoinStyle::Round) {
+                        Ok(r) => r,
+                        Err(e) => fail!("operation {}: floor offset failed: {e}", op.id),
+                    }
+                };
+                if rings.is_empty() {
+                    break;
                 }
-            };
-            if rings.is_empty() {
-                break;
+                for poly in &rings {
+                    for contour in std::iter::once(poly.outer()).chain(poly.holes()) {
+                        if contour.is_valid() && perimeter(contour) >= floor_step {
+                            floor_loops.push(contour.points().to_vec());
+                        }
+                    }
+                }
+                d += floor_step;
             }
-            // Travel at full depth is safe anywhere inside the flat land, so that — not
-            // the individual ring — is what bounds a stay-down link here.
-            emit_rings(
-                &mut body,
-                &mut st,
-                &rings,
-                &flat,
-                floor_z,
-                op,
-                &env.heights,
-                tags,
-                floor_step,
-            );
-            floor_rings += 1;
-            if floor_rings > 0 {
-                deepest = deepest.max(op.depth);
+        }
+
+        if !floor_loops.is_empty() {
+            deepest = deepest.max(op.depth);
+            for pts in order_for_locality(floor_loops, st.at.map(|(q, _)| q)) {
+                emit_loop(
+                    &mut body,
+                    &mut st,
+                    &pts,
+                    &flat,
+                    floor_z,
+                    op,
+                    &env.heights,
+                    tags,
+                );
             }
-            d += floor_step;
         }
 
         // Whatever happened, come home to clearance.
@@ -711,7 +738,6 @@ fn emit_rings(
     tags: RingTags,
     min_perimeter: f64,
 ) {
-    let mut first = true;
     for poly in rings {
         // A hole in the offset result is a ring around an island (or the counter of a
         // letter): it is cut at the same depth, being the same distance from a boundary.
@@ -726,77 +752,141 @@ fn emit_rings(
             if min_perimeter > 0.0 && perimeter(contour) < min_perimeter {
                 continue;
             }
-            // When staying down, begin this ring at the point nearest where the tool
-            // already is, so the link is as short as it can be — the operator's `start`
-            // then applies only to the first ring, which is where the entry witness lands.
-            let nearest = st
-                .at
-                .map(|(q, _)| crate::profile::rotate_to_start(contour.points(), Some([q.x, q.y])));
-            let linked = op.stay_down
-                && match (&st.at, &nearest) {
-                    (Some((q, _)), Some(cand)) => link_is_safe(&st.guard, *q, cand[0]),
-                    _ => false,
-                };
-            let pts = match (linked, nearest) {
-                (true, Some(cand)) => cand,
-                _ => crate::profile::rotate_to_start(contour.points(), op.start),
-            };
-            let start = pts[0];
-
-            match (linked, st.at) {
-                (true, Some((_, zq))) => {
-                    // Traverse at the *previous* ring's depth, where the region just
-                    // verified guarantees no gouge, and only then sink to this ring's
-                    // depth. Both moves cut real material, so they are fed, not rapid.
-                    body.push(Step::Linear {
-                        to: Point3::new(start.x, start.y, zq),
-                        feed: op.feed,
-                        tag: tags.cut,
-                    });
-                    if (z - zq).abs() > 1e-12 {
-                        body.push(Step::Linear {
-                            to: Point3::new(start.x, start.y, z),
-                            feed: op.plunge_feed,
-                            tag: tags.plunge,
-                        });
-                    }
-                }
-                _ => {
-                    // Lift and come back down: either the operator asked for it, or this
-                    // particular link failed its safety check.
-                    if let Some((q, _)) = st.at {
-                        body.push(Step::Rapid {
-                            to: Point3::new(q.x, q.y, heights.clearance),
-                            tag: tags.retract,
-                        });
-                    }
-                    body.push(Step::Rapid {
-                        to: Point3::new(start.x, start.y, heights.clearance),
-                        tag: tags.link,
-                    });
-                    body.push(Step::Rapid {
-                        to: Point3::new(start.x, start.y, heights.retract.max(op.top)),
-                        tag: tags.link,
-                    });
-                    body.push(Step::Linear {
-                        to: Point3::new(start.x, start.y, z),
-                        feed: op.plunge_feed,
-                        tag: tags.plunge,
-                    });
-                    st.lifts += 1;
-                }
-            }
-
-            crate::emit::cut_loop(body, &pts, op.feed, tags.cut, z);
-            st.rings_cut += 1;
-            // `cut_loop` closes back to the start, so that is where the tool is.
-            st.at = Some((start, z));
-            if first {
-                st.guard = guard_next.to_vec();
-                first = false;
-            }
+            emit_loop(body, st, contour.points(), guard_next, z, op, heights, tags);
         }
     }
+}
+
+/// Cut one closed loop at height `z`, linking to it without lifting where that is safe,
+/// and leave `guard_next` as the region the following loop will be judged against.
+#[allow(clippy::too_many_arguments)]
+fn emit_loop(
+    body: &mut Program,
+    st: &mut RingState,
+    contour: &[cam_geo::Point],
+    guard_next: &[Polygon],
+    z: f64,
+    op: &CarveOp,
+    heights: &cam_model::Heights,
+    tags: RingTags,
+) {
+    if contour.len() < 3 {
+        return;
+    }
+    // When staying down, begin this loop at the point nearest where the tool already
+    // is, so the link is as short as it can be — the operator's `start` then applies
+    // only to the first loop, which is where the entry witness lands.
+    let nearest = st
+        .at
+        .map(|(q, _)| crate::profile::rotate_to_start(contour, Some([q.x, q.y])));
+    let linked = op.stay_down
+        && match (&st.at, &nearest) {
+            (Some((q, _)), Some(cand)) => link_is_safe(&st.guard, *q, cand[0]),
+            _ => false,
+        };
+    let pts = match (linked, nearest) {
+        (true, Some(cand)) => cand,
+        _ => crate::profile::rotate_to_start(contour, op.start),
+    };
+    let start = pts[0];
+
+    match (linked, st.at) {
+        (true, Some((_, zq))) => {
+            // Traverse at the *previous* loop's depth, where the region just verified
+            // guarantees no gouge, and only then sink to this one's. Both moves cut real
+            // material, so they are fed, not rapid.
+            body.push(Step::Linear {
+                to: Point3::new(start.x, start.y, zq),
+                feed: op.feed,
+                tag: tags.cut,
+            });
+            if (z - zq).abs() > 1e-12 {
+                body.push(Step::Linear {
+                    to: Point3::new(start.x, start.y, z),
+                    feed: op.plunge_feed,
+                    tag: tags.plunge,
+                });
+            }
+        }
+        _ => {
+            // Lift and come back down: either the operator asked for it, or this
+            // particular link failed its safety check.
+            if let Some((q, _)) = st.at {
+                body.push(Step::Rapid {
+                    to: Point3::new(q.x, q.y, heights.clearance),
+                    tag: tags.retract,
+                });
+            }
+            body.push(Step::Rapid {
+                to: Point3::new(start.x, start.y, heights.clearance),
+                tag: tags.link,
+            });
+            body.push(Step::Rapid {
+                to: Point3::new(start.x, start.y, heights.retract.max(op.top)),
+                tag: tags.link,
+            });
+            body.push(Step::Linear {
+                to: Point3::new(start.x, start.y, z),
+                feed: op.plunge_feed,
+                tag: tags.plunge,
+            });
+            st.lifts += 1;
+        }
+    }
+
+    crate::emit::cut_loop(body, &pts, op.feed, tags.cut, z);
+    st.rings_cut += 1;
+    // `cut_loop` closes back to the start, so that is where the tool is.
+    st.at = Some((start, z));
+    st.guard = guard_next.to_vec();
+}
+
+/// Order same-depth loops so each is followed by whichever is nearest — a greedy
+/// nearest-neighbour walk from wherever the tool already is.
+///
+/// Emitting them in the order the offsets produce them means walking every component at
+/// one radius, then walking them all again at the next: on a rectangle with an island
+/// that is a 36 mm hop between consecutive loops, repeated for every ring. Nothing forces
+/// that order — the floor is one depth and travel across it is safe anywhere — so the
+/// cheapest order is simply available for the taking.
+///
+/// Candidate distance is measured against a bounded sample of each loop (concentric rings
+/// share a centroid, so a centroid test would be blind here), then the winner is rotated
+/// to its true nearest point when it is cut.
+fn order_for_locality(
+    mut loops: Vec<Vec<cam_geo::Point>>,
+    from: Option<cam_geo::Point>,
+) -> Vec<Vec<cam_geo::Point>> {
+    /// Most points of one loop consulted when ranking it, so the walk stays near-linear
+    /// in the number of loops rather than in their total length.
+    const SAMPLES: usize = 32;
+
+    let mut out: Vec<Vec<cam_geo::Point>> = Vec::with_capacity(loops.len());
+    let mut at = from;
+    while !loops.is_empty() {
+        let (pick, entry) = match at {
+            None => (0, None),
+            Some(p) => {
+                let mut best = (f64::MAX, 0usize, p);
+                for (i, l) in loops.iter().enumerate() {
+                    let stride = (l.len() / SAMPLES).max(1);
+                    for q in l.iter().step_by(stride) {
+                        let d = (q.x - p.x).hypot(q.y - p.y);
+                        if d < best.0 {
+                            best = (d, i, *q);
+                        }
+                    }
+                }
+                (best.1, Some(best.2))
+            }
+        };
+        let chosen = loops.swap_remove(pick);
+        // The tool will start and finish this loop at whichever of its points is nearest,
+        // so that — not the loop's own first vertex — is where the next hop starts from.
+        at = Some(entry.unwrap_or(chosen[0]));
+        out.push(chosen);
+    }
+    out
 }
 
 /// The closed length of a contour, mm.
@@ -2506,6 +2596,173 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Andreas's sample: a 60x40 rectangle with a circular island, which is where the
+    /// floor pass's ordering and its sliver rash both showed up.
+    fn ringed_rect() -> (Contour, Vec<Contour>) {
+        let outer = Contour::new(vec![
+            Point::new(10.0, 10.0),
+            Point::new(70.0, 10.0),
+            Point::new(70.0, 50.0),
+            Point::new(10.0, 50.0),
+        ]);
+        let island = Contour::new(
+            (0..64)
+                .map(|i| {
+                    let a = std::f64::consts::TAU * i as f64 / 64.0;
+                    Point::new(40.0 + 5.0 * a.cos(), 30.0 + 5.0 * a.sin())
+                })
+                .collect::<Vec<_>>(),
+        );
+        (outer, vec![island])
+    }
+
+    /// Every floor loop, as (entry XY, cut length). The entry is the plunge point, which
+    /// is where the tool arrives and, since a closed loop returns to its start, also where
+    /// it leaves — so consecutive entries bound the travel between loops.
+    ///
+    /// Measuring the *first cutting move* instead is wrong and was tried first:
+    /// `cut_loop` emits its first move to the loop's **second** vertex, which on a
+    /// rectangular ring is a whole side away, and turns a well-ordered path into what
+    /// looks like a 35 mm hop.
+    fn floor_loops_of(r: &StrategyResult, floor_z: f64) -> Vec<((f64, f64), f64)> {
+        let mut out = Vec::new();
+        let mut entry: Option<(f64, f64)> = None;
+        let mut prev: Option<(f64, f64)> = None;
+        let mut len = 0.0;
+        for s in r.program.steps() {
+            match s {
+                Step::Linear { to, tag, .. } if tag.kind == MoveKind::Plunge => {
+                    if let Some(e) = entry.take() {
+                        out.push((e, len));
+                    }
+                    len = 0.0;
+                    if (to.z - floor_z).abs() < 1e-9 {
+                        entry = Some((to.x, to.y));
+                    }
+                    prev = Some((to.x, to.y));
+                }
+                Step::Linear { to, tag, .. } | Step::Arc { end: to, tag, .. } => {
+                    if tag.kind == MoveKind::Cutting && (to.z - floor_z).abs() < 1e-9 {
+                        if let Some(q) = prev {
+                            len += (to.x - q.0).hypot(to.y - q.1);
+                        }
+                    }
+                    prev = Some((to.x, to.y));
+                }
+                Step::Rapid { to, .. } => prev = Some((to.x, to.y)),
+                _ => {}
+            }
+        }
+        if let Some(e) = entry {
+            out.push((e, len));
+        }
+        out
+    }
+
+    #[test]
+    fn the_clearing_tool_leaves_no_rash_of_slivers_round_an_island() {
+        // A round cutter working round a curved island leaves a scatter of thin rest
+        // slivers. Cutting one costs a full lift/plunge/retract cycle to remove almost
+        // nothing, and a couple of dozen of them is what showed in the viewport as
+        // chaos. A component no wider than half a floor step is already inside the
+        // accepted ridge, by construction, so it is dropped.
+        let (outer, islands) = ringed_rect();
+        let mut o = op(1.0);
+        o.boundary = outer;
+        o.islands = islands;
+        o.clear = Some(cam_model::CarveClearing {
+            tool: 2,
+            params: cam_model::ClearParams::default(),
+        });
+        let r = run_with(o, &[vbit(60.0, 0.1), endmill(2, 6.8)]);
+        assert!(errors(&r).is_empty(), "{:?}", errors(&r));
+        // A loop worth a plunge cycle cuts at least one floor step of material.
+        let loops = floor_loops_of(&r, -1.0);
+        let runts: Vec<f64> = loops
+            .iter()
+            .map(|&(_, len)| len)
+            .filter(|&len| len < 0.173)
+            .collect();
+        assert!(
+            runts.len() <= 2,
+            "{} floor loops cut less than one step: {runts:?}",
+            runts.len()
+        );
+    }
+
+    #[test]
+    fn no_emitted_arc_is_wildly_larger_than_the_part() {
+        // The worst defect this operation has produced. Round an island the clearing
+        // tool leaves degenerate slivers; closing one into a loop gave the arc fitter a
+        // run whose start and end coincide, its near-straight guard had no chord to
+        // measure, and it accepted a circumcircle METRES across. Posted, that is a
+        // `G3` with equal endpoints -- a full 360 circle, at feed, right across the
+        // machine. Fixed in the fitter (cam-geo) and by not emitting the slivers at all;
+        // pinned here on the geometry that produced it.
+        let (outer, islands) = ringed_rect();
+        let mut o = op(1.0);
+        o.boundary = outer;
+        o.islands = islands;
+        o.clear = Some(cam_model::CarveClearing {
+            tool: 2,
+            params: cam_model::ClearParams::default(),
+        });
+        let r = run_with(o, &[vbit(60.0, 0.1), endmill(2, 6.8)]);
+        assert!(errors(&r).is_empty(), "{:?}", errors(&r));
+        // The part spans 60x40; nothing on it justifies an arc bigger than the stock.
+        let mut prev: Option<(f64, f64)> = None;
+        for s in r.program.steps() {
+            match s {
+                Step::Rapid { to, .. } | Step::Linear { to, .. } => prev = Some((to.x, to.y)),
+                Step::Arc { end, center, .. } => {
+                    let radius = (center.x - end.x).hypot(center.y - end.y);
+                    assert!(
+                        radius <= 60.0,
+                        "an arc of radius {radius:.1} mm on a 60x40 part"
+                    );
+                    if let Some(p) = prev {
+                        assert!(
+                            (end.x - p.0).hypot(end.y - p.1) > 1e-9,
+                            "an arc closed on itself: a full circle at ({:.3},{:.3})",
+                            end.x,
+                            end.y
+                        );
+                    }
+                    prev = Some((end.x, end.y));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn floor_loops_are_ordered_so_the_tool_does_not_criss_cross() {
+        // The floor is all one depth and travel across it is safe anywhere, so the order
+        // is free -- and the order the offsets come out in is the wrong one: every
+        // component at one radius, then all of them again at the next, criss-crossing
+        // the part between every pair.
+        let (outer, islands) = ringed_rect();
+        let mut o = op(1.0);
+        o.boundary = outer;
+        o.islands = islands;
+        let r = run(o, vbit(60.0, 0.1));
+        assert!(errors(&r).is_empty(), "{:?}", errors(&r));
+        let loops = floor_loops_of(&r, -1.0);
+        assert!(loops.len() > 20, "expected many floor loops, got {}", loops.len());
+        let total: f64 = loops
+            .windows(2)
+            .map(|w| (w[1].0 .0 - w[0].0 .0).hypot(w[1].0 .1 - w[0].0 .1))
+            .sum();
+        let mean = total / (loops.len() - 1) as f64;
+        // Well ordered, consecutive loops sit about one floor step apart; the
+        // pathological order costs tens of millimetres on this sample every time.
+        assert!(
+            mean < 5.0,
+            "mean hop between floor loops is {mean:.1} mm over {} loops - not ordered",
+            loops.len()
+        );
     }
 
     // --- the ring schedule ---
