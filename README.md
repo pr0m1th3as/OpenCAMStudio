@@ -88,9 +88,17 @@ tagged commit, but they carry no Authenticode or Apple Developer signature —
 those require paid certificates. **Both operating systems will warn you, and the
 warning is expected rather than a sign that something is wrong:**
 
-- **macOS** refuses to open the app on first launch. Right-click it in Finder and
-  choose **Open**, then confirm — after that it launches normally. (Equivalently:
-  `xattr -d com.apple.quarantine "/Applications/Open CAM Studio.app"`.)
+- **macOS** refuses to open the app, and the usual right-click → **Open** → confirm
+  route **does not clear it** for an unsigned bundle. Drag the app to Applications,
+  then run this once:
+
+  ```bash
+  xattr -rd com.apple.quarantine "/Applications/Open CAM Studio.app"
+  ```
+
+  After that it launches normally, from the Dock or Launchpad like any other app.
+  The `-r` matters: the quarantine flag is set on files *inside* the bundle, not
+  just on the bundle itself.
 - **Windows** SmartScreen shows *"Windows protected your PC"*. Choose **More
   info → Run anyway**.
 
