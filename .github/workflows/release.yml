@@ -82,13 +82,13 @@ jobs:
           chmod +x appimagetool-x86_64.AppImage
           # --appimage-extract-and-run because CI runners have no FUSE.
           ARCH=x86_64 ./appimagetool-x86_64.AppImage --appimage-extract-and-run \
-            $APP "opencamstudio-$V-linux-x86_64.AppImage"
+            $APP "OpenCAMStudio-$V-linux-x86_64.AppImage"
       - name: Checksum
-        run: .github/scripts/sha256.sh opencamstudio-*.AppImage
+        run: .github/scripts/sha256.sh OpenCAMStudio-*.AppImage
       - uses: actions/upload-artifact@v4
         with:
           name: linux
-          path: opencamstudio-*.AppImage*
+          path: OpenCAMStudio-*.AppImage*
           if-no-files-found: error
 
   macos:
@@ -143,13 +143,13 @@ jobs:
           PLIST
           mkdir -p dmg && cp -R "$APP" dmg/ && ln -s /Applications dmg/Applications
           hdiutil create -volname "OpenCAMStudio" -srcfolder dmg -ov -format UDZO \
-            "opencamstudio-$V-macos-arm64.dmg"
+            "OpenCAMStudio-$V-macos-arm64.dmg"
       - name: Checksum
-        run: .github/scripts/sha256.sh opencamstudio-*.dmg
+        run: .github/scripts/sha256.sh OpenCAMStudio-*.dmg
       - uses: actions/upload-artifact@v4
         with:
           name: macos
-          path: opencamstudio-*.dmg*
+          path: OpenCAMStudio-*.dmg*
           if-no-files-found: error
 
   windows:
@@ -164,16 +164,19 @@ jobs:
         run: .github/scripts/version.sh
       - name: Build the desktop app
         run: cargo build --release -p cam-app --features gui --bin opencamstudio
-      # The portable .zip is built first and unconditionally: it is the artifact that
-      # cannot fail, so a Windows download exists even if the installer does not.
-      - name: Portable zip
+      # A bare .exe, not a zip: a Rust GUI binary is already self-contained, so
+      # zipping it only forces the user to extract before they can double-click. The
+      # licence obligation that made a zip tempting is met inside the program itself
+      # -- the full GPL text is embedded via include_str! and shown under About --
+      # so the executable carries its own licence wherever it goes.
+      # Built first and unconditionally: it is the artifact that cannot fail, so a
+      # Windows download exists even if the installer step does not.
+      - name: Portable exe
         shell: bash
         run: |
           set -euo pipefail
           V=${{ steps.ver.outputs.v }}
-          mkdir -p dist
-          cp target/release/opencamstudio.exe README.md LICENSE dist/
-          7z a "opencamstudio-$V-windows-x86_64-portable.zip" ./dist/*
+          cp target/release/opencamstudio.exe "OpenCAMStudio-$V-windows-x86_64-portable.exe"
       - name: Install cargo-wix
         run: cargo install cargo-wix --locked
       - name: Build the MSI
@@ -183,16 +186,16 @@ jobs:
           V=${{ steps.ver.outputs.v }}
           cargo wix init --force -p cam-app
           cargo wix -p cam-app --no-build --nocapture \
-            --output "opencamstudio-$V-windows-x86_64-installer.msi"
+            --output "OpenCAMStudio-$V-windows-x86_64-installer.msi"
       - name: Checksums
         shell: bash
-        run: .github/scripts/sha256.sh opencamstudio-*.msi opencamstudio-*.zip
+        run: .github/scripts/sha256.sh OpenCAMStudio-*.msi OpenCAMStudio-*portable.exe
       - uses: actions/upload-artifact@v4
         with:
           name: windows
           path: |
-            opencamstudio-*.msi*
-            opencamstudio-*.zip*
+            OpenCAMStudio-*.msi*
+            OpenCAMStudio-*portable.exe*
           if-no-files-found: error
 
   release:

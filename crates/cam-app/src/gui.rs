@@ -120,13 +120,14 @@ enum Icon {
     SetOrigin,
     Info,
     Machine,
+    License,
 }
 
 impl Icon {
     /// Every icon, so tests can sweep the whole bundled set. Kept beside the enum:
     /// a variant added without a line here fails `every_icon_is_listed_in_all`.
     #[cfg(test)]
-    const ALL: [Icon; 28] = [
+    const ALL: [Icon; 29] = [
         Icon::New,
         Icon::Open,
         Icon::Save,
@@ -155,6 +156,7 @@ impl Icon {
         Icon::SetOrigin,
         Icon::Info,
         Icon::Machine,
+        Icon::License,
     ];
 }
 
@@ -189,6 +191,7 @@ impl Icon {
             Icon::SetOrigin => include_bytes!("../assets/icons/origin.svg"),
             Icon::Info => include_bytes!("../assets/icons/info.svg"),
             Icon::Machine => include_bytes!("../assets/icons/machine.svg"),
+            Icon::License => include_bytes!("../assets/icons/license.svg"),
         }
     }
 
@@ -236,6 +239,10 @@ impl Icon {
             Icon::Machine => {
                 "Set up the machine — working travel and the post-processor (G-code dialect, \
                  e.g. grbl / FluidNC / Fanuc) the exported NC is written for."
+            }
+            Icon::License => {
+                "Licence and credits — the GNU GPL v3 this program is released under, \
+                 and the third-party work it builds on."
             }
         }
     }
@@ -1457,6 +1464,8 @@ struct App {
     /// Whether hover tooltips (inspector parameters + ribbon icons) are shown. On by
     /// default to help new users; toggled off from the View tab once they're fluent.
     tooltips: bool,
+    /// Whether the licence-and-credits overlay is open (View tab -> About -> Licence).
+    show_license: bool,
     /// On-screen edge length of the orientation cube, in **logical pixels** —
     /// fixed (not scaled with the window), adjustable at runtime via the View tab.
     gizmo_size: f32,
@@ -1934,6 +1943,10 @@ enum Message {
     ToggleGizmo,
     /// Show or hide hover tooltips (inspector + ribbon icons).
     ToggleTooltips,
+    /// Open the licence-and-credits overlay.
+    ShowLicense,
+    /// Dismiss the licence-and-credits overlay.
+    CloseLicense,
     /// Set the orientation cube's on-screen size (logical px).
     SetGizmoSize(f32),
     PaneResized(pane_grid::ResizeEvent),
@@ -2070,6 +2083,7 @@ impl App {
         let mut app = Self {
             controller: AppController::new(default_machine()),
             panes: initial_panes(),
+            show_license: false,
             window: iced::Size::new(1280.0, 800.0),
             project_px: 220.0,
             inspector_px: 250.0,
@@ -2665,6 +2679,8 @@ impl App {
             }
             Message::ResetView => self.view = ViewControls::default(),
             Message::ToggleGizmo => self.show_gizmo = !self.show_gizmo,
+            Message::ShowLicense => self.show_license = true,
+            Message::CloseLicense => self.show_license = false,
             Message::ToggleTooltips => {
                 self.tooltips = !self.tooltips;
                 self.status = if self.tooltips {
@@ -4243,7 +4259,122 @@ impl App {
         if let Some(pickbox) = self.pickbox_overlay() {
             layers = layers.push(pickbox);
         }
+        if let Some(card) = self.license_overlay() {
+            // Same catcher pattern as the menus: a click anywhere off the card closes.
+            let catcher = mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
+                .on_press(Message::CloseLicense);
+            layers = layers.push(catcher).push(card);
+        }
         layers.into()
+    }
+
+    /// The licence-and-credits overlay (View tab -> About -> Licence). `None` unless
+    /// open.
+    ///
+    /// The **full GPL text is embedded**, not merely referenced: GPL-3.0 section 4
+    /// asks that a copy of the licence accompany the program, and a shipped binary --
+    /// an AppImage, a .dmg, an MSI -- travels without the repository's LICENSE file
+    /// beside it. `include_str!` makes the copy part of the executable, so it is
+    /// there wherever the program is.
+    ///
+    /// The credits below are the same facts as `assets/icons/CREDITS.md`, restated
+    /// here because a user who has only the binary cannot read that file. They are
+    /// obligations, not courtesies: the ribbon icons are GPL-3.0 from OpenCADStudio,
+    /// and the application icon is the project's one CC BY-SA 4.0 exception.
+    fn license_overlay(&self) -> Option<Element<'_, Message>> {
+        if !self.show_license {
+            return None;
+        }
+        const GPL: &str = include_str!("../../../LICENSE");
+
+        let heading = |t: &'static str| text(t).size(14);
+        let body = |t: String| text(t).size(12);
+
+        let credits = column![
+            heading("Third-party work"),
+            body(
+                "Ribbon icons — several are taken unmodified from OpenCADStudio \
+                 (github.com/HakanSeven12/OpenCADStudio), © its contributors, GPL-3.0, \
+                 reused here under the same licence. The CAM-specific icons are original."
+                    .to_string()
+            ),
+            body(
+                "Application icon — © Andreas Bertsatos, CC BY-SA 4.0 International. \
+                 This is a deliberate exception to this program's GPL-3.0-only licence, \
+                 so the mark may be used and attributed on Wikimedia. Its letterforms \
+                 are outlines of DejaVu Sans Bold (Bitstream Vera Fonts Copyright)."
+                    .to_string()
+            ),
+            body(
+                "DXF/DWG import — acadrust, MPL-2.0. Geometry, toolpaths, posts and the \
+                 simulator are original to this project."
+                    .to_string()
+            ),
+        ]
+        .spacing(6);
+
+        let card = container(
+            column![
+                row![
+                    iced::widget::svg(Icon::License.handle()).width(30).height(30),
+                    text(format!("OpenCAMStudio {}", env!("CARGO_PKG_VERSION"))).size(20),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+                body("A CAM application for CNC toolpath generation.".to_string()),
+                body("Copyright © 2026 Andreas Bertsatos.".to_string()),
+                heading("Licence"),
+                body(
+                    "This program is free software: you can redistribute it and/or modify \
+                     it under the terms of the GNU General Public License, version 3 only, \
+                     as published by the Free Software Foundation.\n\n\
+                     This program is distributed in the hope that it will be useful, but \
+                     WITHOUT ANY WARRANTY; without even the implied warranty of \
+                     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU \
+                     General Public License below for more details."
+                        .to_string()
+                ),
+                credits,
+                heading("GNU General Public License, version 3"),
+                container(scrollable(text(GPL).size(11).font(iced::Font::MONOSPACE)).height(260))
+                    .padding(8)
+                    .style(|theme: &iced::Theme| container::Style {
+                        background: Some(Background::Color(theme.palette().background)),
+                        border: Border {
+                            color: theme.extended_palette().background.strong.color,
+                            width: 1.0,
+                            radius: 3.0.into(),
+                        },
+                        ..Default::default()
+                    }),
+                row![
+                    Space::new().width(Length::Fill),
+                    button(text("Close").size(13)).on_press(Message::CloseLicense),
+                ],
+            ]
+            .spacing(10)
+            .padding(4),
+        )
+        .width(620)
+        .padding(16)
+        .style(|theme: &iced::Theme| container::Style {
+            background: Some(Background::Color(theme.extended_palette().background.weak.color)),
+            border: Border {
+                color: theme.extended_palette().background.strong.color,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..Default::default()
+        });
+
+        Some(
+            container(card)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(Alignment::Center)
+                .align_y(Alignment::Center)
+                .into(),
+        )
     }
 
     /// The operation right-click context menu (Delete / Duplicate), its top-left
@@ -4435,6 +4566,20 @@ impl App {
         for tab in RibbonTab::ALL {
             tabs = tabs.push(tab_btn(tab));
         }
+        // `About` is NOT a tab: it opens the licence-and-credits popup instead of
+        // switching the band below. A tab strip promises that every entry changes the
+        // ribbon under it, so this one is pushed to the far right, away from the tabs
+        // and separated by the fill, to signal that it is an action rather than a tab
+        // before it is clicked. (Same reasoning as Office's File tab.) It also does
+        // not belong under View, which means "what the viewport shows".
+        tabs = tabs
+            .push(Space::new().width(Length::Fill))
+            .push(
+                button(text("About").size(12))
+                    .padding(Padding::from([5.0, 14.0]))
+                    .on_press(Message::ShowLicense)
+                    .style(|_theme, status| tab_button_style(false, status)),
+            );
         let strip = container(tabs.padding(2).align_y(Alignment::Center))
             .width(Length::Fill)
             .style(|_theme| container::Style {
