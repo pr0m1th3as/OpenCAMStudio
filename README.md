@@ -88,17 +88,28 @@ tagged commit, but they carry no Authenticode or Apple Developer signature —
 those require paid certificates. **Both operating systems will warn you, and the
 warning is expected rather than a sign that something is wrong:**
 
-- **macOS** refuses to open the app, and the usual right-click → **Open** → confirm
-  route **does not clear it** for an unsigned bundle. Drag the app to Applications,
-  then run this once:
+- **macOS** reports:
+
+  > **"Open CAM Studio.app" is damaged and can't be opened. You should move it to
+  > the Trash.**
+
+  **It is not damaged, and you should not move it to the Trash.** That is the
+  message macOS gives an unsigned application, and it is indistinguishable from a
+  genuinely corrupt download — if you want to be sure, the `.sha256` above proves
+  the file is byte-for-byte what CI built.
+
+  The usual right-click → **Open** → confirm route **does not clear it** for an
+  unsigned bundle. Open the `.dmg`, **drag the app into Applications first**, then
+  run this once:
 
   ```bash
   xattr -rd com.apple.quarantine "/Applications/Open CAM Studio.app"
   ```
 
-  After that it launches normally, from the Dock or Launchpad like any other app.
-  The `-r` matters: the quarantine flag is set on files *inside* the bundle, not
-  just on the bundle itself.
+  It will not launch until that command has been run; afterwards it opens normally
+  from the Dock or Launchpad, and the step never needs repeating. The `-r` matters:
+  the quarantine flag is set on files *inside* the bundle, not just on the bundle
+  itself.
 - **Windows** SmartScreen shows *"Windows protected your PC"*. Choose **More
   info → Run anyway**.
 
