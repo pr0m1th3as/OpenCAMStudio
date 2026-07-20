@@ -3,6 +3,8 @@ name: Release
 on:
   push:
     tags: [ "v*" ]
+  # Build the three platforms without tagging, to prove the pipeline before a real
+  # release. No Release is published on this path -- see the `release` job's `if`.
   workflow_dispatch:
 
 env:
@@ -28,22 +30,74 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }} --bin opencamstudio
+      # Only Linux needs these; macOS and Windows carry their own window/GL stack.
+      # Kept in step with the `gui build` job in ci.yml.
+      - name: "System libraries (Linux: X11/Wayland/GL/font)"
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libx11-dev libxkbcommon-dev libwayland-dev \
+            libxcursor-dev libxrandr-dev libxi-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libfontconfig1-dev
+      # `--features gui` is the whole point: cam-app's `default = []`, so without it
+      # the shipped binary is the headless stub, which prints a line telling the user
+      # to go and build it themselves. That is what this workflow used to package.
+      - name: Build the desktop app
+        run: >
+          cargo build --release
+          -p cam-app --features gui
+          --bin opencamstudio
+          --target ${{ matrix.target }}
       - name: Package
         shell: bash
         run: |
-          bin=opencamstudio
-          [ "${{ matrix.os }}" = "windows-latest" ] && bin=opencamstudio.exe
+          set -euo pipefail
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/$bin" dist/
           cp README.md LICENSE dist/
-          tar -czf "opencamstudio-${{ matrix.target }}.tar.gz" -C dist .
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp "target/${{ matrix.target }}/release/opencamstudio.exe" dist/
+            # A .zip, not a tarball: Explorer opens one natively.
+            7z a "opencamstudio-${{ matrix.target }}.zip" ./dist/*
+          else
+            cp "target/${{ matrix.target }}/release/opencamstudio" dist/
+            tar -czf "opencamstudio-${{ matrix.target }}.tar.gz" -C dist .
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: opencamstudio-${{ matrix.target }}
-          path: opencamstudio-${{ matrix.target }}.tar.gz
+          path: opencamstudio-${{ matrix.target }}.*
+          if-no-files-found: error
 
-# NOTE: Linux AppImage packaging and attaching assets to the GitHub Release land
-# once there is a GUI to package (P5). For now the platform tarballs above are the
-# stub artifacts that prove the pipeline.
+  release:
+    name: publish the GitHub Release
+    needs: build
+    # Tags only. A `workflow_dispatch` run is a build rehearsal and publishes nothing.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      # Uploading to the Release itself, not just as workflow artifacts -- those expire
+      # in 90 days and cannot be fetched without a GitHub login, so they are useless as
+      # a download for anyone but us. The `gh` CLI is preinstalled on the runner, which
+      # keeps a third-party action out of the release path.
+      - name: Publish the Release and attach the platform builds
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ls -l artifacts/
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "OpenCAMStudio ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            artifacts/*
+
+# NOTE: a Linux AppImage and macOS/Windows code signing are still to come; the
+# platform archives above are unsigned, so both OSes will warn on first launch.
