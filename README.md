@@ -6,6 +6,14 @@ A CAM application for CNC toolpath generation, built in Rust.
 > and material simulation in a live viewport, real G-code out. Everything beyond
 > 2.5-D (3-axis surfacing, turning, plugins) is roadmap.
 
+![The OpenCAMStudio desktop application: the built-in sample part with two
+operations — an outside profile and a pocket — showing the project tree on the
+left, the 3-D toolpath backplot with orientation cube in the centre, the operation
+inspector on the right, and run diagnostics along the bottom.](docs/screenshot.png)
+
+*The built-in sample (**Home → Sample**) with a profile and a pocket, run and ready
+to export.*
+
 ## What works
 
 - **Operations** — profile, pocket, drill, face, chamfer, **thread milling**,
