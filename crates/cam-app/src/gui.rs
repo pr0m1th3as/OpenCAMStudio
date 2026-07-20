@@ -4349,8 +4349,21 @@ impl App {
                     }),
                 row![
                     Space::new().width(Length::Fill),
-                    button(text("Close").size(13)).on_press(Message::CloseLicense),
-                ],
+                    // Explicit padding and a 1.0 line height, matching the other
+                    // buttons in the app. Left to iced's defaults the label sits high
+                    // in the button: the default line box for a 13pt text is taller
+                    // than the glyphs, and uniform default padding centres the BOX,
+                    // not the ink inside it.
+                    button(
+                        text("Close")
+                            .size(13)
+                            .line_height(iced::widget::text::LineHeight::Relative(1.0))
+                            .align_y(Alignment::Center)
+                    )
+                    .padding(Padding::from([5.0, 14.0]))
+                    .on_press(Message::CloseLicense),
+                ]
+                .align_y(Alignment::Center),
             ]
             .spacing(10)
             .padding(4),
