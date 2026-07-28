@@ -30,7 +30,7 @@ fn main() {
 /// commits-ahead + short hash), with `-dirty` appended when the tree has
 /// uncommitted changes. This is what distinguishes an issue filed on a dev build
 /// from one on the release -- the semver alone cannot, since the manifest version
-/// only changes at release time (ROADMAP.md "Versioning"). Consumed by
+/// only changes at release time (see `VERSIONING.md`). Consumed by
 /// `cam_app::version_string`.
 fn emit_git_provenance() {
     // Rebuild when HEAD moves or the index changes, so the stamp tracks the

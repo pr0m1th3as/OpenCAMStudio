@@ -30,7 +30,7 @@ pub use tool_library::{families_for, ToolKindPick, ToolLibrary};
 /// A clean tagged release shows just the semver (`0.1.0`); any build past the tag,
 /// or a dirty tree, shows the full `git describe` so a bug report can be pinned to
 /// an exact commit -- the version field alone cannot do this, because the manifest
-/// version only changes at release time (ROADMAP.md "Versioning"). The provenance
+/// version only changes at release time (see `VERSIONING.md`). The provenance
 /// is stamped in by `build.rs`; see [`emit_git_provenance`](../build.rs).
 pub fn version_string() -> String {
     format_version(
