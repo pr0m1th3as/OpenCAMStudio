@@ -25,5 +25,85 @@ pub use controller::{
 pub use project::{OcamFile, Project};
 pub use tool_library::{families_for, ToolKindPick, ToolLibrary};
 
+/// The human-facing version string, including git provenance on a dev build.
+///
+/// A clean tagged release shows just the semver (`0.1.0`); any build past the tag,
+/// or a dirty tree, shows the full `git describe` so a bug report can be pinned to
+/// an exact commit -- the version field alone cannot do this, because the manifest
+/// version only changes at release time (ROADMAP.md "Versioning"). The provenance
+/// is stamped in by `build.rs`; see [`emit_git_provenance`](../build.rs).
+pub fn version_string() -> String {
+    format_version(
+        env!("CARGO_PKG_VERSION"),
+        env!("OCAM_GIT_DESCRIBE"),
+        env!("OCAM_BUILD_DATE"),
+    )
+}
+
+/// Pure formatter behind [`version_string`], split out so its three branches are
+/// testable without depending on the ambient git state at build time.
+fn format_version(version: &str, describe: &str, date: &str) -> String {
+    // No git at build time (e.g. a source tarball): the semver is all we have.
+    if describe.is_empty() {
+        return version.to_string();
+    }
+    // A clean release: `git describe` is exactly the tag (`v0.1.0`) -- no
+    // `-N-gHASH` offset, no `-dirty`. The provenance would only echo the version.
+    if describe.trim_start_matches('v') == version {
+        return version.to_string();
+    }
+    // A dev build: pin it to the commit, dating it when we have the commit date.
+    if date.is_empty() {
+        format!("{version} ({describe})")
+    } else {
+        format!("{version} ({describe}, {date})")
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::format_version;
+
+    #[test]
+    fn no_git_shows_bare_semver() {
+        // Source-tarball build: build.rs found no `.git`, so both stamps are empty.
+        assert_eq!(format_version("0.1.0", "", ""), "0.1.0");
+    }
+
+    #[test]
+    fn clean_release_shows_bare_semver() {
+        // `git describe` on the exact tag echoes it (with the `v` prefix); the
+        // provenance adds nothing, so it is suppressed -- with or without a date.
+        assert_eq!(format_version("0.1.0", "v0.1.0", "2026-07-28"), "0.1.0");
+        assert_eq!(format_version("0.1.0", "v0.1.0", ""), "0.1.0");
+    }
+
+    #[test]
+    fn dev_build_pins_the_commit() {
+        assert_eq!(
+            format_version("0.1.0", "v0.1.0-4-g748f9ea", "2026-07-28"),
+            "0.1.0 (v0.1.0-4-g748f9ea, 2026-07-28)"
+        );
+    }
+
+    #[test]
+    fn dirty_tree_is_carried_through() {
+        // The `-dirty` suffix must survive to the UI -- it is the signal that the
+        // working tree diverged from any commit.
+        assert_eq!(
+            format_version("0.1.0", "v0.1.0-4-g748f9ea-dirty", "2026-07-28"),
+            "0.1.0 (v0.1.0-4-g748f9ea-dirty, 2026-07-28)"
+        );
+    }
+
+    #[test]
+    fn dev_build_without_date_still_pins_the_commit() {
+        assert_eq!(
+            format_version("0.1.0", "748f9ea", ""),
+            "0.1.0 (748f9ea)"
+        );
+    }
+}
+
 #[cfg(feature = "gui")]
 pub mod gui;

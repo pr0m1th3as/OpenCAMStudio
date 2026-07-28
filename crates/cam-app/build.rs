@@ -19,8 +19,47 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=assets/opencamstudio.ico");
+    emit_git_provenance();
     #[cfg(windows)]
     embed_windows_resources();
+}
+
+/// Embed `git describe` output so every build is traceable to an exact commit,
+/// surfaced in the About box and `--version`. A clean tagged release reports just
+/// the tag (`v0.1.0`); a dev build reports `v0.1.0-47-g748f9ea` (tag +
+/// commits-ahead + short hash), with `-dirty` appended when the tree has
+/// uncommitted changes. This is what distinguishes an issue filed on a dev build
+/// from one on the release -- the semver alone cannot, since the manifest version
+/// only changes at release time (ROADMAP.md "Versioning"). Consumed by
+/// `cam_app::version_string`.
+fn emit_git_provenance() {
+    // Rebuild when HEAD moves or the index changes, so the stamp tracks the
+    // checkout. Only watch the ref files when they exist -- a source-tarball build
+    // has no `.git`, and pointing rerun-if-changed at a missing path would force a
+    // rebuild on every invocation.
+    for p in ["../../.git/HEAD", "../../.git/index"] {
+        if std::path::Path::new(p).exists() {
+            println!("cargo:rerun-if-changed={p}");
+        }
+    }
+
+    // Empty when git is unavailable (a source tarball, or git not installed); the
+    // UI then shows the bare `CARGO_PKG_VERSION` with no provenance suffix.
+    let describe = run_git(&["describe", "--tags", "--dirty", "--always"]).unwrap_or_default();
+    let date = run_git(&["log", "-1", "--format=%cs"]).unwrap_or_default();
+    println!("cargo:rustc-env=OCAM_GIT_DESCRIBE={describe}");
+    println!("cargo:rustc-env=OCAM_BUILD_DATE={date}");
+}
+
+/// Run `git` with `args`, returning trimmed stdout, or `None` if git is missing,
+/// this is not a checkout, or the command fails.
+fn run_git(args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git").args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!s.is_empty()).then_some(s)
 }
 
 #[cfg(windows)]

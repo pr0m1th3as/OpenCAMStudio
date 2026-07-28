@@ -19,15 +19,25 @@ narrow slice exercises **every architectural seam** with the least geometry pain
 
 **Status:** the 2.5-D slice is complete — **P0–P7 done** (headless pipeline, GUI,
 full 2.5-D operations, material simulation). Additive capability has since landed on
-top: **six posts** across three families (grbl / FluidNC / grblHAL, LinuxCNC,
-Fanuc / Haas), engagement-capped area clearing, a **complete tooling subsystem** (a
-cross-project library with every cutter kind fully characterised — per-kind revolve
-geometry + live 2D preview), and three further operations, **thread milling**,
-**V-carve engraving** and **V-carving**, bringing the strategy count to eight — the
-last of them the first to use **two tools in one operation**. The tool generatrix now
-also drives **operation guards** (a tool must cut with a cutting surface) and a
-**profile-aware simulation** in both removal and collision. **P8** (plugin ABI) is the
-next numbered phase.
+top: **seven posts** across four families (grbl / FluidNC / grblHAL, LinuxCNC,
+Fanuc / Haas, and **Okuma OSP** — a fourth output family with its own emitter, not a
+Fanuc parameterisation, exporting `.MIN`), engagement-capped area clearing, a
+**complete tooling subsystem** (a cross-project library with every cutter kind fully
+characterised — per-kind revolve geometry + live 2D preview), and three further
+operations, **thread milling**, **V-carve engraving** and **V-carving**, bringing the
+strategy count to eight — the last of them the first to use **two tools in one
+operation**. The tool generatrix now also drives **operation guards** (a tool must cut
+with a cutting surface) and a **profile-aware simulation** in both removal and
+collision. Most recent additive work: **per-operation spindle speed**, seeded from
+per-tool nominal cutting data (`SCHEMA_VERSION` → 5).
+
+**P8** (plugin ABI) is the next *numbered* phase, but it is **deliberately deferred,
+not the next actual work.** Everything landing since P7 — the extra post families,
+the new operations, per-op speeds — is additive P6/P7-class capability inside the
+static first-party model. P8 freezes the `Strategy`/`Post` trait shapes into a `cdylib`
+ABI, and those shapes are still moving (per-op spindle bumped `SCHEMA_VERSION` this
+cycle). Stabilising the ABI before they settle would be premature; P8 waits until they
+have.
 
 | Phase | Goal | Crates | Done when |
 |-------|------|--------|-----------|
@@ -53,6 +63,42 @@ git-exclusion assumes a repo exists). **Public debut at P3–P4**, once first li
 works end-to-end (in-code or DXF → readable G-code) — a repo that *does something*.
 Optionally push to a **private** GitHub repo earlier so CI actually runs, then flip
 to public.
+
+## Versioning
+
+**The version number is a message to end users and to ourselves about *significance*
+— nothing more.** OpenCAMStudio is an application, not a library: there is no
+downstream `Cargo.toml` depending on us, no public API whose breakage a version
+contractually signals. So the number's only job is to encode *how much changed*.
+
+- **MINOR = a feature batch.** `0.1.0 → 0.2.0 → 0.3.0 …` Real new capability (a post
+  family, a new operation, a new subsystem) bumps the minor digit. This is our normal
+  release cadence.
+- **PATCH = a fix-only release** shipped *between* feature batches. `0.2.0 → 0.2.1`
+  means "same features, we fixed something" — a user can update without relearning
+  anything. Do **not** file feature work under a patch bump; that lies about its weight.
+- **App version ≠ file compatibility.** `SCHEMA_VERSION` (in `cam-model`) governs
+  "can this build open that file"; it moves independently of the app version. Never
+  overload the app version with compat semantics — let each number do one job.
+- **The manifest bumps at release time, and git provenance covers the gap.** The
+  workspace `version` stays at the last *released* value through a dev cycle and is
+  bumped to match the tag in the release commit (so a published artifact never
+  mislabels itself). Because that leaves every dev build reporting the old semver,
+  builds also embed `git describe --tags --dirty --always` (via `cam-app/build.rs`,
+  surfaced by `cam_app::version_string` in the About box and `--version`): a clean
+  release shows the bare tag (`0.1.0`), a dev build shows `0.1.0 (v0.1.0-47-g748f9ea,
+  DATE)`. **This is how an issue is pinned to an exact build** — the semver alone
+  can't, and a `-dev` pre-release suffix only narrows it to a cycle, not a commit, so
+  we don't use one. (Revisit only if pre-release builds ever leave Andreas's machine
+  and reach a third party.)
+- **Staying in `0.x` is itself an honest signal:** young, capabilities still landing,
+  breaking changes on the table. **`1.0.0` is a statement, not a milestone we drift
+  into** — reserve it for "2.5D milling is trustworthy on real machines," a meaningful
+  north-star tag rather than an arbitrary one.
+- Pre-1.0, we do **not** agonise over strict SemVer breaking-change rules — SemVer
+  explicitly lets anything change while `0.x`, and for an app with no API consumers
+  those rules are ceremony. "MINOR = features, PATCH = fixes, 1.0 = we mean it" is the
+  whole discipline.
 
 ## After the slice (unordered candidates)
 

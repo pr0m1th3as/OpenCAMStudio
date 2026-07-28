@@ -31,6 +31,6 @@ fn main() {
     println!(
         "Open CAM Studio {} — headless build. Launch the desktop app with:\n    \
          cargo run -p cam-app --features gui",
-        env!("CARGO_PKG_VERSION")
+        cam_app::version_string()
     );
 }

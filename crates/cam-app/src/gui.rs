@@ -4426,7 +4426,7 @@ impl App {
             column![
                 row![
                     iced::widget::svg(Icon::License.handle()).width(30).height(30),
-                    text(format!("Open CAM Studio {}", env!("CARGO_PKG_VERSION"))).size(20),
+                    text(format!("Open CAM Studio {}", crate::version_string())).size(20),
                 ]
                 .spacing(10)
                 .align_y(Alignment::Center),
