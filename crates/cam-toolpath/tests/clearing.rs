@@ -148,6 +148,7 @@ fn assert_no_rapid_onto_uncut_stock(program: &Program, floor: f64) {
 /// A 60×40 pocket with a 10×10 island, cleared in two levels by a ⌀6 end mill.
 fn pocket_doc() -> Document {
     let op = PocketOp {
+        spindle_rpm: 0.0,
         clearing: Clearing::default(),
         id: 0,
         tool: 1,
@@ -171,6 +172,7 @@ fn pocket_doc() -> Document {
 /// An outside profile with radial roughing — the *other* caller of the clearing engine.
 fn roughing_doc() -> Document {
     let op = ProfileOp {
+        spindle_rpm: 0.0,
         clearing: Clearing::default(),
         id: 0,
         tool: 1,
@@ -197,6 +199,7 @@ fn roughing_doc() -> Document {
 /// separately, and the property below is what says whether that argument holds.
 fn face_doc(overshoot: f64) -> Document {
     let op = FaceOp {
+        spindle_rpm: 0.0,
         id: 0,
         tool: 1,
         boundary: rect(0.0, 0.0, 60.0, 40.0),
@@ -227,6 +230,7 @@ fn carve_doc() -> Document {
         ..Default::default()
     };
     let op = CarveOp {
+        spindle_rpm: 0.0,
         id: 0,
         tool: 1,
         clear: Some(cam_model::CarveClearing { tool: 2, params: cam_model::ClearParams::default() }),

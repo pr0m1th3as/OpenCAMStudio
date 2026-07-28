@@ -291,6 +291,7 @@ mod tests {
 
     fn face_op() -> FaceOp {
         FaceOp {
+            spindle_rpm: 0.0,
             id: 0,
             tool: 1,
             boundary: rect(60.0, 40.0),

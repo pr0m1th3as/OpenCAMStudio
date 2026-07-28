@@ -237,6 +237,20 @@ pub struct Tool {
     /// identity. `#[serde(default)]` (→ `Down`) so older tools load unchanged.
     #[serde(default)]
     pub cutting_direction: CutDir,
+    /// Nominal cutting data — the tool's default spindle speed and feeds, used to
+    /// **seed** a new operation's own values (which stay overridable per operation).
+    /// `0.0` = unspecified (older tools load this way via `#[serde(default)]`), in
+    /// which case the job/operation falls back to its existing default rather than
+    /// commanding a zero. A later physics pass (material + surface speed) will compute
+    /// these; for now they are hand-entered library defaults.
+    #[serde(default)]
+    pub nominal_rpm: f64,
+    /// Nominal cutting feed, mm/min. See [`nominal_rpm`](Self::nominal_rpm).
+    #[serde(default)]
+    pub nominal_feed: f64,
+    /// Nominal plunge feed, mm/min. See [`nominal_rpm`](Self::nominal_rpm).
+    #[serde(default)]
+    pub nominal_plunge_feed: f64,
     /// Tool geometry class.
     pub kind: ToolKind,
 }
@@ -255,6 +269,9 @@ impl Default for Tool {
             neck_diameter: 0.0,
             flutes: 0,
             cutting_direction: CutDir::Down,
+            nominal_rpm: 0.0,
+            nominal_feed: 0.0,
+            nominal_plunge_feed: 0.0,
             kind: ToolKind::EndMill,
         }
     }
@@ -558,6 +575,9 @@ mod tests {
             neck_diameter: 6.0,
             flutes: 3,
             cutting_direction: CutDir::Up,
+            nominal_rpm: 8000.0,
+            nominal_feed: 900.0,
+            nominal_plunge_feed: 300.0,
             kind: ToolKind::BullNose { corner_radius: 1.0 },
         };
         let back: Tool = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();

@@ -266,7 +266,8 @@ use cam_render::{MeshVertex, OrbitCamera, Scene, Vertex, PART};
 use cam_toolpath::{CancelToken, Severity};
 
 use crate::{
-    op_accepts_open_paths, op_selects_circles, op_takes_islands, AppController, LoopRef, OpKind,
+    op_accepts_open_paths, op_selects_circles, op_takes_islands, AppController, CuttingData,
+    LoopRef, OpKind,
     PendingOp,
     PickResult, Selection, SnapHit,
     SnapKind,
@@ -712,6 +713,16 @@ fn apply_tool_dims(t: &mut cam_model::Tool, parsed: &BTreeMap<Field, f64>) {
     if let Some(&v) = parsed.get(&Field::Flutes) {
         t.flutes = v.round().max(1.0) as u32;
     }
+    // Nominal cutting data (library defaults). Clamped non-negative; 0 = unset.
+    if let Some(&v) = parsed.get(&Field::NominalRpm) {
+        t.nominal_rpm = v.max(0.0);
+    }
+    if let Some(&v) = parsed.get(&Field::NominalFeed) {
+        t.nominal_feed = v.max(0.0);
+    }
+    if let Some(&v) = parsed.get(&Field::NominalPlungeFeed) {
+        t.nominal_plunge_feed = v.max(0.0);
+    }
 
     // overall = flute + shank. Snapshot the effective flute/shank *before* the edit.
     let old_flute = t.flute_len();
@@ -820,6 +831,14 @@ enum Field {
     /// Reduced-neck diameter, mm; 0 = same as the cutting diameter.
     NeckDiameter,
     Flutes,
+    /// Tool nominal spindle speed (rpm) — the library default that seeds a new
+    /// operation's own RPM. `0` = unset.
+    NominalRpm,
+    /// Tool nominal cutting feed (mm/min) — seeds a new operation's feed. `0` = unset.
+    NominalFeed,
+    /// Tool nominal plunge feed (mm/min) — seeds a new operation's plunge feed.
+    /// `0` = unset.
+    NominalPlungeFeed,
     /// Bull-nose corner radius (mm).
     CornerRadius,
     /// Chamfer/V mill included point angle (deg).
@@ -843,6 +862,9 @@ enum Field {
     Stepover,
     /// Profile finishing allowance left on the wall (mm).
     ProfileOffset,
+    /// Operation spindle speed (rpm) — `M3 S<rpm>`. Seeded from the tool's nominal
+    /// RPM when the operation is created; `0` falls back to the job default.
+    SpindleRpm,
     Feed,
     PlungeFeed,
     /// Thread major diameter (mm).
@@ -942,6 +964,9 @@ impl Field {
             Field::NeckLength => "Neck length (mm, 0=none)",
             Field::NeckDiameter => "Neck ⌀ (mm, 0=cut ⌀)",
             Field::Flutes => "Flutes",
+            Field::NominalRpm => "Nominal RPM",
+            Field::NominalFeed => "Nominal feed (mm/min)",
+            Field::NominalPlungeFeed => "Nominal plunge (mm/min)",
             Field::CornerRadius => "Corner radius (mm)",
             Field::ChamferAngle => "Point angle (deg)",
             Field::TipDiameter => "Tip ⌀ (mm)",
@@ -955,6 +980,7 @@ impl Field {
             Field::ProfileOffset => "Offset / leave (mm)",
             Field::Stepdown => "Stepdown (mm)",
             Field::Stepover => "Stepover (mm)",
+            Field::SpindleRpm => "Spindle (rpm)",
             Field::Feed => "Feed (mm/min)",
             Field::PlungeFeed => "Plunge feed (mm/min)",
             Field::MajorDia => "Major ⌀ (mm)",
@@ -1070,6 +1096,19 @@ impl Field {
                 "Number of cutting edges (or inserts). Informational for now — \
                  feed-per-tooth math comes later; it does not change the toolpath."
             }
+            Field::NominalRpm => {
+                "Default spindle speed for this tool (rpm). Seeds a new operation's RPM \
+                 when the tool is chosen; the operation can override it. 0 = unset."
+            }
+            Field::NominalFeed => {
+                "Default cutting feed for this tool (mm/min). Seeds a new operation's feed; \
+                 the operation can override it. A per-tool feed is only a starting point — \
+                 it depends on the cut too. 0 = unset (uses the job default)."
+            }
+            Field::NominalPlungeFeed => {
+                "Default plunge (Z-entry) feed for this tool (mm/min). Seeds a new \
+                 operation's plunge feed; the operation can override it. 0 = unset."
+            }
             Field::CornerRadius => {
                 "Corner radius of the rounded-edge (bull-nose) end mill — the fillet \
                  between the flat bottom and the side. Must be smaller than the tool \
@@ -1132,6 +1171,11 @@ impl Field {
             Field::Stepover => {
                 "Radial width of cut between adjacent passes (mm). For outside roughing \
                  it sets the concentric-pass spacing."
+            }
+            Field::SpindleRpm => {
+                "Spindle speed for this operation (rpm), emitted as M3 S<rpm>. Seeded from \
+                 the tool's nominal RPM when the operation is created; edit it for this cut. \
+                 0 falls back to the job default."
             }
             Field::Feed => "Cutting feed rate — how fast the tool advances while cutting (mm/min).",
             Field::PlungeFeed => {
@@ -2467,6 +2511,8 @@ impl App {
                     }
                 }
                 self.refresh_fields();
+                // Seed the wizard's cutting-data row from the (possibly pre-filled) tool.
+                self.seed_wizard_cutting();
                 self.status = if self.controller.pending_op().is_some() {
                     if op_accepts_open_paths(kind) && !self.controller.open_paths().is_empty() {
                         "Choose a tool and click a boundary or an open stroke — in \
@@ -2491,6 +2537,8 @@ impl App {
                 if let Some(&tool) = self.library.tools.get(i) {
                     let number = self.controller.use_tool(tool);
                     self.controller.set_pending_tool(number);
+                    // Re-seed the cutting-data defaults from the newly chosen tool.
+                    self.seed_wizard_cutting();
                 }
             }
             Message::CancelOp => {
@@ -2499,7 +2547,8 @@ impl App {
                 self.status = "Cancelled operation creation.".to_string();
             }
             Message::ConfirmOp => {
-                if self.controller.confirm_operation() {
+                let cutting = self.wizard_cutting();
+                if self.controller.confirm_operation(cutting) {
                     self.cursor = None;
                     self.refresh_fields();
                     self.rerun();
@@ -2615,6 +2664,7 @@ impl App {
                             }
                         }
                         self.refresh_fields();
+                        self.seed_wizard_cutting();
                         self.status = "Reinitialising: pick a tool, then the geometry \
                                        (the operation keeps its place)."
                             .to_string();
@@ -3341,6 +3391,31 @@ impl App {
         }
     }
 
+    /// Seed the wizard's editable cutting-data buffers (RPM / feed / plunge) from the
+    /// pending operation's chosen tool nominals. A no-op unless a tool is set.
+    fn seed_wizard_cutting(&mut self) {
+        let Some(tool) = self.controller.pending_op().and_then(|p| p.tool) else {
+            return;
+        };
+        let c = self.controller.seeded_cutting_for(tool);
+        self.fields.insert(Field::SpindleRpm, fmt_num(c.rpm));
+        self.fields.insert(Field::Feed, fmt_num(c.feed));
+        self.fields.insert(Field::PlungeFeed, fmt_num(c.plunge_feed));
+    }
+
+    /// The cutting data currently in the wizard buffers, parsed. Missing/blank fields
+    /// fall back to the pending tool's seeded nominals, so a confirm never loses them.
+    fn wizard_cutting(&self) -> Option<CuttingData> {
+        let tool = self.controller.pending_op().and_then(|p| p.tool)?;
+        let seeded = self.controller.seeded_cutting_for(tool);
+        let buf = |f: Field| self.fields.get(&f).and_then(|s| s.parse::<f64>().ok());
+        Some(CuttingData {
+            rpm: buf(Field::SpindleRpm).unwrap_or(seeded.rpm).max(0.0),
+            feed: buf(Field::Feed).unwrap_or(seeded.feed).max(0.0),
+            plunge_feed: buf(Field::PlungeFeed).unwrap_or(seeded.plunge_feed).max(0.0),
+        })
+    }
+
     /// Reset the Tooling working copy to the committed library tool — the clean baseline
     /// the dirty check (and thus the Apply button) compares against — and reload the
     /// field buffers from it. Called at every "load" point (tool selection, New, Delete,
@@ -3695,7 +3770,8 @@ impl App {
         // flutes — no neck. Other kinds keep the generic set until characterised in turn.
         // The Cutting-direction control is rendered separately (it's a picker, not a
         // numeric field), as is the Type picker.
-        let tool_fields = |kind: Option<ToolKind>| match kind {
+        let tool_fields = |kind: Option<ToolKind>| {
+            let mut fields = match kind {
             // Square & Ball Nose end mills share the exact end-mill field set.
             Some(ToolKind::EndMill | ToolKind::BallMill) => vec![
                 Field::ToolDiameter, // "Flute ⌀"
@@ -3792,6 +3868,15 @@ impl App {
                 }
                 f
             }
+            };
+            // Nominal cutting data is common to every tool kind — the library defaults
+            // that seed a new operation's RPM/feed/plunge.
+            fields.extend([
+                Field::NominalRpm,
+                Field::NominalFeed,
+                Field::NominalPlungeFeed,
+            ]);
+            fields
         };
         if self.library_mode() {
             // Use the working-copy kind (via inspected_tool_kind) so a Type change swaps
@@ -3832,7 +3917,7 @@ impl App {
                         fields.push(Field::Stepover);
                         fields.push(Field::Engagement);
                     }
-                    fields.extend([Field::ProfileOffset, Field::Feed, Field::PlungeFeed]);
+                    fields.extend([Field::ProfileOffset, Field::SpindleRpm, Field::Feed, Field::PlungeFeed]);
                     // Lead/plunge sizes appear only when the kind uses them.
                     if p.lead_in != Lead::None {
                         fields.push(Field::LeadInSize);
@@ -3858,6 +3943,7 @@ impl App {
                         Field::Overlap,
                         Field::Engagement,
                         Field::ProfileOffset,
+                        Field::SpindleRpm,
                         Field::Feed,
                         Field::PlungeFeed,
                         Field::LeadOverlap,
@@ -3884,6 +3970,7 @@ impl App {
                     Field::Stepdown,
                     Field::Overlap,
                     Field::FaceOvershoot,
+                    Field::SpindleRpm,
                     Field::Feed,
                     Field::PlungeFeed,
                 ],
@@ -3892,6 +3979,7 @@ impl App {
                     Field::DrillStartOffset,
                     Field::Peck,
                     Field::Dwell,
+                    Field::SpindleRpm,
                     Field::Feed,
                 ],
                 Some(Operation::Chamfer(c)) => {
@@ -3899,6 +3987,7 @@ impl App {
                         Field::ChamferWidth,
                         Field::ChamferDepth,
                         Field::ChamferStep,
+                        Field::SpindleRpm,
                         Field::Feed,
                         Field::PlungeFeed,
                     ];
@@ -3915,6 +4004,7 @@ impl App {
                     vec![
                         Field::Depth,
                         Field::Stepdown,
+                        Field::SpindleRpm,
                         Field::Feed,
                         Field::PlungeFeed,
                     ]
@@ -3928,6 +4018,7 @@ impl App {
                         Field::ProfileOffset,
                         Field::RingStep,
                         Field::Scallop,
+                        Field::SpindleRpm,
                         Field::Feed,
                         Field::PlungeFeed,
                     ];
@@ -3979,6 +4070,7 @@ impl App {
                             fields.push(Field::ThreadBlindAllowance);
                         }
                     }
+                    fields.push(Field::SpindleRpm);
                     fields.push(Field::Feed);
                     fields.push(Field::PlungeFeed);
                     fields
@@ -4006,6 +4098,9 @@ impl App {
                 Field::NeckLength => Some(t.neck_length),
                 Field::NeckDiameter => Some(t.neck_diameter),
                 Field::Flutes => Some(t.flutes as f64),
+                Field::NominalRpm => Some(t.nominal_rpm),
+                Field::NominalFeed => Some(t.nominal_feed),
+                Field::NominalPlungeFeed => Some(t.nominal_plunge_feed),
                 _ => tool_kind_field(t.kind, field),
             };
         }
@@ -4064,6 +4159,18 @@ impl App {
             },
             Field::Flutes => match self.controller.selection() {
                 Selection::Tool(i) => setup.tools.get(i).map(|t| t.flutes as f64),
+                _ => None,
+            },
+            Field::NominalRpm => match self.controller.selection() {
+                Selection::Tool(i) => setup.tools.get(i).map(|t| t.nominal_rpm),
+                _ => None,
+            },
+            Field::NominalFeed => match self.controller.selection() {
+                Selection::Tool(i) => setup.tools.get(i).map(|t| t.nominal_feed),
+                _ => None,
+            },
+            Field::NominalPlungeFeed => match self.controller.selection() {
+                Selection::Tool(i) => setup.tools.get(i).map(|t| t.nominal_plunge_feed),
                 _ => None,
             },
             _ => match self.controller.selection() {
@@ -5284,6 +5391,24 @@ impl App {
             }
         }
 
+        // Cutting data for the new operation, seeded from the tool's nominals and
+        // editable here (or later in the operation's inspector). Shown once a tool is
+        // chosen — before then there is nothing to seed from.
+        if pending.tool.is_some() {
+            col = col.push(text("Cutting data").size(12));
+            for f in [Field::SpindleRpm, Field::Feed, Field::PlungeFeed] {
+                let value = self.fields.get(&f).cloned().unwrap_or_default();
+                col = col.push(field_row_labeled(
+                    f,
+                    self.field_label(f),
+                    self.field_help(f),
+                    &value,
+                    self.tooltips,
+                    self.field_invalid(f),
+                ));
+            }
+        }
+
         // Object snaps govern where the start/lead-in lands; show them for the
         // kinds that carry a start, while still awaiting that (boundary) pick.
         if op_uses_snaps(pending.kind) && pending.boundary.is_none() {
@@ -6497,6 +6622,8 @@ fn op_kind(op: &Operation) -> &'static str {
 /// Read an operation's value for a given field, if the op has it.
 fn op_field(op: &Operation, field: Field) -> Option<f64> {
     match (op, field) {
+        // Spindle speed is common to every operation kind.
+        (op, Field::SpindleRpm) => Some(op.spindle_rpm()),
         (Operation::Profile(o), Field::Depth) => Some(o.depth),
         (Operation::Profile(o), Field::Stepover) => Some(o.stepover),
         (Operation::Profile(o), Field::ProfileOffset) => Some(o.offset),
@@ -6579,6 +6706,10 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
 /// Write the parsed inspector fields onto an operation.
 fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
     let get = |f: Field| parsed.get(&f).copied();
+    // Spindle speed is common to every operation kind.
+    if let Some(v) = get(Field::SpindleRpm) {
+        op.set_spindle_rpm(v.max(0.0));
+    }
     match op {
         Operation::Profile(o) => {
             if let Some(v) = get(Field::Depth) {
@@ -8156,6 +8287,7 @@ mod inspector_field_tests {
 
     fn drill(peck: Option<f64>, dwell: Option<f64>) -> Operation {
         Operation::Drill(DrillOp {
+            spindle_rpm: 0.0,
             id: 1,
             tool: 1,
             points: vec![[0.0, 0.0]],

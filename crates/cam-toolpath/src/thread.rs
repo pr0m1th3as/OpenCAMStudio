@@ -479,6 +479,7 @@ mod tests {
     /// M10×1.5 base op: one hole at the origin, 6 mm long (an exact 4 turns).
     fn op(internal: bool, hand: Hand, climb: bool) -> ThreadOp {
         ThreadOp {
+            spindle_rpm: 0.0,
             id: 0,
             tool: 1,
             points: vec![[0.0, 0.0]],

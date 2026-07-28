@@ -41,6 +41,7 @@ fn profile_op(id: u32, chain: cam_geo::Contour, side: Side) -> Operation {
         depth: 4.0,
         stepdown: 2.0,
         stepover: 0.0,
+        spindle_rpm: 0.0,
         feed: 300.0,
         plunge_feed: 100.0,
         start: None,

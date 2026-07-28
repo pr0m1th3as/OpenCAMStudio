@@ -56,6 +56,7 @@ pub fn build_job(
     }
 
     let mut spindle_started = false;
+    let mut current_rpm: Option<f64> = None;
     let mut current_tool: Option<u32> = None;
 
     for operation in &setup.operations {
@@ -82,12 +83,21 @@ pub fn build_job(
             current_tool = Some(tool);
         }
 
-        // Spindle + coolant on, once, before the first cutting.
+        // Spindle speed is per-operation: the op's own value if set, else the job
+        // default (which keeps existing documents — every op at rpm 0 — unchanged).
+        // Re-command M3 S whenever the effective speed changes between operations, so
+        // a slow drill after a fast profile spins at its own rpm rather than inheriting.
+        let rpm = if operation.spindle_rpm() > 0.0 {
+            operation.spindle_rpm()
+        } else {
+            spindle_rpm
+        };
+        if current_rpm.is_none_or(|c| (c - rpm).abs() > f64::EPSILON) {
+            program.push(Step::Spindle { rpm, dir });
+            current_rpm = Some(rpm);
+        }
+        // Coolant on once, after the spindle first starts.
         if !spindle_started {
-            program.push(Step::Spindle {
-                rpm: spindle_rpm,
-                dir,
-            });
             program.push(Step::Coolant(Coolant::Flood));
             spindle_started = true;
         }

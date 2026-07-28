@@ -26,6 +26,7 @@ fn square(x0: f64, y0: f64, x1: f64, y1: f64) -> Contour {
 
 fn profile_square(id: u32, chain: Contour) -> ProfileOp {
     ProfileOp {
+        spindle_rpm: 0.0,
         clearing: cam_model::Clearing::default(),
         id,
         tool: 1,
@@ -93,6 +94,7 @@ fn run(doc: &Document) -> cam_sim::SimResult {
 #[test]
 fn a_pocket_clears_its_floor_without_collisions() {
     let op = PocketOp {
+        spindle_rpm: 0.0,
         clearing: cam_model::Clearing::default(),
         id: 0,
         tool: 1,
@@ -158,6 +160,7 @@ fn pocket_target(intended_depth: f64) -> Heightfield {
 
 fn pocket_op() -> PocketOp {
     PocketOp {
+        spindle_rpm: 0.0,
         clearing: cam_model::Clearing::default(),
         id: 0,
         tool: 1,

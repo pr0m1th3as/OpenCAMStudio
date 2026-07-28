@@ -15,7 +15,11 @@ use crate::Tool;
 /// v2: `ToolKind` became a data-carrying enum (per-kind geometry).
 /// v3: `Stock` became a part-relative spec (offsets + top + thickness).
 /// v4: `Setup` gained a workpiece `origin` (datum) + optional `start_offset`.
-pub const SCHEMA_VERSION: u32 = 4;
+/// v5: `Tool` gained nominal cutting data (`nominal_rpm`/`nominal_feed`/
+///     `nominal_plunge_feed`) and each `Operation` gained a per-op `spindle_rpm`.
+///     All are `#[serde(default)]`, so this bump is a record, not a load barrier —
+///     v4 and earlier files still open (the new fields default to 0).
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// The safety planes for a setup, all **absolute Z in millimetres**. By
 /// convention WCS Z0 is the top of stock, so `top_of_stock` is usually `0.0`.
@@ -209,6 +213,10 @@ pub struct ProfileOp {
     /// them it falls back to a single pass.
     #[serde(default)]
     pub stepover: f64,
+    /// Spindle speed for this operation, rpm (`M3 S<rpm>`). Seeded from the tool's
+    /// nominal RPM when the operation is created; `0.0` falls back to the job default.
+    #[serde(default)]
+    pub spindle_rpm: f64,
     /// Cutting feed, mm/min.
     pub feed: f64,
     /// Plunge feed, mm/min.
@@ -260,6 +268,10 @@ pub struct DrillOp {
     pub peck: Option<f64>,
     /// Dwell at the bottom, seconds; `None` for no dwell.
     pub dwell: Option<f64>,
+    /// Spindle speed for this operation, rpm (`M3 S<rpm>`). Seeded from the tool's
+    /// nominal RPM when the operation is created; `0.0` falls back to the job default.
+    #[serde(default)]
+    pub spindle_rpm: f64,
     /// Plunge feed, mm/min.
     pub feed: f64,
 }
@@ -405,6 +417,10 @@ pub struct PocketOp {
     /// the tool radius.
     #[serde(default)]
     pub offset: f64,
+    /// Spindle speed for this operation, rpm (`M3 S<rpm>`). Seeded from the tool's
+    /// nominal RPM when the operation is created; `0.0` falls back to the job default.
+    #[serde(default)]
+    pub spindle_rpm: f64,
     /// Cutting feed, mm/min.
     pub feed: f64,
     /// Plunge feed, mm/min.
@@ -556,6 +572,10 @@ pub struct FaceOp {
     /// Orientation of the parallel cutting lines.
     #[serde(default)]
     pub direction: Axis,
+    /// Spindle speed for this operation, rpm (`M3 S<rpm>`). Seeded from the tool's
+    /// nominal RPM when the operation is created; `0.0` falls back to the job default.
+    #[serde(default)]
+    pub spindle_rpm: f64,
     /// Cutting feed, mm/min.
     pub feed: f64,
     /// Plunge feed, mm/min.
@@ -612,6 +632,10 @@ pub struct ThreadOp {
     /// default) means *auto* — one thread pitch.
     #[serde(default)]
     pub blind_allowance: f64,
+    /// Spindle speed for this operation, rpm (`M3 S<rpm>`). Seeded from the tool's
+    /// nominal RPM when the operation is created; `0.0` falls back to the job default.
+    #[serde(default)]
+    pub spindle_rpm: f64,
     /// Cutting feed, mm/min.
     pub feed: f64,
     /// Plunge feed for the approach in Z, mm/min.
@@ -657,6 +681,10 @@ pub struct ChamferOp {
     /// removes more material as the bevel widens. `step` sets the first pass.
     #[serde(default)]
     pub gradual: bool,
+    /// Spindle speed for this operation, rpm (`M3 S<rpm>`). Seeded from the tool's
+    /// nominal RPM when the operation is created; `0.0` falls back to the job default.
+    #[serde(default)]
+    pub spindle_rpm: f64,
     /// Cutting feed, mm/min.
     pub feed: f64,
     /// Plunge feed for the approach in Z, mm/min.
@@ -718,6 +746,10 @@ pub struct EngraveOp {
     /// pass — normal for shallow engraving; a deeper groove steps down.
     #[serde(default)]
     pub stepdown: f64,
+    /// Spindle speed for this operation, rpm (`M3 S<rpm>`). Seeded from the tool's
+    /// nominal RPM when the operation is created; `0.0` falls back to the job default.
+    #[serde(default)]
+    pub spindle_rpm: f64,
     /// Cutting feed, mm/min.
     pub feed: f64,
     /// Plunge feed for the approach in Z, mm/min.
@@ -789,6 +821,11 @@ pub struct CarveOp {
     /// does. `0` (the default) uses a sensible fine value.
     #[serde(default)]
     pub scallop: f64,
+    /// Spindle speed for this operation, rpm (`M3 S<rpm>`). Seeded from the V-bit's
+    /// nominal RPM when the operation is created; `0.0` falls back to the job default.
+    /// Applies to the whole carve, including any clearing pass.
+    #[serde(default)]
+    pub spindle_rpm: f64,
     /// Cutting feed, mm/min.
     pub feed: f64,
     /// Plunge feed for the approach in Z, mm/min.
@@ -879,6 +916,35 @@ impl Operation {
                 _ => vec![op.tool],
             },
             other => vec![other.tool()],
+        }
+    }
+
+    /// The operation's commanded spindle speed, rpm. `0.0` means "unset" — the
+    /// planner falls back to the job default rather than commanding a zero.
+    pub fn spindle_rpm(&self) -> f64 {
+        match self {
+            Operation::Profile(op) => op.spindle_rpm,
+            Operation::Drill(op) => op.spindle_rpm,
+            Operation::Pocket(op) => op.spindle_rpm,
+            Operation::Face(op) => op.spindle_rpm,
+            Operation::Chamfer(op) => op.spindle_rpm,
+            Operation::Thread(op) => op.spindle_rpm,
+            Operation::Engrave(op) => op.spindle_rpm,
+            Operation::Carve(op) => op.spindle_rpm,
+        }
+    }
+
+    /// Set the operation's commanded spindle speed, rpm, whatever its kind.
+    pub fn set_spindle_rpm(&mut self, rpm: f64) {
+        match self {
+            Operation::Profile(op) => op.spindle_rpm = rpm,
+            Operation::Drill(op) => op.spindle_rpm = rpm,
+            Operation::Pocket(op) => op.spindle_rpm = rpm,
+            Operation::Face(op) => op.spindle_rpm = rpm,
+            Operation::Chamfer(op) => op.spindle_rpm = rpm,
+            Operation::Thread(op) => op.spindle_rpm = rpm,
+            Operation::Engrave(op) => op.spindle_rpm = rpm,
+            Operation::Carve(op) => op.spindle_rpm = rpm,
         }
     }
 
@@ -996,6 +1062,7 @@ mod tests {
 
     fn profile(id: u32) -> Operation {
         Operation::Profile(ProfileOp {
+            spindle_rpm: 0.0,
             clearing: Clearing::default(),
             id,
             tool: 1,
@@ -1023,6 +1090,7 @@ mod tests {
 
     fn carve(clear_tool: Option<u32>) -> Operation {
         Operation::Carve(CarveOp {
+            spindle_rpm: 0.0,
             id: 3,
             tool: 4,
             clear: clear_tool.map(|t| CarveClearing { tool: t, params: ClearParams::default() }),
@@ -1139,6 +1207,7 @@ mod tests {
     fn same_work_across_kinds_is_false() {
         let prof = profile(0);
         let drill = Operation::Drill(DrillOp {
+            spindle_rpm: 0.0,
             id: 0,
             tool: 1,
             points: vec![[0.0, 0.0]],

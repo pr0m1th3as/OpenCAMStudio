@@ -434,6 +434,7 @@ mod tests {
 
     fn op(width: f64) -> ChamferOp {
         ChamferOp {
+            spindle_rpm: 0.0,
             id: 0,
             tool: 1,
             chain: square(),

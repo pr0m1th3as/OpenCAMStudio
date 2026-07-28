@@ -926,6 +926,7 @@ mod tests {
 
     fn inner_op(hole: f64, lead_r: f64, start: Option<[f64; 2]>) -> ProfileOp {
         ProfileOp {
+            spindle_rpm: 0.0,
             clearing: cam_model::Clearing::default(),
             id: 0,
             tool: 1,
@@ -1047,6 +1048,7 @@ mod tests {
     /// the stock frames, with a stepover and (optionally) an engagement cap.
     fn outside_rough_op(engagement: f64) -> ProfileOp {
         ProfileOp {
+            spindle_rpm: 0.0,
             clearing: cam_model::Clearing { engagement, climb: true },
             id: 0,
             tool: 1,

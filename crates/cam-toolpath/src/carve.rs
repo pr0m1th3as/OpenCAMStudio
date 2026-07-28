@@ -1305,6 +1305,7 @@ mod tests {
 
     fn op(depth: f64) -> CarveOp {
         CarveOp {
+            spindle_rpm: 0.0,
             id: 0,
             tool: 1,
             clear: None,

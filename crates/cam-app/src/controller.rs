@@ -230,6 +230,19 @@ pub fn op_takes_islands(kind: OpKind) -> bool {
     matches!(kind, OpKind::Pocket | OpKind::Carve)
 }
 
+/// The spindle speed and feeds a new operation is created with — the wizard's
+/// editable cutting-data row, seeded from the tool's nominals (see
+/// [`Controller::seeded_cutting_for`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CuttingData {
+    /// Spindle speed, rpm. `0` = unset (falls back to the job default at plan time).
+    pub rpm: f64,
+    /// Cutting feed, mm/min.
+    pub feed: f64,
+    /// Plunge (Z-entry) feed, mm/min.
+    pub plunge_feed: f64,
+}
+
 /// An operation being created via the pick wizard: the kind, the tool, the picked
 /// boundary/path loop (once chosen), and — for a pocket — the loops toggled as
 /// excluded islands.
@@ -888,8 +901,34 @@ impl AppController {
                 part: LoopPart::Outer,
             }
         };
-        if let Some(op) = self.build_op(kind, boundary, &[], tool, None) {
+        if let Some(op) = self.build_op(kind, boundary, &[], tool, None, None) {
             self.add_operation(op);
+        }
+    }
+
+    /// The cutting data (spindle speed + feeds) an operation starts life with: the
+    /// chosen tool's nominals, falling back to the job defaults where the tool leaves
+    /// one unset (0). The wizard shows these as editable defaults; the value that is
+    /// finally committed comes back in via [`Self::confirm_operation`].
+    pub fn seeded_cutting_for(&self, tool: u32) -> CuttingData {
+        let p = self.defaults;
+        let td = self
+            .document
+            .current()
+            .setup
+            .tools
+            .iter()
+            .find(|t| t.number == tool);
+        CuttingData {
+            rpm: td.map_or(0.0, |t| t.nominal_rpm),
+            feed: td
+                .map(|t| t.nominal_feed)
+                .filter(|f| *f > 0.0)
+                .unwrap_or(p.feed),
+            plunge_feed: td
+                .map(|t| t.nominal_plunge_feed)
+                .filter(|f| *f > 0.0)
+                .unwrap_or(p.plunge_feed),
         }
     }
 
@@ -909,6 +948,7 @@ impl AppController {
         islands: &[LoopRef],
         tool: u32,
         start: Option<[f64; 2]>,
+        cutting: Option<CuttingData>,
     ) -> Option<Operation> {
         // An open imported path can only feed an operation that machines one; every
         // other strategy needs a closed region to offset, clear or bound. Refusing
@@ -919,6 +959,14 @@ impl AppController {
         let (points, closed) = self.loop_points(boundary)?;
         let chain = Contour::new(points);
         let p = self.defaults;
+        // Cutting data: the values chosen in the wizard if given, else the tool's
+        // seeded nominals. A `spindle_rpm` of 0 falls back to the job default at plan
+        // time; the inspector can override any of these per operation afterwards.
+        let CuttingData {
+            rpm: spindle_rpm,
+            feed,
+            plunge_feed,
+        } = cutting.unwrap_or_else(|| self.seeded_cutting_for(tool));
         // id 0 is a placeholder — add_operation renumbers with a fresh id.
         let op = match kind {
             OpKind::Profile => Operation::Profile(ProfileOp {
@@ -932,8 +980,9 @@ impl AppController {
                 depth: p.depth,
                 stepdown: p.stepdown,
                 stepover: 0.0,
-                feed: p.feed,
-                plunge_feed: p.plunge_feed,
+                spindle_rpm,
+                feed,
+                plunge_feed,
                 start,
                 lead_in: Lead::None,
                 lead_out: Lead::None,
@@ -955,8 +1004,9 @@ impl AppController {
                     stepdown: p.stepdown,
                     overlap: 0.5,
                     offset: 0.0,
-                    feed: p.feed,
-                    plunge_feed: p.plunge_feed,
+                    spindle_rpm,
+                    feed,
+                    plunge_feed,
                     plunge: Plunge::Straight,
                     start,
                     lead_overlap: 0.0,
@@ -972,7 +1022,8 @@ impl AppController {
                 start_offset: 0.0,
                 peck: None,
                 dwell: None,
-                feed: p.plunge_feed,
+                spindle_rpm,
+                feed: plunge_feed,
             }),
             OpKind::Face => {
                 // Face along the edge the user clicked to pick the boundary (the
@@ -996,8 +1047,9 @@ impl AppController {
                     overlap: 0.5,
                     overshoot: 2.0,
                     direction,
-                    feed: p.feed,
-                    plunge_feed: p.plunge_feed,
+                    spindle_rpm,
+                    feed,
+                    plunge_feed,
                 })
             }
             OpKind::Chamfer => Operation::Chamfer(ChamferOp {
@@ -1011,8 +1063,9 @@ impl AppController {
                 depth: 0.0,
                 step: 0.0,
                 gradual: false,
-                feed: p.feed,
-                plunge_feed: p.plunge_feed,
+                spindle_rpm,
+                feed,
+                plunge_feed,
                 start,
                 lead_in: Lead::None,
                 lead_out: Lead::None,
@@ -1049,8 +1102,9 @@ impl AppController {
                     spring_passes: 0,
                     drill_clearance: 0.0,
                     blind_allowance: 0.0,
-                    feed: p.feed,
-                    plunge_feed: p.plunge_feed,
+                    spindle_rpm,
+                    feed,
+                    plunge_feed,
                 })
             }
             OpKind::Carve => {
@@ -1076,8 +1130,9 @@ impl AppController {
                     offset: 0.0,
                     ring_step: 0.0,
                     scallop: 0.0,
-                    feed: p.feed,
-                    plunge_feed: p.plunge_feed,
+                    spindle_rpm,
+                    feed,
+                    plunge_feed,
                     // On by default: a carve is hundreds of rings, and every link is
                     // verified before it is taken (the ones that would gouge still lift).
                     stay_down: true,
@@ -1095,8 +1150,9 @@ impl AppController {
                 // pass (stepdown 0) — normal at this depth.
                 depth: 0.3,
                 stepdown: 0.0,
-                feed: p.feed,
-                plunge_feed: p.plunge_feed,
+                spindle_rpm,
+                feed,
+                plunge_feed,
                 start,
             }),
         };
@@ -1457,7 +1513,7 @@ impl AppController {
     /// Requires both a chosen tool and a picked boundary; [`Self::pending_ready`]
     /// reports whether those hold, so the UI can gate its Confirm button on the same
     /// condition. Returns `true` if an operation was created.
-    pub fn confirm_operation(&mut self) -> bool {
+    pub fn confirm_operation(&mut self, cutting: Option<CuttingData>) -> bool {
         let Some(pending) = self.pending_op.clone() else {
             return false;
         };
@@ -1465,7 +1521,7 @@ impl AppController {
             return false;
         };
         if let Some(op) =
-            self.build_op(pending.kind, boundary, &pending.islands, tool, pending.start)
+            self.build_op(pending.kind, boundary, &pending.islands, tool, pending.start, cutting)
         {
             match pending.replacing {
                 Some(old) => self.replace_operation(old, op),
@@ -1797,6 +1853,7 @@ impl AppController {
                     depth: p.depth,
                     stepdown: p.stepdown,
                     stepover: 0.0,
+                    spindle_rpm: 0.0,
                     feed: p.feed,
                     plunge_feed: p.plunge_feed,
                     start: None,
@@ -1832,6 +1889,7 @@ impl AppController {
                             start_offset: 0.0,
                             peck: None,
                             dwell: None,
+                            spindle_rpm: 0.0,
                             feed: p.plunge_feed,
                         }));
                     } else {
@@ -1845,6 +1903,7 @@ impl AppController {
                             stepdown: p.stepdown,
                             overlap: 0.5,
                             offset: 0.0,
+                            spindle_rpm: 0.0,
                             feed: p.feed,
                             plunge_feed: p.plunge_feed,
                             plunge: Plunge::Straight,
@@ -2706,7 +2765,7 @@ mod tests {
         let mut app = AppController::new(machine());
         app.open_dxf(PART_WITH_STROKE_DXF, "part.dxf").unwrap();
         let op = app
-            .build_op(OpKind::Engrave, LoopRef::open(0), &[], 1, None)
+            .build_op(OpKind::Engrave, LoopRef::open(0), &[], 1, None, None)
             .expect("engraving accepts an open path");
         match op {
             Operation::Engrave(o) => {
@@ -2731,6 +2790,7 @@ mod tests {
                 &[],
                 1,
                 None,
+                None,
             )
             .expect("engraving accepts a closed loop too");
         match op {
@@ -2754,7 +2814,7 @@ mod tests {
             OpKind::Chamfer,
         ] {
             assert!(
-                app.build_op(kind, LoopRef::open(0), &[], 1, None).is_none(),
+                app.build_op(kind, LoopRef::open(0), &[], 1, None, None).is_none(),
                 "{kind:?} must refuse an open path"
             );
         }
@@ -2843,7 +2903,7 @@ mod tests {
             region: 0,
             part: LoopPart::Outer,
         };
-        let op = app.build_op(OpKind::Profile, picked, &[], 1, None).unwrap();
+        let op = app.build_op(OpKind::Profile, picked, &[], 1, None, None).unwrap();
         app.replace_operation(target, op);
 
         let ids_after = op_ids(&app);
@@ -3355,7 +3415,7 @@ mod tests {
         );
         assert!(app.pending_op().is_some(), "still pending until Confirm");
         assert!(app.pending_ready(), "tool + boundary are both set");
-        assert!(app.confirm_operation());
+        assert!(app.confirm_operation(None));
         assert!(app.pending_op().is_none());
         match app.selected_operation() {
             Some(Operation::Profile(o)) => {
@@ -3378,7 +3438,7 @@ mod tests {
             app.pick_operation_geometry([45.4, 30.0], 2.0, &[SnapKind::End]),
             PickResult::Selecting
         );
-        assert!(app.confirm_operation());
+        assert!(app.confirm_operation(None));
         let hole = app.regions()[0].holes()[0].clone();
         match app.selected_operation() {
             Some(Operation::Profile(o)) => assert_eq!(o.chain, hole, "chain is the circle"),
@@ -3401,13 +3461,13 @@ mod tests {
         assert!(app.pending_op().unwrap().boundary.is_some());
         assert!(app.pending_op().unwrap().tool.is_none());
         assert!(!app.pending_ready(), "no tool yet");
-        assert!(!app.confirm_operation(), "must refuse without a tool");
+        assert!(!app.confirm_operation(None), "must refuse without a tool");
         assert_eq!(op_ids(&app).len(), before, "nothing created");
 
         // Tool second → now ready.
         app.set_pending_tool(1);
         assert!(app.pending_ready());
-        assert!(app.confirm_operation());
+        assert!(app.confirm_operation(None));
         assert_eq!(op_ids(&app).len(), before + 1);
     }
 
@@ -3426,7 +3486,7 @@ mod tests {
         app.pick_operation_geometry([45.4, 30.0], 2.0, &[SnapKind::End]);
         let second = app.pending_op().unwrap().boundary.unwrap();
         assert_ne!(second, first, "the pick must move, not stick");
-        assert!(app.confirm_operation());
+        assert!(app.confirm_operation(None));
     }
 
     #[test]
@@ -3436,7 +3496,7 @@ mod tests {
         app.begin_operation(OpKind::Profile);
         app.set_pending_tool(1);
         assert!(!app.pending_ready(), "no geometry yet");
-        assert!(!app.confirm_operation());
+        assert!(!app.confirm_operation(None));
     }
 
     #[test]
@@ -3463,7 +3523,7 @@ mod tests {
 
         // Re-add it and confirm → a pocket bounded by the rectangle with one island.
         app.pick_operation_geometry([45.4, 30.0], 2.0, &[SnapKind::End]);
-        assert!(app.confirm_operation());
+        assert!(app.confirm_operation(None));
         assert!(app.pending_op().is_none());
         match app.selected_operation() {
             Some(Operation::Pocket(o)) => assert_eq!(o.islands.len(), 1),
@@ -3494,7 +3554,7 @@ mod tests {
 
         // Re-add and confirm: the carve carries the island through.
         app.pick_operation_geometry([45.4, 30.0], 2.0, &[SnapKind::End]);
-        assert!(app.confirm_operation());
+        assert!(app.confirm_operation(None));
         match app.selected_operation() {
             Some(Operation::Carve(o)) => assert_eq!(o.islands.len(), 1),
             other => panic!("expected a carve with one island, got {other:?}"),
@@ -3532,7 +3592,7 @@ mod tests {
         app.begin_operation(OpKind::Carve);
         app.set_pending_tool(1);
         app.pick_operation_geometry([10.4, 25.0], 2.0, &[SnapKind::End]);
-        assert!(app.confirm_operation());
+        assert!(app.confirm_operation(None));
         let id = match app.selection() {
             Selection::Operation(id) => id,
             other => panic!("expected the carve selected, got {other:?}"),
@@ -3628,7 +3688,7 @@ mod tests {
             app.pick_operation_geometry([45.4, 30.0], 2.0, &[]),
             PickResult::Selecting
         );
-        assert!(app.confirm_operation());
+        assert!(app.confirm_operation(None));
         match app.selected_operation() {
             Some(Operation::Drill(o)) => {
                 assert_eq!(o.points.len(), 1);
@@ -3649,7 +3709,7 @@ mod tests {
             app.pick_operation_geometry([69.5, 30.0], 1.5, &[SnapKind::Mid]),
             PickResult::Selecting
         );
-        assert!(app.confirm_operation());
+        assert!(app.confirm_operation(None));
         match app.selected_operation() {
             Some(Operation::Profile(o)) => {
                 let s = o.start.expect("mid snap sets a start");

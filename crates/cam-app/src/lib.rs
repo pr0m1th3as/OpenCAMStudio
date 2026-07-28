@@ -17,8 +17,8 @@ mod project;
 mod tool_library;
 
 pub use controller::{
-    op_accepts_open_paths, op_selects_circles, op_takes_islands, AppController, ExportError,
-    ExportToError,
+    op_accepts_open_paths, op_selects_circles, op_takes_islands, AppController, CuttingData,
+    ExportError, ExportToError,
     JobParams, LoopPart, LoopRef, OpKind, PendingOp, PickResult, ProjectError, RunOutcome,
     Selection, SnapHit, SnapKind,
 };

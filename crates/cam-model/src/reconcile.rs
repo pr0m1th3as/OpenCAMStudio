@@ -365,6 +365,7 @@ mod tests {
     fn operation_tool_references_are_rewritten() {
         let mk_drill = |id: u32, tool: u32| {
             Operation::Drill(DrillOp {
+                spindle_rpm: 0.0,
                 id,
                 tool,
                 points: vec![[0.0, 0.0]],
