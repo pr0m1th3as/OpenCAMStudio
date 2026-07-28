@@ -15,11 +15,13 @@
 mod dialect;
 mod fanuc;
 mod grbl;
+mod okuma;
 mod words;
 mod writer;
 
 pub use fanuc::FanucPost;
 pub use grbl::GrblPost;
+pub use okuma::OkumaPost;
 
 use core::fmt;
 
@@ -43,27 +45,44 @@ pub enum PostKind {
     Fanuc,
     /// Haas (Fanuc-family job-shop control).
     Haas,
+    /// Okuma OSP — a fourth output family, not a Fanuc parameterisation (`G15 H`
+    /// work offsets, `G56 H` tool length, `M02` end, `G71`/`M53` cycles). See
+    /// [`okuma`].
+    Okuma,
 }
 
 impl PostKind {
     /// Every post, in a stable order — for the picker.
-    pub const ALL: [PostKind; 6] = [
+    pub const ALL: [PostKind; 7] = [
         PostKind::Grbl,
         PostKind::FluidNc,
         PostKind::GrblHal,
         PostKind::LinuxCnc,
         PostKind::Fanuc,
         PostKind::Haas,
+        PostKind::Okuma,
     ];
 
-    fn dialect(self) -> &'static dialect::Dialect {
-        match self {
+    /// The flat-knob [`dialect::Dialect`] backing this post, or `None` for families
+    /// (Okuma) whose frame is too divergent for the shared walker and carry their own
+    /// emitter instead.
+    fn dialect(self) -> Option<&'static dialect::Dialect> {
+        Some(match self {
             PostKind::Grbl => &dialect::GRBL,
             PostKind::FluidNc => &dialect::FLUIDNC,
             PostKind::GrblHal => &dialect::GRBLHAL,
             PostKind::LinuxCnc => &dialect::LINUXCNC,
             PostKind::Fanuc => &dialect::FANUC,
             PostKind::Haas => &dialect::HAAS,
+            PostKind::Okuma => return None,
+        })
+    }
+
+    /// The display label for the picker.
+    fn label(self) -> &'static str {
+        match self.dialect() {
+            Some(d) => d.name,
+            None => "Okuma",
         }
     }
 
@@ -74,13 +93,16 @@ impl PostKind {
         machine: &Machine,
         options: &PostOptions,
     ) -> Result<String, PostError> {
-        dialect::emit(program, machine, options, self.dialect())
+        match self.dialect() {
+            Some(d) => dialect::emit(program, machine, options, d),
+            None => okuma::emit(program, machine, options),
+        }
     }
 }
 
 impl fmt::Display for PostKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.dialect().name)
+        f.write_str(self.label())
     }
 }
 
