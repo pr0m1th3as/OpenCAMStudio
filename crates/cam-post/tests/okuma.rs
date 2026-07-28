@@ -124,6 +124,32 @@ fn reference_dump() {
     );
 }
 
+#[test]
+fn a_new_tools_first_move_restates_its_motion_word() {
+    // Finding 1 (O6 audit): the shop always re-emits G00 after a tool change rather
+    // than rely on a modal G0 carrying across M6, and OSP may reset the interpolation
+    // group on a change. So the first move of a second tool must carry its own G-word,
+    // not appear as bare coordinates.
+    let program = ProgramBuilder::new()
+        .tool_change(1)
+        .spindle_on(1000.0, SpindleDir::Cw)
+        .rapid(Point3::new(10.0, 10.0, 5.0), MoveKind::Link)
+        .tool_change(2)
+        .rapid(Point3::new(40.0, 30.0, 5.0), MoveKind::Link)
+        .build();
+    let g = okuma(&program);
+    let first_after_t2 = g
+        .lines()
+        .skip_while(|l| *l != "G56 H2")
+        .skip(1)
+        .find(|l| l.starts_with('G') || l.starts_with('X'))
+        .expect("a move after the second tool change");
+    assert!(
+        first_after_t2.starts_with("G0 "),
+        "the second tool's first move must re-state G0, not rely on modal carry:\n{g}"
+    );
+}
+
 /// Build a single-op drilling program with the given cycle, so a test can assert the
 /// exact G71/M53 frame it lowers to.
 fn drill_program(cycle: DrillCycle) -> Program {

@@ -112,6 +112,11 @@ pub(crate) fn emit(
                 w.line(format!("T{tool} M6"));
                 w.line("G15 H1".to_string());
                 w.line(format!("G56 H{tool}"));
+                // Force the next move to re-state its motion word. The shop files
+                // always re-emit `G00` after a tool change rather than rely on a modal
+                // `G0` carrying across `M6`, and OSP may reset the interpolation group
+                // on a tool change — a bare `X Y Z` would then be an unintended feed.
+                w.reset_modal();
             }
             Step::Spindle { rpm, dir } => {
                 w.check_spindle(*rpm)?;
