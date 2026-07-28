@@ -86,6 +86,24 @@ impl PostKind {
         }
     }
 
+    /// The conventional file extension(s) for this dialect's programs, for the
+    /// export dialog's filter. Okuma OSP programs are `.MIN`; the rest are `.nc`.
+    pub fn file_extensions(self) -> &'static [&'static str] {
+        match self {
+            PostKind::Okuma => &["min"],
+            _ => &["nc"],
+        }
+    }
+
+    /// The default file name the export dialog is seeded with — carries the
+    /// dialect's conventional extension (see [`file_extensions`](Self::file_extensions)).
+    pub fn default_file_name(self) -> &'static str {
+        match self {
+            PostKind::Okuma => "program.min",
+            _ => "program.nc",
+        }
+    }
+
     /// Post `program` in this dialect.
     pub fn post(
         self,

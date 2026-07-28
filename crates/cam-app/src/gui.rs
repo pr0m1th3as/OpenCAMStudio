@@ -2362,8 +2362,9 @@ impl App {
                 // sees it — but don't block (a spring/finishing pass is legitimate).
                 let groups = self.controller.duplicate_operation_groups();
                 if groups.is_empty() {
+                    let kind = self.controller.post_kind();
                     return iced::Task::perform(
-                        pick_save("G-code", "program.nc", &["nc"]),
+                        pick_save("G-code", kind.default_file_name(), kind.file_extensions()),
                         Message::NcToExport,
                     );
                 }
@@ -2373,8 +2374,9 @@ impl App {
                 );
             }
             Message::ExportDupConfirmed(true) => {
+                let kind = self.controller.post_kind();
                 return iced::Task::perform(
-                    pick_save("G-code", "program.nc", &["nc"]),
+                    pick_save("G-code", kind.default_file_name(), kind.file_extensions()),
                     Message::NcToExport,
                 );
             }

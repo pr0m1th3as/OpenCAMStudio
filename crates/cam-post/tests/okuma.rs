@@ -63,6 +63,15 @@ fn okuma_appears_in_the_picker_as_a_seventh_post() {
 }
 
 #[test]
+fn okuma_exports_default_to_the_min_extension() {
+    // OSP programs are .MIN files; every other dialect stays .nc.
+    assert_eq!(PostKind::Okuma.file_extensions(), &["min"]);
+    assert_eq!(PostKind::Okuma.default_file_name(), "program.min");
+    assert_eq!(PostKind::Fanuc.file_extensions(), &["nc"]);
+    assert_eq!(PostKind::Grbl.default_file_name(), "program.nc");
+}
+
+#[test]
 fn frame_is_unwrapped_with_a_defensive_safe_start_and_m02_end() {
     let g = okuma(&mill_program());
     // No `%`/O-number wrapper — the file name is the program name on OSP.
