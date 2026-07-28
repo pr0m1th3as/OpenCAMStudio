@@ -1,7 +1,8 @@
 //! The Okuma OSP post — a fourth output family, verified where it diverges from the
-//! Fanuc-shaped families. O1 scope: the frame skeleton (defensive safe-start, no
-//! wrapper, per-tool-section `G15`/`G56`, `M02` end, `G04 F` dwell, native arcs) and
-//! the deliberate refusal of drilling until the `G71`/`M53` frame lands (O3).
+//! Fanuc-shaped families. Covers the frame skeleton (defensive safe-start, no
+//! wrapper, per-tool-section `G15`/`G56`, `M02` end, `G04 F` dwell, native arcs) —
+//! O1; the `G71`/`M53` drilling cycles — O3; and per-operation multi-WCS
+//! (`G15 H<n>` from a `Step::Datum`, in shop section-head order) — O2.
 
 use cam_cldata::{
     ArcDir, DrillCycle, MoveKind, Point3, Program, ProgramBuilder, SpindleDir, Tag,
@@ -156,6 +157,69 @@ fn a_new_tools_first_move_restates_its_motion_word() {
     assert!(
         first_after_t2.starts_with("G0 "),
         "the second tool's first move must re-state G0, not rely on modal carry:\n{g}"
+    );
+}
+
+#[test]
+fn multi_wcs_section_head_is_tool_then_g15_then_g56_in_shop_order() {
+    // O2: a datum change (`Step::Datum`) that coincides with a tool change rides the
+    // tool-section head, in the shop order `T M6` / `G15 H<n>` / `G56 H<tool>` — the
+    // exact frame of `PL-0-3T.MIN`, where each fixture restarts the tool sequence.
+    // The planner emits the Datum step *before* the tool change; the post defers its
+    // G15 to the head so the three lines land in order.
+    let program = ProgramBuilder::new()
+        .tool_change(88) // datum 1 in force (no Datum step — it is the default)
+        .spindle_on(2779.0, SpindleDir::Cw)
+        .feed(600.0)
+        .linear(Point3::new(10.0, 20.0, -3.0), MoveKind::Cutting)
+        .datum(2) // second fixture; same tool sequence restarts
+        .tool_change(88)
+        .linear(Point3::new(10.0, 20.0, -3.0), MoveKind::Cutting)
+        .spindle_off()
+        .build();
+    let g = okuma(&program);
+    let lines: Vec<&str> = g.lines().collect();
+    // The first section is the default datum.
+    assert!(g.contains("G15 H1"), "first section on datum 1:\n{g}");
+    // Find the *second* `T88 M6` and assert the next two lines, in order.
+    let second_head = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| **l == "T88 M6")
+        .nth(1)
+        .map(|(i, _)| i)
+        .expect("a second tool-section head");
+    assert_eq!(
+        &lines[second_head..second_head + 3],
+        &["T88 M6", "G15 H2", "G56 H88"],
+        "shop order T / G15 H2 / G56 at the second fixture:\n{g}"
+    );
+}
+
+#[test]
+fn a_datum_change_without_a_tool_change_states_g15_standalone() {
+    // Same tool, a different fixture: there is no tool-section head to ride, so the
+    // datum change states `G15 H<n>` on its own line rather than being dropped.
+    let program = ProgramBuilder::new()
+        .tool_change(88)
+        .spindle_on(2779.0, SpindleDir::Cw)
+        .feed(600.0)
+        .linear(Point3::new(10.0, 20.0, -3.0), MoveKind::Cutting)
+        .datum(3) // no tool change follows — a bare cut does
+        .linear(Point3::new(40.0, 20.0, -3.0), MoveKind::Cutting)
+        .spindle_off()
+        .build();
+    let g = okuma(&program);
+    // Exactly one `G15 H3`, and it is not part of a `T.. M6` head (the line before it
+    // is a cut, not a tool change).
+    let idx = g
+        .lines()
+        .position(|l| l == "G15 H3")
+        .expect("a standalone G15 H3:\n");
+    let prev = g.lines().nth(idx - 1).unwrap();
+    assert!(
+        !prev.ends_with("M6"),
+        "the standalone G15 H3 does not ride a tool-section head:\n{g}"
     );
 }
 

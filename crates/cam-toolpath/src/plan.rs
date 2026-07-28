@@ -6,7 +6,7 @@
 //! operation fragments together in order.
 
 use cam_cldata::{Coolant, MoveKind, Point3, Program, SpindleDir, Step, Tag};
-use cam_model::{Document, Operation};
+use cam_model::{DatumKind, Document, Operation, ReplicationOrder, Setup};
 
 use crate::{
     CancelToken, CarveStrategy, ChamferStrategy, Diagnostic, DrillStrategy, EngraveStrategy,
@@ -55,73 +55,164 @@ pub fn build_job(
         });
     }
 
-    let mut spindle_started = false;
-    let mut current_rpm: Option<f64> = None;
-    let mut current_tool: Option<u32> = None;
-
+    // Compute every operation's fragment once. In replication mode the same fragment
+    // is re-emitted under each datum — the coordinates are identical (part frame) and
+    // the post applies each work offset — so geometry is never recomputed per fixture.
+    let mut planned: Vec<Planned> = Vec::new();
     for operation in &setup.operations {
         if cancel.is_cancelled() {
             break;
         }
-
         let result = compute(operation, &env, cancel);
-        let fragment = result.program;
         // Stamp ownership here: the planner knows which operation produced these,
         // the strategy does not need to.
-        let op_id = operation.id();
-        diagnostics.extend(result.diagnostics.into_iter().map(|d| d.for_op(op_id)));
-        if fragment.is_empty() {
+        diagnostics.extend(
+            result
+                .diagnostics
+                .into_iter()
+                .map(|d| d.for_op(operation.id())),
+        );
+        if result.program.is_empty() {
             continue;
         }
-
-        // Tool change when the operation's *first* tool differs from the one in the
-        // spindle. A multi-tool operation orders its own subsequent changes — see the
-        // resync after the fragment is appended.
-        let tool = operation.tools()[0];
-        if current_tool != Some(tool) {
-            program.push(Step::ToolChange { tool });
-            current_tool = Some(tool);
-        }
-
-        // Spindle speed is per-operation: the op's own value if set, else the job
-        // default (which keeps existing documents — every op at rpm 0 — unchanged).
-        // Re-command M3 S whenever the effective speed changes between operations, so
-        // a slow drill after a fast profile spins at its own rpm rather than inheriting.
+        // Per-operation spindle speed: the op's own value if set, else the job default
+        // (which keeps existing documents — every op at rpm 0 — unchanged).
         let rpm = if operation.spindle_rpm() > 0.0 {
             operation.spindle_rpm()
         } else {
             spindle_rpm
         };
-        if current_rpm.is_none_or(|c| (c - rpm).abs() > f64::EPSILON) {
-            program.push(Step::Spindle { rpm, dir });
-            current_rpm = Some(rpm);
+        planned.push(Planned {
+            tool: operation.tools()[0],
+            rpm,
+            // A multi-tool operation (Carve) emits its own tool change mid-fragment;
+            // whatever it leaves in the spindle is what the next instance compares
+            // against, so read it back rather than assume.
+            ends_with: last_tool_change(&result.program),
+            datum: operation.work_offset(),
+            fragment: result.program,
+        });
+    }
+
+    // Emit the planned operations. Without replication each runs once, under its own
+    // `work_offset`. With replication (Workflow A) the whole list is run across the
+    // setup's simultaneous datums, in the chosen order.
+    let mut st = EmitState::new();
+    match setup.replication {
+        None => {
+            for pl in &planned {
+                emit_instance(&mut program, pl, pl.datum, dir, &mut st);
+            }
         }
-        // Coolant on once, after the spindle first starts.
-        if !spindle_started {
-            program.push(Step::Coolant(Coolant::Flood));
-            spindle_started = true;
+        // ByTool: fixtures *inside* each operation — op order preserved, and no tool
+        // change is added over a single part.
+        Some(ReplicationOrder::ByTool) => {
+            let datums = simultaneous_datums(setup);
+            for pl in &planned {
+                for &d in &datums {
+                    emit_instance(&mut program, pl, d, dir, &mut st);
+                }
+            }
         }
-
-        // A multi-tool operation (Carve) emits its own tool change mid-fragment, because
-        // only it knows the order its tools must run in. Whatever it left in the spindle
-        // is what the *next* operation compares against — read it back rather than
-        // assuming, or the next operation would be handed a stale tool number and its
-        // change silently omitted.
-        let ends_with = last_tool_change(&fragment);
-
-        program.extend(fragment);
-
-        if let Some(t) = ends_with {
-            current_tool = Some(t);
+        // ByFixture: the whole operation list per fixture — tool loads multiply by the
+        // fixture count (the `PL-0-3T.MIN` house style).
+        Some(ReplicationOrder::ByFixture) => {
+            let datums = simultaneous_datums(setup);
+            for &d in &datums {
+                for pl in &planned {
+                    emit_instance(&mut program, pl, d, dir, &mut st);
+                }
+            }
         }
     }
 
-    if spindle_started {
+    if st.spindle_started {
         program.push(Step::Coolant(Coolant::Off));
         program.push(Step::SpindleOff);
     }
 
     (program, diagnostics)
+}
+
+/// One operation, computed and ready to be emitted — possibly more than once, under
+/// different datums, in replication mode. The fragment's coordinates are in the part
+/// frame and identical for every datum; only the emitted work offset differs.
+struct Planned {
+    fragment: Program,
+    tool: u32,
+    rpm: f64,
+    /// The tool a multi-tool fragment (Carve) leaves in the spindle, if any.
+    ends_with: Option<u32>,
+    /// The operation's own work datum — used only when not replicating.
+    datum: u32,
+}
+
+/// Running machine state threaded across emitted operation instances, so a tool,
+/// spindle speed, datum or coolant is re-commanded only when it actually changes.
+struct EmitState {
+    spindle_started: bool,
+    current_rpm: Option<f64>,
+    current_tool: Option<u32>,
+    current_datum: u32,
+}
+
+impl EmitState {
+    fn new() -> Self {
+        // Datum 1 is the base WCS and the initial state, so an op on datum 1 emits no
+        // `Step::Datum`; a single-datum job's output is unchanged from before multi-WCS.
+        Self {
+            spindle_started: false,
+            current_rpm: None,
+            current_tool: None,
+            current_datum: 1,
+        }
+    }
+}
+
+/// Emit one operation instance under work datum `d`: the datum select (*before* the
+/// tool change, so a section reads datum-then-tool and a post can state `G15 H<n>` in
+/// the tool-section head), the tool change, spindle and coolant — each only when it
+/// changes — then the operation's motions.
+fn emit_instance(program: &mut Program, pl: &Planned, d: u32, dir: SpindleDir, st: &mut EmitState) {
+    if st.current_datum != d {
+        program.push(Step::Datum(d));
+        st.current_datum = d;
+    }
+    if st.current_tool != Some(pl.tool) {
+        program.push(Step::ToolChange { tool: pl.tool });
+        st.current_tool = Some(pl.tool);
+    }
+    if st.current_rpm.is_none_or(|c| (c - pl.rpm).abs() > f64::EPSILON) {
+        program.push(Step::Spindle { rpm: pl.rpm, dir });
+        st.current_rpm = Some(pl.rpm);
+    }
+    // Coolant on once, after the spindle first starts.
+    if !st.spindle_started {
+        program.push(Step::Coolant(Coolant::Flood));
+        st.spindle_started = true;
+    }
+    program.extend(pl.fragment.clone());
+    if let Some(t) = pl.ends_with {
+        st.current_tool = Some(t);
+    }
+}
+
+/// The indices of the setup's simultaneous datums — the fixtures replication visits,
+/// in registry order. Reorient datums are excluded (they belong to Workflow B, not
+/// replication). Falls back to the base datum 1 if none are simultaneous, so a
+/// replicated job never silently emits nothing.
+fn simultaneous_datums(setup: &Setup) -> Vec<u32> {
+    let datums: Vec<u32> = setup
+        .work_offsets
+        .iter()
+        .filter(|d| d.kind == DatumKind::Simultaneous)
+        .map(|d| d.index)
+        .collect();
+    if datums.is_empty() {
+        vec![1]
+    } else {
+        datums
+    }
 }
 
 /// Dispatch an operation to its strategy and compute it.

@@ -8290,6 +8290,7 @@ mod inspector_field_tests {
     fn drill(peck: Option<f64>, dwell: Option<f64>) -> Operation {
         Operation::Drill(DrillOp {
             spindle_rpm: 0.0,
+            work_offset: 1,
             id: 1,
             tool: 1,
             points: vec![[0.0, 0.0]],

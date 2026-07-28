@@ -150,6 +150,17 @@ pub(crate) fn emit(
                 .to_string(),
             ),
             Step::ToolChange { tool } => w.line(format!("T{tool} M6")),
+            Step::Datum(n) => {
+                // Per-operation multi-WCS is Okuma-only so far (O2). Datum 1 is this
+                // family's single preamble work offset — a no-op here — but a change to
+                // any other datum must not silently collapse onto it and miscut a
+                // multi-fixture job; refuse it, mirroring the cutter-comp rejection.
+                if *n != 1 {
+                    return Err(PostError::Unsupported(format!(
+                        "per-operation work datum (work_offset {n}); only the Okuma post emits multi-WCS so far"
+                    )));
+                }
+            }
             Step::CutterComp(c) => {
                 if dialect.cutter_comp {
                     w.line(match c {

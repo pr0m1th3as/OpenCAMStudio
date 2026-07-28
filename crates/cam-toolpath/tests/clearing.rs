@@ -78,6 +78,8 @@ fn setup(operations: Vec<Operation>, tools: Vec<Tool>) -> Document {
         operations,
         origin: [0.0, 0.0, 0.0],
         start_offset: None,
+        work_offsets: vec![cam_model::Datum::base()],
+        replication: None,
     })
 }
 
@@ -149,6 +151,7 @@ fn assert_no_rapid_onto_uncut_stock(program: &Program, floor: f64) {
 fn pocket_doc() -> Document {
     let op = PocketOp {
         spindle_rpm: 0.0,
+        work_offset: 1,
         clearing: Clearing::default(),
         id: 0,
         tool: 1,
@@ -173,6 +176,7 @@ fn pocket_doc() -> Document {
 fn roughing_doc() -> Document {
     let op = ProfileOp {
         spindle_rpm: 0.0,
+        work_offset: 1,
         clearing: Clearing::default(),
         id: 0,
         tool: 1,
@@ -200,6 +204,7 @@ fn roughing_doc() -> Document {
 fn face_doc(overshoot: f64) -> Document {
     let op = FaceOp {
         spindle_rpm: 0.0,
+        work_offset: 1,
         id: 0,
         tool: 1,
         boundary: rect(0.0, 0.0, 60.0, 40.0),
@@ -231,6 +236,7 @@ fn carve_doc() -> Document {
     };
     let op = CarveOp {
         spindle_rpm: 0.0,
+        work_offset: 1,
         id: 0,
         tool: 1,
         clear: Some(cam_model::CarveClearing { tool: 2, params: cam_model::ClearParams::default() }),

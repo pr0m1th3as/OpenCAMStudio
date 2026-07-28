@@ -19,7 +19,13 @@ use crate::Tool;
 ///     `nominal_plunge_feed`) and each `Operation` gained a per-op `spindle_rpm`.
 ///     All are `#[serde(default)]`, so this bump is a record, not a load barrier —
 ///     v4 and earlier files still open (the new fields default to 0).
-pub const SCHEMA_VERSION: u32 = 5;
+/// v6: each `Operation` gained a per-op `work_offset` — the 1-based work-datum
+///     index for multi-WCS output (Okuma `G15 H<n>`). `#[serde(default =
+///     "default_work_offset")]` → 1, so v5 and earlier files still open on datum 1.
+/// v7: `Setup` gained a work-datum `work_offsets` registry (`Vec<Datum>`) and an
+///     optional `replication` order (Workflow A). Both `#[serde(default)]` — the
+///     registry defaults to a single base datum — so v6 and earlier files still open.
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// The safety planes for a setup, all **absolute Z in millimetres**. By
 /// convention WCS Z0 is the top of stock, so `top_of_stock` is usually `0.0`.
@@ -217,6 +223,11 @@ pub struct ProfileOp {
     /// nominal RPM when the operation is created; `0.0` falls back to the job default.
     #[serde(default)]
     pub spindle_rpm: f64,
+    /// Work-datum index for this operation (1-based; datum 1 is the default). The
+    /// post lowers it to a dialect code — Okuma `G15 H<n>` — so ops on different
+    /// fixtures/setups emit under different work coordinate systems.
+    #[serde(default = "default_work_offset")]
+    pub work_offset: u32,
     /// Cutting feed, mm/min.
     pub feed: f64,
     /// Plunge feed, mm/min.
@@ -272,6 +283,11 @@ pub struct DrillOp {
     /// nominal RPM when the operation is created; `0.0` falls back to the job default.
     #[serde(default)]
     pub spindle_rpm: f64,
+    /// Work-datum index for this operation (1-based; datum 1 is the default). The
+    /// post lowers it to a dialect code — Okuma `G15 H<n>` — so ops on different
+    /// fixtures/setups emit under different work coordinate systems.
+    #[serde(default = "default_work_offset")]
+    pub work_offset: u32,
     /// Plunge feed, mm/min.
     pub feed: f64,
 }
@@ -279,6 +295,12 @@ pub struct DrillOp {
 /// Default for a `#[serde(default)]` boolean field that should default to `true`.
 pub(crate) fn default_true() -> bool {
     true
+}
+
+/// Default for a per-operation `work_offset`: datum 1, the base work coordinate
+/// system. 1-based so a missing field (v5 and earlier files) opens on datum 1.
+pub(crate) fn default_work_offset() -> u32 {
+    1
 }
 
 /// Constant-engagement (trochoidal) clearing parameters, shared by pocket clearing
@@ -421,6 +443,11 @@ pub struct PocketOp {
     /// nominal RPM when the operation is created; `0.0` falls back to the job default.
     #[serde(default)]
     pub spindle_rpm: f64,
+    /// Work-datum index for this operation (1-based; datum 1 is the default). The
+    /// post lowers it to a dialect code — Okuma `G15 H<n>` — so ops on different
+    /// fixtures/setups emit under different work coordinate systems.
+    #[serde(default = "default_work_offset")]
+    pub work_offset: u32,
     /// Cutting feed, mm/min.
     pub feed: f64,
     /// Plunge feed, mm/min.
@@ -576,6 +603,11 @@ pub struct FaceOp {
     /// nominal RPM when the operation is created; `0.0` falls back to the job default.
     #[serde(default)]
     pub spindle_rpm: f64,
+    /// Work-datum index for this operation (1-based; datum 1 is the default). The
+    /// post lowers it to a dialect code — Okuma `G15 H<n>` — so ops on different
+    /// fixtures/setups emit under different work coordinate systems.
+    #[serde(default = "default_work_offset")]
+    pub work_offset: u32,
     /// Cutting feed, mm/min.
     pub feed: f64,
     /// Plunge feed, mm/min.
@@ -636,6 +668,11 @@ pub struct ThreadOp {
     /// nominal RPM when the operation is created; `0.0` falls back to the job default.
     #[serde(default)]
     pub spindle_rpm: f64,
+    /// Work-datum index for this operation (1-based; datum 1 is the default). The
+    /// post lowers it to a dialect code — Okuma `G15 H<n>` — so ops on different
+    /// fixtures/setups emit under different work coordinate systems.
+    #[serde(default = "default_work_offset")]
+    pub work_offset: u32,
     /// Cutting feed, mm/min.
     pub feed: f64,
     /// Plunge feed for the approach in Z, mm/min.
@@ -685,6 +722,11 @@ pub struct ChamferOp {
     /// nominal RPM when the operation is created; `0.0` falls back to the job default.
     #[serde(default)]
     pub spindle_rpm: f64,
+    /// Work-datum index for this operation (1-based; datum 1 is the default). The
+    /// post lowers it to a dialect code — Okuma `G15 H<n>` — so ops on different
+    /// fixtures/setups emit under different work coordinate systems.
+    #[serde(default = "default_work_offset")]
+    pub work_offset: u32,
     /// Cutting feed, mm/min.
     pub feed: f64,
     /// Plunge feed for the approach in Z, mm/min.
@@ -750,6 +792,11 @@ pub struct EngraveOp {
     /// nominal RPM when the operation is created; `0.0` falls back to the job default.
     #[serde(default)]
     pub spindle_rpm: f64,
+    /// Work-datum index for this operation (1-based; datum 1 is the default). The
+    /// post lowers it to a dialect code — Okuma `G15 H<n>` — so ops on different
+    /// fixtures/setups emit under different work coordinate systems.
+    #[serde(default = "default_work_offset")]
+    pub work_offset: u32,
     /// Cutting feed, mm/min.
     pub feed: f64,
     /// Plunge feed for the approach in Z, mm/min.
@@ -826,6 +873,11 @@ pub struct CarveOp {
     /// Applies to the whole carve, including any clearing pass.
     #[serde(default)]
     pub spindle_rpm: f64,
+    /// Work-datum index for this operation (1-based; datum 1 is the default). The
+    /// post lowers it to a dialect code — Okuma `G15 H<n>` — so ops on different
+    /// fixtures/setups emit under different work coordinate systems.
+    #[serde(default = "default_work_offset")]
+    pub work_offset: u32,
     /// Cutting feed, mm/min.
     pub feed: f64,
     /// Plunge feed for the approach in Z, mm/min.
@@ -948,6 +1000,36 @@ impl Operation {
         }
     }
 
+    /// The operation's work-datum index (1-based). Datum 1 is the base work
+    /// coordinate system; higher values select further fixtures/setups, which a
+    /// post lowers to its dialect (Okuma `G15 H<n>`).
+    pub fn work_offset(&self) -> u32 {
+        match self {
+            Operation::Profile(op) => op.work_offset,
+            Operation::Drill(op) => op.work_offset,
+            Operation::Pocket(op) => op.work_offset,
+            Operation::Face(op) => op.work_offset,
+            Operation::Chamfer(op) => op.work_offset,
+            Operation::Thread(op) => op.work_offset,
+            Operation::Engrave(op) => op.work_offset,
+            Operation::Carve(op) => op.work_offset,
+        }
+    }
+
+    /// Set the operation's work-datum index (1-based), whatever its kind.
+    pub fn set_work_offset(&mut self, work_offset: u32) {
+        match self {
+            Operation::Profile(op) => op.work_offset = work_offset,
+            Operation::Drill(op) => op.work_offset = work_offset,
+            Operation::Pocket(op) => op.work_offset = work_offset,
+            Operation::Face(op) => op.work_offset = work_offset,
+            Operation::Chamfer(op) => op.work_offset = work_offset,
+            Operation::Thread(op) => op.work_offset = work_offset,
+            Operation::Engrave(op) => op.work_offset = work_offset,
+            Operation::Carve(op) => op.work_offset = work_offset,
+        }
+    }
+
     /// Overwrite the operation's id, whatever its kind.
     pub fn set_id(&mut self, id: u32) {
         match self {
@@ -1007,6 +1089,63 @@ impl Operation {
     }
 }
 
+/// How a work datum is reached — and therefore whether switching to it is free.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DatumKind {
+    /// Several datums mounted at once (multiple vises, a router grid): switching is a
+    /// taught offset, no operator action. The kind used by replication (Workflow A).
+    #[default]
+    Simultaneous,
+    /// Reaching this datum needs the operator to re-fixture/reorient the part
+    /// (Workflow B): the post halts with a program stop before its operations run.
+    Reorient,
+}
+
+/// One entry in a setup's work-datum registry. The `index` is the abstract selector
+/// the post lowers to a dialect code (Okuma `G15 H<index>`, Fanuc `G54`+(index−1));
+/// the physical location lives in the machine's offset table, not here.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Datum {
+    /// The 1-based work-coordinate selector.
+    pub index: u32,
+    /// Operator-facing label (e.g. "Vise 2", "Back face"). UI only.
+    #[serde(default)]
+    pub label: String,
+    /// How the datum is reached.
+    #[serde(default)]
+    pub kind: DatumKind,
+}
+
+impl Datum {
+    /// The base datum every setup starts with: index 1, simultaneous, unlabelled.
+    pub fn base() -> Self {
+        Self {
+            index: 1,
+            label: String::new(),
+            kind: DatumKind::Simultaneous,
+        }
+    }
+}
+
+/// The order in which replication (Workflow A) visits fixtures and operations.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ReplicationOrder {
+    /// Fixtures inside each operation: `O1→H1,H2,H3`, then `O2→H1,H2,H3`, … Operation
+    /// order is preserved and replication adds **no** tool changes over a single part.
+    /// The default — the usual router/production choice.
+    #[default]
+    ByTool,
+    /// The whole operation list per fixture: `H1: O1,O2,O3`, then `H2: O1,O2,O3`, …
+    /// Tool loads multiply by fixture count; matches the `PL-0-3T.MIN` house style.
+    ByFixture,
+}
+
+/// The default work-datum registry: a single base datum, so a v6-or-earlier document
+/// (no registry on disk) opens as a one-datum setup exactly as before.
+fn default_work_offsets() -> Vec<Datum> {
+    vec![Datum::base()]
+}
+
 /// A machining setup: one fixturing of the stock, its safety planes, and the
 /// ordered operations performed in it.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1021,6 +1160,18 @@ pub struct Setup {
     pub tools: Vec<Tool>,
     /// Operations, in execution order.
     pub operations: Vec<Operation>,
+    /// The work-datum registry: the coordinate systems this setup runs under. The
+    /// machine *owns* their physical locations (the operator teaches each `G15 H<n>`
+    /// / `G54…`); we carry only the index. Always has at least the base datum 1.
+    #[serde(default = "default_work_offsets")]
+    pub work_offsets: Vec<Datum>,
+    /// Replication (Workflow A): when `Some(order)`, the whole operation list is run
+    /// across every [`Simultaneous`](DatumKind::Simultaneous) datum in
+    /// [`work_offsets`](Self::work_offsets), in that order — ops authored once,
+    /// expanded at plan time. `None` (the default) runs each operation under its own
+    /// [`work_offset`](Operation::work_offset) (a single datum, or Workflow B groups).
+    #[serde(default)]
+    pub replication: Option<ReplicationOrder>,
     /// The **workpiece origin** (datum): the part-space point that becomes G-code
     /// `(0,0,0)`. The post subtracts it from every emitted coordinate, so the
     /// operator zeros the machine's work offset (G54) at this point. `[0,0,0]`
@@ -1063,6 +1214,7 @@ mod tests {
     fn profile(id: u32) -> Operation {
         Operation::Profile(ProfileOp {
             spindle_rpm: 0.0,
+            work_offset: 1,
             clearing: Clearing::default(),
             id,
             tool: 1,
@@ -1091,6 +1243,7 @@ mod tests {
     fn carve(clear_tool: Option<u32>) -> Operation {
         Operation::Carve(CarveOp {
             spindle_rpm: 0.0,
+            work_offset: 1,
             id: 3,
             tool: 4,
             clear: clear_tool.map(|t| CarveClearing { tool: t, params: ClearParams::default() }),
@@ -1208,6 +1361,7 @@ mod tests {
         let prof = profile(0);
         let drill = Operation::Drill(DrillOp {
             spindle_rpm: 0.0,
+            work_offset: 1,
             id: 0,
             tool: 1,
             points: vec![[0.0, 0.0]],

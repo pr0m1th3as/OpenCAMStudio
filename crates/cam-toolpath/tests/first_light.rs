@@ -51,6 +51,7 @@ fn document() -> Document {
     };
     let outer = ProfileOp {
         spindle_rpm: 0.0,
+        work_offset: 1,
         clearing: cam_model::Clearing::default(),
         id: 0,
         tool: 1,
@@ -71,6 +72,7 @@ fn document() -> Document {
     };
     let hole = ProfileOp {
         spindle_rpm: 0.0,
+        work_offset: 1,
         clearing: cam_model::Clearing::default(),
         id: 1,
         tool: 1,
@@ -102,6 +104,8 @@ fn document() -> Document {
         operations: vec![Operation::Profile(outer), Operation::Profile(hole)],
         origin: [0.0, 0.0, 0.0],
         start_offset: None,
+        work_offsets: vec![cam_model::Datum::base()],
+        replication: None,
     })
 }
 
@@ -198,6 +202,7 @@ fn tool_too_large_for_hole_reports_error() {
     };
     let op = ProfileOp {
         spindle_rpm: 0.0,
+        work_offset: 1,
         clearing: cam_model::Clearing::default(),
         id: 0,
         tool: 1,
@@ -239,6 +244,7 @@ fn cancellation_stops_before_emitting() {
     };
     let op = ProfileOp {
         spindle_rpm: 0.0,
+        work_offset: 1,
         clearing: cam_model::Clearing::default(),
         id: 0,
         tool: 1,
@@ -288,6 +294,7 @@ fn lead_overlap_recuts_past_the_start() {
     let overlap = 2.0;
     let op = ProfileOp {
         spindle_rpm: 0.0,
+        work_offset: 1,
         clearing: cam_model::Clearing::default(),
         id: 0,
         tool: 1,
@@ -365,6 +372,7 @@ fn offset_leaves_stock_on_the_wall() {
     let run_offset = |offset: f64| {
         let op = ProfileOp {
             spindle_rpm: 0.0,
+            work_offset: 1,
             clearing: cam_model::Clearing::default(),
             id: 0,
             tool: 1,
@@ -429,6 +437,7 @@ fn plunge_count(prog: &Program) -> usize {
 fn rough_op(side: Side, chain: Contour, stepover: f64) -> ProfileOp {
     ProfileOp {
         spindle_rpm: 0.0,
+        work_offset: 1,
         clearing: cam_model::Clearing::default(),
         id: 0,
         tool: 1,
@@ -700,6 +709,7 @@ fn ascii_backplot(prog: &Program, w: usize, h: usize) -> String {
 fn arc_lead_and_helix_plunge_post_to_helical_gcode() {
     let op = ProfileOp {
         spindle_rpm: 0.0,
+        work_offset: 1,
         clearing: cam_model::Clearing::default(),
         id: 0,
         tool: 1,
@@ -743,6 +753,8 @@ fn arc_lead_and_helix_plunge_post_to_helical_gcode() {
         operations: vec![Operation::Profile(op)],
         origin: [0.0, 0.0, 0.0],
         start_offset: None,
+        work_offsets: vec![cam_model::Datum::base()],
+        replication: None,
     });
 
     let (program, diags) = build_job(&doc, 1000.0, SpindleDir::Cw, None, &CancelToken::new());
@@ -806,6 +818,7 @@ fn carve_document(clear_tool: Option<u32>, trailing_tool: Option<u32>) -> Docume
     };
     let carve = cam_model::CarveOp {
         spindle_rpm: 0.0,
+        work_offset: 1,
         id: 0,
         tool: 1,
         clear: clear_tool.map(|t| cam_model::CarveClearing { tool: t, params: cam_model::ClearParams::default() }),
@@ -825,6 +838,7 @@ fn carve_document(clear_tool: Option<u32>, trailing_tool: Option<u32>) -> Docume
     if let Some(t) = trailing_tool {
         operations.push(Operation::Profile(ProfileOp {
             spindle_rpm: 0.0,
+            work_offset: 1,
             clearing: cam_model::Clearing::default(),
             id: 1,
             tool: t,
@@ -857,6 +871,8 @@ fn carve_document(clear_tool: Option<u32>, trailing_tool: Option<u32>) -> Docume
         operations,
         origin: [0.0, 0.0, 0.0],
         start_offset: None,
+        work_offsets: vec![cam_model::Datum::base()],
+        replication: None,
     })
 }
 

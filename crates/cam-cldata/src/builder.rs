@@ -63,6 +63,12 @@ impl ProgramBuilder {
         self
     }
 
+    /// Select work coordinate datum `index` (1-based) for subsequent steps.
+    pub fn datum(mut self, index: u32) -> Self {
+        self.steps.push(Step::Datum(index));
+        self
+    }
+
     /// Dwell in place for `seconds`.
     pub fn dwell(mut self, seconds: f64) -> Self {
         self.steps.push(Step::Dwell { seconds });

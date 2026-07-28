@@ -10,11 +10,12 @@
 //! its own emitter. It reuses the common machinery ([`Writer`], number/word
 //! formatting, travel checking); only the frame diverges. See `OKUMA_PLAN.md`.
 //!
-//! **Status (O1 + O3).** The frame skeleton (defensive safe-start, per-tool-section
-//! `G15`/`G56`, milling motion, standalone dwell) and the `G71`/`M53` drilling cycles
-//! (`G81`/`G82`/`G83`, `G80`, with the `G80` auto-`M05` compensated) are in. One piece
-//! is still open: per-operation multi-WCS `G15 H2`/`H3` (O2) needs a work-coordinate
-//! index plumbed through CL-data, which does not exist yet — every section is `H1`.
+//! **Status (O1 + O2 + O3).** The frame skeleton (defensive safe-start, per-tool-
+//! section `G15`/`G56`, milling motion, standalone dwell), the `G71`/`M53` drilling
+//! cycles (`G81`/`G82`/`G83`, `G80`, with the `G80` auto-`M05` compensated), and
+//! per-operation multi-WCS (`G15 H<n>` driven by a work-datum index in CL-data —
+//! [`Step::Datum`]) are in. Datum 1 is the default, so a single-datum job emits
+//! `G15 H1` per section exactly as before.
 
 use cam_cldata::{Coolant, CutterComp, DrillCycle, Point3, Program, SpindleDir, Step};
 use cam_model::Machine;
@@ -91,6 +92,11 @@ pub(crate) fn emit(
     // OSP's `G80` auto-`M05` when cutting continues (see the `Drill` arm).
     let mut spindle: Option<(f64, SpindleDir)> = None;
 
+    // The work datum in force, restated as `G15 H<n>` in every tool-section head.
+    // Set by `Step::Datum`; defaults to 1, so a program with no datum steps emits
+    // `G15 H1` per section exactly as before multi-WCS existed.
+    let mut current_datum: u32 = 1;
+
     let steps = program.steps();
     for (i, step) in steps.iter().enumerate() {
         match step {
@@ -104,13 +110,27 @@ pub(crate) fn emit(
                 }
                 w.line(format!("({text})"));
             }
+            Step::Datum(n) => {
+                // Work coordinate select. In the ordinary job a datum change coincides
+                // with a tool change — each fixture restarts the tool sequence (see the
+                // shop `PL-0-3T.MIN`: five tools per datum, H1→H2→H3) — so we defer to
+                // the tool-section head, where `G15 H<n>` sits between `T M6` and
+                // `G56 H` in shop order. A datum change with *no* following tool change
+                // (same tool, a different fixture) has no section head to ride, so it
+                // states `G15 H<n>` on its own line.
+                current_datum = *n;
+                if !next_section_is_tool_change(&steps[i + 1..]) {
+                    w.line(format!("G15 H{n}"));
+                }
+            }
             Step::ToolChange { tool } => {
                 // Tool-section head: change tool, select the work coordinate system,
                 // then the tool-length offset keyed to the tool number. `G15 H` and
-                // `G56 H` are unrelated number spaces (OKUMA_PLAN §3) — the WCS is
-                // fixed at H1 until per-operation multi-WCS is plumbed through (O2).
+                // `G56 H` are unrelated number spaces (OKUMA_PLAN §3): `G15 H<n>` is the
+                // work datum in force (restated every section as a modal, matching the
+                // shop files), `G56 H<tool>` the tool-length offset keyed to the tool.
                 w.line(format!("T{tool} M6"));
-                w.line("G15 H1".to_string());
+                w.line(format!("G15 H{current_datum}"));
                 w.line(format!("G56 H{tool}"));
                 // Force the next move to re-state its motion word. The shop files
                 // always re-emit `G00` after a tool change rather than rely on a modal
@@ -245,6 +265,21 @@ fn canned_drill(w: &mut Writer, c: &DrillCycle) -> Result<(), PostError> {
     w.set_position(Point3::new(last[0], last[1], c.retract));
     w.reset_modal();
     Ok(())
+}
+
+/// Whether the next tool-section head follows immediately — i.e. the next
+/// significant step is a [`Step::ToolChange`], with only comments in between. Used
+/// by the `Datum` arm to decide whether to defer its `G15 H<n>` to that head (shop
+/// order `T M6` / `G15` / `G56`) or state it standalone.
+fn next_section_is_tool_change(rest: &[Step]) -> bool {
+    for s in rest {
+        match s {
+            Step::Comment(_) => continue,
+            Step::ToolChange { .. } => return true,
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Whether a cutting move — one that needs the spindle running — occurs before the

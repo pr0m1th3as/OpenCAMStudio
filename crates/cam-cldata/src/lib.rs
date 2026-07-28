@@ -7,9 +7,13 @@
 //! ## Canonical frame
 //!
 //! Every coordinate is **millimetres, absolute, in the part/WCS frame**. The IR
-//! never applies a work offset (G54…), never chooses G90/G91, never converts to
-//! inches — those are a post's job. A [`Program`] is therefore portable across
-//! every controller.
+//! never applies a work-offset *value* — the `G54…` shift the operator dials into
+//! the control — never chooses G90/G91, never converts to inches: those are a
+//! post's job. It *does* carry the work-datum **identity** ([`Step::Datum`]) —
+//! which setup an operation belongs to, an abstract 1-based index the post lowers
+//! to a dialect code (Okuma `G15 H<n>`, a Fanuc-family post `G54`+(n−1)). Identity
+//! is job intent, like a tool number; only the offset value is the post's to own.
+//! A [`Program`] is therefore portable across every controller.
 //!
 //! ## Two tiers
 //!
@@ -180,6 +184,15 @@ pub enum Step {
     Coolant(Coolant),
     /// Change to tool number `tool` (`Tn M6`).
     ToolChange { tool: u32 },
+    /// Select work coordinate datum `index` (1-based; datum 1 is the default).
+    ///
+    /// An **abstract** datum identity, never a controller code: the post maps it
+    /// to its dialect — Okuma `G15 H<index>`, a Fanuc-family post `G54`+(index−1).
+    /// The IR carries *which* setup an operation belongs to, never the offset
+    /// *value*; that stays with the post and the operator. Emitted by the planner
+    /// only when the effective datum changes, so a single-datum job carries none
+    /// and every post's output is unchanged.
+    Datum(u32),
     /// A free-text comment for the operator/backplot.
     Comment(String),
     /// Set the controller's cutter-radius compensation (`G40`/`G41`/`G42`).

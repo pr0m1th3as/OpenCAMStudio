@@ -42,6 +42,7 @@ fn profile_op(id: u32, chain: cam_geo::Contour, side: Side) -> Operation {
         stepdown: 2.0,
         stepover: 0.0,
         spindle_rpm: 0.0,
+        work_offset: 1,
         feed: 300.0,
         plunge_feed: 100.0,
         start: None,
@@ -84,6 +85,8 @@ fn import_and_plan() -> (String, Vec<cam_toolpath::Diagnostic>, usize, usize) {
         operations: ops,
         origin: [0.0, 0.0, 0.0],
         start_offset: None,
+        work_offsets: vec![cam_model::Datum::base()],
+        replication: None,
     });
 
     let (program, diags) = build_job(&doc, 1000.0, SpindleDir::Cw, None, &CancelToken::new());

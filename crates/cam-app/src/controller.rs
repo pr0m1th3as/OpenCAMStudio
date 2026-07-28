@@ -981,6 +981,7 @@ impl AppController {
                 stepdown: p.stepdown,
                 stepover: 0.0,
                 spindle_rpm,
+                work_offset: 1,
                 feed,
                 plunge_feed,
                 start,
@@ -1005,6 +1006,7 @@ impl AppController {
                     overlap: 0.5,
                     offset: 0.0,
                     spindle_rpm,
+                    work_offset: 1,
                     feed,
                     plunge_feed,
                     plunge: Plunge::Straight,
@@ -1023,6 +1025,7 @@ impl AppController {
                 peck: None,
                 dwell: None,
                 spindle_rpm,
+                work_offset: 1,
                 feed: plunge_feed,
             }),
             OpKind::Face => {
@@ -1048,6 +1051,7 @@ impl AppController {
                     overshoot: 2.0,
                     direction,
                     spindle_rpm,
+                    work_offset: 1,
                     feed,
                     plunge_feed,
                 })
@@ -1064,6 +1068,7 @@ impl AppController {
                 step: 0.0,
                 gradual: false,
                 spindle_rpm,
+                work_offset: 1,
                 feed,
                 plunge_feed,
                 start,
@@ -1103,6 +1108,7 @@ impl AppController {
                     drill_clearance: 0.0,
                     blind_allowance: 0.0,
                     spindle_rpm,
+                    work_offset: 1,
                     feed,
                     plunge_feed,
                 })
@@ -1131,6 +1137,7 @@ impl AppController {
                     ring_step: 0.0,
                     scallop: 0.0,
                     spindle_rpm,
+                    work_offset: 1,
                     feed,
                     plunge_feed,
                     // On by default: a carve is hundreds of rings, and every link is
@@ -1151,6 +1158,7 @@ impl AppController {
                 depth: 0.3,
                 stepdown: 0.0,
                 spindle_rpm,
+                work_offset: 1,
                 feed,
                 plunge_feed,
                 start,
@@ -1854,6 +1862,7 @@ impl AppController {
                     stepdown: p.stepdown,
                     stepover: 0.0,
                     spindle_rpm: 0.0,
+                    work_offset: 1,
                     feed: p.feed,
                     plunge_feed: p.plunge_feed,
                     start: None,
@@ -1890,6 +1899,7 @@ impl AppController {
                             peck: None,
                             dwell: None,
                             spindle_rpm: 0.0,
+                            work_offset: 1,
                             feed: p.plunge_feed,
                         }));
                     } else {
@@ -1904,6 +1914,7 @@ impl AppController {
                             overlap: 0.5,
                             offset: 0.0,
                             spindle_rpm: 0.0,
+                            work_offset: 1,
                             feed: p.feed,
                             plunge_feed: p.plunge_feed,
                             plunge: Plunge::Straight,
@@ -1926,6 +1937,8 @@ impl AppController {
             operations,
             origin: [0.0, 0.0, 0.0],
             start_offset: None,
+            work_offsets: vec![cam_model::Datum::base()],
+            replication: None,
         })
     }
 
@@ -2311,6 +2324,8 @@ fn empty_document(p: &JobParams) -> Document {
         operations: Vec::new(),
         origin: [0.0, 0.0, 0.0],
         start_offset: None,
+        work_offsets: vec![cam_model::Datum::base()],
+        replication: None,
     })
 }
 

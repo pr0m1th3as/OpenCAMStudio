@@ -480,6 +480,7 @@ mod tests {
     fn op(internal: bool, hand: Hand, climb: bool) -> ThreadOp {
         ThreadOp {
             spindle_rpm: 0.0,
+            work_offset: 1,
             id: 0,
             tool: 1,
             points: vec![[0.0, 0.0]],
