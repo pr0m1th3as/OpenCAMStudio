@@ -7,9 +7,78 @@
 use cam_cldata::{SpindleDir, Step};
 use cam_geo::{Contour, Point};
 use cam_model::{
-    Comp, Document, Heights, Lead, Operation, Plunge, ProfileOp, Setup, Side, Stock, Tool, ToolKind,
+    Comp, Document, Envelope, Heights, Lead, Machine, Operation, Origin, Plunge, Point3, ProfileOp,
+    Setup, Side, Stock, Tool, ToolKind,
 };
+use cam_post::{PostKind, PostOptions};
 use cam_toolpath::{build_job, CancelToken};
+
+fn machine() -> Machine {
+    Machine {
+        name: "test".into(),
+        rapid_rate: 2000.0,
+        max_spindle_rpm: 10_000.0,
+        max_feed: 800.0,
+        envelope: Envelope::new(Point3::new(0.0, 0.0, -50.0), Point3::new(300.0, 180.0, 50.0)),
+        safe_z: 5.0,
+        tool_change_pos: None,
+    }
+}
+
+/// A two-origin job with a real reorientation: op0 on datum 1, op1 on datum 2, whose
+/// origin sits elsewhere on the part and carries its own start point. Posting this
+/// through Okuma exercises the whole Case-1 frame — the `M05`/`M09`/`M00`
+/// reorientation halt, the `G15 H2` datum select, the per-datum coordinate
+/// re-referencing (`translated_per_datum`), the clean-start rapid, and the Z
+/// re-statement into the new frame.
+fn two_origin_doc() -> Document {
+    let mut d = doc(vec![
+        profile(0, rect(10.0, 10.0, 70.0, 50.0), Side::Outside, 1, 1),
+        profile(1, rect(35.0, 25.0, 45.0, 35.0), Side::Inside, 2, 2),
+    ]);
+    d.setup.extra_origins.push(Origin {
+        index: 2,
+        position: [50.0, 0.0, 0.0],
+        start_offset: Some([5.0, 5.0, 10.0]),
+    });
+    d
+}
+
+/// The export path exactly as the app wires it (`controller.rs`): plan, re-reference
+/// each group to its own origin, then post.
+fn okuma_nc(d: &Document) -> String {
+    let (program, _) = build_job(d, 1000.0, SpindleDir::Cw, None, &CancelToken::new());
+    let setup = &d.setup;
+    let translated = program.translated_per_datum(|idx| {
+        let o = setup.origin_position(idx);
+        [-o[0], -o[1], -o[2]]
+    });
+    PostKind::Okuma
+        .post(
+            &translated,
+            &machine(),
+            &PostOptions {
+                program_name: Some("two_origins".into()),
+                ..Default::default()
+            },
+        )
+        .expect("posts")
+}
+
+/// Byte-pinned end-to-end golden (O5): a two-origin job planned and posted through
+/// Okuma, the whole Case-1 reorientation frame in one file. A tripwire against drift
+/// in *either* the planner's group emission or the post's rendering — the audit above
+/// checked each fragment; this pins the composition. To regenerate after an
+/// intentional change, `std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"),
+/// "/tests/golden/multi_datum_okuma.min"), okuma_nc(&two_origin_doc()))` once, then
+/// re-read the diff. Not a substitute for the O6 line-audit against real posted words.
+#[test]
+fn golden_multi_datum_reorientation() {
+    assert_eq!(
+        okuma_nc(&two_origin_doc()),
+        include_str!("golden/multi_datum_okuma.min")
+    );
+}
 
 fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Contour {
     Contour::new(vec![

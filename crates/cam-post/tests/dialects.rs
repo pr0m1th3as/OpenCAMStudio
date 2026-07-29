@@ -1,7 +1,10 @@
-//! The post picker: the six dialects fall into three output families for basic
-//! milling — grbl-family (expanded, unwrapped), LinuxCNC (canned, unwrapped), and
-//! Fanuc-family (canned, %-wrapped). Proven on a peck-drilling job where the
-//! canned-vs-expanded split is visible.
+//! The post picker: the seven dialects fall into four output families for basic
+//! milling — grbl-family (expanded, unwrapped, `P` dwell), LinuxCNC (canned,
+//! unwrapped, `P` dwell), Fanuc-family (canned, %-wrapped, `X` dwell), and Okuma
+//! (canned, unwrapped, `F` dwell, `G71`/`M53` drilling frame, `M02` end — its own
+//! emitter, not a Fanuc parameterisation). Proven on a peck-drilling job where the
+//! canned-vs-expanded split is visible, and — for Okuma vs LinuxCNC, which share the
+//! (unwrapped, canned) pair — on the standalone-dwell word.
 
 use cam_cldata::{DrillCycle, MoveKind, Point3, Program, ProgramBuilder, SpindleDir, Tag};
 use cam_model::{Envelope, Machine};
@@ -94,11 +97,25 @@ fn fanuc_family_wraps_and_uses_canned_cycles() {
     assert_eq!(f, h, "Haas shares the Fanuc-family output today");
 }
 
+#[test]
+fn okuma_is_its_own_family() {
+    let o = nc(PostKind::Okuma);
+    // Canned, but through the OSP return-level frame, not the Fanuc G98/G99 one.
+    assert!(o.contains("G83") && o.contains("G80"), "canned peck cycle:\n{o}");
+    assert!(o.contains("G71 Z"), "OSP return-level frame declares the retract:\n{o}");
+    assert!(o.contains("M53"), "and the drill cycle carries the M53 return:\n{o}");
+    // Not a Fanuc parameterisation: unwrapped, M02 end (not M30), no O-number.
+    assert!(!o.contains('%'), "Okuma is not %-wrapped:\n{o}");
+    assert!(!o.contains("M30"), "Okuma ends with M02, not M30:\n{o}");
+    assert!(o.trim_end().ends_with("M02"), "M02 program end:\n{o}");
+}
+
 /// A reference program that exercises **every** axis on which the dialects diverge
-/// in one job: a standalone `G4` dwell (the `P`-vs-`X` word), and a peck drill
-/// (canned-vs-expanded, and the `%`/`O`-number wrap). Posting it through all six
+/// in one job: a standalone `G4` dwell (the `P`-vs-`X`-vs-`F` word), and a peck drill
+/// (canned-vs-expanded, and the `%`/`O`-number wrap). Posting it through all seven
 /// controllers gives a signature — (wrapped?, canned?, dwell word) — that uniquely
-/// identifies each family, so the operator can eyeball an exported `.nc` against it.
+/// identifies each family, so the operator can eyeball an exported `.nc`/`.MIN`
+/// against it.
 fn reference_program() -> Program {
     ProgramBuilder::new()
         .comment("dialect reference")
@@ -119,17 +136,18 @@ fn reference_program() -> Program {
         .build()
 }
 
-const ALL_POSTS: [PostKind; 6] = [
+const ALL_POSTS: [PostKind; 7] = [
     PostKind::Grbl,
     PostKind::FluidNc,
     PostKind::GrblHal,
     PostKind::LinuxCnc,
     PostKind::Fanuc,
     PostKind::Haas,
+    PostKind::Okuma,
 ];
 
 /// The word carrying the *standalone* `G4` dwell — the first `G4 ` line (the drill
-/// cycle's own dwell comes later). `P` on grbl/LinuxCNC, `X` on Fanuc/Haas.
+/// cycle's own dwell comes later). `P` on grbl/LinuxCNC, `X` on Fanuc/Haas, `F` on Okuma.
 fn standalone_dwell_word(nc: &str) -> Option<char> {
     nc.lines()
         .find(|l| l.starts_with("G4 "))
@@ -146,6 +164,7 @@ fn each_dialect_has_the_signature_of_its_family() {
         (PostKind::LinuxCnc, false, true, 'P'),
         (PostKind::Fanuc, true, true, 'X'),
         (PostKind::Haas, true, true, 'X'),
+        (PostKind::Okuma, false, true, 'F'),
     ];
     for (kind, wrapped, canned, dwell) in expected {
         let g = kind

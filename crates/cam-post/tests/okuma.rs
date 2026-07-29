@@ -119,6 +119,26 @@ fn arcs_are_native_with_incremental_ij() {
     assert!(arc.contains("I10.000") && arc.contains("J0.000"), "incremental I/J:\n{arc}");
 }
 
+/// Byte-pinned goldens (O5). A tripwire against silent drift in the whole-program
+/// frame — the milling skeleton and the `G71`/`M53` drilling frame end to end. These
+/// pin *our* output, not the shop `.MIN` files (which omit decimals and use a house
+/// block-delete/park we deliberately diverge from — `OKUMA_PLAN` §7). If a change to
+/// the emitter is intentional, regenerate with the `gen_goldens`-style write and
+/// re-read the diff. Not a substitute for the O6 line-audit against real posted words.
+#[test]
+fn golden_mill() {
+    assert_eq!(okuma(&mill_program()), include_str!("golden/mill_okuma.min"));
+}
+
+#[test]
+fn golden_drill() {
+    let g = okuma(&drill_program(DrillCycle {
+        peck: Some(3.0),
+        ..base_cycle()
+    }));
+    assert_eq!(g, include_str!("golden/drill_okuma.min"));
+}
+
 /// A human-readable dump of the Okuma frame. Not an assertion — run it to see the
 /// output for the O6 audit loop:
 ///   `cargo test -p cam-post --test okuma reference_dump -- --nocapture`
