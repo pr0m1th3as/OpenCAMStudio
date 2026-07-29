@@ -175,13 +175,18 @@ impl Strategy for FaceStrategy {
                 to_world(u_hi, v_first)
             };
             if li == 0 {
-                // Approach over the first pass and down to the top cutting plane.
+                // Approach over the first pass at clearance, then rapid down to the
+                // **retract plane** — never to the bare cutting plane. Ending a rapid
+                // exactly on the top plane leaves no margin (slightly proud stock or a
+                // Z-zero error would rapid into material); the plunge below feeds from
+                // the retract plane to the first level. `max` keeps it never lower than
+                // the cutting plane, matching every other strategy.
                 program.push(Step::Rapid {
                     to: Point3::new(s0.x, s0.y, env.heights.clearance),
                     tag: link,
                 });
                 program.push(Step::Rapid {
-                    to: Point3::new(s0.x, s0.y, top),
+                    to: Point3::new(s0.x, s0.y, env.heights.retract.max(top)),
                     tag: link,
                 });
             }
