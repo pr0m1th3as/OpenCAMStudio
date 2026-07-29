@@ -796,6 +796,8 @@ enum Field {
     Clearance,
     Retract,
     TopOfStock,
+    /// Setup: the Z the planner lifts to before a tool change or reorientation.
+    ToolChangeHeight,
     /// Stock: material added on both X sides of the part's bounding box (mm).
     StockXOffset,
     /// Stock: material added on both Y sides of the part's bounding box (mm).
@@ -814,10 +816,6 @@ enum Field {
     OriginZ,
     /// The active origin's machine work-coordinate index (`G15 H<n>`).
     OriginIndex,
-    /// Program start-point offset X / Y / Z from the origin (mm).
-    StartOffX,
-    StartOffY,
-    StartOffZ,
     ToolDiameter,
     ToolLength,
     /// Length of cut (flute length) from the tip, mm. Also reused, kind-aware, as a face
@@ -944,6 +942,7 @@ impl Field {
         match self {
             Field::Clearance => "Clearance (mm)",
             Field::Retract => "Retract (mm)",
+            Field::ToolChangeHeight => "Tool Change Height (mm)",
             Field::TopOfStock => "Top of stock (mm)",
             Field::StockXOffset => "X offset (mm)",
             Field::StockYOffset => "Y offset (mm)",
@@ -956,9 +955,6 @@ impl Field {
             Field::OriginY => "Origin Y (mm)",
             Field::OriginZ => "Origin Z (mm)",
             Field::OriginIndex => "H index",
-            Field::StartOffX => "Offset X (mm)",
-            Field::StartOffY => "Offset Y (mm)",
-            Field::StartOffZ => "Offset Z (mm)",
             Field::ToolDiameter => "Flute diameter (mm)",
             Field::ToolLength => "Overall length (mm)",
             Field::FluteLength => "Flute length (mm)",
@@ -1034,6 +1030,12 @@ impl Field {
                 "Height the tool pulls back to between passes or plunges — lower than \
                  Clearance for speed, but still above any uncut material."
             }
+            Field::ToolChangeHeight => {
+                "Z the tool lifts to before a tool change (M6) or a manual reorientation \
+                 (M00) — above the Clearance plane, so the changer or your hands have room. \
+                 Defaults to the top of the machine's Z travel; set it lower only if you \
+                 have a reason."
+            }
             Field::TopOfStock => {
                 "Absolute Z of the top surface of the raw material. Cutting depths are \
                  measured downward from here."
@@ -1068,12 +1070,6 @@ impl Field {
                  index you've taught on the control. Choosing an index another origin \
                  already uses swaps the two."
             }
-            Field::StartOffX => {
-                "X offset of the program start point from the origin — where the tool \
-                 rapids to before the first cut (e.g. clear of clamps)."
-            }
-            Field::StartOffY => "Y offset of the program start point from the origin.",
-            Field::StartOffZ => "Z offset of the program start point from the origin.",
             Field::ToolDiameter => "The tool's cutting diameter (mm).",
             Field::ToolLength => {
                 "Overall length of the tool — the stickout below the holder. Used for \
@@ -1416,9 +1412,6 @@ mod help {
         "The cutter geometry class. Changing it reveals the geometry fields that class \
          needs (corner radius, point angle, tip diameter, …) and how the toolpath treats \
          the tip.";
-    pub const START_POINT: &str =
-        "Rapid to a chosen point before the first cut — e.g. clear of clamps or over a \
-         pre-drilled entry. When off, the program starts straight from the origin.";
     pub const MACHINE_NAME: &str =
         "A free-text label to tell your machines apart. It does not affect the toolpath \
          or output.";
@@ -1607,21 +1600,6 @@ fn op_uses_snaps(kind: OpKind) -> bool {
         kind,
         OpKind::Profile | OpKind::Chamfer | OpKind::Pocket | OpKind::Engrave | OpKind::Carve
     )
-}
-
-/// The axis index (0=X, 1=Y, 2=Z) a start-point offset field addresses.
-fn start_axis(field: Field) -> usize {
-    match field {
-        Field::StartOffX => 0,
-        Field::StartOffY => 1,
-        _ => 2,
-    }
-}
-
-/// Whether a field belongs to the start-point section (rendered there, not in the
-/// generic Setup field loop).
-fn is_start_field(field: Field) -> bool {
-    matches!(field, Field::StartOffX | Field::StartOffY | Field::StartOffZ)
 }
 
 /// Whether any of `visible`'s edit buffers has diverged from the model.
@@ -1960,8 +1938,6 @@ enum Message {
     ViewportCursor(iced::Point),
     /// Toggle a viewport object-snap on/off during operation picking.
     ToggleSnap(SnapKind),
-    /// Enable/disable the program start point (Setup inspector).
-    ToggleStartPoint(bool),
     /// Focus a workpiece origin (`H<n>`) — makes it active + selects it.
     SelectOrigin(u32),
     /// Add a new workpiece origin (a reorientation group).
@@ -2430,12 +2406,6 @@ impl App {
                 } else {
                     self.status = "Nothing to redo.".to_string();
                 }
-            }
-            Message::ToggleStartPoint(on) => {
-                self.controller
-                    .edit_active_origin_start_offset(|off| *off = on.then_some([0.0, 0.0, 0.0]));
-                self.refresh_fields();
-                self.rerun();
             }
             Message::SelectOrigin(index) => {
                 self.controller.select_origin(index);
@@ -3925,26 +3895,25 @@ impl App {
             return tool_fields(self.inspected_tool_kind());
         }
         match self.controller.selection() {
-            Selection::Setup => vec![Field::Clearance, Field::Retract, Field::TopOfStock],
+            // Ordered top-down by height: tool-change height, clearance, retract, then
+            // the stock top at the bottom — the inspector reads like the Z stack.
+            Selection::Setup => vec![
+                Field::ToolChangeHeight,
+                Field::Clearance,
+                Field::Retract,
+                Field::TopOfStock,
+            ],
             Selection::Machine => vec![
                 Field::MachineTravelX,
                 Field::MachineTravelY,
                 Field::MachineTravelZ,
             ],
-            Selection::Origin => {
-                let mut f = vec![
-                    Field::OriginIndex,
-                    Field::OriginX,
-                    Field::OriginY,
-                    Field::OriginZ,
-                ];
-                // Start-point offset fields, only when enabled. Rendered in the
-                // start-point section, not the generic field loop.
-                if self.controller.active_origin_start_offset().is_some() {
-                    f.extend([Field::StartOffX, Field::StartOffY, Field::StartOffZ]);
-                }
-                f
-            }
+            Selection::Origin => vec![
+                Field::OriginIndex,
+                Field::OriginX,
+                Field::OriginY,
+                Field::OriginZ,
+            ],
             Selection::Tool(i) => {
                 tool_fields(self.controller.document().setup.tools.get(i).map(|t| t.kind))
             }
@@ -4163,14 +4132,15 @@ impl App {
             Field::Clearance => Some(setup.heights.clearance),
             Field::Retract => Some(setup.heights.retract),
             Field::TopOfStock => Some(setup.heights.top_of_stock),
+            // Shows the *effective* height: the explicit value if set, else the
+            // machine-Z-travel default the planner would resolve.
+            Field::ToolChangeHeight => {
+                Some(setup.resolved_tool_change_height(self.controller.machine().envelope.max.z))
+            }
             Field::OriginX => Some(self.controller.origin_position(self.controller.active_origin())[0]),
             Field::OriginY => Some(self.controller.origin_position(self.controller.active_origin())[1]),
             Field::OriginZ => Some(self.controller.origin_position(self.controller.active_origin())[2]),
             Field::OriginIndex => Some(self.controller.active_origin() as f64),
-            Field::StartOffX | Field::StartOffY | Field::StartOffZ => self
-                .controller
-                .active_origin_start_offset()
-                .map(|off| off[start_axis(field)]),
             Field::StockXOffset | Field::StockYOffset | Field::StockTop | Field::StockThickness => {
                 let cam_model::Stock::BoundingBox {
                     x_offset,
@@ -4266,15 +4236,18 @@ impl App {
         }
 
         match self.controller.selection() {
-            Selection::Setup => self.controller.edit_heights(|h| {
+            Selection::Setup => self.controller.edit_setup(|s| {
                 if let Some(&v) = parsed.get(&Field::Clearance) {
-                    h.clearance = v;
+                    s.heights.clearance = v;
                 }
                 if let Some(&v) = parsed.get(&Field::Retract) {
-                    h.retract = v;
+                    s.heights.retract = v;
                 }
                 if let Some(&v) = parsed.get(&Field::TopOfStock) {
-                    h.top_of_stock = v;
+                    s.heights.top_of_stock = v;
+                }
+                if let Some(&v) = parsed.get(&Field::ToolChangeHeight) {
+                    s.tool_change_height = Some(v);
                 }
             }),
             Selection::Machine => self.controller.edit_machine(|m| {
@@ -4311,19 +4284,6 @@ impl App {
                         self.controller.set_active_origin_index(idx);
                     }
                 }
-                self.controller.edit_active_origin_start_offset(|start| {
-                    if let Some(off) = start {
-                        for (f, i) in [
-                            (Field::StartOffX, 0),
-                            (Field::StartOffY, 1),
-                            (Field::StartOffZ, 2),
-                        ] {
-                            if let Some(&v) = parsed.get(&f) {
-                                off[i] = v;
-                            }
-                        }
-                    }
-                });
             }
             Selection::Tool(i) => self.controller.edit_tool(i, |t| {
                 apply_tool_dims(t, &parsed);
@@ -5594,35 +5554,6 @@ impl App {
         .into()
     }
 
-    /// The Setup node's program-start-point editor: an enable toggle, a base
-    /// choice (from the origin, or from a reference point), and the offset (plus
-    /// the reference when chosen). The numeric rows reuse the field pipeline
-    /// (parse + Apply); the toggles commit immediately.
-    fn start_point_editor(&self) -> Element<'_, Message> {
-        let on = self.controller.active_origin_start_offset().is_some();
-        let mut col = column![text("Program start point (offset from origin)")
-            .size(12)
-            .color(palette::GROUP_LABEL)]
-        .spacing(6);
-        col = col.push(
-            row![
-                checkbox(on).size(15).on_toggle(Message::ToggleStartPoint),
-                help_wrap(text("Rapid to a start point").size(13), help::START_POINT, self.tooltips),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center),
-        );
-        if on {
-            let field = |f: Field| {
-                field_row(f, &self.fields.get(&f).cloned().unwrap_or_default(), self.tooltips)
-            };
-            col = col.push(field(Field::StartOffX));
-            col = col.push(field(Field::StartOffY));
-            col = col.push(field(Field::StartOffZ));
-        }
-        col.into()
-    }
-
     /// The **Tool Library pane** — a selectable list of every library tool, in one of
     /// two internal tabs: **Serial** (by number) or **Family** (grouped by kind, sorted
     /// by diameter). Substitutes for the Project pane on the Tooling tab; the selected
@@ -5887,17 +5818,15 @@ impl App {
             list = list.push(text("Nothing to edit here yet.").size(12));
         }
         for field in ordered {
-            // Start-point and clearing-pass fields render in their own sections
-            // (below), not mixed in here.
-            if is_start_field(field) || is_clear_field(field) {
+            // Clearing-pass fields render in their own section (below), not mixed in here.
+            if is_clear_field(field) {
                 continue;
             }
             let value = self.fields.get(&field).cloned().unwrap_or_default();
             list = list.push(field_row_labeled(field, self.field_label(field), self.field_help(field), &value, self.tooltips, self.field_invalid(field)));
         }
-        // Every origin carries the same fields, including its own program start point —
-        // a new orientation begins by rapiding there. The `H index` field renders in the
-        // generic loop above.
+        // A non-base origin is a reorientation: note the operator stop so the part can be
+        // re-fixtured. The `H index` / position fields render in the generic loop above.
         if let Selection::Origin = self.controller.selection() {
             if self.controller.active_origin() != self.controller.base_origin_index() {
                 list = list.push(
@@ -5909,7 +5838,6 @@ impl App {
                     .color(palette::GROUP_LABEL),
                 );
             }
-            list = list.push(self.start_point_editor());
         }
         // The tool geometry class is an enum, so it gets a picker (committed
         // immediately) rather than a text field.
@@ -7216,23 +7144,6 @@ fn tree_note<'a>(label: &str) -> Element<'a, Message> {
     .into()
 }
 
-/// An inspector field row: a label (with a hover tooltip explaining it, when `show`)
-/// and a numeric text input bound to `field`.
-fn field_row<'a>(field: Field, value: &str, show: bool) -> Element<'a, Message> {
-    field_row_styled(field, value, show, false)
-}
-
-/// As [`field_row`], but drawn as **invalid** (red border + value) when `invalid` — the
-/// thicker border also carries the signal by weight, not hue alone.
-fn field_row_styled<'a>(
-    field: Field,
-    value: &str,
-    show: bool,
-    invalid: bool,
-) -> Element<'a, Message> {
-    field_row_labeled(field, field.label(), field.help(), value, show, invalid)
-}
-
 /// Width of an inspector's editable control, logical px.
 ///
 /// Numeric inputs and pickers share it so their right edges line up down the column —
@@ -7249,7 +7160,9 @@ const INSPECTOR_PICKER_W: f32 = 120.0;
 /// selection changed.
 const INSPECTOR_TOOL_PICKER_W: f32 = 140.0;
 
-/// As [`field_row_styled`], but with an explicit label and tooltip so a field can be
+/// An inspector field row: an explicit label + tooltip and a numeric text input bound to
+/// `field`, drawn **invalid** (red border + value) when `invalid` — the thicker border
+/// carries the signal by weight, not hue alone. The explicit label lets a field be
 /// renamed and re-explained per tool kind (e.g. a V-bit's `ToolDiameter` reads "Shank
 /// diameter" with matching help).
 fn field_row_labeled<'a>(
@@ -7562,6 +7475,12 @@ impl Viewport {
             .or(self.bounds)
             .unwrap_or(([0.0, 0.0, 0.0], [1.0, 1.0, 0.0]));
         let mut cam = OrbitCamera::framed(min, max);
+        // Keep the lateral framing on the stock (stable on-screen size), but stretch the
+        // depth range to cover the whole toolpath — tall tool-change lifts reach well
+        // above the stock, and would otherwise clip on rotate at any zoom.
+        if let Some((smin, smax)) = self.bounds {
+            cam.cover_depth(smin, smax);
+        }
         cam.orient = cam_render::orientation(self.controls.yaw, self.controls.pitch);
         cam.zoom = self.controls.zoom;
         cam.pan = self.controls.pan;
@@ -8426,11 +8345,11 @@ mod inspector_field_tests {
 
     #[test]
     fn a_field_the_model_has_no_value_for_is_ignored() {
-        // Start-point offsets read `None` when no start point is set; a stale buffer for
-        // one must not light Apply up forever.
-        let visible = [Field::StartOffX];
+        // A field the model returns `None` for (e.g. not applicable to the current
+        // selection) with a stale buffer must not light Apply up forever.
+        let visible = [Field::OriginX];
         let mut buffers = BTreeMap::new();
-        buffers.insert(Field::StartOffX, "12".to_string());
+        buffers.insert(Field::OriginX, "12".to_string());
         assert!(!fields_are_dirty(&visible, &buffers, |_| None));
     }
 

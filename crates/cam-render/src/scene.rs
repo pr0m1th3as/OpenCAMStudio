@@ -16,6 +16,10 @@ pub const RAPID: Color = [0.85, 0.75, 0.20, 1.0];
 pub const CUT: Color = [0.25, 0.75, 0.35, 1.0];
 /// Plunge / lead-in moves.
 pub const PLUNGE: Color = [0.90, 0.35, 0.25, 1.0];
+/// Tool-change / reorientation traverse (the planner's lift to tool-change height).
+/// A blue, deliberately apart from the gold rapid and red-green-safe against the
+/// cut/plunge pair.
+pub const TRAVERSE: Color = [0.30, 0.60, 0.95, 1.0];
 
 /// Chord tolerance (mm) used when flattening backplot arcs for display.
 const ARC_TOL: f64 = 0.02;
@@ -42,6 +46,7 @@ fn dim(c: Color) -> Color {
 fn color_for(kind: MoveKind) -> Color {
     match kind {
         MoveKind::Link | MoveKind::Retract => RAPID,
+        MoveKind::Traverse => TRAVERSE,
         MoveKind::Cutting => CUT,
         MoveKind::Plunge | MoveKind::LeadIn => PLUNGE,
     }

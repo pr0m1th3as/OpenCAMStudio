@@ -65,6 +65,10 @@ pub enum MoveKind {
     Link,
     /// Withdrawal to a safe height.
     Retract,
+    /// A planner-inserted rapid up to the **tool-change height** — the lift that
+    /// brackets a tool change (`M6`) or a manual reorientation (`M00`), distinct from
+    /// an operation's own `Link`/`Retract` so the backplot can render it apart.
+    Traverse,
     /// A vertical entry into the material.
     Plunge,
 }

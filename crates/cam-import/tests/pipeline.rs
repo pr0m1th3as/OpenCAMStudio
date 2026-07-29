@@ -84,12 +84,19 @@ fn import_and_plan() -> (String, Vec<cam_toolpath::Diagnostic>, usize, usize) {
         }],
         operations: ops,
         origin: [0.0, 0.0, 0.0],
-        start_offset: None,
         extra_origins: vec![],
         origin_index: 1,
+        tool_change_height: None,
     });
 
-    let (program, diags) = build_job(&doc, 1000.0, SpindleDir::Cw, None, &CancelToken::new());
+    let (program, diags) = build_job(
+        &doc,
+        1000.0,
+        SpindleDir::Cw,
+        None,
+        machine().envelope.max.z,
+        &CancelToken::new(),
+    );
     let opts = PostOptions {
         program_name: Some("part".into()),
         ..Default::default()

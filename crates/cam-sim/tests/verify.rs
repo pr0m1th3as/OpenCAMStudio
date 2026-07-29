@@ -68,14 +68,14 @@ fn setup(operations: Vec<Operation>) -> Document {
         }],
         operations,
         origin: [0.0, 0.0, 0.0],
-        start_offset: None,
         extra_origins: vec![],
         origin_index: 1,
+        tool_change_height: None,
     })
 }
 
 fn run(doc: &Document) -> cam_sim::SimResult {
-    let (program, diags) = build_job(doc, 1000.0, SpindleDir::Cw, None, &CancelToken::new());
+    let (program, diags) = build_job(doc, 1000.0, SpindleDir::Cw, None, 50.0, &CancelToken::new());
     assert!(
         !diags
             .iter()
@@ -245,11 +245,11 @@ fn a_bad_setup_that_rapids_low_is_caught() {
             Operation::Profile(profile_square(1, square(25.0, 25.0, 35.0, 35.0))),
         ],
         origin: [0.0, 0.0, 0.0],
-        start_offset: None,
         extra_origins: vec![],
         origin_index: 1,
+        tool_change_height: None,
     });
-    let (program, _) = build_job(&doc, 1000.0, SpindleDir::Cw, None, &CancelToken::new());
+    let (program, _) = build_job(&doc, 1000.0, SpindleDir::Cw, None, 50.0, &CancelToken::new());
     let sim = simulate(
         &program,
         STOCK_MIN,

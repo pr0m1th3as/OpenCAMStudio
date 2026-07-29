@@ -29,6 +29,7 @@ pub fn build_job(
     spindle_rpm: f64,
     dir: SpindleDir,
     stock: Option<([f64; 2], [f64; 2])>,
+    tool_change_height: f64,
     cancel: &CancelToken,
 ) -> (Program, Vec<Diagnostic>) {
     let setup = &doc.setup;
@@ -95,26 +96,20 @@ pub fn build_job(
         .collect();
     planned.sort_by_key(|pl| rank.get(&pl.datum).copied().unwrap_or(0));
 
-    // Emit each operation once, under the origin its `work_offset` names. At the start
-    // of each origin group the emitter breaks cleanly from the previous orientation: an
-    // operator stop (`M00`, except before the very first group), the datum select, and a
-    // rapid to that origin's own start point — so a new fixturing never links to where
-    // the last operation ended.
+    // Emit each operation once, under the origin its `work_offset` names. Every new
+    // context — the first operation, a tool change, or a reorientation — opens by lifting
+    // to the tool-change height and descending to clearance (a reorientation adds the
+    // `M00` operator stop for re-fixturing); the emitter handles that.
     let mut st = EmitState::new();
-    let mut prev_group: Option<u32> = None;
     for pl in &planned {
-        let group_start = if prev_group != Some(pl.datum) {
-            prev_group = Some(pl.datum);
-            // The group's start point (origin + its start offset), in the part frame;
-            // the post re-references it to this group's origin like everything else.
-            setup.origin_start_offset(pl.datum).map(|off| {
-                let o = setup.origin_position(pl.datum);
-                Point3::new(o[0] + off[0], o[1] + off[1], o[2] + off[2])
-            })
-        } else {
-            None
-        };
-        emit_instance(&mut program, pl, dir, &mut st, group_start);
+        emit_instance(
+            &mut program,
+            pl,
+            dir,
+            &mut st,
+            tool_change_height,
+            setup.heights.clearance,
+        );
     }
 
     if st.spindle_started {
@@ -161,36 +156,53 @@ impl EmitState {
     }
 }
 
-/// Emit one operation instance. When `group_start` is `Some`, this is the first
-/// operation of a new origin group: emit an operator stop (unless it's the very first
-/// group), select the datum, and — after the tool/spindle/coolant setup — a rapid to
-/// the group's start point, breaking any link to the previous orientation's last move.
+/// Emit one operation instance, opening every new context from the tool-change height.
+///
 /// The datum select precedes the tool change so a post can state `G15 H<n>` in the
-/// tool-section head; each of tool/spindle/coolant is re-commanded only on change.
+/// tool-section head; tool/spindle/coolant are re-commanded only on change. Then, for
+/// the first operation, a tool change, or a reorientation, the planner crosses to the
+/// operation's start at the tool-change height and descends to clearance before handing
+/// off — so the tool always reaches a known safe height before descending, whatever the
+/// machine's prior state. A reorientation additionally halts (`M00`) for the manual
+/// re-fixture, and its cross is left visually broken in the backplot (the pen-lift at the
+/// `Datum`). Same-tool, same-datum consecutive operations get no transition — they hop at
+/// clearance via the operation's own approach.
 fn emit_instance(
     program: &mut Program,
     pl: &Planned,
     dir: SpindleDir,
     st: &mut EmitState,
-    group_start: Option<Point3>,
+    tool_change_height: f64,
+    clearance: f64,
 ) {
-    if st.current_datum != pl.datum {
+    let datum_changing = st.current_datum != pl.datum;
+    let tool_changing = st.current_tool != Some(pl.tool);
+
+    if datum_changing {
         // A new datum is a physical reorientation of the part. Before the operator
         // handles it, stop the spindle and coolant (`M05`/`M09`) so nothing is live
-        // during the flip, then halt (`M00`) — but not before the *first* group
-        // (nothing to re-fixture from). Force spindle and coolant to be re-commanded for
-        // the new group by clearing their running state.
+        // during the flip, lift clear to the tool-change height so the part is free to
+        // handle, then halt (`M00`) — but not before the *first* group (nothing to
+        // re-fixture from). Force spindle and coolant to be re-commanded for the new
+        // group by clearing their running state.
         if st.spindle_started {
             program.push(Step::SpindleOff);
             program.push(Step::Coolant(Coolant::Off));
+            lift_to_tool_change(program, tool_change_height, pl.op_id);
             program.push(Step::Stop);
             st.current_rpm = None;
             st.spindle_started = false;
         }
         program.push(Step::Datum(pl.datum));
         st.current_datum = pl.datum;
+    } else if tool_changing && st.spindle_started {
+        // A same-datum tool change: lift clear to the tool-change height in place before
+        // the `M6`, so the ATC swings with the tool out of the work. The first tool load
+        // (spindle not yet started) has nothing to lift away from — the cross below still
+        // takes it up to the tool-change height first.
+        lift_to_tool_change(program, tool_change_height, pl.op_id);
     }
-    if st.current_tool != Some(pl.tool) {
+    if tool_changing {
         program.push(Step::ToolChange { tool: pl.tool });
         st.current_tool = Some(pl.tool);
     }
@@ -203,17 +215,63 @@ fn emit_instance(
         program.push(Step::Coolant(Coolant::Flood));
         st.spindle_started = true;
     }
-    // The clean start into a new orientation: rapid to its own start point.
-    if let Some(to) = group_start {
-        program.push(Step::Rapid {
-            to,
-            tag: Tag::new(pl.op_id, MoveKind::Link),
-        });
+    // Open every new context from the tool-change height: cross to this operation's start
+    // XY at that height, then descend to clearance and hand off (the operation owns
+    // clearance and below). Tagged `Traverse` so the backplot draws it apart. For the
+    // first op and same-datum tool changes it draws as one continuous up-over-down; for a
+    // reorientation the pen-lift at the `Datum` breaks the cross, leaving it distinct.
+    // Same-tool, same-datum consecutive operations skip this and hop at clearance.
+    if tool_changing || datum_changing {
+        if let Some(start) = first_position(&pl.fragment) {
+            program.push(Step::Rapid {
+                to: Point3::new(start.x, start.y, tool_change_height),
+                tag: Tag::new(pl.op_id, MoveKind::Traverse),
+            });
+            program.push(Step::Rapid {
+                to: Point3::new(start.x, start.y, clearance),
+                tag: Tag::new(pl.op_id, MoveKind::Traverse),
+            });
+        }
     }
     program.extend(pl.fragment.clone());
     if let Some(t) = pl.ends_with {
         st.current_tool = Some(t);
     }
+}
+
+/// Rapid straight up to the tool-change height, in place (X/Y unchanged), so a tool
+/// change or manual re-fixture happens with the tool clear of the work. Tagged
+/// [`MoveKind::Traverse`] so the backplot renders it apart from an operation's own
+/// rapids. A no-op if nothing has moved yet — there is no prior position to lift from.
+fn lift_to_tool_change(program: &mut Program, z: f64, op_id: u32) {
+    if let Some(p) = last_position(program) {
+        program.push(Step::Rapid {
+            to: Point3::new(p.x, p.y, z),
+            tag: Tag::new(op_id, MoveKind::Traverse),
+        });
+    }
+}
+
+/// The tool's current position: the endpoint of the last positional step emitted so
+/// far. A drill cycle ends above its last hole, at that cycle's retract plane.
+fn last_position(program: &Program) -> Option<Point3> {
+    program.steps().iter().rev().find_map(|s| match s {
+        Step::Rapid { to, .. } | Step::Linear { to, .. } => Some(*to),
+        Step::Arc { end, .. } => Some(*end),
+        Step::Drill(c) => c.points.last().map(|[x, y]| Point3::new(*x, *y, c.retract)),
+        _ => None,
+    })
+}
+
+/// The first point an operation's fragment moves to — its approach start. Used to aim
+/// the tool-change cross-and-descend at the next operation before handing off.
+fn first_position(program: &Program) -> Option<Point3> {
+    program.steps().iter().find_map(|s| match s {
+        Step::Rapid { to, .. } | Step::Linear { to, .. } => Some(*to),
+        Step::Arc { end, .. } => Some(*end),
+        Step::Drill(c) => c.points.first().map(|[x, y]| Point3::new(*x, *y, c.retract)),
+        _ => None,
+    })
 }
 
 /// Dispatch an operation to its strategy and compute it.

@@ -77,14 +77,21 @@ fn setup(operations: Vec<Operation>, tools: Vec<Tool>) -> Document {
         tools,
         operations,
         origin: [0.0, 0.0, 0.0],
-        start_offset: None,
         extra_origins: vec![],
         origin_index: 1,
+        tool_change_height: None,
     })
 }
 
 fn post(doc: &Document, name: &str) -> (Program, String) {
-    let (program, diags) = build_job(doc, 1000.0, SpindleDir::Cw, None, &CancelToken::new());
+    let (program, diags) = build_job(
+        doc,
+        1000.0,
+        SpindleDir::Cw,
+        None,
+        machine().envelope.max.z,
+        &CancelToken::new(),
+    );
     assert!(
         !diags
             .iter()

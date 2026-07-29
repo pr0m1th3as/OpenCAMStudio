@@ -31,7 +31,16 @@ use crate::Tool;
 ///     default 1). All `#[serde(default)]`, so v6-and-earlier files (base origin only,
 ///     H1) open unchanged; the base position/start-point stay in `Setup::origin` /
 ///     `Setup::start_offset`.
-pub const SCHEMA_VERSION: u32 = 8;
+/// v9: `Setup` gained `tool_change_height` (`Option<f64>`): the Z the planner lifts to
+///     before a tool change (`M6`) or a manual reorientation (`M00`), above the
+///     toolpath `clearance` plane. `#[serde(default)]` → `None`, which resolves to the
+///     machine's max Z travel at plan time, so v8-and-earlier files open unchanged.
+///     **Also removes** the v4/v8 per-origin program start point (`Setup::start_offset`
+///     and `Origin::start_offset`, both `Option<[f64;3]>`): superseded by the
+///     unconditional lift-to-tool-change-height then descend-to-clearance that now opens
+///     every operation group. Old files still open — serde drops the now-unknown field,
+///     so a saved start point becomes "start straight into the first op" (a safe no-op).
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// The safety planes for a setup, all **absolute Z in millimetres**. By
 /// convention WCS Z0 is the top of stock, so `top_of_stock` is usually `0.0`.
@@ -1109,12 +1118,6 @@ pub struct Origin {
     /// The part-space point this datum is zeroed to. Subtracted from its group's
     /// coordinates at post time, exactly as the base origin is.
     pub position: [f64; 3],
-    /// Optional **program start point** for this origin, as an offset (mm, part axes)
-    /// from `position` — the same field the base carries in [`Setup::start_offset`].
-    /// A new orientation begins by rapiding here, breaking any link to the previous
-    /// group's last position. `None` starts straight into the group's first operation.
-    #[serde(default)]
-    pub start_offset: Option<[f64; 3]>,
 }
 
 /// A machining setup: one fixturing of the stock, its safety planes, and the
@@ -1148,15 +1151,26 @@ pub struct Setup {
     /// `1` by default; editable and swappable like an extra origin's index.
     #[serde(default = "default_origin_index")]
     pub origin_index: u32,
-    /// Optional **program start point**, as an offset (mm, part axes) **from the
-    /// origin**: the toolpath begins with a rapid to `origin + start_offset`, so
-    /// the first motion originates at a known safe spot. `None` starts straight
-    /// into the first operation.
+    /// Optional **tool-change height** (absolute Z, mm): the plane the planner lifts to
+    /// before a tool change (`M6`) or a manual reorientation (`M00`), then descends from
+    /// once the next operation takes over. It sits **above** the toolpath
+    /// [`clearance`](Heights::clearance) plane — a tool change wants maximum clearance
+    /// (an ATC swing, an operator's hands during a re-fixture), not the cutting-traverse
+    /// height. `None` (the default) resolves to the machine's max Z travel at plan time
+    /// via [`resolved_tool_change_height`](Self::resolved_tool_change_height).
     #[serde(default)]
-    pub start_offset: Option<[f64; 3]>,
+    pub tool_change_height: Option<f64>,
 }
 
 impl Setup {
+    /// The tool-change height to plan with: the explicit
+    /// [`tool_change_height`](Self::tool_change_height) if set, else `machine_max_z`
+    /// (the top of the machine's Z envelope). The caller supplies `machine_max_z`
+    /// because the setup does not carry the machine.
+    pub fn resolved_tool_change_height(&self, machine_max_z: f64) -> f64 {
+        self.tool_change_height.unwrap_or(machine_max_z)
+    }
+
     /// The part-space position of the origin with the given `index`: the base
     /// [`origin`](Self::origin) when `index == origin_index`, otherwise the matching
     /// [`extra_origins`](Self::extra_origins) entry. Falls back to the base origin for
@@ -1170,19 +1184,6 @@ impl Setup {
             .iter()
             .find(|o| o.index == index)
             .map_or(self.origin, |o| o.position)
-    }
-
-    /// The program start-point offset for the origin with `index`: the base's
-    /// [`start_offset`](Self::start_offset) when `index == origin_index`, otherwise the
-    /// matching extra's. `None` if that origin has no start point.
-    pub fn origin_start_offset(&self, index: u32) -> Option<[f64; 3]> {
-        if index == self.origin_index {
-            return self.start_offset;
-        }
-        self.extra_origins
-            .iter()
-            .find(|o| o.index == index)
-            .and_then(|o| o.start_offset)
     }
 
     /// Every origin index this setup defines, base first: `origin_index` then each of

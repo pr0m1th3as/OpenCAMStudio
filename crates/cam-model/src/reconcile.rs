@@ -389,9 +389,9 @@ mod tests {
             tools: vec![t(7, 12.0, ToolKind::EndMill), t(4, 8.0, ToolKind::EndMill)],
             operations: vec![mk_drill(1, 7), mk_drill(2, 4)],
             origin: [0.0, 0.0, 0.0],
-            start_offset: None,
             extra_origins: vec![],
             origin_index: 1,
+            tool_change_height: None,
         };
         let shop = [t(4, 12.0, ToolKind::EndMill)]; // ⌀12 is shop #4
         let rep = reconcile_tool_numbers(&mut setup, &shop);

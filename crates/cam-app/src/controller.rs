@@ -635,17 +635,17 @@ impl AppController {
         self.invalidate();
     }
 
+    /// Edit setup-level fields beyond [`Heights`] — e.g. the tool-change height.
+    pub fn edit_setup(&mut self, f: impl FnOnce(&mut cam_model::Setup)) {
+        self.document.edit(|doc| f(&mut doc.setup));
+        self.invalidate();
+    }
+
     /// Edit the workpiece origin (datum) as one undoable change. Re-references the
     /// posted G-code; the design/sim frame is unaffected, so no re-run is needed —
     /// but `invalidate` keeps the pipeline honest.
     pub fn edit_origin(&mut self, f: impl FnOnce(&mut [f64; 3])) {
         self.document.edit(|doc| f(&mut doc.setup.origin));
-        self.invalidate();
-    }
-
-    /// Edit the optional program start offset (from origin) as one undoable change.
-    pub fn edit_start_offset(&mut self, f: impl FnOnce(&mut Option<[f64; 3]>)) {
-        self.document.edit(|doc| f(&mut doc.setup.start_offset));
         self.invalidate();
     }
 
@@ -697,37 +697,13 @@ impl AppController {
         self.invalidate();
     }
 
-    /// The active origin's program start-point offset (base or extra).
-    pub fn active_origin_start_offset(&self) -> Option<[f64; 3]> {
-        self.setup().origin_start_offset(self.active_origin)
-    }
-
-    /// Edit the active origin's program start-point offset as one undoable change — the
-    /// base's [`Setup::start_offset`] when it holds the active index, else the matching
-    /// extra's.
-    pub fn edit_active_origin_start_offset(&mut self, f: impl FnOnce(&mut Option<[f64; 3]>)) {
-        let index = self.active_origin;
-        self.document.edit(|doc| {
-            if doc.setup.origin_index == index {
-                f(&mut doc.setup.start_offset);
-            } else if let Some(o) = doc.setup.extra_origins.iter_mut().find(|o| o.index == index) {
-                f(&mut o.start_offset);
-            }
-        });
-        self.invalidate();
-    }
-
     /// Add a new workpiece origin (a reorientation of the part), indexed one past the
     /// highest, seeded at the base origin's position, and make it active + selected.
     pub fn add_origin(&mut self) {
         let index = self.setup().next_origin_index();
         let position = self.setup().origin;
         self.document.edit(move |doc| {
-            doc.setup.extra_origins.push(Origin {
-                index,
-                position,
-                start_offset: None,
-            })
+            doc.setup.extra_origins.push(Origin { index, position })
         });
         self.active_origin = index;
         self.selection = Selection::Origin;
@@ -1916,11 +1892,17 @@ impl AppController {
         // clear out to the raw material.
         let (smin, smax) = self.stock_box();
         let stock = Some(([smin[0], smin[1]], [smax[0], smax[1]]));
+        // Tool-change lift height: the setup's explicit value, else the top of the
+        // machine's Z envelope.
+        let tool_change_height = document
+            .setup
+            .resolved_tool_change_height(self.machine.envelope.max.z);
         let (program, diagnostics) = build_job(
             &document,
             self.defaults.spindle_rpm,
             SpindleDir::Cw,
             stock,
+            tool_change_height,
             cancel,
         );
 
@@ -2147,9 +2129,9 @@ impl AppController {
             tools,
             operations,
             origin: [0.0, 0.0, 0.0],
-            start_offset: None,
             extra_origins: vec![],
             origin_index: 1,
+            tool_change_height: None,
         })
     }
 
@@ -2545,9 +2527,9 @@ fn empty_document(p: &JobParams) -> Document {
         }],
         operations: Vec::new(),
         origin: [0.0, 0.0, 0.0],
-        start_offset: None,
         extra_origins: vec![],
         origin_index: 1,
+        tool_change_height: None,
     })
 }
 

@@ -62,15 +62,15 @@ fn doc(ops: Vec<Operation>) -> Document {
         }],
         operations: ops,
         origin: [0.0, 0.0, 0.0],
-        start_offset: None,
         extra_origins: vec![],
         origin_index: 1,
+        tool_change_height: None,
     })
 }
 
 /// The RPMs of every `Step::Spindle` the job emits, in order.
 fn spindle_rpms(doc: &Document) -> Vec<f64> {
-    let (program, _) = build_job(doc, 1000.0, SpindleDir::Cw, None, &CancelToken::new());
+    let (program, _) = build_job(doc, 1000.0, SpindleDir::Cw, None, 50.0, &CancelToken::new());
     program
         .steps()
         .iter()

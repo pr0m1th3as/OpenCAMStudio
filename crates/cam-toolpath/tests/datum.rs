@@ -39,7 +39,6 @@ fn two_origin_doc() -> Document {
     d.setup.extra_origins.push(Origin {
         index: 2,
         position: [50.0, 0.0, 0.0],
-        start_offset: Some([5.0, 5.0, 10.0]),
     });
     d
 }
@@ -47,7 +46,14 @@ fn two_origin_doc() -> Document {
 /// The export path exactly as the app wires it (`controller.rs`): plan, re-reference
 /// each group to its own origin, then post.
 fn okuma_nc(d: &Document) -> String {
-    let (program, _) = build_job(d, 1000.0, SpindleDir::Cw, None, &CancelToken::new());
+    let (program, _) = build_job(
+        d,
+        1000.0,
+        SpindleDir::Cw,
+        None,
+        machine().envelope.max.z,
+        &CancelToken::new(),
+    );
     let setup = &d.setup;
     let translated = program.translated_per_datum(|idx| {
         let o = setup.origin_position(idx);
@@ -63,6 +69,78 @@ fn okuma_nc(d: &Document) -> String {
             },
         )
         .expect("posts")
+}
+
+#[test]
+fn a_same_datum_tool_change_is_a_full_planner_owned_transition() {
+    use cam_cldata::MoveKind;
+    // Two ops on the same datum, different tools. The planner owns the whole transition:
+    // a Traverse lift to the tool-change height (42) before the `M6`, then after the
+    // change a Traverse cross at 42 to the next op's XY and a Traverse descent to
+    // clearance (5, from the doc's Heights) — all in the distinct Traverse role.
+    let d = doc(vec![
+        profile(0, rect(10.0, 10.0, 70.0, 50.0), Side::Outside, 1, 1),
+        profile(1, rect(35.0, 25.0, 45.0, 35.0), Side::Inside, 2, 1),
+    ]);
+    let (program, _) = build_job(&d, 1000.0, SpindleDir::Cw, None, 42.0, &CancelToken::new());
+    let s = program.steps();
+    let tc = s
+        .iter()
+        .position(|x| matches!(x, Step::ToolChange { tool: 2 }))
+        .expect("the second tool change");
+
+    // Just before the M6: the in-place lift to tool-change height.
+    match &s[tc - 1] {
+        Step::Rapid { to, tag } => {
+            assert_eq!(tag.kind, MoveKind::Traverse, "the pre-M6 lift is a Traverse");
+            assert_eq!(to.z, 42.0, "the lift rises to the tool-change height");
+        }
+        other => panic!("expected a Traverse lift before the M6, got {other:?}"),
+    }
+
+    // After the M6: the two Traverse moves that cross to the next op and descend to
+    // clearance, in order. (Spindle/coolant re-commands sit between the M6 and these.)
+    let traverses: Vec<&Point3> = s[tc..]
+        .iter()
+        .filter_map(|x| match x {
+            Step::Rapid { to, tag } if tag.kind == MoveKind::Traverse => Some(to),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(traverses.len(), 2, "a cross then a descent after the M6:\n{s:#?}");
+    assert_eq!(traverses[0].z, 42.0, "cross to the next op at tool-change height");
+    assert_eq!(traverses[1].z, 5.0, "then descend to clearance");
+    assert_eq!(
+        (traverses[0].x, traverses[0].y),
+        (traverses[1].x, traverses[1].y),
+        "cross and descent share the next op's XY (descent is vertical)"
+    );
+}
+
+#[test]
+fn same_tool_consecutive_ops_get_no_transition() {
+    use cam_cldata::MoveKind;
+    // One tool, one datum. The first op opens from tool-change height (its own cross +
+    // descend), but the second same-tool op adds no transition — it hops at clearance via
+    // its own approach. So the only Traverse moves are the first op's opening pair.
+    let d = doc(vec![
+        profile(0, rect(10.0, 10.0, 70.0, 50.0), Side::Outside, 1, 1),
+        profile(1, rect(35.0, 25.0, 45.0, 35.0), Side::Inside, 1, 1),
+    ]);
+    let (program, _) = build_job(&d, 1000.0, SpindleDir::Cw, None, 42.0, &CancelToken::new());
+    let traverse_ops: Vec<u32> = program
+        .steps()
+        .iter()
+        .filter_map(|x| match x {
+            Step::Rapid { tag, .. } if tag.kind == MoveKind::Traverse => Some(tag.op_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        traverse_ops,
+        vec![0, 0],
+        "only the first op opens from TCH (cross + descend); the second adds none"
+    );
 }
 
 /// Byte-pinned end-to-end golden (O5): a two-origin job planned and posted through
@@ -137,14 +215,21 @@ fn doc(ops: Vec<Operation>) -> Document {
         tools: vec![tool(1), tool(2)],
         operations: ops,
         origin: [0.0, 0.0, 0.0],
-        start_offset: None,
         extra_origins: vec![],
         origin_index: 1,
+        tool_change_height: None,
     })
 }
 
 fn steps(doc: &Document) -> Vec<Step> {
-    let (program, _) = build_job(doc, 1000.0, SpindleDir::Cw, None, &CancelToken::new());
+    let (program, _) = build_job(
+        doc,
+        1000.0,
+        SpindleDir::Cw,
+        None,
+        machine().envelope.max.z,
+        &CancelToken::new(),
+    );
     program.steps().to_vec()
 }
 
@@ -213,47 +298,24 @@ fn a_reorientation_emits_an_operator_stop_before_the_new_datum() {
 }
 
 #[test]
-fn a_new_origin_group_starts_with_a_rapid_to_its_own_start_point() {
-    use cam_cldata::{MoveKind, Point3};
-    use cam_model::Origin;
-    let mut d = doc(vec![
-        profile(0, rect(10.0, 10.0, 70.0, 50.0), Side::Outside, 1, 1),
-        profile(1, rect(35.0, 25.0, 45.0, 35.0), Side::Inside, 1, 2),
-    ]);
-    // Origin 2 sits elsewhere on the part and carries its own start point.
-    d.setup.extra_origins.push(Origin {
-        index: 2,
-        position: [50.0, 0.0, 0.0],
-        start_offset: Some([5.0, 5.0, 10.0]),
-    });
-    let s = steps(&d);
-    let di = s.iter().position(|x| matches!(x, Step::Datum(2))).expect("datum 2");
-    // The first motion of the new group is a rapid to origin2 + its start offset
-    // (part frame; the post re-references it to origin 2 at export).
-    let first_rapid = s[di..]
-        .iter()
-        .find_map(|x| match x {
-            Step::Rapid { to, tag } if tag.kind == MoveKind::Link => Some(*to),
-            _ => None,
-        })
-        .expect("a clean-start rapid after the datum");
-    assert_eq!(first_rapid, Point3::new(55.0, 5.0, 10.0), "rapid to origin2 + start_offset");
-}
-
-#[test]
 fn a_reorientation_stops_spindle_and_coolant_before_the_halt_and_restarts_after() {
-    use cam_cldata::Coolant;
+    use cam_cldata::{Coolant, MoveKind};
     let d = doc(vec![
         profile(0, rect(10.0, 10.0, 70.0, 50.0), Side::Outside, 1, 1),
         profile(1, rect(35.0, 25.0, 45.0, 35.0), Side::Inside, 1, 2),
     ]);
     let s = steps(&d);
     let stop_at = s.iter().position(|x| matches!(x, Step::Stop)).expect("an M00");
-    // Nothing live during the flip: M05 then M09 immediately precede the M00.
-    assert!(matches!(s[stop_at - 2], Step::SpindleOff), "spindle off before the halt");
+    // Nothing live during the flip: M05 then M09, then a lift clear to tool-change
+    // height, immediately precede the M00 so the part is free to re-fixture.
+    assert!(matches!(s[stop_at - 3], Step::SpindleOff), "spindle off before the halt");
     assert!(
-        matches!(s[stop_at - 1], Step::Coolant(Coolant::Off)),
+        matches!(s[stop_at - 2], Step::Coolant(Coolant::Off)),
         "coolant off before the halt"
+    );
+    assert!(
+        matches!(s[stop_at - 1], Step::Rapid { tag, .. } if tag.kind == MoveKind::Traverse),
+        "a lift to tool-change height before the halt"
     );
     // The new group brings both back.
     let datum_at = s.iter().position(|x| matches!(x, Step::Datum(2))).unwrap();
