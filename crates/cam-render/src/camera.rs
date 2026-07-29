@@ -76,8 +76,14 @@ fn orthographic(l: f32, r: f32, b: f32, t: f32, z_near: f32, z_far: f32) -> [[f3
 pub struct OrbitCamera {
     /// Point the camera orbits, before panning (world mm).
     pub target: [f32; 3],
-    /// Bounding-sphere radius of the framed scene (world mm).
+    /// Bounding-sphere radius that sets the **lateral** framing — the on-screen size
+    /// (world mm). Framed on the stable stock so the part keeps a constant size.
     pub radius: f32,
+    /// Bounding-sphere radius that sets the **depth** range (near/far) only, never the
+    /// on-screen size. Grown past `radius` to cover toolpath that reaches well beyond
+    /// the stock — e.g. tall tool-change lifts — so nothing clips at any orientation or
+    /// zoom. Defaults to `radius`; expand with [`cover_depth`](Self::cover_depth).
+    pub depth_radius: f32,
     /// World→view rotation (column-major; upper-left 3×3 is orthonormal).
     pub orient: Mat4,
     /// Magnification exponent: on-screen scale is `2^zoom`.
@@ -102,10 +108,31 @@ impl OrbitCamera {
         Self {
             target,
             radius,
+            depth_radius: radius,
             orient: IDENTITY,
             zoom: 0.0,
             pan: [0.0, 0.0, 0.0],
         }
+    }
+
+    /// Expand the **depth** range so the box `(min, max)` stays within the near/far
+    /// planes at any orientation, without touching the lateral framing (`radius`) — so
+    /// on-screen size is unchanged. Call after [`framed`](Self::framed) when the toolpath
+    /// reaches beyond the framed stock (tall tool-change lifts). Uses the sphere about
+    /// the (unpanned) `target`, which is orientation-independent.
+    pub fn cover_depth(&mut self, min: [f32; 3], max: [f32; 3]) {
+        let mut r = self.depth_radius;
+        for &cx in &[min[0], max[0]] {
+            for &cy in &[min[1], max[1]] {
+                for &cz in &[min[2], max[2]] {
+                    let dx = cx - self.target[0];
+                    let dy = cy - self.target[1];
+                    let dz = cz - self.target[2];
+                    r = r.max((dx * dx + dy * dy + dz * dz).sqrt());
+                }
+            }
+        }
+        self.depth_radius = r;
     }
 
     /// The vertical half-extent of the orthographic view, mm (before aspect).
@@ -148,10 +175,13 @@ impl OrbitCamera {
         };
 
         // Push the scene in front of the camera so depths are positive; near/far
-        // straddle the bounding sphere with margin.
-        let dist = 2.0 * self.radius;
-        let near = (dist - 1.5 * self.radius).max(1e-3);
-        let far = dist + 1.5 * self.radius;
+        // straddle the *depth* sphere (≥ the framing radius) with margin, so toolpath
+        // reaching beyond the stock — tall tool-change lifts — never clips. Orthographic,
+        // so a larger depth range costs nothing on screen.
+        let dr = self.depth_radius.max(self.radius);
+        let dist = 2.0 * dr;
+        let near = (dist - 1.5 * dr).max(1e-3);
+        let far = dist + 1.5 * dr;
 
         let eff_target = [
             self.target[0] + self.pan[0],
@@ -436,6 +466,32 @@ mod tests {
         let below = transform(&m, [cam.target[0], cam.target[1], cam.target[2] - 3.0]);
         let above = transform(&m, [cam.target[0], cam.target[1], cam.target[2] + 3.0]);
         assert!(below[2] < above[2], "underside now faces the camera");
+    }
+
+    #[test]
+    fn cover_depth_keeps_tall_toolpath_in_the_depth_range_at_any_angle() {
+        // A tool-change lift reaches far above the stock (here Z 200, vs a stock top of
+        // 0). Framed on the stock alone it would clip on rotate; cover_depth must expand
+        // the near/far so the tall point stays within clip depth [0,1] at every
+        // orientation — without changing the lateral framing (half_height).
+        let cam0 = OrbitCamera::framed(MIN, MAX);
+        let mut cam = cam0;
+        cam.cover_depth([0.0, 0.0, 0.0], [20.0, 10.0, 200.0]);
+        assert_eq!(
+            cam.half_height(),
+            cam0.half_height(),
+            "depth coverage must not change the lateral framing"
+        );
+        let tall = [10.0, 5.0, 200.0];
+        for &(yaw, pitch) in &[(0.0, 0.0), (0.6, 0.5), (-1.2, 0.9), (2.5, -0.7), (0.0, 1.9)] {
+            cam.orient = orientation(yaw, pitch);
+            let c = transform(&cam.view_proj(16.0 / 9.0), tall);
+            assert!(
+                (-1e-4..=1.0 + 1e-4).contains(&c[2]),
+                "tall toolpath depth {} out of [0,1] at ({yaw},{pitch})",
+                c[2]
+            );
+        }
     }
 
     #[test]
