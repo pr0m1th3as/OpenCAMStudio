@@ -63,8 +63,8 @@ fn doc(ops: Vec<Operation>) -> Document {
         operations: ops,
         origin: [0.0, 0.0, 0.0],
         start_offset: None,
-        work_offsets: vec![cam_model::Datum::base()],
-        replication: None,
+        extra_origins: vec![],
+        origin_index: 1,
     })
 }
 

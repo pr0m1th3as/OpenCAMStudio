@@ -223,6 +223,33 @@ fn a_datum_change_without_a_tool_change_states_g15_standalone() {
     );
 }
 
+#[test]
+fn a_move_after_a_datum_change_restates_z() {
+    // A datum change shifts the coordinate frame, so the first move under the new datum
+    // must re-state Z — even when the number is unchanged — rather than glide at the
+    // previous group's now-meaningless height.
+    let program = ProgramBuilder::new()
+        .tool_change(1)
+        .spindle_on(1000.0, SpindleDir::Cw)
+        .feed(300.0)
+        .rapid(Point3::new(10.0, 10.0, 5.0), MoveKind::Link)
+        .linear(Point3::new(10.0, 20.0, 5.0), MoveKind::Cutting)
+        .datum(2)
+        .rapid(Point3::new(30.0, 30.0, 5.0), MoveKind::Link)
+        .build();
+    let g = okuma(&program);
+    let first_move = g
+        .lines()
+        .skip_while(|l| !l.contains("G15 H2"))
+        .skip(1)
+        .find(|l| l.starts_with("G0") || l.starts_with('X'))
+        .expect("a move after the datum change");
+    assert!(
+        first_move.contains('Z'),
+        "the first move after G15 H2 re-states Z (frame shifted): {first_move}"
+    );
+}
+
 /// Build a single-op drilling program with the given cycle, so a test can assert the
 /// exact G71/M53 frame it lowers to.
 fn drill_program(cycle: DrillCycle) -> Program {

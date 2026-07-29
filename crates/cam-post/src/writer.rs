@@ -55,6 +55,14 @@ impl<'a> Writer<'a> {
         self.cur = Some(p);
     }
 
+    /// Forget the tracked position, so the next move re-states **all** of X/Y/Z. Call
+    /// after a work-coordinate change (`G15 H<n>` / `G54…`): the frame has shifted, so
+    /// nothing about the previous position carries — a bare `X Y` would move at a
+    /// stale, now-meaningless Z.
+    pub(crate) fn reset_position(&mut self) {
+        self.cur = None;
+    }
+
     /// Join the accumulated lines, ending with a newline.
     pub(crate) fn finish(self) -> String {
         let mut s = self.out.join("\n");

@@ -22,10 +22,16 @@ use crate::Tool;
 /// v6: each `Operation` gained a per-op `work_offset` — the 1-based work-datum
 ///     index for multi-WCS output (Okuma `G15 H<n>`). `#[serde(default =
 ///     "default_work_offset")]` → 1, so v5 and earlier files still open on datum 1.
-/// v7: `Setup` gained a work-datum `work_offsets` registry (`Vec<Datum>`) and an
-///     optional `replication` order (Workflow A). Both `#[serde(default)]` — the
-///     registry defaults to a single base datum — so v6 and earlier files still open.
-pub const SCHEMA_VERSION: u32 = 7;
+/// v7: `Setup` gained a work-datum `work_offsets` registry + `replication` order.
+///     **Superseded by v8** — those fields were removed before any public release.
+/// v8: `Setup` gained `extra_origins` (`Vec<Origin>`): additional workpiece origins
+///     for re-fixturing/reorientation, each with its own `index`, `position` and
+///     optional `start_offset` (a program start point per orientation), emitted under
+///     its own `G15 H<index>`; plus `origin_index` (the base origin's editable `H<n>`,
+///     default 1). All `#[serde(default)]`, so v6-and-earlier files (base origin only,
+///     H1) open unchanged; the base position/start-point stay in `Setup::origin` /
+///     `Setup::start_offset`.
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// The safety planes for a setup, all **absolute Z in millimetres**. By
 /// convention WCS Z0 is the top of stock, so `top_of_stock` is usually `0.0`.
@@ -1089,61 +1095,26 @@ impl Operation {
     }
 }
 
-/// How a work datum is reached — and therefore whether switching to it is free.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum DatumKind {
-    /// Several datums mounted at once (multiple vises, a router grid): switching is a
-    /// taught offset, no operator action. The kind used by replication (Workflow A).
-    #[default]
-    Simultaneous,
-    /// Reaching this datum needs the operator to re-fixture/reorient the part
-    /// (Workflow B): the post halts with a program stop before its operations run.
-    Reorient,
-}
-
-/// One entry in a setup's work-datum registry. The `index` is the abstract selector
-/// the post lowers to a dialect code (Okuma `G15 H<index>`, Fanuc `G54`+(index−1));
-/// the physical location lives in the machine's offset table, not here.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct Datum {
-    /// The 1-based work-coordinate selector.
+/// An additional workpiece origin beyond the base [`Setup::origin`] — a distinct
+/// datum for a re-fixturing/reorientation of the part (Case 1: machine one side,
+/// flip, machine another). The `index` is the machine work-coordinate selector the
+/// post lowers to a dialect code (Okuma `G15 H<index>`); the `position` is the
+/// part-space point that becomes *that* datum's `(0,0,0)`, the same role
+/// [`Setup::origin`] plays for the base (index 1). Operations reference which origin
+/// they belong to via [`Operation::work_offset`].
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Origin {
+    /// The machine work-coordinate index (index 1 is the base by default; editable).
     pub index: u32,
-    /// Operator-facing label (e.g. "Vise 2", "Back face"). UI only.
+    /// The part-space point this datum is zeroed to. Subtracted from its group's
+    /// coordinates at post time, exactly as the base origin is.
+    pub position: [f64; 3],
+    /// Optional **program start point** for this origin, as an offset (mm, part axes)
+    /// from `position` — the same field the base carries in [`Setup::start_offset`].
+    /// A new orientation begins by rapiding here, breaking any link to the previous
+    /// group's last position. `None` starts straight into the group's first operation.
     #[serde(default)]
-    pub label: String,
-    /// How the datum is reached.
-    #[serde(default)]
-    pub kind: DatumKind,
-}
-
-impl Datum {
-    /// The base datum every setup starts with: index 1, simultaneous, unlabelled.
-    pub fn base() -> Self {
-        Self {
-            index: 1,
-            label: String::new(),
-            kind: DatumKind::Simultaneous,
-        }
-    }
-}
-
-/// The order in which replication (Workflow A) visits fixtures and operations.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum ReplicationOrder {
-    /// Fixtures inside each operation: `O1→H1,H2,H3`, then `O2→H1,H2,H3`, … Operation
-    /// order is preserved and replication adds **no** tool changes over a single part.
-    /// The default — the usual router/production choice.
-    #[default]
-    ByTool,
-    /// The whole operation list per fixture: `H1: O1,O2,O3`, then `H2: O1,O2,O3`, …
-    /// Tool loads multiply by fixture count; matches the `PL-0-3T.MIN` house style.
-    ByFixture,
-}
-
-/// The default work-datum registry: a single base datum, so a v6-or-earlier document
-/// (no registry on disk) opens as a one-datum setup exactly as before.
-fn default_work_offsets() -> Vec<Datum> {
-    vec![Datum::base()]
+    pub start_offset: Option<[f64; 3]>,
 }
 
 /// A machining setup: one fixturing of the stock, its safety planes, and the
@@ -1160,30 +1131,77 @@ pub struct Setup {
     pub tools: Vec<Tool>,
     /// Operations, in execution order.
     pub operations: Vec<Operation>,
-    /// The work-datum registry: the coordinate systems this setup runs under. The
-    /// machine *owns* their physical locations (the operator teaches each `G15 H<n>`
-    /// / `G54…`); we carry only the index. Always has at least the base datum 1.
-    #[serde(default = "default_work_offsets")]
-    pub work_offsets: Vec<Datum>,
-    /// Replication (Workflow A): when `Some(order)`, the whole operation list is run
-    /// across every [`Simultaneous`](DatumKind::Simultaneous) datum in
-    /// [`work_offsets`](Self::work_offsets), in that order — ops authored once,
-    /// expanded at plan time. `None` (the default) runs each operation under its own
-    /// [`work_offset`](Operation::work_offset) (a single datum, or Workflow B groups).
+    /// Additional workpiece origins (index ≥ 2) beyond the base [`origin`](Self::origin)
+    /// (index 1) — one per re-fixturing/reorientation of the part. Each operation runs
+    /// under the origin named by its [`work_offset`](Operation::work_offset); a group of
+    /// operations on a new origin is a physical reorientation, emitted under its own
+    /// `G15 H<index>` with an operator stop before it. Empty (the default) = one origin.
     #[serde(default)]
-    pub replication: Option<ReplicationOrder>,
+    pub extra_origins: Vec<Origin>,
     /// The **workpiece origin** (datum): the part-space point that becomes G-code
     /// `(0,0,0)`. The post subtracts it from every emitted coordinate, so the
     /// operator zeros the machine's work offset (G54) at this point. `[0,0,0]`
     /// means the part frame *is* the program frame. Design/sim stay in part space.
     #[serde(default)]
     pub origin: [f64; 3],
+    /// The machine work-coordinate index (`G15 H<n>`) the **base** origin selects.
+    /// `1` by default; editable and swappable like an extra origin's index.
+    #[serde(default = "default_origin_index")]
+    pub origin_index: u32,
     /// Optional **program start point**, as an offset (mm, part axes) **from the
     /// origin**: the toolpath begins with a rapid to `origin + start_offset`, so
     /// the first motion originates at a known safe spot. `None` starts straight
     /// into the first operation.
     #[serde(default)]
     pub start_offset: Option<[f64; 3]>,
+}
+
+impl Setup {
+    /// The part-space position of the origin with the given `index`: the base
+    /// [`origin`](Self::origin) when `index == origin_index`, otherwise the matching
+    /// [`extra_origins`](Self::extra_origins) entry. Falls back to the base origin for
+    /// an unknown index, so a stale [`work_offset`](Operation::work_offset) can never
+    /// silently pick a bogus datum.
+    pub fn origin_position(&self, index: u32) -> [f64; 3] {
+        if index == self.origin_index {
+            return self.origin;
+        }
+        self.extra_origins
+            .iter()
+            .find(|o| o.index == index)
+            .map_or(self.origin, |o| o.position)
+    }
+
+    /// The program start-point offset for the origin with `index`: the base's
+    /// [`start_offset`](Self::start_offset) when `index == origin_index`, otherwise the
+    /// matching extra's. `None` if that origin has no start point.
+    pub fn origin_start_offset(&self, index: u32) -> Option<[f64; 3]> {
+        if index == self.origin_index {
+            return self.start_offset;
+        }
+        self.extra_origins
+            .iter()
+            .find(|o| o.index == index)
+            .and_then(|o| o.start_offset)
+    }
+
+    /// Every origin index this setup defines, base first: `origin_index` then each of
+    /// [`extra_origins`](Self::extra_origins) in order.
+    pub fn origin_indices(&self) -> Vec<u32> {
+        std::iter::once(self.origin_index)
+            .chain(self.extra_origins.iter().map(|o| o.index))
+            .collect()
+    }
+
+    /// The lowest unused origin index (for adding a new one): one past the highest.
+    pub fn next_origin_index(&self) -> u32 {
+        self.origin_indices().into_iter().max().map_or(2, |m| m + 1)
+    }
+}
+
+/// Default for a `#[serde(default)]` base-origin index: `1`.
+fn default_origin_index() -> u32 {
+    1
 }
 
 /// The top-level document: a schema version and a setup.

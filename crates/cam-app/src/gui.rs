@@ -812,6 +812,8 @@ enum Field {
     OriginX,
     OriginY,
     OriginZ,
+    /// The active origin's machine work-coordinate index (`G15 H<n>`).
+    OriginIndex,
     /// Program start-point offset X / Y / Z from the origin (mm).
     StartOffX,
     StartOffY,
@@ -953,6 +955,7 @@ impl Field {
             Field::OriginX => "Origin X (mm)",
             Field::OriginY => "Origin Y (mm)",
             Field::OriginZ => "Origin Z (mm)",
+            Field::OriginIndex => "H index",
             Field::StartOffX => "Offset X (mm)",
             Field::StartOffY => "Offset Y (mm)",
             Field::StartOffZ => "Offset Z (mm)",
@@ -1060,6 +1063,11 @@ impl Field {
             }
             Field::OriginY => "Part-space Y of the workpiece datum (see Origin X).",
             Field::OriginZ => "Part-space Z of the workpiece datum (see Origin X).",
+            Field::OriginIndex => {
+                "The machine work-coordinate index (G15 H<n>) this origin selects — the \
+                 index you've taught on the control. Choosing an index another origin \
+                 already uses swaps the two."
+            }
             Field::StartOffX => {
                 "X offset of the program start point from the origin — where the tool \
                  rapids to before the first cut (e.g. clear of clamps)."
@@ -1954,6 +1962,14 @@ enum Message {
     ToggleSnap(SnapKind),
     /// Enable/disable the program start point (Setup inspector).
     ToggleStartPoint(bool),
+    /// Focus a workpiece origin (`H<n>`) — makes it active + selects it.
+    SelectOrigin(u32),
+    /// Add a new workpiece origin (a reorientation group).
+    AddOrigin,
+    /// Delete the workpiece origin with the given index (extras only).
+    DeleteOrigin(u32),
+    /// Freeze/unfreeze an origin's operations (drop them from the run/viewport).
+    ToggleOriginDisabled(u32, bool),
     /// Enter/leave single-point "set workpiece origin" pick mode (Edit tab).
     ToggleSetOrigin,
     /// Enter/leave two-point origin pick mode: X from the 1st pick, Y from the
@@ -2417,8 +2433,26 @@ impl App {
             }
             Message::ToggleStartPoint(on) => {
                 self.controller
-                    .edit_start_offset(|off| *off = on.then_some([0.0, 0.0, 0.0]));
+                    .edit_active_origin_start_offset(|off| *off = on.then_some([0.0, 0.0, 0.0]));
                 self.refresh_fields();
+                self.rerun();
+            }
+            Message::SelectOrigin(index) => {
+                self.controller.select_origin(index);
+                self.refresh_fields();
+            }
+            Message::AddOrigin => {
+                self.controller.add_origin();
+                self.refresh_fields();
+            }
+            Message::DeleteOrigin(index) => {
+                self.controller.delete_origin(index);
+                self.refresh_fields();
+                self.rerun();
+            }
+            Message::ToggleOriginDisabled(index, disabled) => {
+                self.controller.set_origin_disabled(index, disabled);
+                self.rerun();
             }
             Message::ToggleShowOrigin => self.show_origin = !self.show_origin,
             Message::ToggleSetOrigin => {
@@ -2466,20 +2500,25 @@ impl App {
                 self.snap_hover = None;
                 self.hover_loop = None;
                 if self.setting_origin {
-                    // Single point: X and Y (Z stays; edit it in the fields).
-                    self.controller.edit_origin(|o| {
+                    // Single point: X and Y (Z stays; edit it in the fields). Sets the
+                    // *active* origin — the one selected in the tree.
+                    self.controller.edit_active_origin(|o| {
                         o[0] = p[0];
                         o[1] = p[1];
                     });
                     self.setting_origin = false;
                     self.refresh_fields();
+                    // `edit_active_origin` invalidates the run; repaint the backplot (the
+                    // typed-origin path reruns via `apply_inspector`, the pick path must too).
+                    self.rerun();
                     self.status = format!("Origin set to X{:.3} Y{:.3}.", p[0], p[1]);
                 } else if let Some(first) = self.origin_first.take() {
                     // Two-point: X from the 1st pick, Y from the 2nd, Z the midpoint.
                     let origin = [first[0], p[1], (first[2] + p[2]) / 2.0];
-                    self.controller.edit_origin(|o| *o = origin);
+                    self.controller.edit_active_origin(|o| *o = origin);
                     self.setting_origin_2pt = false;
                     self.refresh_fields();
+                    self.rerun();
                     self.status = format!(
                         "Origin set to X{:.3} Y{:.3} Z{:.3}.",
                         origin[0], origin[1], origin[2]
@@ -3893,10 +3932,15 @@ impl App {
                 Field::MachineTravelZ,
             ],
             Selection::Origin => {
-                let mut f = vec![Field::OriginX, Field::OriginY, Field::OriginZ];
+                let mut f = vec![
+                    Field::OriginIndex,
+                    Field::OriginX,
+                    Field::OriginY,
+                    Field::OriginZ,
+                ];
                 // Start-point offset fields, only when enabled. Rendered in the
                 // start-point section, not the generic field loop.
-                if self.controller.document().setup.start_offset.is_some() {
+                if self.controller.active_origin_start_offset().is_some() {
                     f.extend([Field::StartOffX, Field::StartOffY, Field::StartOffZ]);
                 }
                 f
@@ -4119,12 +4163,14 @@ impl App {
             Field::Clearance => Some(setup.heights.clearance),
             Field::Retract => Some(setup.heights.retract),
             Field::TopOfStock => Some(setup.heights.top_of_stock),
-            Field::OriginX => Some(setup.origin[0]),
-            Field::OriginY => Some(setup.origin[1]),
-            Field::OriginZ => Some(setup.origin[2]),
-            Field::StartOffX | Field::StartOffY | Field::StartOffZ => {
-                setup.start_offset.map(|off| off[start_axis(field)])
-            }
+            Field::OriginX => Some(self.controller.origin_position(self.controller.active_origin())[0]),
+            Field::OriginY => Some(self.controller.origin_position(self.controller.active_origin())[1]),
+            Field::OriginZ => Some(self.controller.origin_position(self.controller.active_origin())[2]),
+            Field::OriginIndex => Some(self.controller.active_origin() as f64),
+            Field::StartOffX | Field::StartOffY | Field::StartOffZ => self
+                .controller
+                .active_origin_start_offset()
+                .map(|off| off[start_axis(field)]),
             Field::StockXOffset | Field::StockYOffset | Field::StockTop | Field::StockThickness => {
                 let cam_model::Stock::BoundingBox {
                     x_offset,
@@ -4246,7 +4292,7 @@ impl App {
                 }
             }),
             Selection::Origin => {
-                self.controller.edit_origin(|o| {
+                self.controller.edit_active_origin(|o| {
                     if let Some(&v) = parsed.get(&Field::OriginX) {
                         o[0] = v;
                     }
@@ -4257,7 +4303,15 @@ impl App {
                         o[2] = v;
                     }
                 });
-                self.controller.edit_start_offset(|start| {
+                // The H index applies on Apply (like every field). A round to the
+                // nearest positive integer; changing it may swap with another origin.
+                if let Some(&v) = parsed.get(&Field::OriginIndex) {
+                    let idx = v.round().max(1.0) as u32;
+                    if idx != self.controller.active_origin() {
+                        self.controller.set_active_origin_index(idx);
+                    }
+                }
+                self.controller.edit_active_origin_start_offset(|start| {
                     if let Some(off) = start {
                         for (f, i) in [
                             (Field::StartOffX, 0),
@@ -5078,21 +5132,64 @@ impl App {
     /// (read-only), and the operations. Rows are plain selectable text (the selected
     /// row is highlighted, not a button). Each operation row carries inline controls
     /// (include checkbox + reorder arrows) and a right-click menu (Duplicate/Delete).
+    /// A workpiece-origin group header in the operation list: `Origin H<n>` with its
+    /// position, a freeze checkbox (drops the group's ops from the run/viewport), and a
+    /// delete button (extras only — the base H1 is not removable). Clicking the row
+    /// makes the origin active so new ops join it and the inspector edits it.
+    fn origin_header_row(&self, index: u32) -> Element<'_, Message> {
+        let pos = self.controller.origin_position(index);
+        let disabled = self.controller.is_origin_disabled(index);
+        let active = self.controller.selection() == Selection::Origin
+            && self.controller.active_origin() == index;
+        let freeze = checkbox(!disabled)
+            .size(15)
+            .on_toggle(move |on| Message::ToggleOriginDisabled(index, !on));
+        let label = text(format!(
+            "Origin H{index} — X{} Y{} Z{}",
+            fmt_num(pos[0]),
+            fmt_num(pos[1]),
+            fmt_num(pos[2])
+        ))
+        .size(13)
+        .width(Length::Fill)
+        .color(if active {
+            palette::LABEL_COLOR
+        } else {
+            palette::GROUP_LABEL
+        });
+        let mut controls = row![freeze, label].spacing(6).align_y(Alignment::Center);
+        if index != self.controller.base_origin_index() {
+            controls = controls.push(
+                button(text("✕").size(12)).on_press(Message::DeleteOrigin(index)),
+            );
+        }
+        let inner = container(controls.padding(Padding::from([2.0, 6.0])))
+            .width(Length::Fill)
+            .style(move |_theme| container::Style {
+                background: active.then_some(Background::Color(palette::SELECT_BG)),
+                border: Border {
+                    radius: 3.0.into(),
+                    ..Border::default()
+                },
+                ..container::Style::default()
+            });
+        mouse_area(inner)
+            .on_press(Message::SelectOrigin(index))
+            .into()
+    }
+
     fn project_tree(&self) -> Element<'_, Message> {
         let setup = &self.controller.document().setup;
         let sel = self.controller.selection();
 
-        let o = setup.origin;
+        // Workpiece origins live as group headers in the operation list below (H1
+        // above the first op, added origins each heading their own group), not as a
+        // node here — an origin *is* the datum a group of operations runs under.
         let mut list = column![
             select_row(
                 format!("Setup — {}", setup.name),
                 sel == Selection::Setup,
                 Message::Select(Selection::Setup),
-            ),
-            select_row(
-                format!("Origin — X{} Y{} Z{}", fmt_num(o[0]), fmt_num(o[1]), fmt_num(o[2])),
-                sel == Selection::Origin,
-                Message::Select(Selection::Origin),
             ),
             select_row(
                 "Stock".to_string(),
@@ -5191,9 +5288,32 @@ impl App {
         if setup.operations.is_empty() {
             list = list.push(tree_note("none — add one from the Operations tab"));
         }
-        let op_count = setup.operations.len();
-        for (i, op) in setup.operations.iter().enumerate() {
-            let id = op.id();
+        // Operations are grouped under their origin (`H<n>`) header, in origin order.
+        // An op whose `work_offset` names no current origin falls under the base (H1).
+        let origin_indices = self.controller.origin_indices();
+        let base_index = self.controller.base_origin_index();
+        let group_of = |op: &Operation| {
+            let wo = op.work_offset();
+            if origin_indices.contains(&wo) {
+                wo
+            } else {
+                base_index
+            }
+        };
+        for &oidx in &origin_indices {
+            list = list.push(self.origin_header_row(oidx));
+            let group: Vec<(usize, &Operation)> = setup
+                .operations
+                .iter()
+                .enumerate()
+                .filter(|(_, op)| group_of(op) == oidx)
+                .collect();
+            if group.is_empty() {
+                list = list.push(tree_note("    (no operations)"));
+            }
+            let glen = group.len();
+            for (gi, (_flat, op)) in group.iter().copied().enumerate() {
+                let id = op.id();
             // Row highlight tracks the viewport focus set, so every op lit in the
             // viewport reads as selected here — including a multi-selection.
             let active = self.focus_ops.contains(&id);
@@ -5212,10 +5332,12 @@ impl App {
             } else {
                 palette::LABEL_COLOR
             });
+            // Reorder within the origin group: enabled only when there's a sibling in
+            // that direction under the same origin.
             let up = button(text("↑").size(12))
-                .on_press_maybe((i > 0).then_some(Message::MoveOp(id, true)));
+                .on_press_maybe((gi > 0).then_some(Message::MoveOp(id, true)));
             let down = button(text("↓").size(12))
-                .on_press_maybe((i + 1 < op_count).then_some(Message::MoveOp(id, false)));
+                .on_press_maybe((gi + 1 < glen).then_some(Message::MoveOp(id, false)));
             // On an exact duplicate, mark it ⚠ and name its twin(s) by id — both
             // would post the same toolpath.
             let mut controls = row![include, name].spacing(4).align_y(Alignment::Center);
@@ -5281,7 +5403,12 @@ impl App {
                     .on_press(Message::ClickOp(id))
                     .on_right_press(Message::OpMenu(id)),
             );
+            }
         }
+        // A control to add another origin (a reorientation of the part).
+        list = list.push(
+            button(text("+ New origin").size(13)).on_press(Message::AddOrigin),
+        );
 
         // The right-click menu anchors to the window-absolute cursor tracked by the
         // global subscription, so the pane itself needs no cursor tracking.
@@ -5472,7 +5599,7 @@ impl App {
     /// the reference when chosen). The numeric rows reuse the field pipeline
     /// (parse + Apply); the toggles commit immediately.
     fn start_point_editor(&self) -> Element<'_, Message> {
-        let on = self.controller.document().setup.start_offset.is_some();
+        let on = self.controller.active_origin_start_offset().is_some();
         let mut col = column![text("Program start point (offset from origin)")
             .size(12)
             .color(palette::GROUP_LABEL)]
@@ -5695,7 +5822,7 @@ impl App {
         }
         let heading = match self.controller.selection() {
             Selection::Setup => "Setup".to_string(),
-            Selection::Origin => "Workpiece origin".to_string(),
+            Selection::Origin => format!("Workpiece origin H{}", self.controller.active_origin()),
             Selection::Stock => "Stock".to_string(),
             Selection::Machine => "Machine".to_string(),
             Selection::Tool(i) => format!("Tool {}", i + 1),
@@ -5768,8 +5895,20 @@ impl App {
             let value = self.fields.get(&field).cloned().unwrap_or_default();
             list = list.push(field_row_labeled(field, self.field_label(field), self.field_help(field), &value, self.tooltips, self.field_invalid(field)));
         }
-        // The program start-point editor lives on the Origin node (offset from it).
+        // Every origin carries the same fields, including its own program start point —
+        // a new orientation begins by rapiding there. The `H index` field renders in the
+        // generic loop above.
         if let Selection::Origin = self.controller.selection() {
+            if self.controller.active_origin() != self.controller.base_origin_index() {
+                list = list.push(
+                    text(
+                        "Teach this G15 H<n> on the control to the point set here. A stop \
+                         (M00) precedes this group so you can re-fixture the part.",
+                    )
+                    .size(11)
+                    .color(palette::GROUP_LABEL),
+                );
+            }
             list = list.push(self.start_point_editor());
         }
         // The tool geometry class is an enum, so it gets a picker (committed
@@ -7350,9 +7489,16 @@ impl Viewport {
         // loaded — never on an empty document at startup — and sized to the scene.
         if show_origin && controller.has_geometry() {
             if let Some((mn, mx)) = bounds {
-                let origin = controller.document().setup.origin;
-                let r = ((mx[0] - mn[0]).max(mx[1] - mn[1]) * 0.06).max(1.0);
-                add_origin_marker(&mut scene, origin, pick_z, r);
+                let base_r = ((mx[0] - mn[0]).max(mx[1] - mn[1]) * 0.06).max(1.0);
+                let active = controller.active_origin();
+                // One marker per origin so every datum is visible; the active origin
+                // (the one the pick flow and inspector edit) is drawn larger, so it
+                // reads without relying on colour.
+                for idx in controller.origin_indices() {
+                    let pos = controller.origin_position(idx);
+                    let r = if idx == active { base_r } else { base_r * 0.65 };
+                    add_origin_marker(&mut scene, pos, pick_z, r);
+                }
             }
         }
         // The first point captured in two-point origin mode (awaiting the second).

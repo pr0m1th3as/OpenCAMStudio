@@ -104,8 +104,8 @@ fn document() -> Document {
         operations: vec![Operation::Profile(outer), Operation::Profile(hole)],
         origin: [0.0, 0.0, 0.0],
         start_offset: None,
-        work_offsets: vec![cam_model::Datum::base()],
-        replication: None,
+        extra_origins: vec![],
+        origin_index: 1,
     })
 }
 
@@ -753,8 +753,8 @@ fn arc_lead_and_helix_plunge_post_to_helical_gcode() {
         operations: vec![Operation::Profile(op)],
         origin: [0.0, 0.0, 0.0],
         start_offset: None,
-        work_offsets: vec![cam_model::Datum::base()],
-        replication: None,
+        extra_origins: vec![],
+        origin_index: 1,
     });
 
     let (program, diags) = build_job(&doc, 1000.0, SpindleDir::Cw, None, &CancelToken::new());
@@ -871,8 +871,8 @@ fn carve_document(clear_tool: Option<u32>, trailing_tool: Option<u32>) -> Docume
         operations,
         origin: [0.0, 0.0, 0.0],
         start_offset: None,
-        work_offsets: vec![cam_model::Datum::base()],
-        replication: None,
+        extra_origins: vec![],
+        origin_index: 1,
     })
 }
 

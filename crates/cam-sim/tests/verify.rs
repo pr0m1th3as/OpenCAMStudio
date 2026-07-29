@@ -69,8 +69,8 @@ fn setup(operations: Vec<Operation>) -> Document {
         operations,
         origin: [0.0, 0.0, 0.0],
         start_offset: None,
-        work_offsets: vec![cam_model::Datum::base()],
-        replication: None,
+        extra_origins: vec![],
+        origin_index: 1,
     })
 }
 
@@ -246,8 +246,8 @@ fn a_bad_setup_that_rapids_low_is_caught() {
         ],
         origin: [0.0, 0.0, 0.0],
         start_offset: None,
-        work_offsets: vec![cam_model::Datum::base()],
-        replication: None,
+        extra_origins: vec![],
+        origin_index: 1,
     });
     let (program, _) = build_job(&doc, 1000.0, SpindleDir::Cw, None, &CancelToken::new());
     let sim = simulate(

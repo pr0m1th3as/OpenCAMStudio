@@ -69,8 +69,8 @@ fn doc(ops: Vec<Operation>) -> Document {
         operations: ops,
         origin: [0.0, 0.0, 0.0],
         start_offset: None,
-        work_offsets: vec![cam_model::Datum::base()],
-        replication: None,
+        extra_origins: vec![],
+        origin_index: 1,
     })
 }
 
@@ -124,6 +124,87 @@ fn the_first_op_on_a_non_default_datum_still_emits_it() {
         2,
     )]);
     assert_eq!(datums(&d), vec![2]);
+}
+
+#[test]
+fn a_reorientation_emits_an_operator_stop_before_the_new_datum() {
+    // Two ops on origins 1 then 2. Crossing to origin 2 is a physical reorientation, so
+    // an `M00` stop (`Step::Stop`) precedes the `Step::Datum(2)`; the first group carries
+    // no stop (datum 1 is the initial state).
+    let d = doc(vec![
+        profile(0, rect(10.0, 10.0, 70.0, 50.0), Side::Outside, 1, 1),
+        profile(1, rect(35.0, 25.0, 45.0, 35.0), Side::Inside, 1, 2),
+    ]);
+    let s = steps(&d);
+    let stops = s.iter().filter(|x| matches!(x, Step::Stop)).count();
+    assert_eq!(stops, 1, "one stop, at the single reorientation");
+    let stop_at = s.iter().position(|x| matches!(x, Step::Stop)).unwrap();
+    let datum_at = s.iter().position(|x| matches!(x, Step::Datum(2))).unwrap();
+    assert_eq!(stop_at + 1, datum_at, "the stop immediately precedes the new datum");
+}
+
+#[test]
+fn a_new_origin_group_starts_with_a_rapid_to_its_own_start_point() {
+    use cam_cldata::{MoveKind, Point3};
+    use cam_model::Origin;
+    let mut d = doc(vec![
+        profile(0, rect(10.0, 10.0, 70.0, 50.0), Side::Outside, 1, 1),
+        profile(1, rect(35.0, 25.0, 45.0, 35.0), Side::Inside, 1, 2),
+    ]);
+    // Origin 2 sits elsewhere on the part and carries its own start point.
+    d.setup.extra_origins.push(Origin {
+        index: 2,
+        position: [50.0, 0.0, 0.0],
+        start_offset: Some([5.0, 5.0, 10.0]),
+    });
+    let s = steps(&d);
+    let di = s.iter().position(|x| matches!(x, Step::Datum(2))).expect("datum 2");
+    // The first motion of the new group is a rapid to origin2 + its start offset
+    // (part frame; the post re-references it to origin 2 at export).
+    let first_rapid = s[di..]
+        .iter()
+        .find_map(|x| match x {
+            Step::Rapid { to, tag } if tag.kind == MoveKind::Link => Some(*to),
+            _ => None,
+        })
+        .expect("a clean-start rapid after the datum");
+    assert_eq!(first_rapid, Point3::new(55.0, 5.0, 10.0), "rapid to origin2 + start_offset");
+}
+
+#[test]
+fn a_reorientation_stops_spindle_and_coolant_before_the_halt_and_restarts_after() {
+    use cam_cldata::Coolant;
+    let d = doc(vec![
+        profile(0, rect(10.0, 10.0, 70.0, 50.0), Side::Outside, 1, 1),
+        profile(1, rect(35.0, 25.0, 45.0, 35.0), Side::Inside, 1, 2),
+    ]);
+    let s = steps(&d);
+    let stop_at = s.iter().position(|x| matches!(x, Step::Stop)).expect("an M00");
+    // Nothing live during the flip: M05 then M09 immediately precede the M00.
+    assert!(matches!(s[stop_at - 2], Step::SpindleOff), "spindle off before the halt");
+    assert!(
+        matches!(s[stop_at - 1], Step::Coolant(Coolant::Off)),
+        "coolant off before the halt"
+    );
+    // The new group brings both back.
+    let datum_at = s.iter().position(|x| matches!(x, Step::Datum(2))).unwrap();
+    assert!(
+        s[datum_at..].iter().any(|x| matches!(x, Step::Spindle { .. })),
+        "spindle restarts for the new group"
+    );
+    assert!(
+        s[datum_at..].iter().any(|x| matches!(x, Step::Coolant(Coolant::Flood))),
+        "coolant restarts for the new group"
+    );
+}
+
+#[test]
+fn a_single_origin_job_emits_no_stop() {
+    let d = doc(vec![
+        profile(0, rect(10.0, 10.0, 70.0, 50.0), Side::Outside, 1, 1),
+        profile(1, rect(35.0, 25.0, 45.0, 35.0), Side::Inside, 1, 1),
+    ]);
+    assert!(!steps(&d).iter().any(|x| matches!(x, Step::Stop)), "no stop without reorientation");
 }
 
 #[test]

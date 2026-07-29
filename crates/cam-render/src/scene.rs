@@ -168,6 +168,10 @@ impl Scene {
                     }
                     cur = None;
                 }
+                // A work-datum change or a program stop breaks the toolpath: the next
+                // group is a different fixturing/orientation, so lift the pen — don't
+                // draw a rapid linking it to where the previous group ended.
+                Step::Datum(_) | Step::Stop => cur = None,
                 _ => {}
             }
         }

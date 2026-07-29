@@ -78,8 +78,8 @@ fn setup(operations: Vec<Operation>, tools: Vec<Tool>) -> Document {
         operations,
         origin: [0.0, 0.0, 0.0],
         start_offset: None,
-        work_offsets: vec![cam_model::Datum::base()],
-        replication: None,
+        extra_origins: vec![],
+        origin_index: 1,
     })
 }
 

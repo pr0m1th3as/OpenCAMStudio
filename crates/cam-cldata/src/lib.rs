@@ -193,6 +193,10 @@ pub enum Step {
     /// only when the effective datum changes, so a single-datum job carries none
     /// and every post's output is unchanged.
     Datum(u32),
+    /// A mandatory program stop (`M00`): the machine halts and waits for the operator
+    /// to press cycle-start. Emitted before a datum change that is a physical
+    /// reorientation, so the operator can re-fixture the part before the next group.
+    Stop,
     /// A free-text comment for the operator/backplot.
     Comment(String),
     /// Set the controller's cutter-radius compensation (`G40`/`G41`/`G42`).
@@ -249,6 +253,27 @@ impl Program {
         Program {
             steps: self.steps.iter().map(|s| s.translated(d)).collect(),
         }
+    }
+
+    /// A copy re-referenced **per work datum**: each step is shifted by
+    /// `offset_for(datum)`, where `datum` is the [`Step::Datum`] index in force at that
+    /// step (starting at 1). Pass `|idx| -origin(idx)` to subtract each group's own
+    /// origin before posting, so operations under different origins emit relative to
+    /// their own zero — the reorientation case. With one datum this is exactly
+    /// [`translated`](Self::translated) by `-origin(1)`.
+    pub fn translated_per_datum(&self, offset_for: impl Fn(u32) -> [f64; 3]) -> Program {
+        let mut datum = 1u32;
+        let steps = self
+            .steps
+            .iter()
+            .map(|s| {
+                if let Step::Datum(n) = s {
+                    datum = *n;
+                }
+                s.translated(offset_for(datum))
+            })
+            .collect();
+        Program { steps }
     }
 }
 
@@ -318,6 +343,34 @@ mod translate_tests {
                 let ij = (center.x - end.x, center.y - end.y);
                 assert_eq!(ij, (-5.0, 0.0));
             }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn translated_per_datum_re_references_each_group_to_its_own_origin() {
+        // A move under datum 1, then a datum switch, then a move under datum 2. Each
+        // group is shifted by its own origin: datum 1 by −[10,0,0], datum 2 by −[0,20,0].
+        let prog = ProgramBuilder::new()
+            .op(0)
+            .feed(300.0)
+            .linear(Point3::new(10.0, 5.0, -1.0), MoveKind::Cutting) // datum 1
+            .datum(2)
+            .linear(Point3::new(3.0, 25.0, -1.0), MoveKind::Cutting) // datum 2
+            .build();
+        let t = prog.translated_per_datum(|idx| match idx {
+            1 => [-10.0, 0.0, 0.0],
+            2 => [0.0, -20.0, 0.0],
+            _ => [0.0, 0.0, 0.0],
+        });
+        // Group 1 move: (10,5) − (10,0) = (0,5).
+        match &t.steps()[0] {
+            Step::Linear { to, .. } => assert_eq!(*to, Point3::new(0.0, 5.0, -1.0)),
+            other => panic!("{other:?}"),
+        }
+        // Group 2 move (after the Datum marker): (3,25) − (0,20) = (3,5).
+        match &t.steps()[2] {
+            Step::Linear { to, .. } => assert_eq!(*to, Point3::new(3.0, 5.0, -1.0)),
             other => panic!("{other:?}"),
         }
     }

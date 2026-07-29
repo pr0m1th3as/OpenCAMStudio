@@ -17,8 +17,8 @@ use crate::project::{OcamFile, Project};
 use cam_model::{
     CarveOp, EngraveOp,
     reconcile_tool_numbers, Axis, ChamferOp, Comp, Document, DrillOp, FaceOp, Hand, Heights,
-    History, Lead, Machine, Operation, Plunge, PocketOp, ProfileOp, ReconcileReport, Setup, Side,
-    Stock, ThreadOp, Tool, ToolKind,
+    History, Lead, Machine, Operation, Origin, Plunge, PocketOp, ProfileOp, ReconcileReport, Setup,
+    Side, Stock, ThreadOp, Tool, ToolKind,
 };
 use cam_post::{PostError, PostKind, PostOptions};
 use cam_render::{mesh_vertices, MeshVertex, Scene, PART};
@@ -162,6 +162,12 @@ pub struct AppController {
     selection: Selection,
     /// Operation ids excluded from toolpath generation (kept in the tree).
     excluded: BTreeSet<u32>,
+    /// The origin new operations are assigned to, and the one the origin inspector /
+    /// pick flow edits. Defaults to the base origin (index 1).
+    active_origin: u32,
+    /// Origin indices whose operations are frozen out of the run (kept in the tree) —
+    /// the group-level analogue of [`excluded`], for working one orientation at a time.
+    disabled_origins: BTreeSet<u32>,
     source_name: String,
     /// The `.ocam` path this project was last saved to / opened from.
     current_path: Option<PathBuf>,
@@ -371,6 +377,8 @@ impl AppController {
             defaults,
             selection: Selection::default(),
             excluded: BTreeSet::new(),
+            active_origin: 1,
+            disabled_origins: BTreeSet::new(),
             source_name: String::new(),
             current_path: None,
             pending_op: None,
@@ -405,6 +413,11 @@ impl AppController {
     /// The current document.
     pub fn document(&self) -> &Document {
         self.document.current()
+    }
+
+    /// The current setup (shorthand for `document().setup`).
+    fn setup(&self) -> &Setup {
+        &self.document.current().setup
     }
 
     /// The seed defaults used when a document is generated on import.
@@ -526,6 +539,8 @@ impl AppController {
         let document = self.generate_document(seed_ops);
         self.document = History::new(document);
         self.excluded.clear();
+        self.disabled_origins.clear();
+        self.active_origin = self.document.current().setup.origin_index;
         self.pending_op = None;
         self.current_path = None;
         self.selection = self
@@ -545,6 +560,8 @@ impl AppController {
         self.open_paths.clear();
         self.document = History::new(empty_document(&self.defaults));
         self.excluded.clear();
+        self.disabled_origins.clear();
+        self.active_origin = self.document.current().setup.origin_index;
         self.source_name.clear();
         self.current_path = None;
         self.pending_op = None;
@@ -594,6 +611,8 @@ impl AppController {
         self.source_name = project.source_name;
         self.document = History::new(project.document);
         self.excluded.clear();
+        self.disabled_origins.clear();
+        self.active_origin = self.document.current().setup.origin_index;
         self.pending_op = None;
         self.current_path = Some(path.to_path_buf());
         self.selection = Selection::Setup;
@@ -627,6 +646,183 @@ impl AppController {
     /// Edit the optional program start offset (from origin) as one undoable change.
     pub fn edit_start_offset(&mut self, f: impl FnOnce(&mut Option<[f64; 3]>)) {
         self.document.edit(|doc| f(&mut doc.setup.start_offset));
+        self.invalidate();
+    }
+
+    /// The origin (`H<n>` index) new operations attach to and the origin inspector
+    /// edits.
+    pub fn active_origin(&self) -> u32 {
+        self.active_origin
+    }
+
+    /// The index the **base** origin currently holds (its position lives in
+    /// `Setup::origin`). Editable/swappable, so not necessarily 1.
+    pub fn base_origin_index(&self) -> u32 {
+        self.setup().origin_index
+    }
+
+    /// Focus an origin: make it active (new ops and the pick flow target it) and select
+    /// its node. Falls back to the base origin if the index is unknown.
+    pub fn select_origin(&mut self, index: u32) {
+        self.active_origin = if self.setup().origin_indices().contains(&index) {
+            index
+        } else {
+            self.setup().origin_index
+        };
+        self.selection = Selection::Origin;
+    }
+
+    /// Every origin index in this setup, base (1) first — for the tree headers.
+    pub fn origin_indices(&self) -> Vec<u32> {
+        self.setup().origin_indices()
+    }
+
+    /// The part-space position of origin `index` (base or an extra).
+    pub fn origin_position(&self, index: u32) -> [f64; 3] {
+        self.setup().origin_position(index)
+    }
+
+    /// Edit the **active** origin's position as one undoable change — the base
+    /// [`Setup::origin`] when it holds the active index, otherwise the matching
+    /// `extra_origins` entry.
+    pub fn edit_active_origin(&mut self, f: impl FnOnce(&mut [f64; 3])) {
+        let index = self.active_origin;
+        self.document.edit(|doc| {
+            if doc.setup.origin_index == index {
+                f(&mut doc.setup.origin);
+            } else if let Some(o) = doc.setup.extra_origins.iter_mut().find(|o| o.index == index) {
+                f(&mut o.position);
+            }
+        });
+        self.invalidate();
+    }
+
+    /// The active origin's program start-point offset (base or extra).
+    pub fn active_origin_start_offset(&self) -> Option<[f64; 3]> {
+        self.setup().origin_start_offset(self.active_origin)
+    }
+
+    /// Edit the active origin's program start-point offset as one undoable change — the
+    /// base's [`Setup::start_offset`] when it holds the active index, else the matching
+    /// extra's.
+    pub fn edit_active_origin_start_offset(&mut self, f: impl FnOnce(&mut Option<[f64; 3]>)) {
+        let index = self.active_origin;
+        self.document.edit(|doc| {
+            if doc.setup.origin_index == index {
+                f(&mut doc.setup.start_offset);
+            } else if let Some(o) = doc.setup.extra_origins.iter_mut().find(|o| o.index == index) {
+                f(&mut o.start_offset);
+            }
+        });
+        self.invalidate();
+    }
+
+    /// Add a new workpiece origin (a reorientation of the part), indexed one past the
+    /// highest, seeded at the base origin's position, and make it active + selected.
+    pub fn add_origin(&mut self) {
+        let index = self.setup().next_origin_index();
+        let position = self.setup().origin;
+        self.document.edit(move |doc| {
+            doc.setup.extra_origins.push(Origin {
+                index,
+                position,
+                start_offset: None,
+            })
+        });
+        self.active_origin = index;
+        self.selection = Selection::Origin;
+        self.invalidate();
+    }
+
+    /// Delete the origin with `index` (the base origin — the one holding
+    /// `origin_index` — is never removed). Its operations are reassigned to the base,
+    /// and it drops from the active / disabled sets.
+    pub fn delete_origin(&mut self, index: u32) {
+        let base = self.setup().origin_index;
+        if index == base {
+            return;
+        }
+        self.document.edit(move |doc| {
+            doc.setup.extra_origins.retain(|o| o.index != index);
+            for op in &mut doc.setup.operations {
+                if op.work_offset() == index {
+                    op.set_work_offset(base);
+                }
+            }
+        });
+        self.disabled_origins.remove(&index);
+        if self.active_origin == index {
+            self.active_origin = base;
+        }
+        self.invalidate();
+    }
+
+    /// Renumber the active origin's `H<n>` to `new_index` (≥ 1). If another origin
+    /// already uses `new_index`, the two **swap** indices (tool-library style) rather
+    /// than colliding; operations are remapped to follow their origin. A no-op if
+    /// unchanged or `new_index` is 0.
+    pub fn set_active_origin_index(&mut self, new_index: u32) {
+        let old = self.active_origin;
+        if new_index == old || new_index == 0 {
+            return;
+        }
+        let swap = self.setup().origin_indices().contains(&new_index);
+        self.document.edit(move |doc| {
+            let s = &mut doc.setup;
+            if swap {
+                // Park the other origin at a temporary index so the two reindexes
+                // don't collide, then move old→new and parked→old.
+                set_origin_index_value(s, new_index, u32::MAX);
+                set_origin_index_value(s, old, new_index);
+                set_origin_index_value(s, u32::MAX, old);
+            } else {
+                set_origin_index_value(s, old, new_index);
+            }
+            for op in &mut s.operations {
+                let wo = op.work_offset();
+                if wo == old {
+                    op.set_work_offset(new_index);
+                } else if swap && wo == new_index {
+                    op.set_work_offset(old);
+                }
+            }
+        });
+        // Mirror the swap in the transient disabled set.
+        let was_old = self.disabled_origins.remove(&old);
+        let was_new = swap && self.disabled_origins.remove(&new_index);
+        if was_old {
+            self.disabled_origins.insert(new_index);
+        }
+        if was_new {
+            self.disabled_origins.insert(old);
+        }
+        self.active_origin = new_index;
+        self.invalidate();
+    }
+
+    /// Reassign operation `id` to origin `index` (its group), as one undoable change.
+    pub fn set_operation_origin(&mut self, id: u32, index: u32) {
+        self.document.edit(move |doc| {
+            if let Some(op) = doc.setup.operations.iter_mut().find(|o| o.id() == id) {
+                op.set_work_offset(index);
+            }
+        });
+        self.invalidate();
+    }
+
+    /// Whether origin `index`'s operations are frozen out of the run.
+    pub fn is_origin_disabled(&self, index: u32) -> bool {
+        self.disabled_origins.contains(&index)
+    }
+
+    /// Freeze/unfreeze an origin's operations (kept in the tree, dropped from the run —
+    /// so its toolpaths leave the viewport). The base can be frozen like any other.
+    pub fn set_origin_disabled(&mut self, index: u32, disabled: bool) {
+        if disabled {
+            self.disabled_origins.insert(index);
+        } else {
+            self.disabled_origins.remove(&index);
+        }
         self.invalidate();
     }
 
@@ -830,6 +1026,8 @@ impl AppController {
     pub fn add_operation(&mut self, mut op: Operation) {
         let id = self.next_op_id();
         set_op_id(&mut op, id);
+        // A new operation joins the active origin's group (H<n>).
+        op.set_work_offset(self.active_origin);
         self.document.edit(move |doc| doc.setup.operations.push(op));
         self.selection = Selection::Operation(id);
         self.invalidate();
@@ -1640,12 +1838,17 @@ impl AppController {
         self.document.edit(|doc| {
             let ops = &mut doc.setup.operations;
             if let Some(i) = ops.iter().position(|o| o.id() == id) {
+                // Reorder within the operation's own origin group: swap with the nearest
+                // sibling of the same `work_offset` in the chosen direction. This keeps
+                // moves confined to a group, matching how the tree renders them.
+                let wo = ops[i].work_offset();
                 let j = if up {
-                    i.checked_sub(1)
-                } else if i + 1 < ops.len() {
-                    Some(i + 1)
+                    ops[..i].iter().rposition(|o| o.work_offset() == wo)
                 } else {
-                    None
+                    ops[i + 1..]
+                        .iter()
+                        .position(|o| o.work_offset() == wo)
+                        .map(|k| i + 1 + k)
                 };
                 if let Some(j) = j {
                     ops.swap(i, j);
@@ -1694,16 +1897,16 @@ impl AppController {
     /// diagnostics, viewport scene, and simulated stock. Returns a reference to
     /// the outcome. `cancel` allows a long run to be aborted.
     pub fn run(&mut self, cancel: &CancelToken) -> &RunOutcome {
-        // Excluded operations are dropped from the job (kept in the tree, just
-        // not machined) by running a filtered copy of the document.
+        // Excluded operations, and operations under a frozen origin, are dropped from
+        // the job (kept in the tree, just not machined) by running a filtered copy.
         let base = self.document.current();
-        let document = if self.excluded.is_empty() {
+        let document = if self.excluded.is_empty() && self.disabled_origins.is_empty() {
             Cow::Borrowed(base)
         } else {
             let mut d = base.clone();
             d.setup
                 .operations
-                .retain(|o| !self.excluded.contains(&o.id()));
+                .retain(|o| !self.excluded.contains(&o.id()) && !self.disabled_origins.contains(&o.work_offset()));
             Cow::Owned(d)
         };
         // The resolved stock box (XY) lets roughing strategies (profile stepover)
@@ -1760,11 +1963,16 @@ impl AppController {
             program_name: Some(self.program_name()),
             ..Default::default()
         };
-        // Re-reference the whole job to the workpiece origin (datum): shift every
-        // coordinate by −origin so the chosen part point becomes G-code (0,0,0),
-        // matched by the operator's G54 touch-off. Design/sim stay in part space.
-        let origin = self.document.current().setup.origin;
-        let program = outcome.program.translated([-origin[0], -origin[1], -origin[2]]);
+        // Re-reference each group to its own workpiece origin (datum): shift every
+        // coordinate by −origin so that group's chosen part point becomes G-code
+        // (0,0,0), matched by the operator's touch-off for `G15 H<n>`. Operations under
+        // different origins (a reorientation) each subtract their own; with one origin
+        // this is the whole job shifted by −origin. Design/sim stay in part space.
+        let setup = &self.document.current().setup;
+        let program = outcome.program.translated_per_datum(|idx| {
+            let o = setup.origin_position(idx);
+            [-o[0], -o[1], -o[2]]
+        });
         let nc = self.post_kind.post(&program, &self.machine, &options)?;
         self.nc = Some(nc);
         Ok(self.nc.as_deref().unwrap())
@@ -1937,8 +2145,8 @@ impl AppController {
             operations,
             origin: [0.0, 0.0, 0.0],
             start_offset: None,
-            work_offsets: vec![cam_model::Datum::base()],
-            replication: None,
+            extra_origins: vec![],
+            origin_index: 1,
         })
     }
 
@@ -2301,6 +2509,17 @@ fn set_op_id(op: &mut Operation, id: u32) {
     op.set_id(id);
 }
 
+/// Retarget whichever origin currently holds index `from` to `to` — the base origin
+/// (its index lives in `Setup::origin_index`) or a matching extra. Used to renumber /
+/// swap origin indices.
+fn set_origin_index_value(setup: &mut Setup, from: u32, to: u32) {
+    if setup.origin_index == from {
+        setup.origin_index = to;
+    } else if let Some(o) = setup.extra_origins.iter_mut().find(|o| o.index == from) {
+        o.index = to;
+    }
+}
+
 /// An empty starting document: a zero-size box stock, one default end mill, no
 /// operations.
 fn empty_document(p: &JobParams) -> Document {
@@ -2324,8 +2543,8 @@ fn empty_document(p: &JobParams) -> Document {
         operations: Vec::new(),
         origin: [0.0, 0.0, 0.0],
         start_offset: None,
-        work_offsets: vec![cam_model::Datum::base()],
-        replication: None,
+        extra_origins: vec![],
+        origin_index: 1,
     })
 }
 
@@ -3712,6 +3931,42 @@ mod tests {
             }
             other => panic!("expected a drill, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn adding_origins_grows_the_index_list_and_activates_the_new_one() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        assert_eq!(app.origin_indices(), vec![1], "starts with the base origin");
+        app.add_origin();
+        assert_eq!(app.origin_indices(), vec![1, 2], "second origin present");
+        assert_eq!(app.active_origin(), 2, "new origin becomes active");
+        app.add_origin();
+        assert_eq!(app.origin_indices(), vec![1, 2, 3]);
+        app.delete_origin(2);
+        assert_eq!(app.origin_indices(), vec![1, 3], "delete removes just that origin");
+    }
+
+    #[test]
+    fn setting_an_origin_index_to_an_existing_one_swaps_them() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        app.add_origin(); // H2, active
+        assert_eq!(app.origin_indices(), vec![1, 2]);
+        // Renumber the base (H1) to H2 -> the two swap: base becomes H2, extra becomes H1.
+        app.select_origin(1);
+        app.set_active_origin_index(2);
+        assert_eq!(app.base_origin_index(), 2, "base took the new index");
+        assert_eq!(app.active_origin(), 2, "the edited origin is now H2");
+        let mut idx = app.origin_indices();
+        idx.sort_unstable();
+        assert_eq!(idx, vec![1, 2], "both indices still present, just swapped");
+        // A plain renumber to an unused index (no swap).
+        app.set_active_origin_index(5);
+        assert_eq!(app.base_origin_index(), 5);
+        idx = app.origin_indices();
+        idx.sort_unstable();
+        assert_eq!(idx, vec![1, 5]);
     }
 
     #[test]

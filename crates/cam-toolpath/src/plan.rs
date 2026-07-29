@@ -6,7 +6,7 @@
 //! operation fragments together in order.
 
 use cam_cldata::{Coolant, MoveKind, Point3, Program, SpindleDir, Step, Tag};
-use cam_model::{DatumKind, Document, Operation, ReplicationOrder, Setup};
+use cam_model::{Document, Operation};
 
 use crate::{
     CancelToken, CarveStrategy, ChamferStrategy, Diagnostic, DrillStrategy, EngraveStrategy,
@@ -43,21 +43,8 @@ pub fn build_job(
 
     program.push(Step::Comment(setup.name.clone()));
 
-    // Optional program start point: begin with a rapid to origin + offset, so the
-    // toolpath's first motion originates at a known safe spot. Tagged to the first
-    // op (Link) so it colours as a rapid.
-    if let Some(off) = setup.start_offset {
-        let o = setup.origin;
-        let op_id = setup.operations.first().map_or(0, Operation::id);
-        program.push(Step::Rapid {
-            to: Point3::new(o[0] + off[0], o[1] + off[1], o[2] + off[2]),
-            tag: Tag::new(op_id, MoveKind::Link),
-        });
-    }
-
-    // Compute every operation's fragment once. In replication mode the same fragment
-    // is re-emitted under each datum — the coordinates are identical (part frame) and
-    // the post applies each work offset — so geometry is never recomputed per fixture.
+    // Compute every operation's fragment once. Coordinates are in the part frame; the
+    // post re-references each group to its origin.
     let mut planned: Vec<Planned> = Vec::new();
     for operation in &setup.operations {
         if cancel.is_cancelled() {
@@ -83,6 +70,7 @@ pub fn build_job(
             spindle_rpm
         };
         planned.push(Planned {
+            op_id: operation.id(),
             tool: operation.tools()[0],
             rpm,
             // A multi-tool operation (Carve) emits its own tool change mid-fragment;
@@ -94,36 +82,39 @@ pub fn build_job(
         });
     }
 
-    // Emit the planned operations. Without replication each runs once, under its own
-    // `work_offset`. With replication (Workflow A) the whole list is run across the
-    // setup's simultaneous datums, in the chosen order.
+    // Group the operations by origin, in the setup's origin order, so each datum's
+    // block is contiguous however the operations happen to be ordered in the list — a
+    // reorientation is done once, never ping-ponged. A stable sort keeps each group's
+    // internal order; an operation whose `work_offset` names no known origin falls into
+    // the base group (rank 0), never silently dropped.
+    let rank: std::collections::HashMap<u32, usize> = setup
+        .origin_indices()
+        .into_iter()
+        .enumerate()
+        .map(|(i, idx)| (idx, i))
+        .collect();
+    planned.sort_by_key(|pl| rank.get(&pl.datum).copied().unwrap_or(0));
+
+    // Emit each operation once, under the origin its `work_offset` names. At the start
+    // of each origin group the emitter breaks cleanly from the previous orientation: an
+    // operator stop (`M00`, except before the very first group), the datum select, and a
+    // rapid to that origin's own start point — so a new fixturing never links to where
+    // the last operation ended.
     let mut st = EmitState::new();
-    match setup.replication {
-        None => {
-            for pl in &planned {
-                emit_instance(&mut program, pl, pl.datum, dir, &mut st);
-            }
-        }
-        // ByTool: fixtures *inside* each operation — op order preserved, and no tool
-        // change is added over a single part.
-        Some(ReplicationOrder::ByTool) => {
-            let datums = simultaneous_datums(setup);
-            for pl in &planned {
-                for &d in &datums {
-                    emit_instance(&mut program, pl, d, dir, &mut st);
-                }
-            }
-        }
-        // ByFixture: the whole operation list per fixture — tool loads multiply by the
-        // fixture count (the `PL-0-3T.MIN` house style).
-        Some(ReplicationOrder::ByFixture) => {
-            let datums = simultaneous_datums(setup);
-            for &d in &datums {
-                for pl in &planned {
-                    emit_instance(&mut program, pl, d, dir, &mut st);
-                }
-            }
-        }
+    let mut prev_group: Option<u32> = None;
+    for pl in &planned {
+        let group_start = if prev_group != Some(pl.datum) {
+            prev_group = Some(pl.datum);
+            // The group's start point (origin + its start offset), in the part frame;
+            // the post re-references it to this group's origin like everything else.
+            setup.origin_start_offset(pl.datum).map(|off| {
+                let o = setup.origin_position(pl.datum);
+                Point3::new(o[0] + off[0], o[1] + off[1], o[2] + off[2])
+            })
+        } else {
+            None
+        };
+        emit_instance(&mut program, pl, dir, &mut st, group_start);
     }
 
     if st.spindle_started {
@@ -134,16 +125,17 @@ pub fn build_job(
     (program, diagnostics)
 }
 
-/// One operation, computed and ready to be emitted — possibly more than once, under
-/// different datums, in replication mode. The fragment's coordinates are in the part
-/// frame and identical for every datum; only the emitted work offset differs.
+/// One operation, computed and ready to be emitted. The fragment's coordinates are in
+/// the part frame; the post re-references them to the operation's origin.
 struct Planned {
+    /// The emitting operation's id — for tagging the group's start-point rapid.
+    op_id: u32,
     fragment: Program,
     tool: u32,
     rpm: f64,
     /// The tool a multi-tool fragment (Carve) leaves in the spindle, if any.
     ends_with: Option<u32>,
-    /// The operation's own work datum — used only when not replicating.
+    /// The operation's origin index (its `work_offset`) — the group it belongs to.
     datum: u32,
 }
 
@@ -169,14 +161,34 @@ impl EmitState {
     }
 }
 
-/// Emit one operation instance under work datum `d`: the datum select (*before* the
-/// tool change, so a section reads datum-then-tool and a post can state `G15 H<n>` in
-/// the tool-section head), the tool change, spindle and coolant — each only when it
-/// changes — then the operation's motions.
-fn emit_instance(program: &mut Program, pl: &Planned, d: u32, dir: SpindleDir, st: &mut EmitState) {
-    if st.current_datum != d {
-        program.push(Step::Datum(d));
-        st.current_datum = d;
+/// Emit one operation instance. When `group_start` is `Some`, this is the first
+/// operation of a new origin group: emit an operator stop (unless it's the very first
+/// group), select the datum, and — after the tool/spindle/coolant setup — a rapid to
+/// the group's start point, breaking any link to the previous orientation's last move.
+/// The datum select precedes the tool change so a post can state `G15 H<n>` in the
+/// tool-section head; each of tool/spindle/coolant is re-commanded only on change.
+fn emit_instance(
+    program: &mut Program,
+    pl: &Planned,
+    dir: SpindleDir,
+    st: &mut EmitState,
+    group_start: Option<Point3>,
+) {
+    if st.current_datum != pl.datum {
+        // A new datum is a physical reorientation of the part. Before the operator
+        // handles it, stop the spindle and coolant (`M05`/`M09`) so nothing is live
+        // during the flip, then halt (`M00`) — but not before the *first* group
+        // (nothing to re-fixture from). Force spindle and coolant to be re-commanded for
+        // the new group by clearing their running state.
+        if st.spindle_started {
+            program.push(Step::SpindleOff);
+            program.push(Step::Coolant(Coolant::Off));
+            program.push(Step::Stop);
+            st.current_rpm = None;
+            st.spindle_started = false;
+        }
+        program.push(Step::Datum(pl.datum));
+        st.current_datum = pl.datum;
     }
     if st.current_tool != Some(pl.tool) {
         program.push(Step::ToolChange { tool: pl.tool });
@@ -191,27 +203,16 @@ fn emit_instance(program: &mut Program, pl: &Planned, d: u32, dir: SpindleDir, s
         program.push(Step::Coolant(Coolant::Flood));
         st.spindle_started = true;
     }
+    // The clean start into a new orientation: rapid to its own start point.
+    if let Some(to) = group_start {
+        program.push(Step::Rapid {
+            to,
+            tag: Tag::new(pl.op_id, MoveKind::Link),
+        });
+    }
     program.extend(pl.fragment.clone());
     if let Some(t) = pl.ends_with {
         st.current_tool = Some(t);
-    }
-}
-
-/// The indices of the setup's simultaneous datums — the fixtures replication visits,
-/// in registry order. Reorient datums are excluded (they belong to Workflow B, not
-/// replication). Falls back to the base datum 1 if none are simultaneous, so a
-/// replicated job never silently emits nothing.
-fn simultaneous_datums(setup: &Setup) -> Vec<u32> {
-    let datums: Vec<u32> = setup
-        .work_offsets
-        .iter()
-        .filter(|d| d.kind == DatumKind::Simultaneous)
-        .map(|d| d.index)
-        .collect();
-    if datums.is_empty() {
-        vec![1]
-    } else {
-        datums
     }
 }
 

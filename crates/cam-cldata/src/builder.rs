@@ -69,6 +69,12 @@ impl ProgramBuilder {
         self
     }
 
+    /// A mandatory program stop (`M00`) — the machine waits for the operator.
+    pub fn stop(mut self) -> Self {
+        self.steps.push(Step::Stop);
+        self
+    }
+
     /// Dwell in place for `seconds`.
     pub fn dwell(mut self, seconds: f64) -> Self {
         self.steps.push(Step::Dwell { seconds });

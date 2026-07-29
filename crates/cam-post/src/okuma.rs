@@ -110,6 +110,7 @@ pub(crate) fn emit(
                 }
                 w.line(format!("({text})"));
             }
+            Step::Stop => w.line("M00".to_string()),
             Step::Datum(n) => {
                 // Work coordinate select. In the ordinary job a datum change coincides
                 // with a tool change — each fixture restarts the tool sequence (see the
@@ -119,6 +120,11 @@ pub(crate) fn emit(
                 // (same tool, a different fixture) has no section head to ride, so it
                 // states `G15 H<n>` on its own line.
                 current_datum = *n;
+                // The coordinate frame has shifted: forget the tracked position and
+                // motion word so the first move of the new group re-states X/Y/Z (and
+                // its G-word) in the new datum, rather than gliding at a stale Z.
+                w.reset_modal();
+                w.reset_position();
                 if !next_section_is_tool_change(&steps[i + 1..]) {
                     w.line(format!("G15 H{n}"));
                 }

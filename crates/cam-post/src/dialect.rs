@@ -150,6 +150,7 @@ pub(crate) fn emit(
                 .to_string(),
             ),
             Step::ToolChange { tool } => w.line(format!("T{tool} M6")),
+            Step::Stop => w.line("M0".to_string()),
             Step::Datum(n) => {
                 // Per-operation multi-WCS is Okuma-only so far (O2). Datum 1 is this
                 // family's single preamble work offset — a no-op here — but a change to

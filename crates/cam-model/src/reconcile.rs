@@ -390,8 +390,8 @@ mod tests {
             operations: vec![mk_drill(1, 7), mk_drill(2, 4)],
             origin: [0.0, 0.0, 0.0],
             start_offset: None,
-            work_offsets: vec![crate::Datum::base()],
-            replication: None,
+            extra_origins: vec![],
+            origin_index: 1,
         };
         let shop = [t(4, 12.0, ToolKind::EndMill)]; // ⌀12 is shop #4
         let rep = reconcile_tool_numbers(&mut setup, &shop);
