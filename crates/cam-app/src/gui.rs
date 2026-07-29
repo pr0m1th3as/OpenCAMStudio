@@ -6940,7 +6940,8 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
                 o.overlap = (v / 100.0).clamp(0.0, 0.99);
             }
             if let Some(v) = get(Field::FaceOvershoot) {
-                o.overshoot = v.max(0.0);
+                // Negative is allowed — it plunges into the stock (the strategy warns).
+                o.overshoot = v;
             }
             if let Some(v) = get(Field::Feed) {
                 o.feed = v;

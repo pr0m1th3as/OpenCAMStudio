@@ -70,9 +70,6 @@ impl Strategy for FaceStrategy {
                 op.id
             );
         }
-        if op.overshoot < 0.0 {
-            fail!("operation {}: overshoot must be >= 0", op.id);
-        }
         if op.depth <= 0.0 {
             diagnostics.push(Diagnostic::warning(format!(
                 "operation {}: depth is not positive; nothing to face",
@@ -90,24 +87,40 @@ impl Strategy for FaceStrategy {
             fail!("operation {}: overlap leaves no stepover", op.id);
         }
 
-        // Part bounds in the (travel, step) frame for the chosen pass direction.
-        let (bx, by) = bounds(op.boundary.points());
+        // Face the whole **stock** top (fall back to the picked boundary only when
+        // there is no stock). Bounds in the (travel, step) frame for the pass direction.
+        let (bx, by) = match env.stock {
+            Some((smin, smax)) => ((smin[0], smax[0]), (smin[1], smax[1])),
+            None => bounds(op.boundary.points()),
+        };
         let (u_min, u_max, v_min, v_max) = match op.direction {
             Axis::X => (bx.0, bx.1, by.0, by.1), // pass along X, step in Y
             Axis::Y => (by.0, by.1, bx.0, bx.1), // pass along Y, step in X
         };
 
         // Pass centres along the step axis. The first sits so the tool's far edge
-        // is `p` inside the stock edge (a `p`-wide first strip); step by `p` until
+        // is `p` inside the near edge (a `p`-wide first strip); step by `p` until
         // the far edge clears the opposite side, so the whole width is covered.
         let mut centres = vec![v_min - r + p];
         while centres.last().unwrap() + r < v_max {
             let next = centres.last().unwrap() + p;
             centres.push(next);
         }
-        // Travel ends: overshoot past each stock edge before the turnaround arc.
-        let u_lo = u_min - op.overshoot;
-        let u_hi = u_max + op.overshoot;
+        // Travel ends: `overshoot` is the clearance between the cutter **edge** and the
+        // material edge at the plunge and turnarounds, so the tool always plunges clear
+        // and feeds in — the centre therefore sits a radius plus the overshoot outside
+        // each end. `overshoot = 0` is tangent (just clears); a **negative** overshoot
+        // plunges into the stock. That's the user's prerogative (a soft or pre-cleared
+        // top), so we warn rather than forbid.
+        let u_lo = u_min - r - op.overshoot;
+        let u_hi = u_max + r + op.overshoot;
+        if env.stock.is_some() && op.overshoot < 0.0 {
+            diagnostics.push(Diagnostic::warning(format!(
+                "operation {}: overshoot is negative — the face mill plunges into the \
+                 stock rather than clearing it first",
+                op.id
+            )));
+        }
 
         let top = op.start_offset;
         let bottom = op.start_offset - op.depth;
@@ -377,14 +390,77 @@ mod tests {
     }
 
     #[test]
-    fn overshoot_extends_the_pass_past_the_edge() {
-        // X passes over [0,60] with 2 mm overshoot run from x=-2 to x=62.
+    fn overshoot_is_edge_clearance_past_the_edge() {
+        // `overshoot` is the cutter-*edge* clearance past the material edge, so the far
+        // pass end (tool centre) sits at edge + radius + overshoot. No stock ⇒ the
+        // boundary is the fallback: [0,60] X, r=5, overshoot=2 ⇒ far end centre 67, and
+        // the trailing edge (67-5=62) clears the boundary by the 2 mm overshoot.
         let r = run(face_op());
         let first_pass_end_x = r.program.steps().iter().find_map(|s| match s {
             Step::Linear { to, tag, .. } if tag.kind == MoveKind::Cutting => Some(to.x),
             _ => None,
         });
-        assert_eq!(first_pass_end_x, Some(62.0), "pass overshoots the far edge by 2 mm");
+        assert_eq!(first_pass_end_x, Some(67.0), "far end = edge + radius + overshoot");
+    }
+
+    fn run_stock(op: FaceOp, stock: ([f64; 2], [f64; 2])) -> StrategyResult {
+        let tools = [tool(10.0)];
+        let env = JobEnv {
+            heights: Heights::new(5.0, 2.0, 0.0),
+            tools: &tools,
+            stock: Some(stock),
+        };
+        FaceStrategy::new(op).compute(&env, &CancelToken::new())
+    }
+
+    fn first_plunge_x(r: &StrategyResult) -> f64 {
+        r.program
+            .steps()
+            .iter()
+            .find_map(|s| match s {
+                Step::Linear { to, tag, .. } if tag.kind == MoveKind::Plunge => Some(to.x),
+                _ => None,
+            })
+            .expect("a plunge move")
+    }
+
+    #[test]
+    fn overshoot_is_measured_from_the_cutter_edge_to_the_stock_edge() {
+        // Stock spans x=[-5,65] (proud of the 0..60 boundary). The r=5 mill plunges with
+        // its edge `overshoot` clear of the stock edge (-5): centre = -5 - r - overshoot.
+        let os = 3.0;
+        let mut op = face_op();
+        op.overshoot = os;
+        let x = first_plunge_x(&run_stock(op, ([-5.0, -5.0], [65.0, 45.0])));
+        assert!((x - (-5.0 - 5.0 - os)).abs() < 1e-6, "plunge centre -5-r-overshoot: {x}");
+        // Edge (= centre + r) sits `overshoot` clear of the stock edge.
+        assert!((x + 5.0 - (-5.0 - os)).abs() < 1e-6, "edge clears stock by overshoot");
+    }
+
+    #[test]
+    fn zero_overshoot_leaves_the_cutter_edge_tangent_to_the_stock_and_warns_nothing() {
+        let mut op = face_op();
+        op.overshoot = 0.0;
+        let r = run_stock(op, ([-5.0, -5.0], [65.0, 45.0]));
+        assert!(!r.has_errors(), "{:?}", r.diagnostics);
+        assert!(r.diagnostics.is_empty(), "tangent is not a warning: {:?}", r.diagnostics);
+        // Edge at the stock edge: centre = -5 - r.
+        assert!((first_plunge_x(&r) - (-10.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn negative_overshoot_plunges_into_the_stock_and_warns() {
+        let mut op = face_op();
+        op.overshoot = -2.0;
+        let r = run_stock(op, ([-5.0, -5.0], [65.0, 45.0]));
+        assert!(!r.has_errors(), "a warning, not an error: {:?}", r.diagnostics);
+        assert!(
+            r.diagnostics.iter().any(|d| d.message.contains("plunges into the stock")),
+            "warns that the plunge is not clear: {:?}",
+            r.diagnostics
+        );
+        // Edge 2 mm *inside* the stock edge (-5): centre = -5 - r - (-2) = -8.
+        assert!((first_plunge_x(&r) - (-8.0)).abs() < 1e-6);
     }
 
     #[test]
@@ -393,12 +469,13 @@ mod tests {
         op.direction = Axis::Y;
         let r = run(op);
         assert!(!r.has_errors(), "{:?}", r.diagnostics);
-        // First Y-pass steps in X: centre x = 0, runs y from -2 to 42.
+        // First Y-pass steps in X: centre x = 0, far end y = edge + radius + overshoot
+        // = 40 + 5 + 2 = 47 (boundary fallback, no stock).
         let first = r.program.steps().iter().find_map(|s| match s {
             Step::Linear { to, tag, .. } if tag.kind == MoveKind::Cutting => Some((to.x, to.y)),
             _ => None,
         });
-        assert_eq!(first, Some((0.0, 42.0)), "pass runs along Y at x=0");
+        assert_eq!(first, Some((0.0, 47.0)), "pass runs along Y at x=0");
     }
 
     #[test]

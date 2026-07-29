@@ -1246,7 +1246,10 @@ impl AppController {
                     depth: 1.0,
                     stepdown: p.stepdown,
                     overlap: 0.5,
-                    overshoot: 2.0,
+                    // `overshoot` is the cutter-edge clearance past the stock edge; the
+                    // strategy handles the radius and stock geometry, so this is just a
+                    // 5 mm comfort margin. Negative would plunge into the stock (warned).
+                    overshoot: 5.0,
                     direction,
                     spindle_rpm,
                     work_offset: 1,
