@@ -965,6 +965,51 @@ pub(crate) fn certify_moves(moves: &[(Point, bool)], r: f64, to_clear: &Polygon)
     Verdict { max_engagement: max_e, uncut_area, gouge_area }
 }
 
+/// Peak engagement measured **at a fixed spatial cadence**, independent of how the path
+/// happens to be subdivided.
+///
+/// The gate's own [`certify_moves`] measures each move against the model as it stood *before*
+/// that move, so the reading moves with the move length: a long move probes material its own
+/// sweep is in the act of removing and is charged for it, while the same motion cut as twenty
+/// slivers commits each sliver first and is charged for almost nothing. One 0.75 mm radial move
+/// out of a plunge hole reads **6.00**; the identical motion in twenty pieces reads **2.48**.
+///
+/// This walks the same path but re-samples it into uniform pieces of `cadence` first, so the
+/// answer is a property of the geometry rather than of the vertex spacing. It is a measuring
+/// instrument, not a replacement gate — see `ADAPTIVE_PLAN.md` §10.10.
+pub(crate) fn peak_engagement_at_cadence(
+    moves: &[(Point, bool)],
+    r: f64,
+    to_clear: &Polygon,
+    cadence: f64,
+) -> f64 {
+    let mut model = ClearedModel::bounded(r, to_clear.clone());
+    let (mut prev, mut prev_cut) = (None, false);
+    let mut max_e = 0.0_f64;
+    for &(p, cut) in moves {
+        if cut {
+            if let Some(pp) = prev {
+                if !prev_cut {
+                    model.seed_disc(pp);
+                }
+                let len = pp.distance(p);
+                let n = ((len / cadence).ceil() as usize).max(1);
+                let mut a = pp;
+                for k in 1..=n {
+                    let t = k as f64 / n as f64;
+                    let b = Point::new(pp.x + (p.x - pp.x) * t, pp.y + (p.y - pp.y) * t);
+                    max_e = max_e.max(model.engagement_grid(a, b));
+                    model.commit(a, b);
+                    a = b;
+                }
+            }
+        }
+        prev = Some(p);
+        prev_cut = cut;
+    }
+    max_e
+}
+
 /// Coverage and gouge by **exact polygon booleans** — the reference measure, and the
 /// fallback when no occupancy grid could be built.
 ///

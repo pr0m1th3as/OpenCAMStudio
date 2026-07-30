@@ -887,6 +887,93 @@ mod tests {
         println!();
     }
 
+    /// Diagnostic: **is the certification gate's peak a property of the path, or of its vertex
+    /// spacing?** `certify_moves` measures each move against the model as it stood before that
+    /// move, so a long move is charged for material its own sweep removes and a finely
+    /// subdivided one is charged for almost nothing — one 0.75 mm radial move out of a plunge
+    /// hole reads 6.00, the same motion in twenty pieces reads 2.48.
+    ///
+    /// Re-sampling the path to a fixed spatial cadence removes that degree of freedom. If the
+    /// answer is stable across cadences it is a property of the geometry, and the gap to the
+    /// gate's own number is the size of the problem.
+    /// **The two engagement oracles must agree when fed identical moves.**
+    ///
+    /// Everything measured about this generator is denominated in `a_e`, and two independent
+    /// implementations of it exist: the polygon oracle the gate certifies with, and the grid
+    /// oracle the controller steers by. If they drift apart, the controller aims at a different
+    /// number than the gate checks — the exact mismatch that let a full-diameter link slot ship
+    /// once already. Cheap to hold, and it is the premise of the cadence diagnostic below.
+    #[test]
+    fn the_two_engagement_oracles_agree() {
+        let (r, e) = (3.0, 2.0);
+        let region = Polygon::new(rect(0.0, 0.0, 24.0, 24.0)).unwrap();
+        let run = steer_region(&region, r, 0.0, e, None, &CancelToken::new()).expect("a path");
+        let mut model = crate::clearsim::ClearedModel::bounded(r, region);
+        let (mut prev, mut prev_cut) = (None, false);
+        let (mut max_poly, mut max_grid) = (0.0_f64, 0.0_f64);
+        for &(p, cut) in &run.path {
+            if cut {
+                if let Some(pp) = prev {
+                    if !prev_cut {
+                        model.seed_disc(pp);
+                    }
+                    max_poly = max_poly.max(model.engagement(pp, p));
+                    max_grid = max_grid.max(model.engagement_grid(pp, p));
+                    model.commit(pp, p);
+                }
+            }
+            prev = Some(p);
+            prev_cut = cut;
+        }
+        assert!(
+            (max_poly - max_grid).abs() <= 0.05 * max_poly.max(1e-9),
+            "the engagement oracles disagree: polygon {max_poly:.3} vs grid {max_grid:.3}"
+        );
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn engagement_is_a_property_of_the_path_not_its_vertices() {
+        let (r, e) = (3.0, 2.0);
+        let region =
+            Polygon::with_holes(rect(0.0, 0.0, 60.0, 60.0), vec![rect(20.0, 20.0, 40.0, 40.0)])
+                .unwrap();
+        let run = steer_region(&region, r, 0.0, e, None, &CancelToken::new()).expect("a path");
+
+        // Part 1: the two oracles, walked identically. They must agree — if they diverge, the
+        // rest of this measurement is meaningless.
+        let mut model = crate::clearsim::ClearedModel::bounded(r, region.clone());
+        let (mut prev, mut prev_cut) = (None, false);
+        let (mut max_poly, mut max_grid) = (0.0_f64, 0.0_f64);
+        for &(p, cut) in &run.path {
+            if cut {
+                if let Some(pp) = prev {
+                    if !prev_cut {
+                        model.seed_disc(pp);
+                    }
+                    max_poly = max_poly.max(model.engagement(pp, p));
+                    max_grid = max_grid.max(model.engagement_grid(pp, p));
+                    model.commit(pp, p);
+                }
+            }
+            prev = Some(p);
+            prev_cut = cut;
+        }
+        println!(
+            "\npolygon oracle {max_poly:.2} vs grid oracle {max_grid:.2} on identical moves\n"
+        );
+
+        // Part 2: the same path, re-sampled to a fixed spatial cadence. The front's own step is
+        // 0.75 mm, which is where the gate reads it.
+        println!("| cadence mm | peak a_e |");
+        println!("|---|---|");
+        for c in [1.5, 0.75, 0.375, 0.25, 0.15, 0.1, 0.05] {
+            let v = crate::clearsim::peak_engagement_at_cadence(&run.path, r, &region, c);
+            println!("| {c:.3} | **{v:.2}** |");
+        }
+        println!();
+    }
+
     /// Diagnostic: is the seed *search* what a tighter turn floor starves? The shape table
     /// already hints it — at 0.5·r the same shapes take 8–49 re-entries where 0.25·r takes
     /// 55–122, while abandoning 800–1400 mm² — but a hint read off a summary column is not a
