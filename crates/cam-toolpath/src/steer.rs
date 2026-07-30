@@ -890,6 +890,100 @@ mod tests {
         println!();
     }
 
+    /// Diagnostic: **why did three shapes read higher at a finer cadence, and is the higher
+    /// number the true one?** Two candidates: the finer walk finds a spike the whole-move walk
+    /// never sampled, or the switch from the polygon oracle to the grid one is doing it. Both
+    /// are separable — measure the same path four ways and locate the peak in each.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn where_did_the_higher_peak_come_from() {
+        let (r, e) = (3.0, 2.0);
+        let region =
+            Polygon::with_holes(rect(0.0, 0.0, 60.0, 60.0), vec![rect(20.0, 20.0, 40.0, 40.0)])
+                .unwrap();
+        let run = steer_region(&region, r, 0.0, e, None, &CancelToken::new()).expect("a path");
+
+        // Four walks: {whole move, 0.5 mm cadence} x {polygon oracle, grid oracle}. Each
+        // records the peak and the move it happened on.
+        for (label, cadence) in [("whole move", f64::INFINITY), ("cadence 0.5", 0.5)] {
+            for use_grid in [false, true] {
+                let mut model = crate::clearsim::ClearedModel::bounded(r, region.clone());
+                let (mut prev, mut prev_cut) = (None, false);
+                let mut best = (0.0_f64, 0usize, Point::new(0.0, 0.0));
+                for (i, &(p, cut)) in run.path.iter().enumerate() {
+                    if cut {
+                        if let Some(pp) = prev {
+                            if !prev_cut {
+                                model.seed_disc(pp);
+                            }
+                            let len: f64 = pp.distance(p);
+                            let n = ((len / cadence).ceil() as usize).max(1);
+                            let mut a = pp;
+                            for k in 1..=n {
+                                let t = k as f64 / n as f64;
+                                let b = Point::new(
+                                    pp.x + (p.x - pp.x) * t,
+                                    pp.y + (p.y - pp.y) * t,
+                                );
+                                let v = if use_grid {
+                                    model.engagement_grid(a, b)
+                                } else {
+                                    model.engagement(a, b)
+                                };
+                                if v > best.0 {
+                                    best = (v, i, b);
+                                }
+                                model.commit(a, b);
+                                a = b;
+                            }
+                        }
+                    }
+                    prev = Some(p);
+                    prev_cut = cut;
+                }
+                println!(
+                    "  {label:12} {:8}: peak {:.2} at move {} ({:.1}, {:.1})",
+                    if use_grid { "grid" } else { "polygon" },
+                    best.0,
+                    best.1,
+                    best.2.x,
+                    best.2.y
+                );
+            }
+        }
+        // Now the clincher: replay to the move the fine walk peaked on, and ask the *coarse*
+        // model what sits at that move's midpoint — the position the coarse walk never samples.
+        let mut model = crate::clearsim::ClearedModel::bounded(r, region.clone());
+        let (mut prev, mut prev_cut) = (None, false);
+        for (i, &(p, cut)) in run.path.iter().enumerate() {
+            if cut {
+                if let Some(pp) = prev {
+                    if !prev_cut {
+                        model.seed_disc(pp);
+                    }
+                    if i == 2497 {
+                        let mid = Point::new(0.5 * (pp.x + p.x), 0.5 * (pp.y + p.y));
+                        println!(
+                            "  move {i}: length {:.3} mm\n    \
+                             coarse, whole move (endpoints only): {:.2}\n    \
+                             coarse model, probed at the midpoint: {:.2}\n    \
+                             first half only (what the fine walk measures): {:.2}",
+                            pp.distance(p),
+                            model.engagement(pp, p),
+                            model.engagement(mid, p),
+                            model.engagement(pp, mid),
+                        );
+                        break;
+                    }
+                    model.commit(pp, p);
+                }
+            }
+            prev = Some(p);
+            prev_cut = cut;
+        }
+        println!();
+    }
+
     /// Diagnostic: **does the peak scale with the requested engagement?** The gate's bound is a
     /// *multiple* of `e`, which is only meaningful if the measured peak tracks `e`. Calibrating
     /// that multiplier at a single operating point is how this module has been bitten before.
