@@ -205,6 +205,47 @@ pub(crate) struct SteerRun {
     pub(crate) stopped: &'static str,
 }
 
+/// The points of an Archimedean spiral opening a pocket of radius `open_r` about `c`, clipped
+/// to the tool-centre region.
+///
+/// **This is the one entry primitive whose bite is fixed by construction.** A spiral of pitch
+/// `p` exposes an annulus `p` wide per revolution, so its radial width of cut *is* `p`, chosen
+/// here at `e/2`. Contrast the trochoidal entry loop tried four times and rejected: for a
+/// trochoid in steady state the instantaneous bite is `a·cos θ` — the advance per revolution —
+/// but an *entry* loop has no previous revolution to subtract from, so its first pass takes the
+/// whole swept band `R + r − c` at once, which nothing in the loop's parameters bounds. That is
+/// why shrinking the advance made engagement *worse* rather than better: each extra loop was
+/// another entry bite.
+fn open_pocket(tc: &Polygon, c: Point, open_r: f64, e: f64) -> Vec<Point> {
+    let turns = ((open_r / (0.5 * e)).ceil() as usize).max(1);
+    let steps = turns * 48;
+    let mut out = Vec::with_capacity(steps);
+    for k in 1..=steps {
+        let t = k as f64 / steps as f64;
+        let ang = std::f64::consts::TAU * turns as f64 * t;
+        let rad = open_r * t;
+        let q = Point::new(c.x + rad * ang.cos(), c.y + rad * ang.sin());
+        // The entry is bound by `tc` like every other move. It was not, and at small tool
+        // radii the opening spiral walked outside the part — the only gouge left in the
+        // measurements (9–16 mm² at Ø3–Ø4, none at Ø5–Ø6, which is exactly the pattern a
+        // fixed-radius opening in a shrinking tool-centre region produces).
+        if tc.contains(q) {
+            out.push(q);
+        }
+    }
+    out
+}
+
+/// How big an opening fits about `c`, by the rule the initial entry has always used.
+///
+/// Size the opening to what actually fits, rather than assuming. A fixed radius is fine in the
+/// middle of a wide pocket and wrong in a narrow band, where it would be clipped away against
+/// `tc` and leave the front to start from a hole too small to steer out of.
+fn opening_radius(tc: &Polygon, c: Point, e: f64) -> f64 {
+    let room = crate::frontadvance::boundary_dist(tc, c);
+    (1.5 * e).min((room - 0.5 * e).max(0.25 * e))
+}
+
 /// How far clear of uncut stock a move must sweep before it may be emitted as a traverse, in mm.
 ///
 /// Two discretisations have to be paid for: the generator's own occupancy grid (0.1 mm cells,
@@ -250,26 +291,13 @@ pub(crate) fn steer_path(
     let mut air_flags: Vec<bool> = vec![false];
     model.seed_disc(start);
     {
-        let turns = ((open_r / (0.5 * e)).ceil() as usize).max(1);
-        let steps = turns * 48;
         let mut prev = start;
-        for k in 1..=steps {
-            let t = k as f64 / steps as f64;
-            let ang = std::f64::consts::TAU * turns as f64 * t;
-            let rad = open_r * t;
-            let p = Point::new(start.x + rad * ang.cos(), start.y + rad * ang.sin());
-            // The entry is bound by `tc` like every other move. It was not, and at small tool
-            // radii the opening spiral walked outside the part — the only gouge left in the
-            // measurements (9–16 mm² at Ø3–Ø4, none at Ø5–Ø6, which is exactly the pattern a
-            // fixed-radius opening in a shrinking tool-centre region produces).
-            if !tc.contains(p) {
-                continue;
-            }
-            model.commit(prev, p);
-            path.push((p, true));
+        for q in open_pocket(&tc, start, open_r, e) {
+            model.commit(prev, q);
+            path.push((q, true));
             hunting.push(false);
             air_flags.push(false);
-            prev = p;
+            prev = q;
         }
     }
 
@@ -681,11 +709,7 @@ pub(crate) fn steer_region(
         .map(|s| Point::new(s[0], s[1]))
         .filter(|p| tc.contains(*p))
         .or_else(|| crate::frontadvance::entry_point(&tc))?;
-    // Size the opening to what actually fits, rather than assuming. A fixed radius is fine in
-    // the middle of a wide pocket and wrong in a narrow band, where it would be clipped away
-    // against `tc` and leave the front to start from a hole too small to steer out of.
-    let room = crate::frontadvance::boundary_dist(&tc, entry);
-    let open_r = (1.5 * e).min((room - 0.5 * e).max(0.25 * e));
+    let open_r = opening_radius(&tc, entry, e);
     steer_path(
         region,
         r,
@@ -708,6 +732,10 @@ pub(crate) fn steer_region(
 /// leaves a strip exactly the tool's diameter cannot be cleared at a bounded width of cut by
 /// anything; this generator now leaves that strip **uncut** rather than slotting it, the
 /// coverage check sees it, and the operator gets the proven concentric clear.
+/// A certified steered path: the moves (with their cut/reposition flag) and, per move, whether
+/// it removes nothing and may be traversed.
+pub(crate) type CertifiedPath = (Vec<(Point, bool)>, Vec<bool>);
+
 pub(crate) fn steer_certified(
     region: &Polygon,
     r: f64,
@@ -715,7 +743,7 @@ pub(crate) fn steer_certified(
     e: f64,
     start: Option<[f64; 2]>,
     cancel: &CancelToken,
-) -> Option<(Vec<(Point, bool)>, Vec<bool>)> {
+) -> Option<CertifiedPath> {
     let run = steer_region(region, r, finish, e, start, cancel)?;
     if run.stopped == "cancelled" {
         return None; // a half-cleared region must never be emitted as if it were finished
@@ -730,7 +758,7 @@ pub(crate) fn steer_certified(
     let ok = v.max_engagement <= e * crate::frontadvance::CERT_ENGAGEMENT_SLACK
         && v.uncut_area <= cover_tol
         && v.gouge_area <= cover_tol;
-    ok.then(|| (run.path, run.air))
+    ok.then_some((run.path, run.air))
 }
 
 /// The largest polygon by area.
@@ -947,12 +975,23 @@ mod tests {
             Polygon::with_holes(rect(0.0, 0.0, 60.0, 40.0), vec![rect(25.0, 15.0, 35.0, 25.0)])
                 .unwrap();
         let run = steer_region(&region, r, 0.0, e, None, &CancelToken::new()).expect("a path");
-        let mut turns: Vec<f64> = Vec::new();
-        let mut cut_turns: Vec<f64> = Vec::new();
-        let mut air_turns: Vec<f64> = Vec::new();
+        // **Measure the radius each corner actually has, from the chords either side of it.**
+        // This used to divide a constant `STEP_RADII·r` by the turn angle, which is right only
+        // while every move is a front step. It is not: an opening spiral's chords are ~0.4 mm,
+        // so a constant 0.75 mm numerator reported roughly twice the radius those corners have.
+        // And a bare percentage is diluted by however many moves a variant happens to emit, so
+        // the rate per metre of path is reported alongside it — that is the number a machine
+        // feels, since every sharp corner is one deceleration.
+        struct Corner {
+            radius: f64,
+            cutting: bool,
+        }
+        let mut corners: Vec<Corner> = Vec::new();
+        let mut path_mm = 0.0_f64;
         let idx: Vec<usize> = (0..run.path.len()).filter(|&i| run.path[i].1).collect();
         let pts: Vec<Point> = idx.iter().map(|&i| run.path[i].0).collect();
-        let hunt: Vec<bool> = idx.iter().map(|&i| run.hunting.get(i).copied().unwrap_or(false)).collect();
+        let hunt: Vec<bool> =
+            idx.iter().map(|&i| run.hunting.get(i).copied().unwrap_or(false)).collect();
         for (k, w) in pts.windows(3).enumerate() {
             let (a, b, c) = (w[0], w[1], w[2]);
             let (ux, uy) = (b.x - a.x, b.y - a.y);
@@ -961,37 +1000,43 @@ mod tests {
             if lu < 1e-9 || lv < 1e-9 {
                 continue;
             }
+            path_mm += lv;
             let ang = ((ux * vy - uy * vx) / (lu * lv)).clamp(-1.0, 1.0).asin().abs();
-            turns.push(ang);
-            // the turn belongs to the middle point of the triple
-            if hunt.get(k + 1).copied().unwrap_or(false) {
-                air_turns.push(ang)
+            // The circle through the three points: chord over twice the sine of the half-turn.
+            let radius = if ang > 1e-6 {
+                0.5 * (lu + lv) / (2.0 * (ang / 2.0).sin())
             } else {
-                cut_turns.push(ang)
-            }
+                f64::INFINITY
+            };
+            corners.push(Corner { radius, cutting: !hunt.get(k + 1).copied().unwrap_or(false) });
         }
-        turns.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let deg = |x: f64| x.to_degrees();
-        let pct = |q: f64| turns[((turns.len() - 1) as f64 * q) as usize];
-        let h = STEP_RADII * r;
-        println!("\n{} cutting corners, step {h:.2} mm", turns.len());
-        for q in [0.5, 0.9, 0.99, 1.0] {
-            let a = pct(q);
-            let radius = if a > 1e-6 { h / (2.0 * (a / 2.0).sin()) } else { f64::INFINITY };
-            println!("  p{:>3.0}: turn {:5.1}°  -> corner radius {:6.2} mm ({:.2}·r)",
-                     q * 100.0, deg(a), radius, radius / r);
+        let mut radii: Vec<f64> = corners.iter().map(|c| c.radius).collect();
+        radii.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!("\n{} corners over {path_mm:.0} mm of path", corners.len());
+        for q in [0.5, 0.1, 0.01, 0.0] {
+            let v = radii[((radii.len() - 1) as f64 * q) as usize];
+            println!(
+                "  p{:>3.0} sharpest: corner radius {:6.2} mm ({:.2}·r)",
+                (1.0 - q) * 100.0,
+                v,
+                v / r
+            );
         }
-        let sharp = turns.iter().filter(|&&a| a.to_degrees() > 20.0).count();
-        println!("  corners over 20°: {sharp} ({:.1}%)", 100.0 * sharp as f64 / turns.len() as f64);
-        // The question that decides the remedy: are the corners where the tool is *cutting*,
-        // or where it is crossing stock already gone?
-        for (label, v) in [("cutting", &cut_turns), ("hunting (air)", &air_turns)] {
+        // A corner the tool must decelerate into: tighter than half the tool radius.
+        let tight = 0.5 * r;
+        for (label, want_cut) in [("cutting", true), ("hunting (air)", false)] {
+            let v: Vec<&Corner> = corners.iter().filter(|c| c.cutting == want_cut).collect();
             if v.is_empty() {
                 continue;
             }
-            let n = v.iter().filter(|&&a| a.to_degrees() > 20.0).count();
-            println!("    {label}: {} steps, {n} over 20° ({:.1}%)", v.len(),
-                     100.0 * n as f64 / v.len() as f64);
+            let n = v.iter().filter(|c| c.radius < tight).count();
+            let mm: f64 = path_mm * v.len() as f64 / corners.len() as f64;
+            println!(
+                "    {label}: {} corners, {n} tighter than {tight:.2} mm ({:.1}%, {:.0} per metre)",
+                v.len(),
+                100.0 * n as f64 / v.len() as f64,
+                1000.0 * n as f64 / mm.max(1e-9),
+            );
         }
         println!();
     }
