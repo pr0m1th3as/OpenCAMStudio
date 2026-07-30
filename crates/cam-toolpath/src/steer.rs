@@ -755,7 +755,7 @@ pub(crate) fn steer_certified(
     }
     let cover_tol = 0.02 * reach.iter().map(Polygon::area).sum::<f64>() + 1.0;
     let v = crate::clearsim::certify_moves(&run.path, r, &to_clear);
-    let ok = v.max_engagement <= e * crate::frontadvance::CERT_ENGAGEMENT_SLACK
+    let ok = v.max_engagement <= crate::frontadvance::engagement_bound(e, r)
         && v.uncut_area <= cover_tol
         && v.gouge_area <= cover_tol;
     ok.then_some((run.path, run.air))
@@ -841,9 +841,9 @@ mod tests {
             ),
         ];
         println!(
-            "\n| case | moves | a_e | uncut/tol | cut mm | air mm | air % | re-entries | est time | verdict |"
+            "\n| case | moves | a_e gate | a_e @0.5 | uncut/tol | cut mm | air mm | air % | re-entries | est time | verdict |"
         );
-        println!("|---|---|---|---|---|---|---|---|---|---|");
+        println!("|---|---|---|---|---|---|---|---|---|---|---|");
         for (name, region) in cases {
             let t0 = std::time::Instant::now();
             let Some(run) = steer_region(&region, r, 0.0, e, None, &CancelToken::new()) else {
@@ -855,12 +855,15 @@ mod tests {
             let reach: f64 =
                 crate::clearsim::reachable(&region, r).iter().map(|p| p.area()).sum();
             let tol = 0.02 * reach + 1.0;
-            let ok = v.max_engagement <= 1.5 * e && v.uncut_area <= tol && v.gouge_area <= tol;
+            let ok = v.max_engagement <= crate::frontadvance::engagement_bound(e, r)
+                && v.uncut_area <= tol
+                && v.gouge_area <= tol;
             // **Estimated cycle time, not path length.** Length was the wrong quantity: a
             // re-entry costs a retract, a cross and a plunge at *plunge* feed, and tuning to
             // minimise air travel quietly bought that overhead instead. On a real exported
             // part this showed up as 168 plunges totalling 504 mm at F100 — **5 minutes of
             // plunging** against 6.5 minutes of actual cutting.
+            let fine = crate::clearsim::peak_engagement_at_cadence(&run.path, r, &region, 0.5);
             let (feed, plunge_feed, rapid) = (300.0, 100.0, 5000.0);
             let plunge_depth = 4.0; // retract-to-floor per re-entry, mm
             let mins = run.cut_len / feed
@@ -869,8 +872,8 @@ mod tests {
                 + (run.reentries as f64) * 20.0 / rapid;
             let total = run.cut_len + run.air_len;
             println!(
-                "| {name} | {} | **{:.2}** | {:.0}/{:.0} | {:.0} | {:.0} | {:.0}% | {} | \
-                 **{:.1} min** | {} |",
+                "| {name} | {} | **{:.2}** | **{fine:.2}** | {:.0}/{:.0} | {:.0} | {:.0} | \
+                 {:.0}% | {} | **{:.1} min** | {} |",
                 run.path.len(),
                 v.max_engagement,
                 v.uncut_area,
@@ -887,15 +890,56 @@ mod tests {
         println!();
     }
 
-    /// Diagnostic: **is the certification gate's peak a property of the path, or of its vertex
-    /// spacing?** `certify_moves` measures each move against the model as it stood before that
-    /// move, so a long move is charged for material its own sweep removes and a finely
-    /// subdivided one is charged for almost nothing — one 0.75 mm radial move out of a plunge
-    /// hole reads 6.00, the same motion in twenty pieces reads 2.48.
-    ///
-    /// Re-sampling the path to a fixed spatial cadence removes that degree of freedom. If the
-    /// answer is stable across cadences it is a property of the geometry, and the gap to the
-    /// gate's own number is the size of the problem.
+    /// Diagnostic: **does the peak scale with the requested engagement?** The gate's bound is a
+    /// *multiple* of `e`, which is only meaningful if the measured peak tracks `e`. Calibrating
+    /// that multiplier at a single operating point is how this module has been bitten before.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn does_the_peak_scale_with_the_requested_engagement() {
+        let r = 3.0;
+        let shapes: [(&str, Polygon); 3] = [
+            (
+                "sq40 island12",
+                Polygon::with_holes(rect(0.0, 0.0, 40.0, 40.0), vec![rect(14.0, 14.0, 26.0, 26.0)])
+                    .unwrap(),
+            ),
+            (
+                "sq60 island20",
+                Polygon::with_holes(rect(0.0, 0.0, 60.0, 60.0), vec![rect(20.0, 20.0, 40.0, 40.0)])
+                    .unwrap(),
+            ),
+            ("circle r20", {
+                let pts = (0..96)
+                    .map(|i| {
+                        let a = std::f64::consts::TAU * (i as f64) / 96.0;
+                        Point::new(20.0 * a.cos(), 20.0 * a.sin())
+                    })
+                    .collect();
+                ("circle r20", Polygon::new(Contour::new(pts)).unwrap())
+            }
+            .1),
+        ];
+        println!("\n| shape | e=1.0 | e=1.5 | e=2.0 | e=3.0 |");
+        println!("|---|---|---|---|---|");
+        for (name, region) in shapes {
+            let mut cells = String::new();
+            for e in [1.0, 1.5, 2.0, 3.0] {
+                let cell = match steer_region(&region, r, 0.0, e, None, &CancelToken::new()) {
+                    Some(run) => {
+                        let v = crate::clearsim::peak_engagement_at_cadence(
+                            &run.path, r, &region, 0.5,
+                        );
+                        format!(" {v:.2} (**{:.2}**·e) |", v / e)
+                    }
+                    None => " — |".to_string(),
+                };
+                cells.push_str(&cell);
+            }
+            println!("| {name} |{cells}");
+        }
+        println!();
+    }
+
     /// **The two engagement oracles must agree when fed identical moves.**
     ///
     /// Everything measured about this generator is denominated in `a_e`, and two independent
@@ -931,6 +975,9 @@ mod tests {
         );
     }
 
+    /// Diagnostic: **is the peak a property of the path, or of its vertex spacing?** Two
+    /// candidates: the oracles disagree, or both are sensitive to the cadence at which moves are
+    /// committed. Part 1 answers the first, part 2 the second.
     #[test]
     #[ignore = "diagnostic"]
     fn engagement_is_a_property_of_the_path_not_its_vertices() {
@@ -1183,7 +1230,9 @@ mod tests {
             let reach: f64 =
                 crate::clearsim::reachable(&region, r).iter().map(|p| p.area()).sum();
             let tol = 0.02 * reach + 1.0;
-            let ok = v.max_engagement <= 1.5 * e && v.uncut_area <= tol && v.gouge_area <= tol;
+            let ok = v.max_engagement <= crate::frontadvance::engagement_bound(e, r)
+                && v.uncut_area <= tol
+                && v.gouge_area <= tol;
             println!(
                 "| {:.1} | {:.2} | **{:.2}** | {:.0}/{:.0} | {:.1} | {} |",
                 2.0 * r,

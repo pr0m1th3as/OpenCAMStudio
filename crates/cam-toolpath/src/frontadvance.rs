@@ -429,7 +429,39 @@ const MIN_CORE_PITCH: f64 = 0.25;
 /// slot is 3·e, so 1.5·e cleanly separates "held to the floor" from "slotting": front-
 /// advance's measured whole-path peak is 2.69–2.90 on r=3/e=2 (1.35–1.45·e), which passes;
 /// the retired spiral-morph and the raster-gated links read 6.00, which does not.
-pub(crate) const CERT_ENGAGEMENT_SLACK: f64 = 1.5;
+pub(crate) const CERT_ENGAGEMENT_SLACK: f64 = 1.75;
+
+/// The floor of the bound, in tool radii — **the part `SLACK·e` cannot express.**
+///
+/// Measured at a fixed 0.5 mm cadence, the peak barely tracks `e` at all: on three shapes the
+/// *absolute* peak stays in 2.07–3.31 mm across `e` = 1.0, 1.5, 2.0, while the *ratio* swings
+/// from 1.04·e to 3.00·e. It is set by the tool and the turn floor, not by what the operator
+/// asked for — which is what the geometric floor `a_e(ρ) = e(ρ+r)/ρ − e²/(2ρ)` says too, since
+/// the `(ρ+r)/ρ` factor dominates as ρ tightens and the `e` dependence weakens.
+///
+/// So a pure multiple of `e` is the wrong shape of rule: no multiplier below 3 admits these
+/// paths at `e` = 1.0, and a multiplier of 3 at `e` = 2.0 would wave through a full-diameter
+/// slot. 1.15·r = 3.45 mm at Ø6 clears the measured 2.79–3.00 at `e` = 1.0 with a little room.
+pub(crate) const CERT_ENGAGEMENT_FLOOR: f64 = 1.15;
+
+/// The hard ceiling, as a fraction of the tool **diameter** — the property this gate exists for.
+///
+/// The original rationale read "a full-diameter slot is 3·e, so 1.5·e separates held-to-the-floor
+/// from slotting", which is true only at `e` = 2, r = 3. A slot is `2r` whatever `e` is, so at
+/// `e` = 3 a 1.75·e bound would be 5.25 against a 6.00 slot — 14% of margin, and the retired
+/// spiral-morph read exactly 6.00. Expressed against the diameter it cannot drift with `e`.
+pub(crate) const CERT_SLOT_FRACTION: f64 = 0.75;
+
+/// The peak radial width of cut a path may reach and still certify, in mm.
+///
+/// Two terms because two different things can bound it — the operator's request scaled by the
+/// slack, or the floor the tool geometry imposes no matter how light the request — and one
+/// ceiling, because neither may be allowed to approach slotting. See each constant.
+pub(crate) fn engagement_bound(e: f64, r: f64) -> f64 {
+    (e * CERT_ENGAGEMENT_SLACK)
+        .max(r * CERT_ENGAGEMENT_FLOOR)
+        .min(2.0 * r * CERT_SLOT_FRACTION)
+}
 /// Samples across a loop-to-loop seam transition.
 const SEAM_SAMPLES: usize = 24;
 
@@ -964,7 +996,7 @@ pub(crate) fn front_advance_certified(
     // area-proportional term for tessellation slivers.
     let cover_tol = 0.02 * total_area(&reach) + 1.0;
     let verdict = crate::clearsim::certify_moves(&path, r, &to_clear);
-    let ok = verdict.max_engagement <= e * CERT_ENGAGEMENT_SLACK
+    let ok = verdict.max_engagement <= engagement_bound(e, r)
         && verdict.uncut_area <= cover_tol
         && verdict.gouge_area <= cover_tol;
     ok.then_some(path)
@@ -1324,7 +1356,7 @@ mod tests {
             };
             let v = crate::clearsim::certify_moves(&path, R, &region);
             let reach: f64 = crate::clearsim::reachable(&region, R).iter().map(|p| p.area()).sum();
-            let ok = v.max_engagement <= E * CERT_ENGAGEMENT_SLACK
+            let ok = v.max_engagement <= engagement_bound(E, R)
                 && v.uncut_area <= 0.02 * reach + 1.0
                 && v.gouge_area <= 0.02 * reach + 1.0;
             println!(

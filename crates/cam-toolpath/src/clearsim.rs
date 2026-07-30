@@ -936,6 +936,20 @@ fn cut_runs(moves: &[(Point, bool)]) -> Vec<Vec<Point>> {
 /// A rapid **launders nothing**: lifting before a slot does not make it read less than the
 /// diameter, because engagement is measured against the running cleared model, not against
 /// the path's shape.
+/// The spatial cadence the gate measures engagement at, in mm.
+///
+/// Engagement is only meaningful over a window: measured finer than ~0.2 mm the instrument
+/// bottoms out (`engagement_grid` probes at `r − 0.1` over 0.1 mm cells, so once slivers are
+/// committed at that scale the probe cannot see past the boundary its own previous sliver just
+/// cleared, and the reading falls to 0.02); measured coarser, a move is charged for material its
+/// own sweep is in the act of removing. The plateau between is 0.25–0.75 mm, where the answer is
+/// stable within 10%. 0.5 mm sits in the middle of it.
+///
+/// | cadence mm | 1.500 | 0.750 | 0.375 | 0.250 | 0.150 | 0.100 | 0.050 |
+/// |---|---|---|---|---|---|---|---|
+/// | peak `a_e` | 2.58 | 3.31 | 3.10 | 3.00 | 1.78 | 0.64 | 0.02 |
+pub(crate) const CADENCE: f64 = 0.5;
+
 pub(crate) fn certify_moves(moves: &[(Point, bool)], r: f64, to_clear: &Polygon) -> Verdict {
     // Peak engagement is inherently sequential: walk the cutting moves against the running
     // cleared region. Bound it to the target so cutting air outside the part is not charged
@@ -950,8 +964,21 @@ pub(crate) fn certify_moves(moves: &[(Point, bool)], r: f64, to_clear: &Polygon)
                 if !prev_cut {
                     model.seed_disc(pp); // a cut after a rapid = a plunge at pp
                 }
-                max_e = max_e.max(model.engagement(pp, p));
-                model.commit(pp, p);
+                // **At a fixed spatial cadence, not per move.** Measured per whole move, the
+                // peak is a property of the path's vertex spacing rather than of its geometry:
+                // this gate read a flat 2.58 on six different shapes whose honest peaks span
+                // 2.07–3.31, because it happened to measure at exactly the front's own 0.75 mm
+                // step. See `CADENCE` and `ADAPTIVE_PLAN.md` §10.10.
+                let len = pp.distance(p);
+                let n = ((len / CADENCE).ceil() as usize).max(1);
+                let mut a = pp;
+                for k in 1..=n {
+                    let t = k as f64 / n as f64;
+                    let b = Point::new(pp.x + (p.x - pp.x) * t, pp.y + (p.y - pp.y) * t);
+                    max_e = max_e.max(model.engagement_grid(a, b));
+                    model.commit(a, b);
+                    a = b;
+                }
             }
         }
         prev = Some(p);
