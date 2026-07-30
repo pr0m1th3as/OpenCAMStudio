@@ -648,6 +648,42 @@ impl ClearedModel {
         (l > 1e-9).then(|| (sx / l, sy / l))
     }
 
+    /// Whether the move `from`→`to` sweeps **only stock that is already gone** — i.e. it
+    /// removes nothing and may be traversed rather than fed.
+    ///
+    /// Deliberately not [`Self::engagement_grid`], which is a *cutting-load* measure and counts
+    /// only the tool's **leading** arc. A move can read zero engagement while the body of the
+    /// tool sits squarely in material: flagging traverses that way produced **776
+    /// `RapidThroughStock` collisions** against `cam-sim`, every one "stock standing at Z 0.000".
+    /// What licenses a traverse is that *no part* of the swept disc meets uncut material.
+    pub(crate) fn sweeps_only_cleared(&self, from: Point, to: Point, margin: f64) -> bool {
+        let (Some(g), Some(mask)) = (&self.grid, &self.material_mask) else {
+            return false;
+        };
+        let r = self.r + margin;
+        let (minx, maxx) = (from.x.min(to.x) - r, from.x.max(to.x) + r);
+        let (miny, maxy) = (from.y.min(to.y) - r, from.y.max(to.y) + r);
+        let ix0 = (((minx - g.ox) / g.cell).floor().max(0.0)) as usize;
+        let iy0 = (((miny - g.oy) / g.cell).floor().max(0.0)) as usize;
+        let ix1 = ((((maxx - g.ox) / g.cell).ceil()) as usize).min(g.nx.saturating_sub(1));
+        let iy1 = ((((maxy - g.oy) / g.cell).ceil()) as usize).min(g.ny.saturating_sub(1));
+        let r2 = r * r;
+        for iy in iy0..=iy1 {
+            let cy = g.oy + (iy as f64 + 0.5) * g.cell;
+            for ix in ix0..=ix1 {
+                let idx = iy * g.nx + ix;
+                if g.occ[idx] || !mask.occ[idx] {
+                    continue; // cleared, or not material at all
+                }
+                let c = Point::new(g.ox + (ix as f64 + 0.5) * g.cell, cy);
+                if seg_dist_sq(c, from, to) <= r2 {
+                    return false; // uncut material under the swept disc
+                }
+            }
+        }
+        true
+    }
+
     /// Whether the cell containing `p` has been cleared.
     pub(crate) fn is_cleared_at(&self, p: Point) -> bool {
         self.grid.as_ref().is_some_and(|g| g.is_cleared(p))

@@ -192,11 +192,26 @@ pub(crate) struct SteerRun {
     pub(crate) air_len: f64,
     /// Per move of `path`: was this step hunting (air) rather than cutting at target?
     pub(crate) hunting: Vec<bool>,
+    /// Per move of `path`: does this move remove **nothing at all**?
+    ///
+    /// Not the same as `hunting`. A starving step may still shave up to `STALL_FRAC` of the
+    /// target — real material, at a real feed. Only a move measured to remove *zero* is safe
+    /// to emit as a traverse, and that is the distinction that lets the emitter turn air into
+    /// a rapid without turning a light cut into one.
+    pub(crate) air: Vec<bool>,
     /// Re-entries: each costs a retract, a reposition and a plunge.
     pub(crate) reentries: usize,
     /// Why the run ended.
     pub(crate) stopped: &'static str,
 }
+
+/// How far clear of uncut stock a move must sweep before it may be emitted as a traverse, in mm.
+///
+/// Two discretisations have to be paid for: the generator's own occupancy grid (0.1 mm cells,
+/// which can mark a cell cleared when the tool only clipped it) and `cam-sim`'s heightfield
+/// (0.5 mm cells — half-diagonal 0.35 mm — where a cell whose centre escaped every cut still
+/// stands at full stock height). 0.6 mm covers both with room to spare.
+const AIR_MARGIN: f64 = 0.6;
 
 /// Steer a path that clears `region` (less a `finish` skin) at radial width of cut `e`,
 /// starting at `start` heading `dir0`, having already opened a pocket of radius `open_r`
@@ -232,6 +247,7 @@ pub(crate) fn steer_path(
     // would size to the region.
     let mut path: Vec<(Point, bool)> = vec![(start, false)];
     let mut hunting: Vec<bool> = vec![false];
+    let mut air_flags: Vec<bool> = vec![false];
     model.seed_disc(start);
     {
         let turns = ((open_r / (0.5 * e)).ceil() as usize).max(1);
@@ -252,6 +268,7 @@ pub(crate) fn steer_path(
             model.commit(prev, p);
             path.push((p, true));
             hunting.push(false);
+            air_flags.push(false);
             prev = p;
         }
     }
@@ -320,6 +337,7 @@ pub(crate) fn steer_path(
             model.seed_disc(p);
             path.push((p, false));
             hunting.push(false);
+            air_flags.push(false);
             continue;
         };
 
@@ -347,6 +365,8 @@ pub(crate) fn steer_path(
                 next_check = path.len() + PROGRESS_WINDOW;
                 model.seed_disc(p);
                 path.push((p, false));
+                hunting.push(false);
+                air_flags.push(false);
                 continue;
             }
         }
@@ -363,6 +383,9 @@ pub(crate) fn steer_path(
         } else {
             cut_len += h;
         }
+        // **Before** the commit: afterwards this move's own swath reads as cleared and every
+        // move would be flagged as air.
+        air_flags.push(model.sweeps_only_cleared(p, q, AIR_MARGIN));
         model.commit(p, q);
         path.push((q, true));
         hunting.push(step.starving);
@@ -370,7 +393,13 @@ pub(crate) fn steer_path(
         d = dd;
     }
 
-    Some(SteerRun { path, buried_steps, resumes, starved_steps, cut_len, air_len, hunting, reentries: resumes, stopped })
+    // The flags are read by index against `path`; a `path.push` without its pair silently
+    // misattributes every later move. That is not hypothetical — the re-seed branch was
+    // missing both pushes, and the resulting drift made a third of the emitted traverses
+    // point at the wrong move, standing stock included.
+    debug_assert_eq!(path.len(), air_flags.len());
+    debug_assert_eq!(path.len(), hunting.len());
+    Some(SteerRun { path, buried_steps, resumes, starved_steps, cut_len, air_len, hunting, air: air_flags, reentries: resumes, stopped })
 }
 
 /// One step's decision: which way to turn, and what kind of step it is.
@@ -686,7 +715,7 @@ pub(crate) fn steer_certified(
     e: f64,
     start: Option<[f64; 2]>,
     cancel: &CancelToken,
-) -> Option<Vec<(Point, bool)>> {
+) -> Option<(Vec<(Point, bool)>, Vec<bool>)> {
     let run = steer_region(region, r, finish, e, start, cancel)?;
     if run.stopped == "cancelled" {
         return None; // a half-cleared region must never be emitted as if it were finished
@@ -701,7 +730,7 @@ pub(crate) fn steer_certified(
     let ok = v.max_engagement <= e * crate::frontadvance::CERT_ENGAGEMENT_SLACK
         && v.uncut_area <= cover_tol
         && v.gouge_area <= cover_tol;
-    ok.then_some(run.path)
+    ok.then(|| (run.path, run.air))
 }
 
 /// The largest polygon by area.

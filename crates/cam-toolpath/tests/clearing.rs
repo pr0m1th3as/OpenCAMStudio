@@ -411,3 +411,54 @@ fn an_adaptively_cleared_island_pocket_simulates_clean() {
         sim.collisions
     );
 }
+
+
+/// A steered clear must actually **traverse** the stock it has already removed.
+///
+/// A third of a steered path is the tool crossing cleared ground to reach the next front, and
+/// feeding it at cutting rate cost 0.76 min of a 10.42 min pocket here. The saving is only
+/// real if the flags survive: they are read by index against the path, and a single
+/// `path.push` without its matching flag once misattributed every later move — silently, and
+/// straight past the simulator on the shapes that happened not to collide. So assert both
+/// halves: that traverses are emitted at all, and (in the simulation test above) that they are
+/// safe.
+#[test]
+fn a_steered_clear_traverses_the_stock_it_has_already_removed() {
+    let mut op = match pocket_doc().setup.operations[0].clone() {
+        Operation::Pocket(p) => p,
+        other => panic!("expected a pocket, got {other:?}"),
+    };
+    op.clearing = Clearing { engagement: 2.0, climb: true };
+    let doc = setup(vec![Operation::Pocket(op)], vec![end_mill(1, 6.0)]);
+    let (program, _) = build_job(
+        &doc,
+        1000.0,
+        SpindleDir::Cw,
+        None,
+        machine().envelope.max.z,
+        &CancelToken::new(),
+    );
+
+    let mut prev: Option<[f64; 3]> = None;
+    let mut traversed = 0.0_f64;
+    for step in &program.steps {
+        let to = match step {
+            Step::Linear { to, .. } => [to.x, to.y, to.z],
+            Step::Rapid { to, .. } => {
+                if let Some(a) = prev {
+                    // Lateral, at cutting depth: a link across ground already cleared.
+                    if a[2] < -0.5 && (a[2] - to.z).abs() < 1e-9 {
+                        traversed += (a[0] - to.x).hypot(a[1] - to.y);
+                    }
+                }
+                [to.x, to.y, to.z]
+            }
+            _ => continue,
+        };
+        prev = Some(to);
+    }
+    assert!(
+        traversed > 100.0,
+        "a steered island clear should traverse its cleared ground, got {traversed:.0} mm"
+    );
+}

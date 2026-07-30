@@ -152,7 +152,7 @@ pub(crate) fn clear(
         // measures *better* there too (2.07 against 2.69–2.90), but switching it would change
         // every shipped hole-free toolpath and regenerate every golden, which is a decision to
         // take on its own evidence rather than as a side effect of adding islands.
-        if let Some(moves) = crate::steer::steer_certified(
+        if let Some((moves, air)) = crate::steer::steer_certified(
             region,
             job.radius,
             job.finish,
@@ -160,7 +160,7 @@ pub(crate) fn clear(
             job.start,
             cancel,
         ) {
-            emit_adaptive_moves(prog, &moves, job, heights, levels);
+            emit_adaptive_moves(prog, &moves, &air, job, heights, levels);
             return Ok(1);
         }
         // Uncertified — fall through to the proven concentric path below.
@@ -179,7 +179,7 @@ pub(crate) fn clear(
             job.clearing.engagement,
             job.start,
         ) {
-            emit_adaptive_moves(prog, &moves, job, heights, levels);
+            emit_adaptive_moves(prog, &moves, &[], job, heights, levels);
             // One continuous certified path (not a ring count); `Ok(_)` ⇒ emitted.
             return Ok(1);
         }
@@ -240,6 +240,7 @@ pub(crate) fn clear(
 fn emit_adaptive_moves(
     prog: &mut Program,
     moves: &[(Point, bool)],
+    air: &[bool],
     job: &ClearJob,
     h: &Heights,
     levels: &[f64],
@@ -283,7 +284,25 @@ fn emit_adaptive_moves(
 
         for i in 1..moves.len() {
             let (p, is_cut) = moves[i];
-            if is_cut {
+            if is_cut && air.get(i).copied().unwrap_or(false) {
+                // **A move that removes nothing is a traverse, not a cut.** A third of a
+                // steered path is the tool crossing stock it has already removed to reach the
+                // next front, and feeding it at cutting rate is the single largest remaining
+                // waste — 352 mm of a 5.8 min program, ~1.2 min of pure air.
+                //
+                // Safe as a rapid *because of what is measured*, not by assumption: the flag
+                // means the move's whole swept disc, inflated by a margin, met no uncut
+                // material in the running model. Engagement will not do here — it is a
+                // cutting-*load* measure, counting only the tool's leading arc, so a move
+                // reads zero while the body of the tool sits in stock. Flagging traverses that
+                // way put 776 `RapidThroughStock` collisions past this line. Nor is a
+                // *starving* step enough: it may still shave a fraction of the target, and
+                // that is a cut.
+                prog.push(Step::Rapid {
+                    to: Point3::new(p.x, p.y, z),
+                    tag: link,
+                });
+            } else if is_cut {
                 prog.push(Step::Linear {
                     to: Point3::new(p.x, p.y, z),
                     feed: job.feed,
