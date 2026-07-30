@@ -75,6 +75,9 @@ struct OccGrid {
     nx: usize,
     ny: usize,
     occ: Vec<bool>,
+    /// How many cells are set. Maintained incrementally so a generator can ask "am I still
+    /// making progress?" in O(1) rather than re-measuring coverage.
+    filled: usize,
 }
 
 impl OccGrid {
@@ -82,7 +85,7 @@ impl OccGrid {
     fn new(min: [f64; 2], max: [f64; 2], cell: f64) -> Self {
         let nx = (((max[0] - min[0]) / cell).ceil() as usize + 1).max(1);
         let ny = (((max[1] - min[1]) / cell).ceil() as usize + 1).max(1);
-        Self { ox: min[0], oy: min[1], cell, nx, ny, occ: vec![false; nx * ny] }
+        Self { ox: min[0], oy: min[1], cell, nx, ny, occ: vec![false; nx * ny], filled: 0 }
     }
 
     /// Whether the cell containing `q` is marked cleared (out-of-grid ⇒ not cleared).
@@ -98,6 +101,85 @@ impl OccGrid {
         self.occ[iy * self.nx + ix]
     }
 
+    /// An empty grid on the **same lattice** as `self`, so the two can be compared cell for
+    /// cell without any coordinate arithmetic at the comparison site.
+    fn same_lattice(&self) -> OccGrid {
+        OccGrid {
+            ox: self.ox,
+            oy: self.oy,
+            cell: self.cell,
+            nx: self.nx,
+            ny: self.ny,
+            occ: vec![false; self.nx * self.ny],
+            filled: 0,
+        }
+    }
+
+    /// Rasterise `polys` into this grid by **scanline**, marking every cell whose centre
+    /// lies inside their union. Uses the nonzero winding rule over every ring, outer and
+    /// hole alike — the same rule as [`cam_geo::Polygon::locate`], so a cell inside an
+    /// island nets to zero and reads as outside, exactly as the polygon test would say.
+    ///
+    /// Scanline rather than per-cell point-in-polygon on purpose: this is O(rows × edges +
+    /// cells filled) where the naive version is O(cells × edges), and on the grids that
+    /// matter here that is the difference between milliseconds and minutes.
+    fn fill(&mut self, polys: &[Polygon]) {
+        let mut xs: Vec<(f64, i32)> = Vec::new();
+        for iy in 0..self.ny {
+            let y = self.oy + (iy as f64 + 0.5) * self.cell;
+            xs.clear();
+            for poly in polys {
+                let rings = std::iter::once(poly.outer().points())
+                    .chain(poly.holes().iter().map(|h| h.points()));
+                for ring in rings {
+                    let n = ring.len();
+                    for k in 0..n {
+                        let (p0, p1) = (ring[k], ring[(k + 1) % n]);
+                        // Half-open rule: a vertex exactly on the scanline counts once, so
+                        // a ring is never entered or left twice at the same point.
+                        if (p0.y <= y) == (p1.y <= y) {
+                            continue;
+                        }
+                        let t = (y - p0.y) / (p1.y - p0.y);
+                        xs.push((p0.x + (p1.x - p0.x) * t, if p1.y > p0.y { 1 } else { -1 }));
+                    }
+                }
+            }
+            if xs.is_empty() {
+                continue;
+            }
+            xs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            let mut wind = 0;
+            for w in xs.windows(2) {
+                wind += w[0].1;
+                if wind == 0 {
+                    continue; // outside between these two crossings
+                }
+                // Cells whose centres lie in [w[0].0, w[1].0).
+                let x0 = ((w[0].0 - self.ox) / self.cell - 0.5).ceil().max(0.0) as usize;
+                let x1 = ((w[1].0 - self.ox) / self.cell - 0.5).floor();
+                if x1 < 0.0 || x0 >= self.nx {
+                    continue;
+                }
+                let x1 = (x1 as usize).min(self.nx - 1);
+                for ix in x0..=x1 {
+                    self.occ[iy * self.nx + ix] = true;
+                }
+            }
+        }
+    }
+
+    /// Area (mm²) of the cells set in `self` but **not** in `other`.
+    fn area_minus(&self, other: &OccGrid) -> f64 {
+        let n = self
+            .occ
+            .iter()
+            .zip(&other.occ)
+            .filter(|(a, b)| **a && !**b)
+            .count();
+        n as f64 * self.cell * self.cell
+    }
+
     /// Mark every cell whose centre lies within `r` of the segment `a`→`b` as cleared.
     fn stamp(&mut self, a: Point, b: Point, r: f64) {
         let (minx, maxx) = (a.x.min(b.x) - r, a.x.max(b.x) + r);
@@ -111,8 +193,10 @@ impl OccGrid {
             let cy = self.oy + (iy as f64 + 0.5) * self.cell;
             for ix in ix0..=ix1 {
                 let cx = self.ox + (ix as f64 + 0.5) * self.cell;
-                if seg_dist_sq(Point::new(cx, cy), a, b) <= r2 {
-                    self.occ[iy * self.nx + ix] = true;
+                let idx = iy * self.nx + ix;
+                if !self.occ[idx] && seg_dist_sq(Point::new(cx, cy), a, b) <= r2 {
+                    self.occ[idx] = true;
+                    self.filled += 1;
                 }
             }
         }
@@ -134,6 +218,13 @@ pub(crate) struct ClearedModel {
     /// runtime and front-advance use); `None` for the unbounded primitive tests, which
     /// fall back to polygon `contains` (their paths are a move or two, so it is cheap).
     grid: Option<OccGrid>,
+    /// `material` rasterised onto the same lattice, for [`Self::cut_area_grid`] only.
+    ///
+    /// Deliberately **not** used by [`Self::is_uncut`], which keeps its exact polygon test:
+    /// `is_uncut` feeds the engagement reading that gates every path, and swapping an exact
+    /// containment for a cell-quantised one there would shift the certified numbers by a
+    /// hair for no gain. The controller can afford the approximation; the gate cannot.
+    material_mask: Option<OccGrid>,
 }
 
 impl ClearedModel {
@@ -144,6 +235,7 @@ impl ClearedModel {
             cleared: Vec::new(),
             material: None,
             grid: None,
+            material_mask: None,
         }
     }
 
@@ -172,11 +264,17 @@ impl ClearedModel {
         } else {
             None
         };
+        let material_mask = grid.as_ref().map(|g| {
+            let mut m = g.same_lattice();
+            m.fill(std::slice::from_ref(&material));
+            m
+        });
         Self {
             r,
             cleared: Vec::new(),
             material: Some(material),
             grid,
+            material_mask,
         }
     }
 
@@ -311,13 +409,18 @@ impl ClearedModel {
     /// Add the move `from`→`to` to the cleared region.
     pub(crate) fn commit(&mut self, from: Point, to: Point) {
         // The grid is the hot path: stamp the swept capsule (O(cells under it)), no union.
+        //
+        // **When there is a grid, it *is* the model.** The polygon list below exists only
+        // for [`Self::engagement_area`], the area-based cross-check, which is only ever run
+        // on an unbounded model (a short, hand-built path) — never on the runtime gate. So
+        // building and keeping a swept polygon per move here is pure waste on exactly the
+        // paths where there are most of them: it is one `stroke_path` per move, and on an
+        // 8000-move island path it cost **32 s of a 56 s certification** in release. Bail
+        // out and let the grid carry it.
         if let Some(g) = &mut self.grid {
             g.stamp(from, to, self.r);
+            return;
         }
-        // Append the swept region for `engagement_area`. Not unioned — that was the other
-        // O(n²) cost (a union of a growing polygon per move); `difference` in
-        // `engagement_area` subtracts the whole list regardless, and this list is only
-        // read by the (small-path) cross-check test, never the runtime gate.
         let sweep = swept(&[from, to], self.r);
         self.cleared.extend(sweep);
     }
@@ -325,6 +428,391 @@ impl ClearedModel {
     /// The cleared region so far.
     pub(crate) fn cleared(&self) -> &[Polygon] {
         &self.cleared
+    }
+
+    /// The **controller's** measure of a candidate move: the area of uncut material the move
+    /// `from`→`to` would newly remove, read off the occupancy grid.
+    ///
+    /// This is [`Self::engagement_area`]'s quantity — area removed per advance, the textbook
+    /// radial width of cut once divided by the move length — but computed by counting cells
+    /// instead of doing polygon booleans. That matters because of *how it is used*: the exact
+    /// version is called once per move to **judge** a path, while this is called ~8 times per
+    /// step to **choose** one, over thousands of steps. Exact is right for a gate and
+    /// hopeless for a controller.
+    ///
+    /// Cells already under the tool at `from` are excluded, so this is what the advance
+    /// uncovers rather than what the tool is sitting on — without that, a short step would
+    /// charge its whole starting disc.
+    pub(crate) fn cut_area_grid(&self, from: Point, to: Point) -> f64 {
+        let (Some(g), Some(mask)) = (&self.grid, &self.material_mask) else {
+            return 0.0;
+        };
+        let r = self.r;
+        let (minx, maxx) = (from.x.min(to.x) - r, from.x.max(to.x) + r);
+        let (miny, maxy) = (from.y.min(to.y) - r, from.y.max(to.y) + r);
+        let ix0 = (((minx - g.ox) / g.cell).floor().max(0.0)) as usize;
+        let iy0 = (((miny - g.oy) / g.cell).floor().max(0.0)) as usize;
+        let ix1 = ((((maxx - g.ox) / g.cell).ceil()) as usize).min(g.nx.saturating_sub(1));
+        let iy1 = ((((maxy - g.oy) / g.cell).ceil()) as usize).min(g.ny.saturating_sub(1));
+        let r2 = r * r;
+        let mut n = 0usize;
+        for iy in iy0..=iy1 {
+            let cy = g.oy + (iy as f64 + 0.5) * g.cell;
+            for ix in ix0..=ix1 {
+                let idx = iy * g.nx + ix;
+                if g.occ[idx] || !mask.occ[idx] {
+                    continue; // already cleared, or not material
+                }
+                let c = Point::new(g.ox + (ix as f64 + 0.5) * g.cell, cy);
+                if seg_dist_sq(c, from, to) > r2 {
+                    continue; // outside the swept capsule
+                }
+                if (c.x - from.x).powi(2) + (c.y - from.y).powi(2) <= r2 {
+                    continue; // already under the tool before the move
+                }
+                n += 1;
+            }
+        }
+        n as f64 * g.cell * g.cell
+    }
+
+    /// [`Self::engagement`] computed entirely on the grid — the **controller's** form of the
+    /// gate's own measure.
+    ///
+    /// Steering on area-per-advance and being judged on the contact arc is optimising one
+    /// quantity and being marked on another, and the two genuinely differ: the arc formula
+    /// `a_e = r(1−cos Φ)` assumes the uncut region is a half-plane, so where material *wraps*
+    /// the tool — a concave corner — it reports a deep cut for a shallow one. That is not a
+    /// flaw to route around; a wrapped tool really is loaded differently. Measured, steering
+    /// on area put the peak at 5.30 in a region corner while the area removed there was
+    /// unremarkable. So the controller uses this instead, and aims at the number it will be
+    /// certified against.
+    ///
+    /// Identical to [`Self::engagement`] except that material containment is a mask lookup
+    /// rather than a polygon test, which is what makes it affordable inside a search.
+    pub(crate) fn engagement_grid(&self, from: Point, to: Point) -> f64 {
+        let (Some(g), Some(mask)) = (&self.grid, &self.material_mask) else {
+            return self.engagement(from, to);
+        };
+        let (dx, dy) = (to.x - from.x, to.y - from.y);
+        let len = dx.hypot(dy);
+        if len < 1e-9 {
+            return 0.0;
+        }
+        let d = (dx / len, dy / len);
+        // The **same** angular resolution as `engagement`. A coarser sweep here would make
+        // the controller aim at a slightly different number than the gate measures, which is
+        // the very mismatch this method exists to remove.
+        const NA: usize = 180;
+        let rp = (self.r - 0.1).max(self.r * 0.9);
+        let pos_steps = ((len / (0.5 * self.r).max(1e-3)).ceil() as usize).max(1);
+        let uncut = |q: Point| -> bool {
+            let (fx, fy) = ((q.x - g.ox) / g.cell, (q.y - g.oy) / g.cell);
+            if fx < 0.0 || fy < 0.0 {
+                return false;
+            }
+            let (ix, iy) = (fx as usize, fy as usize);
+            if ix >= g.nx || iy >= g.ny {
+                return false;
+            }
+            let idx = iy * g.nx + ix;
+            mask.occ[idx] && !g.occ[idx]
+        };
+        let mut max_ae = 0.0_f64;
+        for s in 0..=pos_steps {
+            let t = len * (s as f64) / (pos_steps as f64);
+            let c = Point::new(from.x + d.0 * t, from.y + d.1 * t);
+            let mut engaged = 0usize;
+            for k in 0..NA {
+                let a = std::f64::consts::TAU * (k as f64) / (NA as f64);
+                let (ca, sa) = (a.cos(), a.sin());
+                if ca * d.0 + sa * d.1 <= 0.0 {
+                    continue; // trailing half — not the cutting edge
+                }
+                if uncut(Point::new(c.x + rp * ca, c.y + rp * sa)) {
+                    engaged += 1;
+                }
+            }
+            let phi = std::f64::consts::TAU * (engaged as f64) / (NA as f64);
+            max_ae = max_ae.max(self.r * (1.0 - phi.cos()));
+        }
+        max_ae
+    }
+
+    /// Commit a move, **recording** which cells it newly cleared so it can be undone.
+    ///
+    /// This is what lets a generator ask "if I started here, would the next few steps hold?"
+    /// and get a *measured* answer rather than a heuristic one. Simulating without committing
+    /// does not work — each step must see the material the previous one removed — and cloning
+    /// the grid per candidate is far too expensive. Recording the handful of cells a 0.75 mm
+    /// step touches, and putting them back, costs nothing.
+    pub(crate) fn commit_recording(&mut self, from: Point, to: Point, undo: &mut Vec<usize>) {
+        let Some(g) = &mut self.grid else {
+            self.commit(from, to);
+            return;
+        };
+        let r = self.r;
+        let (minx, maxx) = (from.x.min(to.x) - r, from.x.max(to.x) + r);
+        let (miny, maxy) = (from.y.min(to.y) - r, from.y.max(to.y) + r);
+        let ix0 = (((minx - g.ox) / g.cell).floor().max(0.0)) as usize;
+        let iy0 = (((miny - g.oy) / g.cell).floor().max(0.0)) as usize;
+        let ix1 = ((((maxx - g.ox) / g.cell).ceil()) as usize).min(g.nx.saturating_sub(1));
+        let iy1 = ((((maxy - g.oy) / g.cell).ceil()) as usize).min(g.ny.saturating_sub(1));
+        let r2 = r * r;
+        for iy in iy0..=iy1 {
+            let cy = g.oy + (iy as f64 + 0.5) * g.cell;
+            for ix in ix0..=ix1 {
+                let idx = iy * g.nx + ix;
+                if g.occ[idx] {
+                    continue;
+                }
+                let c = Point::new(g.ox + (ix as f64 + 0.5) * g.cell, cy);
+                if seg_dist_sq(c, from, to) <= r2 {
+                    g.occ[idx] = true;
+                    g.filled += 1;
+                    undo.push(idx);
+                }
+            }
+        }
+    }
+
+    /// [`Self::seed_disc`], recording the cells it cleared so it can be undone.
+    pub(crate) fn seed_disc_recording(&mut self, c: Point, undo: &mut Vec<usize>) {
+        self.commit_recording(c, c, undo);
+        let pts = Arc::circle(c, self.r).flatten(0.05);
+        if let Ok(d) = Polygon::new(Contour::new(pts)) {
+            self.cleared.push(d);
+        }
+    }
+
+    /// Undo the cells recorded by [`Self::commit_recording`].
+    pub(crate) fn rollback(&mut self, undo: &[usize]) {
+        if let Some(g) = &mut self.grid {
+            for &i in undo {
+                if g.occ[i] {
+                    g.occ[i] = false;
+                    g.filled -= 1;
+                }
+            }
+        }
+    }
+
+    /// How many grid cells have been cleared so far — a generator's O(1) progress signal.
+    pub(crate) fn cleared_cells(&self) -> usize {
+        self.grid.as_ref().map_or(0, |g| g.filled)
+    }
+
+    /// The direction from a tool centre at `at` toward the material it is engaged with — the
+    /// **mid-bearing of the contact arc**, and so the local outward normal of the cleared
+    /// region *at the tool's own scale*.
+    ///
+    /// This is what a trochoidal loop has to be built on. The first attempt oriented its loops
+    /// from `nearest_uncut`, a single point found on a **0.5 mm stride**: a coarse guess at
+    /// where material lies, not where the boundary faces. Misaligned, the loop ploughed on
+    /// re-entry instead of retreating through cleared stock, and engagement went *up* — 3.4–3.9
+    /// against a 3.00 gate — with a smaller advance per revolution making it worse rather than
+    /// better, which is what showed the geometry was wrong rather than the tuning.
+    ///
+    /// Measured over the whole perimeter (not just the leading half, as [`Self::engagement`]
+    /// does) at ray resolution, from the same occupancy the controller steers by. `None` when
+    /// nothing around the tool is uncut.
+    pub(crate) fn material_bearing(&self, at: Point) -> Option<(f64, f64)> {
+        let (g, mask) = (self.grid.as_ref()?, self.material_mask.as_ref()?);
+        let rp = (self.r - 0.1).max(self.r * 0.9);
+        const NA: usize = 180;
+        let (mut sx, mut sy) = (0.0_f64, 0.0_f64);
+        let mut n = 0usize;
+        for k in 0..NA {
+            let a = std::f64::consts::TAU * (k as f64) / (NA as f64);
+            let (ca, sa) = (a.cos(), a.sin());
+            let q = Point::new(at.x + rp * ca, at.y + rp * sa);
+            let (fx, fy) = ((q.x - g.ox) / g.cell, (q.y - g.oy) / g.cell);
+            if fx < 0.0 || fy < 0.0 {
+                continue;
+            }
+            let (ix, iy) = (fx as usize, fy as usize);
+            if ix >= g.nx || iy >= g.ny {
+                continue;
+            }
+            let idx = iy * g.nx + ix;
+            if mask.occ[idx] && !g.occ[idx] {
+                sx += ca;
+                sy += sa;
+                n += 1;
+            }
+        }
+        if n == 0 {
+            return None;
+        }
+        let l = sx.hypot(sy);
+        (l > 1e-9).then(|| (sx / l, sy / l))
+    }
+
+    /// Whether the cell containing `p` has been cleared.
+    pub(crate) fn is_cleared_at(&self, p: Point) -> bool {
+        self.grid.as_ref().is_some_and(|g| g.is_cleared(p))
+    }
+
+    /// Every uncut-material point on a coarse `stride` lattice, nearest to `near` first.
+    ///
+    /// A generator restarting a dead front needs *candidates*, not the single nearest one:
+    /// the nearest is very often a place the tool cannot actually work from, and a search
+    /// that returns only that gets stuck on it. Measured, with the nearest-only version the
+    /// probe resumed **401 times inside one 8 × 11 mm patch** and cleared nothing new.
+    pub(crate) fn uncut_candidates(&self, near: Point, stride_mm: f64, limit: usize) -> Vec<Point> {
+        let (Some(g), Some(mask)) = (self.grid.as_ref(), self.material_mask.as_ref()) else {
+            return Vec::new();
+        };
+        let stride = ((stride_mm / g.cell).round() as usize).max(1);
+        let mut out: Vec<(f64, Point)> = Vec::new();
+        let mut iy = 0;
+        while iy < g.ny {
+            let mut ix = 0;
+            while ix < g.nx {
+                let idx = iy * g.nx + ix;
+                if mask.occ[idx] && !g.occ[idx] {
+                    let p = Point::new(
+                        g.ox + (ix as f64 + 0.5) * g.cell,
+                        g.oy + (iy as f64 + 0.5) * g.cell,
+                    );
+                    out.push((p.distance(near), p));
+                }
+                ix += stride;
+            }
+            iy += stride;
+        }
+        out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        out.truncate(limit);
+        out.into_iter().map(|(_, p)| p).collect()
+    }
+
+    /// The nearest uncut material to `from`, within `max_dist`, for a steered generator to
+    /// aim at when its bite has run out. Searched on a **stride** of cells rather than every
+    /// cell: this is used to point the tool, and pointing does not need sub-millimetre
+    /// resolution, while scanning every cell of a 40 mm neighbourhood at 0.1 mm would cost
+    /// 160k tests per step.
+    pub(crate) fn nearest_uncut(&self, from: Point, max_dist: f64) -> Option<Point> {
+        let (g, mask) = (self.grid.as_ref()?, self.material_mask.as_ref()?);
+        let stride = ((0.5 / g.cell).round() as usize).max(1);
+        let span = ((max_dist / g.cell).ceil()) as i64;
+        let (cx, cy) = (
+            ((from.x - g.ox) / g.cell) as i64,
+            ((from.y - g.oy) / g.cell) as i64,
+        );
+        let mut best: Option<(f64, Point)> = None;
+        let mut iy = (cy - span).max(0);
+        while iy < (cy + span).min(g.ny as i64 - 1) {
+            let mut ix = (cx - span).max(0);
+            while ix < (cx + span).min(g.nx as i64 - 1) {
+                let idx = iy as usize * g.nx + ix as usize;
+                if mask.occ[idx] && !g.occ[idx] {
+                    let p = Point::new(
+                        g.ox + (ix as f64 + 0.5) * g.cell,
+                        g.oy + (iy as f64 + 0.5) * g.cell,
+                    );
+                    let d = p.distance(from);
+                    if d <= max_dist && best.is_none_or(|(bd, _)| d < bd) {
+                        best = Some((d, p));
+                    }
+                }
+                ix += stride as i64;
+            }
+            iy += stride as i64;
+        }
+        best.map(|(_, p)| p)
+    }
+
+    /// Somewhere to pick the cut back up when a front dies: a tool-centre position that is
+    /// **already cleared** (so the re-plunge goes into air, not solid) and **inside `bound`**
+    /// (so it is a legal place for the tool at all), with uncut material within reach.
+    /// Returns `(stand_here, cut_toward)`, nearest to `near`.
+    ///
+    /// Both conditions are load-bearing and were each learned the hard way. Returning a bare
+    /// cleared cell gives positions up to a tool radius outside the tool-centre region, since
+    /// that is how far the cleared region extends beyond the path that made it. Returning a
+    /// bare *material* cell gives positions the tool would have to plunge into solid to reach.
+    pub(crate) fn resume_from(
+        &self,
+        near: Point,
+        bound: &Polygon,
+        span: f64,
+    ) -> Option<(Point, Point)> {
+        let (g, mask) = (self.grid.as_ref()?, self.material_mask.as_ref()?);
+        // Material must sit **just beyond** the tool's own disc: closer and the re-plunge
+        // would be into solid, further and the first step cannot reach it, so the new front
+        // dies on the spot and the search returns to the same place for ever. Measured: with
+        // no near bound this resumed 401 times and cleared nothing.
+        let kmin = ((self.r / g.cell).ceil() as i64).max(1) + 1;
+        let kmax = kmin + ((span / g.cell).ceil() as i64).max(1);
+        let mut best: Option<(f64, Point, Point)> = None;
+        for iy in 0..g.ny {
+            for ix in 0..g.nx {
+                let idx = iy * g.nx + ix;
+                if !g.occ[idx] {
+                    continue; // stand in cleared stock
+                }
+                let c = Point::new(
+                    g.ox + (ix as f64 + 0.5) * g.cell,
+                    g.oy + (iy as f64 + 0.5) * g.cell,
+                );
+                let d = c.distance(near);
+                if best.is_some_and(|(bd, _, _)| d >= bd) {
+                    continue; // cannot beat what we have; skip the expensive tests
+                }
+                // Uncut material within a tool radius, in one of the four axis directions.
+                let mut target = None;
+                for (dx, dy) in [(1_i64, 0_i64), (-1, 0), (0, 1), (0, -1)] {
+                    for k in kmin..=kmax {
+                        let (jx, jy) = (ix as i64 + dx * k, iy as i64 + dy * k);
+                        if jx < 0 || jy < 0 || jx >= g.nx as i64 || jy >= g.ny as i64 {
+                            break;
+                        }
+                        let jdx = jy as usize * g.nx + jx as usize;
+                        if mask.occ[jdx] && !g.occ[jdx] {
+                            target = Some(Point::new(
+                                g.ox + (jx as f64 + 0.5) * g.cell,
+                                g.oy + (jy as f64 + 0.5) * g.cell,
+                            ));
+                            break;
+                        }
+                    }
+                    if target.is_some() {
+                        break;
+                    }
+                }
+                let Some(t) = target else { continue };
+                if !bound.contains(c) {
+                    continue;
+                }
+                best = Some((d, c, t));
+            }
+        }
+        best.map(|(_, c, t)| (c, t))
+    }
+
+    /// Coverage and gouge, read straight off the occupancy grid this model already built
+    /// while measuring engagement. Returns `(uncut_area, gouge_area)`, or `None` when there
+    /// is no grid (a degenerate region), so the caller can fall back to the exact booleans.
+    ///
+    /// **This is what makes certifying a long path affordable.** The exact route strokes the
+    /// whole cut path into a polygon and differences it against the target — and stroking a
+    /// several-thousand-segment self-overlapping polyline is quadratic-ish work that
+    /// measured **11.18 s of a 12.71 s certification** on a 5431-move island path, against
+    /// 1.47 s for the entire engagement scan. The grid, meanwhile, is *already paid for*:
+    /// every cutting move has been stamped into it. Coverage then costs two scanline fills
+    /// and a linear pass.
+    ///
+    /// **Both errors fall the safe way.** A cell counts as cleared only if its centre lies
+    /// within `r` of a committed move, so a partially-cut cell reads *uncut* — which can
+    /// only overstate the coverage gap, and an overstated gap fails certification and falls
+    /// back to the proven concentric clear. It cannot pass a path that should have failed.
+    fn coverage(&self, to_clear: &Polygon, reach: &[Polygon]) -> Option<(f64, f64)> {
+        let g = self.grid.as_ref()?;
+        let mut reach_mask = g.same_lattice();
+        reach_mask.fill(reach);
+        let mut target_mask = g.same_lattice();
+        target_mask.fill(std::slice::from_ref(to_clear));
+        Some((reach_mask.area_minus(g), g.area_minus(&target_mask)))
     }
 }
 
@@ -355,10 +843,107 @@ impl Verdict {
 /// Certify a cutting path (tool-centre points, all treated as cutting moves)
 /// against the target material region `to_clear` for a tool of radius `r`: peak
 /// engagement, uncut remainder (of the reachable target), and gouge.
+///
+/// A thin wrapper over [`certify_moves`] with every move flagged cutting — deliberately
+/// *one* implementation rather than two, so the continuous and moves-aware entries cannot
+/// drift apart under maintenance.
 pub(crate) fn certify(path: &[Point], r: f64, to_clear: &Polygon) -> Verdict {
-    // Coverage and gouge come from the whole swept region in one boolean pass —
-    // exact and cheap (no per-segment accumulation).
-    let full = swept(path, r);
+    let moves: Vec<(Point, bool)> = path.iter().enumerate().map(|(i, &p)| (p, i > 0)).collect();
+    certify_moves(&moves, r, to_clear)
+}
+
+/// Split a move path into its **cutting runs**: maximal polylines of consecutive points
+/// joined by cutting moves. A run begins at the point a cut departs *from* (the plunge
+/// point), so stroking it with round caps reproduces the entry disc.
+fn cut_runs(moves: &[(Point, bool)]) -> Vec<Vec<Point>> {
+    let mut runs: Vec<Vec<Point>> = Vec::new();
+    let mut cur: Vec<Point> = Vec::new();
+    let mut prev: Option<Point> = None;
+    for &(p, cut) in moves {
+        if cut {
+            if let Some(pp) = prev {
+                if cur.is_empty() {
+                    cur.push(pp);
+                }
+                cur.push(p);
+            }
+        } else if !cur.is_empty() {
+            runs.push(std::mem::take(&mut cur));
+        }
+        prev = Some(p);
+    }
+    if !cur.is_empty() {
+        runs.push(cur);
+    }
+    runs
+}
+
+/// Certify a path of `(point, is_cut)` moves — the form an island/frame path takes, where
+/// the tool **lifts between loop families** and so has no continuous form at all. Same
+/// verdict as [`certify`], same exactness; the flags are what let a rapid be a rapid.
+///
+/// This exists because the exact oracle previously had no moves-aware entry, which is the
+/// only reason the frame path was gated on [`crate::raster`] — an oracle measured
+/// under-reading engagement by 7.5× in the unsafe direction. A certifier that cannot score
+/// a path containing rapids is not an alternative to the raster; this is.
+///
+/// The three semantics that make a rapid a rapid, each pinned by a test:
+///
+/// - **A rapid removes nothing.** Coverage and gouge are stroked from the cutting runs
+///   only ([`cut_runs`]), so the corridor a rapid crosses is *not* credited as cleared —
+///   it stays uncut, which is what fails certification and is the whole point.
+/// - **A rapid is charged no engagement.** It travels above the stock; it cannot cut.
+/// - **A cut following a rapid is a plunge**, so the entry disc is seeded there — the
+///   move out of the hole is not charged for stock the plunge itself removed. Round caps
+///   on the run's stroke count the same disc toward coverage.
+///
+/// A rapid **launders nothing**: lifting before a slot does not make it read less than the
+/// diameter, because engagement is measured against the running cleared model, not against
+/// the path's shape.
+pub(crate) fn certify_moves(moves: &[(Point, bool)], r: f64, to_clear: &Polygon) -> Verdict {
+    // Peak engagement is inherently sequential: walk the cutting moves against the running
+    // cleared region. Bound it to the target so cutting air outside the part is not charged
+    // as engagement. The occupancy grid this builds is then *also* the coverage answer.
+    let mut model = ClearedModel::bounded(r, to_clear.clone());
+    let mut prev: Option<Point> = None;
+    let mut prev_cut = false;
+    let mut max_e = 0.0_f64;
+    for &(p, cut) in moves {
+        if cut {
+            if let Some(pp) = prev {
+                if !prev_cut {
+                    model.seed_disc(pp); // a cut after a rapid = a plunge at pp
+                }
+                max_e = max_e.max(model.engagement(pp, p));
+                model.commit(pp, p);
+            }
+        }
+        prev = Some(p);
+        prev_cut = cut;
+    }
+
+    let reach = reachable(to_clear, r);
+    let (uncut_area, gouge_area) = model
+        .coverage(to_clear, &reach)
+        .unwrap_or_else(|| coverage_exact(moves, r, to_clear));
+    Verdict { max_engagement: max_e, uncut_area, gouge_area }
+}
+
+/// Coverage and gouge by **exact polygon booleans** — the reference measure, and the
+/// fallback when no occupancy grid could be built.
+///
+/// Kept, but off the hot path: it strokes every cutting run into a polygon and differences
+/// that against the target, and stroking a long self-overlapping polyline is what made
+/// certification unaffordable (11.18 s of 12.71 s on a 5431-move path). Its job now is to be
+/// the independent second opinion that
+/// [`tests::the_two_coverage_measures_agree`] holds the grid to — the same discipline as the
+/// two independent engagement measures, and for the same reason: this subsystem's history is
+/// of instruments quietly lying.
+fn coverage_exact(moves: &[(Point, bool)], r: f64, to_clear: &Polygon) -> (f64, f64) {
+    let mut full: Vec<Polygon> = Vec::new();
+    for run in cut_runs(moves) {
+        full.extend(swept(&run, r));
+    }
     let reach = reachable(to_clear, r);
     let uncut = if reach.is_empty() {
         Vec::new()
@@ -366,26 +951,7 @@ pub(crate) fn certify(path: &[Point], r: f64, to_clear: &Polygon) -> Verdict {
         difference(&reach, &full).unwrap_or_default()
     };
     let gouge = difference(&full, std::slice::from_ref(to_clear)).unwrap_or_default();
-
-    // Peak engagement is inherently sequential: walk the path against the running
-    // cleared region. This is the costly part, so it is measured, not the coverage.
-    // Bound it to the target so cutting air outside the part is not charged as
-    // engagement. Seed the entry disc the plunge opens, so the first moves are not
-    // charged for it.
-    let mut model = ClearedModel::bounded(r, to_clear.clone());
-    if let Some(first) = path.first() {
-        model.seed_disc(*first);
-    }
-    let mut max_e = 0.0_f64;
-    for w in path.windows(2) {
-        max_e = max_e.max(model.engagement(w[0], w[1]));
-        model.commit(w[0], w[1]);
-    }
-    Verdict {
-        max_engagement: max_e,
-        uncut_area: total_area(&uncut),
-        gouge_area: total_area(&gouge),
-    }
+    (total_area(&uncut), total_area(&gouge))
 }
 
 #[cfg(test)]
@@ -493,6 +1059,201 @@ mod tests {
         assert!((1.85..2.15).contains(&area), "peel by area should read 2, got {area}");
     }
 
+    fn holed_60() -> Polygon {
+        use cam_geo::Contour;
+        Polygon::with_holes(
+            Contour::new(vec![
+                Point::new(0.0, 0.0),
+                Point::new(60.0, 0.0),
+                Point::new(60.0, 60.0),
+                Point::new(0.0, 60.0),
+            ]),
+            vec![Contour::new(vec![
+                Point::new(20.0, 20.0),
+                Point::new(40.0, 20.0),
+                Point::new(40.0, 40.0),
+                Point::new(20.0, 40.0),
+            ])],
+        )
+        .unwrap()
+    }
+
+    /// **The grid coverage measure against the exact one.** `certify_moves` now reads
+    /// coverage and gouge off the occupancy grid rather than stroking the path into a
+    /// polygon, because the stroke cost 11.18 s of a 12.71 s certification. That is a change
+    /// to the correctness spine, so it is held to the polygon booleans it replaced — the
+    /// same discipline as `the_two_independent_engagement_measures_agree`, and for the same
+    /// reason: every instrument in this subsystem has to be checked against an independent
+    /// one, because two of them have quietly lied already.
+    ///
+    /// The two cannot agree exactly and should not be asked to, and the direction of the
+    /// disagreement is **not** the one I first assumed. The grid samples at cell centres, so
+    /// it is blind to any feature thinner than a cell — measured, it reads the standoff's
+    /// 1.1 mm² corner residue as **0.0**, an *understatement* of the gap. My first version of
+    /// this test asserted the grid could only overstate, and it failed immediately; that
+    /// assertion was wrong, not the code.
+    ///
+    /// So the safety argument has to be made on **magnitude**, and it is this: the area the
+    /// grid can miss is bounded by `boundary length × cell`, because what it loses is a
+    /// sub-cell sliver along a boundary. At 0.1 mm cells that is ~20 mm² along a 200 mm wall
+    /// — while the certification tolerance is `0.02 × reachable + 1`, which is 65 mm² for
+    /// this 60 mm part. For the blind spot to flip a verdict the skin would have to run
+    /// **650 mm** in a 60 mm square, which is not a shape. The check below therefore pins
+    /// what actually matters: the two measures agree to within that bound, *and* they return
+    /// the same certification verdict.
+    #[test]
+    fn the_two_coverage_measures_agree() {
+        let r = 3.0;
+        for (name, region) in [
+            ("square 40", {
+                use cam_geo::Contour;
+                Polygon::new(Contour::new(vec![
+                    Point::new(0.0, 0.0),
+                    Point::new(40.0, 0.0),
+                    Point::new(40.0, 40.0),
+                    Point::new(0.0, 40.0),
+                ]))
+                .unwrap()
+            }),
+            ("square 60 with a 20 mm island", holed_60()),
+        ] {
+            let moves = crate::frontadvance::front_advance_path(&region, r, 0.0, 2.0, None)
+                .unwrap_or_else(|| panic!("{name}: a path"));
+            let mut model = ClearedModel::bounded(r, region.clone());
+            let (mut prev, mut prev_cut) = (None, false);
+            for &(p, cut) in &moves {
+                if cut {
+                    if let Some(pp) = prev {
+                        if !prev_cut {
+                            model.seed_disc(pp);
+                        }
+                        model.commit(pp, p);
+                    }
+                }
+                prev = Some(p);
+                prev_cut = cut;
+            }
+            let reach = reachable(&region, r);
+            let (g_uncut, g_gouge) = model.coverage(&region, &reach).expect("a grid");
+            let (x_uncut, x_gouge) = coverage_exact(&moves, r, &region);
+
+            // The blind-spot bound: a sub-cell sliver along the region's own boundary.
+            let ring_len = |ring: &[Point]| -> f64 {
+                let n = ring.len();
+                (0..n).map(|k| ring[k].distance(ring[(k + 1) % n])).sum()
+            };
+            let perim = ring_len(region.outer().points())
+                + region.holes().iter().map(|h| ring_len(h.points())).sum::<f64>();
+            let tol = 0.1 * perim + 2.0; // 0.1 mm cells
+            assert!(
+                (g_uncut - x_uncut).abs() < tol,
+                "{name}: uncut grid {g_uncut:.1} vs exact {x_uncut:.1} (tol {tol:.1})"
+            );
+            assert!(
+                (g_gouge - x_gouge).abs() < tol,
+                "{name}: gouge grid {g_gouge:.1} vs exact {x_gouge:.1} (tol {tol:.1})"
+            );
+
+            // What actually matters: the same verdict either way, at the tolerance the
+            // caller certifies with — and that tolerance comfortably exceeds the blind spot.
+            let cover_tol = 0.02 * total_area(&reach) + 1.0;
+            assert!(
+                tol < cover_tol,
+                "{name}: the grid's blind spot ({tol:.1}) must stay under the certification \
+                 tolerance ({cover_tol:.1}), or it could flip a verdict"
+            );
+            let verdict = |u: f64, gg: f64| u <= cover_tol && gg <= cover_tol;
+            assert_eq!(
+                verdict(g_uncut, g_gouge),
+                verdict(x_uncut, x_gouge),
+                "{name}: grid and exact must certify alike — grid ({g_uncut:.1}, {g_gouge:.1}), \
+                 exact ({x_uncut:.1}, {x_gouge:.1})"
+            );
+        }
+    }
+
+    /// Diagnostic: where does `certify_moves` actually spend its time on a big path? The
+    /// certification of an island pocket costs 25–32 s in release, and the parts are not
+    /// obviously comparable — a stroke of a several-thousand-point self-overlapping
+    /// polyline, two polygon differences over the result, and a per-move engagement scan
+    /// with 180 rays each. Guessing which dominates is how the last three wrong turns
+    /// started.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn certify_phase_timing() {
+        use cam_geo::Contour;
+        let region = Polygon::with_holes(
+            Contour::new(vec![
+                Point::new(0.0, 0.0),
+                Point::new(60.0, 0.0),
+                Point::new(60.0, 60.0),
+                Point::new(0.0, 60.0),
+            ]),
+            vec![Contour::new(vec![
+                Point::new(20.0, 20.0),
+                Point::new(40.0, 20.0),
+                Point::new(40.0, 40.0),
+                Point::new(20.0, 40.0),
+            ])],
+        )
+        .unwrap();
+        let (r, e) = (3.0, 2.0);
+        let moves = crate::frontadvance::front_advance_path(&region, r, 0.0, e, None)
+            .expect("a path");
+        println!("\npath: {} moves", moves.len());
+
+        let t = std::time::Instant::now();
+        let runs = cut_runs(&moves);
+        let t_runs = t.elapsed().as_secs_f64();
+
+        let t = std::time::Instant::now();
+        let mut full: Vec<Polygon> = Vec::new();
+        for run in &runs {
+            full.extend(swept(run, r));
+        }
+        let t_swept = t.elapsed().as_secs_f64();
+
+        let t = std::time::Instant::now();
+        let reach = reachable(&region, r);
+        let t_reach = t.elapsed().as_secs_f64();
+
+        let t = std::time::Instant::now();
+        let _uncut = difference(&reach, &full).unwrap_or_default();
+        let t_uncut = t.elapsed().as_secs_f64();
+
+        let t = std::time::Instant::now();
+        let _gouge = difference(&full, std::slice::from_ref(&region)).unwrap_or_default();
+        let t_gouge = t.elapsed().as_secs_f64();
+
+        let t = std::time::Instant::now();
+        let mut model = ClearedModel::bounded(r, region.clone());
+        let (mut prev, mut prev_cut) = (None, false);
+        for &(p, cut) in &moves {
+            if cut {
+                if let Some(pp) = prev {
+                    if !prev_cut {
+                        model.seed_disc(pp);
+                    }
+                    model.engagement(pp, p);
+                    model.commit(pp, p);
+                }
+            }
+            prev = Some(p);
+            prev_cut = cut;
+        }
+        let t_engage = t.elapsed().as_secs_f64();
+
+        println!(
+            "  cut_runs {t_runs:.2}s | swept {t_swept:.2}s ({} polys) | reachable {t_reach:.2}s \
+             | uncut-diff {t_uncut:.2}s | gouge-diff {t_gouge:.2}s | engagement scan {t_engage:.2}s",
+            full.len()
+        );
+        println!(
+            "  total {:.2}s\n",
+            t_runs + t_swept + t_reach + t_uncut + t_gouge + t_engage
+        );
+    }
+
     #[test]
     fn certify_flags_a_gouge_outside_the_region() {
         // A cut whose swept tool leaves the target reports gouge area.
@@ -500,5 +1261,88 @@ mod tests {
         let path = vec![Point::new(10.0, 10.0), Point::new(30.0, 10.0)];
         let v = certify(&path, r, &square(0.0, 20.0));
         assert!(v.gouge_area > 1.0, "a cut past the edge must register a gouge, got {}", v.gouge_area);
+    }
+
+    /// A serpentine over `[0,20]²` at 2·`r` spacing (tangent passes, so each strip is
+    /// load-bearing — at the overlapping spacing the neighbours cover for a missing pass
+    /// and a coverage test cannot see it). Every move cuts except the first point.
+    fn serpentine_moves(r: f64) -> Vec<(Point, bool)> {
+        let mut moves = Vec::new();
+        let mut y = r;
+        let mut forward = true;
+        while y <= 20.0 - r + 1e-9 {
+            let (a, b) = if forward { (r, 20.0 - r) } else { (20.0 - r, r) };
+            moves.push((Point::new(a, y), !moves.is_empty()));
+            moves.push((Point::new(b, y), true));
+            y += 2.0 * r;
+            forward = !forward;
+        }
+        moves
+    }
+
+    #[test]
+    fn cut_runs_split_at_rapids_and_begin_at_the_plunge_point() {
+        let p = |x: f64| Point::new(x, 0.0);
+        // a --rapid--> b --cut--> c --rapid--> d --cut--> e
+        let moves = vec![(p(0.0), false), (p(1.0), true), (p(2.0), false), (p(3.0), true)];
+        let runs = cut_runs(&moves);
+        assert_eq!(runs.len(), 2, "two cutting runs, split by the rapid");
+        // Each run starts at the point the cut departed *from* — the plunge point — so
+        // stroking it with round caps reproduces the entry disc for coverage.
+        assert_eq!(runs[0], vec![p(0.0), p(1.0)]);
+        assert_eq!(runs[1], vec![p(2.0), p(3.0)]);
+    }
+
+    #[test]
+    fn a_path_of_pure_rapids_cuts_nothing() {
+        // Flags are not decoration: with no cutting move the tool removes no material and
+        // is charged no engagement, however far it travels across the stock.
+        let r = 3.0;
+        let moves = vec![
+            (Point::new(5.0, 5.0), false),
+            (Point::new(35.0, 5.0), false),
+            (Point::new(35.0, 35.0), false),
+        ];
+        let v = certify_moves(&moves, r, &square(0.0, 40.0));
+        assert_eq!(v.max_engagement, 0.0, "a rapid cannot cut");
+        assert!(v.gouge_area < 1e-6, "a rapid cannot gouge, got {}", v.gouge_area);
+        assert!(v.uncut_area > 1000.0, "nothing was cleared, uncut {}", v.uncut_area);
+    }
+
+    #[test]
+    fn a_rapid_corridor_is_not_credited_as_cleared() {
+        // The semantic that makes the moves-aware entry worth having: material the tool
+        // only *flew over* stays uncut. Same points, same order — one pass reflagged as a
+        // rapid — and the strip it would have cleared must reappear as a coverage gap.
+        // (An implementation that stroked the whole point list would report it covered.)
+        let r = 2.0;
+        let target = square(0.0, 20.0);
+        let all = serpentine_moves(r);
+        let covered = certify_moves(&all, r, &target);
+        assert!(covered.uncut_area < 8.0, "tangent passes tile the square, uncut {}", covered.uncut_area);
+
+        // Reflag the third pass (its terminating point) as a rapid.
+        let mut gapped = all.clone();
+        gapped[5].1 = false;
+        let v = certify_moves(&gapped, r, &target);
+        let strip = v.uncut_area - covered.uncut_area;
+        assert!(strip > 40.0, "the flown-over strip must read as uncut, gained only {strip}");
+    }
+
+    /// **A lift launders nothing.** Engagement is measured against the running cleared
+    /// model, not against the path's shape, so retracting before a slot does not make the
+    /// slot read less than the diameter. This guards the *unsafe* direction — the failure
+    /// this whole subsystem exists to prevent is an oracle that under-reads.
+    #[test]
+    fn a_lift_does_not_launder_a_following_slot() {
+        let r = 3.0;
+        let moves = vec![
+            (Point::new(2.0, 10.0), false),
+            (Point::new(38.0, 10.0), true), // slot into virgin stock
+            (Point::new(2.0, 30.0), false), // lift and cross
+            (Point::new(38.0, 30.0), true), // slot into virgin stock again
+        ];
+        let v = certify_moves(&moves, r, &square(0.0, 40.0));
+        assert!(v.max_engagement > 5.5, "a slot reads the diameter, got {}", v.max_engagement);
     }
 }

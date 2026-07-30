@@ -543,6 +543,7 @@ dependencies = [
  "cam-geo",
  "cam-model",
  "cam-post",
+ "cam-sim",
 ]
 
 [[package]]

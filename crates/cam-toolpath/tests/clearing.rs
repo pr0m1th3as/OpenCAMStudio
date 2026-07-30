@@ -360,3 +360,54 @@ fn facing_enters_beyond_the_stock_edge() {
         first_descent.x
     );
 }
+
+/// **The guard that should have caught the collision Andreas hit.** Run the same
+/// simulator the GUI runs over an island pocket cleared adaptively, and require it clean.
+///
+/// This exists because a real defect reached a real machine file with the whole headless
+/// suite green: an optimisation had the steered clearer *rapid* down to just above the floor
+/// on re-entry instead of feeding, which `cam-sim` rightly flags — it checks descending
+/// rapids, and a seed stands by construction where uncut material sits just outside the
+/// tool's disc. Every island pocket reported
+/// `RapidThroughStock: rapid at Z -1.500 passes through stock standing at Z 0.000`
+/// and would not export. Nothing in this crate's tests simulated anything, so nothing knew.
+#[test]
+fn an_adaptively_cleared_island_pocket_simulates_clean() {
+    use cam_sim::{simulate, SimOptions, SimTool, ToolProfile};
+
+    let mut op = match pocket_doc().setup.operations[0].clone() {
+        Operation::Pocket(p) => p,
+        other => panic!("expected a pocket, got {other:?}"),
+    };
+    // An engagement cap + climb is what routes a holed region to the steered clearer.
+    op.clearing = Clearing { engagement: 2.0, climb: true };
+    let doc = setup(vec![Operation::Pocket(op)], vec![end_mill(1, 6.0)]);
+
+    let (program, diags) = build_job(
+        &doc,
+        1000.0,
+        SpindleDir::Cw,
+        None,
+        machine().envelope.max.z,
+        &CancelToken::new(),
+    );
+    assert!(
+        !diags
+            .iter()
+            .any(|d| d.severity == cam_toolpath::Severity::Error),
+        "{diags:?}"
+    );
+
+    let sim = simulate(
+        &program,
+        [-5.0, -5.0, TOP - 10.0],
+        [65.0, 45.0, TOP],
+        &SimOptions { resolution: 0.5, tool_radius: 3.0 },
+        &[SimTool { number: 1, profile: ToolProfile::flat(3.0) }],
+    );
+    assert!(
+        sim.is_clean(),
+        "the adaptive island clear must simulate without collisions, got: {:?}",
+        sim.collisions
+    );
+}

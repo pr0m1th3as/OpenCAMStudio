@@ -15,3 +15,5 @@ cam-model = { path = "../cam-model" }
 
 [dev-dependencies]
 cam-post = { path = "../cam-post" }
+# The collision simulator, so the clearing tests can assert what the GUI asserts.
+cam-sim = { path = "../cam-sim" }

@@ -1,9 +1,17 @@
 //! Front-advance (cleared-region-tracking) adaptive clearing.
 //!
-//! Where the spiral-morph generator ([`crate::adaptive`]) blends pre-computed offset
-//! rings and *hopes* they hold engagement — the exact oracle showed they slot at the
-//! entry, at sharp corners, and at ring/handoff transitions — this advances the
+//! Where the retired spiral-morph generator (`adaptive.rs`, **deleted 2026-07-29**) blended
+//! pre-computed offset rings and *hoped* they held engagement — the exact oracle showed they
+//! slot at the entry, at sharp corners, and at ring/handoff transitions — this advances the
 //! **actual cleared region** outward by one stepover per pass.
+//!
+//! That module was kept for a while on the theory that its frame/trochoidal pieces were the
+//! starting point for islands here. Measured before deleting it, they were not: its frame
+//! path read the **full diameter** (6.00 against a cap of 2.00) *and* gouged the outer wall
+//! by ~111 mm², its trochoidal entry channel being struck at radius `1.5·e` along a guide
+//! only `5 mm` inside the wall with nothing bounding the two against each other. Islands are
+//! reached from *this* module instead, via split-frontier connection. Full measurements in
+//! `ADAPTIVE_PLAN.md` §5.
 //!
 //! Each pass's tool centres follow `offset(cleared ⊕ a, −r)`, so the tool reaches exactly
 //! `a` beyond what is already cleared and the *loops themselves* peel that much by
@@ -179,6 +187,56 @@ fn standoff_open(polys: &[Polygon], rho: f64) -> Vec<Polygon> {
     }
 }
 
+/// The corner standoff, applied **only where it is a corner standoff**.
+///
+/// [`standoff_open`] is a *global* morphological opening, so it deletes every feature of the
+/// frontier narrower than `2·rho` — and the annular band between an island and the wall is
+/// exactly such a feature. The tool then reaches that band with nothing cleared beside it
+/// and cuts it at the **full diameter**. Measured over the island set, `a_e` falls
+/// monotonically as the standoff is reduced and then cliffs to 6.00 the moment the opening
+/// starts eating the band:
+///
+/// ```text
+///   standoff            0.5·r  0.75·r   1·r  1.25·r  1.5·r   2·r
+///   square 40, no island 3.73   3.62   3.42   3.21   3.00   2.90   ← wants the big standoff
+///   square 40, island 12 4.85   3.93   3.52   3.31   6.00   6.00   ← cliffs at 1.5·r
+///   circle r20, island r6 4.76  3.83   3.62   3.31   6.00   6.00   ← cliffs at 1.5·r
+///   square 60, 2 islands 4.93   3.93   6.00   6.00   6.00   6.00   ← cliffs at 1·r
+/// ```
+///
+/// There is no global value that serves both: the hole-free pocket is best at `2·r` and the
+/// two-island one has already collapsed by `1·r`. But the tension is an artefact, because
+/// the standoff exists to hold the front off **sharp corners** and nothing else. So take
+/// what the opening removed, split it into components, and **give back every component that
+/// is not against a sharp corner** — the wide-open pocket keeps its full corner standoff
+/// while a narrow passage keeps its frontier.
+///
+/// **Two rejected attempts at making the standoff island-safe**, recorded so they are not
+/// tried again. The sweep below shows `a_e` falling monotonically as the standoff is reduced
+/// and then cliffing to 6.00, and the cliff moves with the shape — so the standoff is the
+/// dominant lever on an island region, and no single global value serves every shape:
+///
+/// ```text
+///   standoff             0.5·r  0.75·r   1·r  1.25·r  1.5·r   2·r
+///   square 40, no island  3.73   3.62   3.42   3.21   3.00   2.90  ← wants the big standoff
+///   square 40, island 12  4.85   3.93   3.52   3.31   6.00   6.00  ← cliffs at 1.5·r
+///   circle r20, island r6 4.76   3.83   3.62   3.31   6.00   6.00  ← cliffs at 1.5·r
+///   square 60, 2 islands  4.93   3.93   6.00   6.00   6.00   6.00  ← cliffs at 1·r
+/// ```
+///
+/// **1. Restrict it to the corners it is named for** — give back every removed component not
+/// against a sharp vertex of `tc`. Made every case *worse*: the one region that certified
+/// (square 60 / island 20, 2.90) collapsed to 6.00. The standoff is not only a corner
+/// device — it also holds the front off the concavity that forms as it **closes around an
+/// island**, which is nowhere near a sharp vertex of the outer contour.
+///
+/// **2. Shrink it per pass when it costs too much area** — a ladder stepping down while the
+/// opening removes more than a set fraction of the pass. Changed **nothing**, and the trace
+/// says why: on the two cases that slot the opening removes **0.0% of the area** (6.3% at
+/// worst on the third). The band is not being eaten, so the mechanism inferred from the
+/// sweep is wrong. Whatever `rho` does here it does by **reshaping** the frontier — an
+/// opening rounds reflex corners at radius `rho` while barely touching area — not by
+/// deleting it. That is where the next investigation should start.
 /// The largest polygon by area (the body of a boolean/offset result).
 fn largest(polys: Vec<Polygon>) -> Option<Polygon> {
     polys
@@ -208,6 +266,60 @@ fn seg_dist(p: Point, a: Point, b: Point) -> f64 {
     }
     let t = (((p.x - a.x) * dx + (p.y - a.y) * dy) / len2).clamp(0.0, 1.0);
     p.distance(Point::new(a.x + dx * t, a.y + dy * t))
+}
+
+/// Distance from `p` to the nearest point of `poly`'s boundary — **including its holes**,
+/// so an island counts as a wall the plunge must stand clear of.
+pub(crate) fn boundary_dist(poly: &Polygon, p: Point) -> f64 {
+    let rings = std::iter::once(poly.outer().points())
+        .chain(poly.holes().iter().map(|h| h.points()));
+    let mut best = f64::MAX;
+    for ring in rings {
+        let n = ring.len();
+        for k in 0..n {
+            best = best.min(seg_dist(p, ring[k], ring[(k + 1) % n]));
+        }
+    }
+    best
+}
+
+/// Where to plunge in the tool-centre region `tc`.
+///
+/// The centroid when it lies inside — which is every hole-free region, so this changes no
+/// existing measurement. For a region with an **island** the centroid can land in the hole
+/// (dead centre of an annulus is the one place the tool cannot be), so fall back to the
+/// deepest interior point: a coarse pole of inaccessibility, which is also the best plunge
+/// on its own merits — the most room around the tool.
+pub(crate) fn entry_point(tc: &Polygon) -> Option<Point> {
+    let c = centroid(tc);
+    if tc.contains(c) {
+        return Some(c);
+    }
+    let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
+    for p in tc.outer().points() {
+        lo[0] = lo[0].min(p.x);
+        lo[1] = lo[1].min(p.y);
+        hi[0] = hi[0].max(p.x);
+        hi[1] = hi[1].max(p.y);
+    }
+    let step = ((hi[0] - lo[0]).max(hi[1] - lo[1]) / 64.0).max(1e-3);
+    let mut best: Option<(f64, Point)> = None;
+    let mut y = lo[1];
+    while y <= hi[1] {
+        let mut x = lo[0];
+        while x <= hi[0] {
+            let p = Point::new(x, y);
+            if tc.contains(p) {
+                let d = boundary_dist(tc, p);
+                if best.is_none_or(|(bd, _)| d > bd) {
+                    best = Some((d, p));
+                }
+            }
+            x += step;
+        }
+        y += step;
+    }
+    best.map(|(_, p)| p)
 }
 
 /// Douglas–Peucker simplify of a closed ring at tolerance `eps` (iterative, so a
@@ -317,9 +429,114 @@ const MIN_CORE_PITCH: f64 = 0.25;
 /// slot is 3·e, so 1.5·e cleanly separates "held to the floor" from "slotting": front-
 /// advance's measured whole-path peak is 2.69–2.90 on r=3/e=2 (1.35–1.45·e), which passes;
 /// the retired spiral-morph and the raster-gated links read 6.00, which does not.
-const CERT_ENGAGEMENT_SLACK: f64 = 1.5;
+pub(crate) const CERT_ENGAGEMENT_SLACK: f64 = 1.5;
 /// Samples across a loop-to-loop seam transition.
 const SEAM_SAMPLES: usize = 24;
+
+/// How far apart two consecutive frontier rings may sit, in stepovers, for the seam
+/// hand-off to be a valid connection between them.
+///
+/// **This is a correctness gate, not a tuning knob.** The hand-off blends ring `k` into ring
+/// `k+1` at matched arc-length-back-from-the-seam, and that blend is only meaningful while
+/// the two rings are *adjacent* — a stepover of drift apart, which is what the frontier
+/// guarantees for rings one pass apart. When the frontier changes topology (the front closes
+/// around an island and the outer contour snaps from a horseshoe to a plain wall loop) or
+/// splits into components, consecutive rings are **not** adjacent, and blending between them
+/// interpolates a chord straight across the region — through uncut stock, and through the
+/// island itself if one lies between. Measured on square 40 with a 12 mm island, that chord
+/// is what read 6.00 and gouged 76 mm².
+///
+/// So the hand-off is *checked* rather than assumed, and a ring pair that fails is connected
+/// by a **rapid** instead. 2·e leaves generous room over the frontier's own advance (`adv ≤
+/// e`) while a topology jump is tens of millimetres — the two are not close.
+const MAX_HANDOFF_GAP: f64 = 2.0;
+
+/// Sample spacing (mm) when testing whether a segment stays inside the tool-centre region.
+/// Far below the tool radius, so a segment that leaves the region is caught while the tool
+/// is still a long way from actually being outside the part.
+const SEGMENT_SAMPLE: f64 = 0.4;
+
+/// How far outside the tool-centre region a cutting move may stray before it counts as a
+/// gouge, in mm.
+///
+/// **A tolerance, not a boolean, and that distinction is the whole test.** Frontier rings are
+/// contours of regions built by repeated offsets, so their vertices sit *on* `tc`'s boundary
+/// to within tessellation — the round-join flattening, the [`SIMPLIFY_EPS`] decimation, the
+/// integer grid the booleans run on. Sampling between two such vertices dips microns outside
+/// constantly and means nothing. A plain `!tc.contains(..)` test therefore condemns almost
+/// every move on a curved wall: measured on a circle with an island, it turned **1383 of
+/// 2852 moves into rapids** while the real worst excursion was 0.019 mm. The quantity that
+/// distinguishes noise from a gouge is the *depth*, and the two are three orders of
+/// magnitude apart — 0.019 mm of tessellation against 7.593 mm of chord through an island.
+/// 0.1 mm sits between them with room to spare either way.
+const GOUGE_TOL: f64 = 0.1;
+
+/// **A cutting move that leaves the tool-centre region is not a cut, it is a gouge.**
+/// Rewrite each such move as a rapid, so the tool lifts at the last legal point and
+/// re-plunges at the next one instead of drawing a line through whatever lies between.
+///
+/// This is the backstop that makes islands safe, and it is deliberately about *segments*
+/// rather than vertices. Every vertex on a front-advance path is legal by construction —
+/// frontier rings are contours of a region inside `tc`, and the seam blend interpolates
+/// between two of them — so a vertex test reports these paths as clean. What is not
+/// guaranteed is the straight line *between* two legal vertices: across a region with an
+/// island, `tc` is an annulus, and a chord joining two points on opposite sides of it runs
+/// straight over the island. Measured on square 40 with a 12 mm island, that chord was a
+/// single 42 mm step through the island's centre — the whole of a 76 mm² gouge, invisible
+/// to every vertex-based check.
+///
+/// Sampling, not exact: a segment could in principle duck outside `tc` and back between two
+/// samples. [`SEGMENT_SAMPLE`] is an order of magnitude below the tool radius, so anything
+/// it misses is far smaller than the certifier's own tolerance — and the certifier still
+/// has the last word regardless.
+fn break_gouging_segments(path: &mut [(Point, bool)], tc: &Polygon) {
+    for i in 1..path.len() {
+        if !path[i].1 {
+            continue; // already a rapid
+        }
+        let (a, b) = (path[i - 1].0, path[i].0);
+        let n = ((a.distance(b) / SEGMENT_SAMPLE).ceil() as usize).max(1);
+        let leaves = (0..=n).any(|k| {
+            let t = k as f64 / n as f64;
+            let p = Point::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+            !tc.contains(p) && boundary_dist(tc, p) > GOUGE_TOL
+        });
+        if leaves {
+            path[i].1 = false;
+        }
+    }
+}
+
+/// Distance from `p` to the closed ring `ring` as a whole.
+fn ring_dist(p: Point, ring: &[Point]) -> f64 {
+    let n = ring.len();
+    (0..n)
+        .map(|k| seg_dist(p, ring[k], ring[(k + 1) % n]))
+        .fold(f64::MAX, f64::min)
+}
+
+/// The worst separation between the two rings across a seam hand-off — the quantity
+/// [`MAX_HANDOFF_GAP`] bounds.
+///
+/// Measured as the distance from each hand-off sample to **the other ring as a whole**, not
+/// to that ring's arc-length-matched point. The difference matters: matched-point distance
+/// is phase-dependent, and the phase of two rings measured back from their own seams drifts
+/// with the hand-off length whenever their perimeters differ — so that version grows on
+/// perfectly nested rings as `SEAM_ARC` rises, and would condemn a hand-off that is fine
+/// (measured: it fired on a hole-free square at `seam_arc = 12`, where the peak engagement
+/// is known to be flat). Distance to the ring is phase-independent and is what adjacency
+/// actually means.
+fn handoff_gap(cur: &[Point], ccur: &[f64], nxt: &[Point], cnxt: &[f64], delta: f64) -> f64 {
+    let (total, tot_n) = (*ccur.last().unwrap_or(&0.0), *cnxt.last().unwrap_or(&0.0));
+    let mut worst = 0.0_f64;
+    for i in 0..=SEAM_SAMPLES {
+        let t = i as f64 / SEAM_SAMPLES as f64;
+        let a = at_len(cur, ccur, total - delta + t * delta);
+        let b = at_len(nxt, cnxt, tot_n - delta + t * delta);
+        worst = worst.max(ring_dist(a, nxt)).max(ring_dist(b, cur));
+    }
+    worst
+}
 
 /// Where the **+X ray** from `from` first crosses the closed loop `pts`. This is the
 /// *seam*: one consistent place on every frontier loop to hand off to the next, chosen
@@ -480,13 +697,28 @@ fn connect_seam_spiral(
     reliefs: &[Vec<Point>],
     r: f64,
     cap: f64,
-) -> Option<Vec<Point>> {
-    let seamed: Vec<Vec<Point>> =
-        loops.iter().map(|l| seam_rotate(l, entry)).collect::<Option<_>>()?;
+) -> Option<Vec<(Point, bool)>> {
+    // Seam each ring on the +X ray from the entry. A ring that does not straddle that ray —
+    // a component of a split frontier sitting off to one side — has no such seam; start it
+    // at its own nearest point instead, since the hand-off into it will be a rapid anyway.
+    let seamed: Vec<Vec<Point>> = loops
+        .iter()
+        .map(|l| {
+            seam_rotate(l, entry).or_else(|| {
+                let rot = crate::profile::rotate_to_start(l, Some([entry.x, entry.y]));
+                (rot.len() >= 3).then_some(rot)
+            })
+        })
+        .collect::<Option<_>>()?;
     let cums: Vec<Vec<f64>> = seamed.iter().map(|l| cum_len(l)).collect();
 
-    // Open the core out to the first loop's seam, landing on it.
-    let mut path = core_spiral_to_seam(entry, seamed[0][0].distance(entry), e, r, cap);
+    // Open the core out to the first loop's seam, landing on it. The first point is the
+    // plunge; everything after it cuts until a hand-off says otherwise.
+    let core = core_spiral_to_seam(entry, seamed[0][0].distance(entry), e, r, cap);
+    let mut path: Vec<(Point, bool)> = Vec::with_capacity(core.len());
+    for (i, p) in core.iter().enumerate() {
+        path.push((*p, i > 0));
+    }
 
     for k in 0..seamed.len() {
         let (cur, ccur) = (&seamed[k], &cums[k]);
@@ -503,10 +735,10 @@ fn connect_seam_spiral(
             // uncut until this lap cuts it. A relief's loops reach the wall by construction,
             // so run early they drive into virgin stock: measured on square 40, relief
             // 0.84 → 3.93 and the corner 2.58 → 4.93.
-            path.extend_from_slice(&cur[1..]);
-            path.push(cur[0]);
+            path.extend(cur[1..].iter().map(|&p| (p, true)));
+            path.push((cur[0], true));
             for rel in reliefs {
-                path.extend_from_slice(rel);
+                path.extend(rel.iter().map(|&p| (p, true)));
             }
             break;
         };
@@ -518,12 +750,22 @@ fn connect_seam_spiral(
         if delta <= 1e-9 {
             return None;
         }
+        // **Is this hand-off a connection at all?** Only if the two rings are adjacent; see
+        // [`MAX_HANDOFF_GAP`]. When they are not — the frontier changed topology or split —
+        // finish this ring and *rapid* to the next, rather than blending a chord across
+        // whatever lies between.
+        if handoff_gap(cur, ccur, nxt, cnxt, delta) > MAX_HANDOFF_GAP * e {
+            path.extend(cur[1..].iter().map(|&p| (p, true)));
+            path.push((cur[0], true)); // close this ring
+            path.push((nxt[0], false)); // lift, reposition, plunge on the next
+            continue;
+        }
         // Cut this loop from its seam up to where the hand-off begins.
         for (i, p) in cur.iter().enumerate().skip(1) {
             if ccur[i] >= total - delta {
                 break;
             }
-            path.push(*p);
+            path.push((*p, true));
         }
         // Hand off: blend this loop's tail into the next loop's tail, so we arrive at
         // the next seam already travelling along it.
@@ -531,7 +773,7 @@ fn connect_seam_spiral(
             let t = i as f64 / SEAM_SAMPLES as f64;
             let a = at_len(cur, ccur, total - delta + t * delta);
             let b = at_len(nxt, cnxt, tot_n - delta + t * delta);
-            path.push(Point::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t));
+            path.push((Point::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t), true));
         }
     }
     Some(path)
@@ -666,15 +908,20 @@ fn corner_relief_tuned(c: Corner, r: f64, e: f64, reach: f64, pitch: f64) -> Vec
 /// Generate a constant-engagement tool-centre path that clears `region` (leaving
 /// `finish` skin on the walls) with a tool of radius `r`, holding the radial width of
 /// cut at or below `e` by advancing the cleared front. `start` is the preferred entry
-/// (part XY). Returns `None` when it cannot build a path (degenerate, or — for now —
-/// an island region, handled in a later increment).
+/// (part XY). Returns `None` when it cannot build a path (degenerate).
+///
+/// Returns `(point, is_cut)` **moves**, not bare points: a frontier that changes topology —
+/// which is what an island makes it do — cannot be joined into one continuous cut, and the
+/// honest representation of that is a rapid rather than a chord drawn across the part.
+/// Hole-free regions produce no rapids at all beyond the initial positioning move, so their
+/// paths are unchanged.
 pub(crate) fn front_advance_path(
     region: &Polygon,
     r: f64,
     finish: f64,
     e: f64,
     start: Option<[f64; 2]>,
-) -> Option<Vec<Point>> {
+) -> Option<Vec<(Point, bool)>> {
     front_advance_tuned(region, r, finish, e, start, Tuning::new(r, e))
 }
 
@@ -683,13 +930,16 @@ pub(crate) fn front_advance_path(
 /// This is the entry [`crate::clearing::clear`] dispatches: it returns the tool-centre
 /// path only if that path holds engagement at the geometric-floor bound
 /// ([`CERT_ENGAGEMENT_SLACK`]·`e`), covers the reachable target, and never gouges —
-/// otherwise `None`, meaning *fall back to concentric*, mirroring
-/// [`crate::adaptive::adaptive_path`]'s contract. The bare [`front_advance_path`] is left
-/// uncertified for the module's measurement tests, which need the raw path to instrument.
+/// otherwise `None`, meaning *fall back to concentric*. The bare [`front_advance_path`] is
+/// left uncertified for the module's measurement tests, which need the raw path to
+/// instrument.
 ///
-/// **The gate is the exact oracle, never the raster** — the raster is blind to slots (it
-/// read 0.80 against a true 6.00 on square 24), which is precisely why the previous,
-/// raster-gated adaptive dispatch shipped full-diameter cuts and was retired. The exact
+/// **The gate is the exact oracle, never the raster.** With its old formula the raster read
+/// 0.80 against a true 6.00 on square 24, which is precisely why the previous,
+/// raster-gated adaptive dispatch shipped full-diameter cuts and was retired. That formula
+/// has since been repaired and the raster now tracks the exact oracle closely on the cases
+/// measured — which changes nothing here: its bias is no longer *characterised* in either
+/// direction, so it stays an instrument and never a gate. The exact
 /// oracle is O(path × rays) but runs once per op (the path is reused across depth levels),
 /// so the trade is a second against a broken cutter.
 pub(crate) fn front_advance_certified(
@@ -698,10 +948,12 @@ pub(crate) fn front_advance_certified(
     finish: f64,
     e: f64,
     start: Option<[f64; 2]>,
-) -> Option<Vec<Point>> {
+) -> Option<Vec<(Point, bool)>> {
     let path = front_advance_path(region, r, finish, e, start)?;
     // The material to remove (skin left on the walls) — the same region the generator
-    // clears, recomputed here so the certifier scores against the true target.
+    // clears, recomputed here so the certifier scores against the true target. `largest`
+    // keeps the holes: an island is a hole of this polygon, and the oracle reads it as
+    // material that must not be touched rather than as stock to remove.
     let to_clear = largest(offset(std::slice::from_ref(region), -finish, JoinStyle::Round).ok()?)?;
     let reach = crate::clearsim::reachable(&to_clear, r);
     if reach.is_empty() {
@@ -711,7 +963,7 @@ pub(crate) fn front_advance_certified(
     // construction (charged here, deliberately — see [`STANDOFF_RADII`]), plus a small
     // area-proportional term for tessellation slivers.
     let cover_tol = 0.02 * total_area(&reach) + 1.0;
-    let verdict = crate::clearsim::certify(&path, r, &to_clear);
+    let verdict = crate::clearsim::certify_moves(&path, r, &to_clear);
     let ok = verdict.max_engagement <= e * CERT_ENGAGEMENT_SLACK
         && verdict.uncut_area <= cover_tol
         && verdict.gouge_area <= cover_tol;
@@ -751,32 +1003,43 @@ impl Tuning {
     }
 }
 
-/// [`front_advance_path`] with the tuning exposed, so it can be swept.
-fn front_advance_tuned(
+/// The generated frontier, before it is stitched into a path. Separating generation from
+/// connection is what makes a split frontier tractable: the connection needs to know which
+/// rings belong to the *same pass* (far apart, no shared seam) and which are a pass apart
+/// (adjacent, a stepover of drift between them), and a flattened ring list cannot say.
+struct Frontier {
+    /// Where the tool plunges.
+    entry: Point,
+    /// The tool-centre region (the region eroded by `r + finish`).
+    tc: Polygon,
+    /// The material to remove (the region less the finish skin).
+    to_clear: Polygon,
+    /// Frontier rings, innermost pass first, each pass holding its components.
+    passes: Vec<Vec<Vec<Point>>>,
+    /// Whether any pass split into more than one component. Diagnostic only now — the
+    /// connection no longer branches on it, since the hand-off is checked pair by pair.
+    split: bool,
+}
+
+/// Advance the cleared region outward one stepover per pass, collecting the frontier.
+/// This is the half of the generator that carries the engagement guarantee; connecting
+/// what it produces is [`connect_seam_spiral`]'s problem, and a much harder one.
+fn frontier(
     region: &Polygon,
     r: f64,
     finish: f64,
     e: f64,
     start: Option<[f64; 2]>,
-    t: Tuning,
-) -> Option<Vec<Point>> {
-    let Tuning { seam_arc, standoff, entry_target, relief_reach } = t;
-    if !(e > 0.0 && e < 2.0 * r) {
-        return None;
-    }
-    if !region.holes().is_empty() {
-        return None; // islands: a later increment (the frontier flows around holes)
-    }
+    standoff: f64,
+    entry_target: f64,
+) -> Option<Frontier> {
     let to_clear = largest(offset(std::slice::from_ref(region), -finish, JoinStyle::Round).ok()?)?;
     let tc = largest(offset(std::slice::from_ref(region), -(r + finish), JoinStyle::Round).ok()?)?;
 
     let entry = start
         .map(|s| Point::new(s[0], s[1]))
         .filter(|p| tc.contains(*p))
-        .unwrap_or_else(|| centroid(&tc));
-    if !tc.contains(entry) {
-        return None;
-    }
+        .or_else(|| entry_point(&tc))?;
 
     let clear_slice = std::slice::from_ref(&to_clear);
     let to_clear_area = to_clear.area();
@@ -784,14 +1047,17 @@ fn front_advance_tuned(
     let covered_tol = 0.001 * to_clear_area + 0.5 * e * e;
 
     let mut cleared = vec![disc(entry, r)?];
-    // The frontier loops, innermost first. Collected rather than emitted as we go: the
-    // seam hand-off needs the *next* loop while cutting the current one.
-    let mut loops: Vec<Vec<Point>> = Vec::new();
+    // The frontier, innermost pass first, **keeping each pass's components together**.
+    // Collected rather than emitted as we go: the seam hand-off needs the *next* loop while
+    // cutting the current one. The nesting is load-bearing for a split frontier — a ring's
+    // neighbour is the ring of the adjacent *pass*, not whatever happens to sit next in a
+    // flattened list, which may be a far-away component of the same pass.
+    let mut passes: Vec<Vec<Vec<Point>>> = Vec::new();
     // A pass whose frontier split into several loops (a concavity pinching the front in
-    // two) has no single seam — those fall back to the slotting nearest-point links.
+    // two, or an island it has begun to flow around).
     let mut split = false;
-    // Area and ring count of the previous pass, to notice the frontier standing still.
-    let mut prev_pass: Option<(f64, usize)> = None;
+    // Area of the previous pass, to notice the frontier standing still.
+    let mut prev_area: Option<f64> = None;
 
     for _ in 0..MAX_PASSES {
         // **Radius-aware advance.** The frontier cannot afford a full stepover near the
@@ -843,64 +1109,106 @@ fn front_advance_tuned(
         // one took — and it must hold however many loops the frontier is in, or a split
         // front never terminates and grinds on to `MAX_PASSES`.
         let area_now = total_area(&pass);
-        if let Some((prev_area, prev_rings)) = prev_pass {
-            if (area_now - prev_area).abs() < DUP_LAP_TOL {
+        // Decimate as the frontier is: the standoff's offsets re-tessellate their round
+        // joins, and an un-decimated ring carries that straight into the point count.
+        let rings: Vec<Vec<Point>> = pass
+            .iter()
+            .map(|poly| simplify_ring(poly.outer().points(), SIMPLIFY_EPS))
+            .collect();
+        if let Some(prev) = prev_area {
+            if (area_now - prev).abs() < DUP_LAP_TOL {
                 // Keep whichever lap encloses more — the later one reaches the wall exactly
                 // where the earlier stopped a hair short.
-                if area_now > prev_area {
-                    loops.truncate(loops.len() - prev_rings);
-                    for poly in &pass {
-                        loops.push(simplify_ring(poly.outer().points(), SIMPLIFY_EPS));
-                    }
+                if area_now > prev {
+                    passes.pop();
+                    passes.push(rings);
                 }
                 break;
             }
         }
-        prev_pass = Some((area_now, pass.len()));
-        for poly in &pass {
-            // Decimate as the frontier is: the standoff's offsets re-tessellate their round
-            // joins, and an un-decimated ring carries that straight into the point count.
-            loops.push(simplify_ring(poly.outer().points(), SIMPLIFY_EPS));
-        }
-        // Done once the frontier fills the stock — stable, unlike an area-delta check
-        // (which the decimation jitter would trip early or never).
-        if to_clear_area - total_area(&grown) < covered_tol {
-            break;
-        }
+        prev_area = Some(area_now);
+        passes.push(rings);
         // Advance: the new cleared region is what the tool cut (opening of `grown`),
         // decimated so repeated round offsets don't balloon its vertex count (the
         // tolerance is far below the stepover — engagement unaffected).
         let opened = offset(&pass, r, JoinStyle::Round).ok()?;
         cleared = simplify_polys(&union(&cleared, &opened).ok().unwrap_or(opened), SIMPLIFY_EPS);
+        // Done once the frontier fills the stock — stable, unlike an area-delta check
+        // (which the decimation jitter would trip early or never).
+        if to_clear_area - total_area(&grown) < covered_tol {
+            break;
+        }
     }
-    if loops.is_empty() {
+    if passes.is_empty() {
         return None;
     }
+    Some(Frontier { entry, tc, to_clear, passes, split })
+}
 
-    // Stitch the frontier into one continuous path. The seam spiral is the real
-    // connection; a split frontier has no single seam, so it keeps the plain links
-    // (which slot — the caller's certification rejects them).
+/// [`front_advance_path`] with the tuning exposed, so it can be swept.
+fn front_advance_tuned(
+    region: &Polygon,
+    r: f64,
+    finish: f64,
+    e: f64,
+    start: Option<[f64; 2]>,
+    t: Tuning,
+) -> Option<Vec<(Point, bool)>> {
+    let Tuning { seam_arc, standoff, entry_target, relief_reach } = t;
+    if !(e > 0.0 && e < 2.0 * r) {
+        return None;
+    }
+    let f = frontier(region, r, finish, e, start, standoff, entry_target)?;
+    let (path, _) = connect(&f, r, e, seam_arc, relief_reach, entry_target)?;
+    (path.len() > 3).then_some(path)
+}
+
+/// Stitch a generated [`Frontier`] into one continuous tool-centre path. Returns the path
+/// and whether the **seam spiral** carried it — `false` means it fell back to the plain
+/// nearest-point links, which slot at the full diameter and which the caller's
+/// certification is expected to reject.
+fn connect(
+    f: &Frontier,
+    r: f64,
+    e: f64,
+    seam_arc: f64,
+    relief_reach: f64,
+    entry_target: f64,
+) -> Option<(Vec<(Point, bool)>, bool)> {
+    let loops: Vec<Vec<Point>> = f.passes.iter().flatten().cloned().collect();
     // Trochoidal relief for each sharp corner of the tool-centre region. Every loop is a
     // maximal inscribed circle, so these cannot gouge however they are sequenced.
-    let reliefs: Vec<Vec<Point>> =
-        sharp_corners(&tc)
+    let reliefs: Vec<Vec<Point>> = sharp_corners(&f.tc)
         .into_iter()
         .map(|c| corner_relief_tuned(c, r, e, relief_reach, RELIEF_PITCH))
         .filter(|p| p.len() > 2)
         .collect();
-    let path = match (!split).then(|| connect_seam_spiral(entry, &loops, e, seam_arc, &reliefs, r, entry_target)).flatten() {
-        Some(p) => p,
+    // The seam spiral is attempted for **every** frontier now, split or not: the hand-off
+    // gap check ([`MAX_HANDOFF_GAP`]) is what decides ring by ring whether a blend is a
+    // connection or a chord across the region, and a rapid carries the pairs it refuses. A
+    // split frontier is just the case where several of those checks fail in a row, so it no
+    // longer needs its own (slotting) code path — `f.split` is now only a diagnostic.
+    match connect_seam_spiral(f.entry, &loops, e, seam_arc, &reliefs, r, entry_target) {
+        Some(mut p) => {
+            // Whatever the hand-off check let through, no cutting move may leave the
+            // tool-centre region.
+            break_gouging_segments(&mut p, &f.tc);
+            Some((p, true))
+        }
         None => {
-            let mut p = vec![entry];
-            let mut prev = entry;
+            // Last resort: the seam construction itself failed (a degenerate ring). The
+            // plain links slot, and the caller's certification is expected to reject them.
+            let mut p = vec![f.entry];
+            let mut prev = f.entry;
             for l in &loops {
                 append_loop(&mut p, l, &mut prev);
             }
-            p
+            let mut moves: Vec<(Point, bool)> =
+                p.iter().enumerate().map(|(i, &q)| (q, i > 0)).collect();
+            break_gouging_segments(&mut moves, &f.tc);
+            Some((moves, false))
         }
-    };
-
-    (path.len() > 3).then_some(path)
+    }
 }
 
 #[cfg(test)]
@@ -910,6 +1218,21 @@ mod tests {
     /// Reference tool radius and engagement cap for the measured tests.
     const R: f64 = 3.0;
     const E: f64 = 2.0;
+
+    /// A move path as bare points, for the measurement tests that instrument geometry.
+    ///
+    /// Safe for those tests **because they are all hole-free**, and a hole-free frontier
+    /// emits no rapid but the initial positioning move — so the points are the cut path and
+    /// every number they report is unchanged by the move-path refactor. Do not reach for
+    /// this on a holed region: it would silently charge the rapids as cuts.
+    fn pts(moves: &[(Point, bool)]) -> Vec<Point> {
+        moves.iter().map(|&(p, _)| p).collect()
+    }
+
+    /// How many real rapids a move path contains (the initial positioning move aside).
+    fn rapids(moves: &[(Point, bool)]) -> usize {
+        moves.iter().skip(1).filter(|(_, cut)| !cut).count()
+    }
 
     fn square(s: f64) -> Polygon {
         Polygon::new(Contour::new(vec![
@@ -931,6 +1254,482 @@ mod tests {
                 .collect(),
         ))
         .unwrap()
+    }
+
+    fn ring_at(cx: f64, cy: f64, rad: f64, n: usize) -> Contour {
+        Contour::new(
+            (0..n)
+                .map(|i| {
+                    let a = std::f64::consts::TAU * (i as f64) / (n as f64);
+                    Point::new(cx + rad * a.cos(), cy + rad * a.sin())
+                })
+                .collect(),
+        )
+    }
+
+    fn rect_at(x0: f64, y0: f64, x1: f64, y1: f64) -> Contour {
+        Contour::new(vec![
+            Point::new(x0, y0),
+            Point::new(x1, y0),
+            Point::new(x1, y1),
+            Point::new(x0, y1),
+        ])
+    }
+
+    fn island_cases() -> Vec<(&'static str, Polygon)> {
+        vec![
+            (
+                "square 40, island 12 centred",
+                Polygon::with_holes(rect_at(0.0, 0.0, 40.0, 40.0), vec![rect_at(14.0, 14.0, 26.0, 26.0)]).unwrap(),
+            ),
+            (
+                "square 40, island 12 offset",
+                Polygon::with_holes(rect_at(0.0, 0.0, 40.0, 40.0), vec![rect_at(22.0, 14.0, 34.0, 26.0)]).unwrap(),
+            ),
+            (
+                "circle r20, island r6",
+                Polygon::with_holes(ring_at(0.0, 0.0, 20.0, 64), vec![ring_at(0.0, 0.0, 6.0, 32)]).unwrap(),
+            ),
+            (
+                "square 60, island 20 centred",
+                Polygon::with_holes(rect_at(0.0, 0.0, 60.0, 60.0), vec![rect_at(20.0, 20.0, 40.0, 40.0)]).unwrap(),
+            ),
+            (
+                "square 60, two islands",
+                Polygon::with_holes(
+                    rect_at(0.0, 0.0, 60.0, 60.0),
+                    vec![rect_at(12.0, 12.0, 24.0, 24.0), rect_at(36.0, 36.0, 48.0, 48.0)],
+                )
+                .unwrap(),
+            ),
+        ]
+    }
+
+    /// **The Route B measurement.** Front-advance over holed regions, scored by the exact
+    /// oracle — engagement at the cap, coverage of the reachable target, gouge.
+    #[test]
+    #[ignore = "measurement harness for ADAPTIVE_PLAN.md §8"]
+    fn island_oracle_table() {
+        println!("\n| case | passes | split | a_e | uncut | reach | gouge | verdict |");
+        println!("|---|---|---|---|---|---|---|---|");
+        for (name, region) in island_cases() {
+            let Some(f) = frontier(&region, R, 0.0, E, None, STANDOFF_RADII * R, ENTRY_TARGET) else {
+                println!("| {name} | — | — | — | — | — | — | **no frontier** |");
+                continue;
+            };
+            let (np, sp) = (f.passes.len(), f.split);
+            let Some(path) = front_advance_path(&region, R, 0.0, E, None) else {
+                println!("| {name} | {np} | {sp} | — | — | — | — | **no path** |");
+                continue;
+            };
+            let v = crate::clearsim::certify_moves(&path, R, &region);
+            let reach: f64 = crate::clearsim::reachable(&region, R).iter().map(|p| p.area()).sum();
+            let ok = v.max_engagement <= E * CERT_ENGAGEMENT_SLACK
+                && v.uncut_area <= 0.02 * reach + 1.0
+                && v.gouge_area <= 0.02 * reach + 1.0;
+            println!(
+                "| {name} | {np} | {sp} | {:.2} | {:.1} | {:.0} | {:.1} | {} |",
+                v.max_engagement,
+                v.uncut_area,
+                reach,
+                v.gouge_area,
+                if ok { "PASS" } else { "**FAIL**" }
+            );
+        }
+        println!();
+    }
+
+    /// **A hole-free pocket is still one continuous cut.** The gouge backstop rewrites a
+    /// cutting move that leaves the tool-centre region into a rapid, and the failure mode
+    /// that guards against is not it missing a gouge — the certifier catches that — but it
+    /// firing on *legitimate* moves. It is a containment test on a region whose own boundary
+    /// the path is supposed to hug, so a boolean version of it condemns nearly everything:
+    /// measured, `!tc.contains(..)` with no tolerance turned **1383 of 2852 moves** on a
+    /// round pocket with an island into lift-and-replunge, against a true worst excursion of
+    /// 0.019 mm. This pins the cheap end of that: a pocket with no island must come out with
+    /// no lift in it at all.
+    #[test]
+    fn a_hole_free_pocket_is_still_one_continuous_cut() {
+        for (name, region, ctr) in [
+            ("square 40", square(40.0), [20.0, 20.0]),
+            ("circle r30", circle(30.0, 96), [0.0, 0.0]),
+        ] {
+            let path = front_advance_path(&region, R, 0.0, E, Some(ctr))
+                .unwrap_or_else(|| panic!("{name}: should produce a path"));
+            assert_eq!(
+                rapids(&path),
+                0,
+                "{name}: a hole-free pocket needs no lift, got {} of {} moves",
+                rapids(&path),
+                path.len()
+            );
+        }
+    }
+
+    /// **No cutting move leaves the tool-centre region.** The property the whole island
+    /// increment rests on: a tool centre inside `tc` is a tool inside the part, so a cutting
+    /// segment that leaves `tc` is a gouge by definition. Checked on *segments*, densely —
+    /// every vertex of a front-advance path is legal by construction, and the defect this
+    /// found was a single 42 mm chord between two legal vertices, straight through the
+    /// centre of an island.
+    #[test]
+    fn no_cutting_move_leaves_the_tool_centre_region() {
+        for (name, region) in island_cases() {
+            let Some(f) = frontier(&region, R, 0.0, E, None, STANDOFF_RADII * R, ENTRY_TARGET)
+            else {
+                continue;
+            };
+            let Some((path, _)) = connect(&f, R, E, SEAM_ARC, RELIEF_REACH, ENTRY_TARGET) else {
+                continue;
+            };
+            let mut worst = 0.0_f64;
+            for i in 1..path.len() {
+                if !path[i].1 {
+                    continue;
+                }
+                let (a, b) = (path[i - 1].0, path[i].0);
+                let n = ((a.distance(b) / SEGMENT_SAMPLE).ceil() as usize).max(1);
+                for k in 0..=n {
+                    let t = k as f64 / n as f64;
+                    let p = Point::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+                    if !f.tc.contains(p) {
+                        worst = worst.max(boundary_dist(&f.tc, p));
+                    }
+                }
+            }
+            assert!(
+                worst <= GOUGE_TOL,
+                "{name}: a cutting move left the tool-centre region by {worst:.3} mm"
+            );
+        }
+    }
+
+    /// Diagnostic: where does the time go on an island region — generation, connection, or
+    /// certification? Relevant because `clearing::clear` no longer refuses holed regions, so
+    /// **every** island pocket now pays this cost even when it ends up falling back to
+    /// concentric. Run under `--release`; the debug figure is not the shipping one.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn island_timing() {
+        let mut cases = vec![
+            ("CONTROL square 40 (no island)", square(40.0)),
+            ("CONTROL circle r30 (no island)", circle(30.0, 96)),
+        ];
+        cases.extend(island_cases());
+        for (name, region) in cases {
+            let t0 = std::time::Instant::now();
+            let Some(f) = frontier(&region, R, 0.0, E, None, STANDOFF_RADII * R, ENTRY_TARGET)
+            else {
+                println!("{name}: no frontier");
+                continue;
+            };
+            let gen = t0.elapsed().as_secs_f64();
+            let t1 = std::time::Instant::now();
+            let Some((path, _)) = connect(&f, R, E, SEAM_ARC, RELIEF_REACH, ENTRY_TARGET) else {
+                continue;
+            };
+            let con = t1.elapsed().as_secs_f64();
+            let t2 = std::time::Instant::now();
+            let _ = crate::clearsim::certify_moves(&path, R, &region);
+            let cert = t2.elapsed().as_secs_f64();
+            println!(
+                "{name}: generate {gen:.2}s  connect {con:.2}s  certify {cert:.2}s  \
+                 total {:.2}s  ({} passes, {} moves)",
+                gen + con + cert,
+                f.passes.len(),
+                path.len()
+            );
+        }
+    }
+
+    /// **The standoff sweep.** Hypothesis: the corner standoff is a *global* morphological
+    /// opening by `rho`, so it erases any part of the frontier narrower than `2·rho` — and
+    /// the annular band between an island and the wall is exactly that. Band widths (tool
+    /// centres): square 40/island 12 → 8 mm; circle r20/r6 → 8 mm; square 60/two islands →
+    /// 6 mm between them; **square 60/island 20 → 14 mm, the only one wider than 2·rho = 12
+    /// mm, and the only one that certifies.** If that is the mechanism, dropping the
+    /// standoff should move the peak on the narrow cases and not on the wide one.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn standoff_sweep_over_islands() {
+        let fracs = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+        println!("\n| case | narrowest | {} |", fracs.map(|f| format!("{f}·r")).join(" | "));
+        println!("|---|---|{}", "---|".repeat(fracs.len()));
+        let mut cases = vec![("CONTROL square 40 (no island)", square(40.0))];
+        cases.extend(island_cases());
+        for (name, region) in cases {
+            // The narrowest passage of the tool-centre region, by the largest erosion that
+            // still leaves something: the quantity a global opening is in tension with.
+            let tc = largest(offset(std::slice::from_ref(&region), -R, JoinStyle::Round).unwrap())
+                .unwrap();
+            let mut narrow = 0.0_f64;
+            for k in 1..40 {
+                let d = k as f64 * 0.5;
+                match offset(std::slice::from_ref(&tc), -d, JoinStyle::Round) {
+                    Ok(v) if !v.is_empty() && total_area(&v) > 1.0 => narrow = 2.0 * d,
+                    _ => break,
+                }
+            }
+            let mut cells = vec![format!("{narrow:.0} mm")];
+            for f in fracs {
+                let standoff = f * R;
+                let t = Tuning { standoff, ..Tuning::new(R, E) };
+                match front_advance_tuned(&region, R, 0.0, E, None, t) {
+                    Some(path) => {
+                        let v = crate::clearsim::certify_moves(&path, R, &region);
+                        cells.push(format!(
+                            "a_e {:.2} / uncut {:.0}",
+                            v.max_engagement, v.uncut_area
+                        ));
+                    }
+                    None => cells.push("no path".into()),
+                }
+            }
+            println!("| {name} | {} |", cells.join(" | "));
+        }
+        println!();
+    }
+
+    /// Diagnostic: **where** is the island path's engagement peak? A number without a place
+    /// cannot be acted on — the whole point of the densified readings on the hole-free
+    /// cases. Reports the worst few cutting moves by `a_e`, with their location, step
+    /// length, and how far along the path they sit.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn locate_the_island_slot() {
+        for (name, region) in island_cases().into_iter().take(3) {
+            let Some(path) = front_advance_path(&region, R, 0.0, E, None) else {
+                continue;
+            };
+            let mut m = crate::clearsim::ClearedModel::bounded(R, region.clone());
+            let mut worst: Vec<(f64, Point, f64, usize)> = Vec::new();
+            let mut prev_cut = false;
+            for i in 1..path.len() {
+                let (a, b) = (path[i - 1].0, path[i].0);
+                if !path[i].1 {
+                    prev_cut = false;
+                    continue;
+                }
+                if !prev_cut {
+                    m.seed_disc(a);
+                }
+                prev_cut = true;
+                // Densify so a reading localises to a place rather than to a whole run.
+                let n = ((a.distance(b) / 0.5).ceil() as usize).max(1);
+                for k in 0..n {
+                    let (t0, t1) = (k as f64 / n as f64, (k + 1) as f64 / n as f64);
+                    let p0 = Point::new(a.x + (b.x - a.x) * t0, a.y + (b.y - a.y) * t0);
+                    let p1 = Point::new(a.x + (b.x - a.x) * t1, a.y + (b.y - a.y) * t1);
+                    worst.push((m.engagement(p0, p1), p0, a.distance(b), i));
+                }
+                m.commit(a, b);
+            }
+            worst.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
+            println!("\n{name} ({} moves):", path.len());
+            for (ae, p, step, i) in worst.iter().take(5) {
+                println!(
+                    "  a_e {ae:.2} at ({:.1},{:.1})  step {step:.2} mm  move {i}",
+                    p.x, p.y
+                );
+            }
+        }
+        println!();
+    }
+
+    /// Diagnostic: **where** does the path leave the tool-centre region? Densifies every
+    /// segment, so it catches a chord whose endpoints are both legal but whose middle is
+    /// not — the failure mode that a vertex-only check reports as clean. Reports the worst
+    /// excursion, where it is, and the step length of the segment responsible, because a
+    /// long step is the signature of a hand-off between rings that are not adjacent.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn locate_the_island_gouge() {
+        for (name, region) in island_cases().into_iter().take(3) {
+            let Some(f) = frontier(&region, R, 0.0, E, None, STANDOFF_RADII * R, ENTRY_TARGET) else {
+                continue;
+            };
+            let Some((path, _)) = connect(&f, R, E, SEAM_ARC, RELIEF_REACH, ENTRY_TARGET) else {
+                continue;
+            };
+            let mut worst = (0.0_f64, Point::new(0.0, 0.0), 0.0_f64, 0usize);
+            let mut longest_step = (0.0_f64, 0usize);
+            for i in 1..path.len() {
+                let (a, b) = (path[i - 1].0, path[i].0);
+                let step = a.distance(b);
+                if step > longest_step.0 {
+                    longest_step = (step, i);
+                }
+                if !path[i].1 {
+                    continue; // a rapid removes nothing
+                }
+                let n = ((step / 0.2).ceil() as usize).max(1);
+                for k in 0..=n {
+                    let t = k as f64 / n as f64;
+                    let p = Point::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+                    if !f.tc.contains(p) {
+                        let d = boundary_dist(&f.tc, p);
+                        if d > worst.0 {
+                            worst = (d, p, step, i);
+                        }
+                    }
+                }
+            }
+            println!(
+                "{name}: worst excursion {:.3} mm at ({:.1},{:.1}) on a {:.2} mm step (move {}) | \
+                 longest step {:.2} mm at move {} of {} | rapids {}",
+                worst.0, worst.1.x, worst.1.y, worst.2, worst.3,
+                longest_step.0, longest_step.1, path.len(), rapids(&path),
+            );
+        }
+    }
+
+    /// Diagnostic: is the long step *inside a frontier ring* rather than between two of
+    /// them? A ring is a closed contour of a real region, so consecutive vertices should be
+    /// millimetres apart at most; a 40 mm jump inside one means the contour itself is not
+    /// what it is assumed to be.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn ring_internal_steps() {
+        for (name, region) in island_cases().into_iter().take(2) {
+            let Some(f) = frontier(&region, R, 0.0, E, None, STANDOFF_RADII * R, ENTRY_TARGET) else {
+                continue;
+            };
+            let mut worst = (0.0_f64, 0usize, 0usize, 0usize);
+            for (k, pass) in f.passes.iter().enumerate() {
+                for (c, ring) in pass.iter().enumerate() {
+                    let n = ring.len();
+                    for i in 0..n {
+                        let d = ring[i].distance(ring[(i + 1) % n]);
+                        if d > worst.0 {
+                            worst = (d, k, c, n);
+                        }
+                    }
+                }
+            }
+            println!(
+                "{name}: worst step inside a ring {:.2} mm (pass {}, component {}, {} pts)",
+                worst.0, worst.1, worst.2, worst.3
+            );
+            // And how many components each pass really has, around the topology change.
+            let counts: Vec<usize> = f.passes.iter().map(|p| p.len()).collect();
+            println!("  components per pass: {counts:?}");
+        }
+    }
+
+    /// Diagnostic: do the two derived regions keep the island at all? `to_clear` clips the
+    /// frontier's growth and `tc` bounds the tool centres; if either silently loses the
+    /// hole, the frontier runs straight over the island and every downstream measurement is
+    /// meaningless.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn derived_regions_keep_their_holes() {
+        for (name, region) in island_cases() {
+            for finish in [0.0, 0.5] {
+                let tc_polys = offset(std::slice::from_ref(&region), -(R + finish), JoinStyle::Round).unwrap();
+                let clear_polys = offset(std::slice::from_ref(&region), -finish, JoinStyle::Round).unwrap();
+                let to_clear = largest(clear_polys.clone()).unwrap();
+                let tc = largest(tc_polys.clone()).unwrap();
+                println!(
+                    "{name} finish {finish}: region holes {} | to_clear {} polys, holes {} | tc {} polys, holes {}",
+                    region.holes().len(),
+                    clear_polys.len(),
+                    to_clear.holes().len(),
+                    tc_polys.len(),
+                    tc.holes().len(),
+                );
+            }
+        }
+    }
+
+    /// Diagnostic: is the island slot the *frontier* failing, or the **connection**? Cheap
+    /// — no oracle. Reports whether the seam spiral carried each case, and whether any ring
+    /// of the frontier leaves the tool-centre region (which is where a gouge would come
+    /// from, since frontier rings are gouge-free by construction and the links are not).
+    #[test]
+    #[ignore = "diagnostic"]
+    fn island_connection_provenance() {
+        for (name, region) in island_cases() {
+            let Some(f) = frontier(&region, R, 0.0, E, None, STANDOFF_RADII * R, ENTRY_TARGET) else {
+                println!("{name}: no frontier");
+                continue;
+            };
+            let Some((path, seamed)) = connect(&f, R, E, SEAM_ARC, RELIEF_REACH, ENTRY_TARGET) else {
+                println!("{name}: no connection");
+                continue;
+            };
+            // **How far** outside the tool-centre region does the path stray — not how many
+            // points do, which cannot tell tessellation noise from driving over an island.
+            let depth = |p: &Point| if f.tc.contains(*p) { 0.0 } else { boundary_dist(&f.tc, *p) };
+            let ring_worst = f.passes.iter().flatten().flatten().map(depth).fold(0.0_f64, f64::max);
+            let path_worst = path.iter().map(|(p, _)| depth(p)).fold(0.0_f64, f64::max);
+            // And how far into an *island* specifically (the gouge that matters).
+            let isl_worst = region
+                .holes()
+                .iter()
+                .map(|h| {
+                    let hp = Polygon::new(h.clone()).unwrap();
+                    path.iter()
+                        .map(|&(p, _)| if hp.contains(p) { boundary_dist(&hp, p) } else { 0.0 })
+                        .fold(0.0_f64, f64::max)
+                })
+                .fold(0.0_f64, f64::max);
+            println!(
+                "{name}: seam-connected {seamed}, passes {}, rings {}, path {} pts | \
+                 worst outside tc: rings {ring_worst:.3} mm, path {path_worst:.3} mm | \
+                 deepest into an island: {isl_worst:.3} mm",
+                f.passes.len(),
+                f.passes.iter().flatten().count(),
+                path.len(),
+            );
+        }
+    }
+
+    /// Diagnostic: what a frontier over a **holed** region actually looks like, pass by
+    /// pass — whether it flows around an island at all, and where it splits when it does.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn frontier_shape_over_islands() {
+        let cases: Vec<(&str, Polygon)> = vec![
+            ("square 40 (control, no island)", square(40.0)),
+            (
+                "square 40, island 12 centred",
+                Polygon::with_holes(rect_at(0.0, 0.0, 40.0, 40.0), vec![rect_at(14.0, 14.0, 26.0, 26.0)]).unwrap(),
+            ),
+            (
+                "circle r20, island r6",
+                Polygon::with_holes(ring_at(0.0, 0.0, 20.0, 64), vec![ring_at(0.0, 0.0, 6.0, 32)]).unwrap(),
+            ),
+            (
+                "square 60, island 20 centred",
+                Polygon::with_holes(rect_at(0.0, 0.0, 60.0, 60.0), vec![rect_at(20.0, 20.0, 40.0, 40.0)]).unwrap(),
+            ),
+        ];
+        for (name, region) in cases {
+            println!("\n=== {name} ===");
+            let Some(f) = frontier(&region, R, 0.0, E, None, STANDOFF_RADII * R, ENTRY_TARGET) else {
+                println!("  frontier: None");
+                continue;
+            };
+            println!(
+                "  entry {:?}  passes {}  split {}",
+                (f.entry.x, f.entry.y),
+                f.passes.len(),
+                f.split
+            );
+            for (k, pass) in f.passes.iter().enumerate() {
+                let comps: Vec<String> = pass
+                    .iter()
+                    .map(|ring| {
+                        let per: f64 = (0..ring.len())
+                            .map(|i| ring[i].distance(ring[(i + 1) % ring.len()]))
+                            .sum();
+                        format!("{}pts/{:.0}mm", ring.len(), per)
+                    })
+                    .collect();
+                println!("  pass {k}: {} comp(s)  [{}]", pass.len(), comps.join(", "));
+            }
+        }
+        println!();
     }
 
     /// Split every segment of `path` to at most `step`, so each engagement reading
@@ -963,8 +1762,8 @@ mod tests {
     /// yet at that instant, which reads lower than production ever will. So the peak
     /// over these readings is the number `certify` sees, only localised.
     fn readings(region: &Polygon, r: f64, e: f64, ctr: [f64; 2]) -> Vec<(f64, Point)> {
-        let raw = front_advance_path(region, r, 0.0, e, Some(ctr))
-            .expect("front-advance produces a path");
+        let raw = pts(&front_advance_path(region, r, 0.0, e, Some(ctr))
+            .expect("front-advance produces a path"));
         let mut m = crate::clearsim::ClearedModel::bounded(r, region.clone());
         m.seed_disc(raw[0]);
         let mut out = Vec::with_capacity(raw.len() * 2);
@@ -1026,7 +1825,15 @@ mod tests {
             // is wired into `clearing::clear`), so wall-clock under a saturated runner
             // reflects contention, not the generator. The **point count** below is the
             // contention-independent guard that the frontier decimation is working.
-            assert!(gen < 20.0, "{name}: generation regressed to a grind, took {gen:.2}s");
+            // Raised 20 s → 60 s on 2026-07-30, and the reason is worth keeping: the suite
+            // grew heavier (island clearing now dispatches the steered generator, and its
+            // tests run the exact oracle), the debug run reached **664 s**, and this
+            // assertion started failing on contention alone — 7.34 s for the same case run
+            // by itself. A guard that fires on how busy the machine is guards nothing.
+            //
+            // 60 s still catches everything it was written for by an order of magnitude: the
+            // 120 s pre-decimation grind and the 37-minute split-front `MAX_PASSES` loop.
+            assert!(gen < 60.0, "{name}: generation regressed to a grind, took {gen:.2}s");
             assert!(path.len() < 4000, "{name}: sane point count, got {}", path.len());
         }
     }
@@ -1123,6 +1930,7 @@ mod tests {
             Some([20.0, 20.0]),
             Tuning { standoff: 0.0, ..Tuning::new(R, E) },
         )
+        .map(|m| pts(&m))
         .unwrap();
         let mut m = crate::clearsim::ClearedModel::bounded(R, region.clone());
         m.seed_disc(bare[0]);
@@ -1190,6 +1998,7 @@ mod tests {
             Some([0.0, 0.0]),
             Tuning { entry_target: 4.0 * E, ..Tuning::new(R, E) },
         )
+        .map(|m| pts(&m))
         .unwrap();
         let mut m = crate::clearsim::ClearedModel::bounded(R, region.clone());
         m.seed_disc(flat[0]);
@@ -1231,6 +2040,7 @@ mod tests {
                         Some([20.0, 20.0]),
                         Tuning { seam_arc: sa, ..Tuning::new(r, e) },
                     )
+                    .map(|mv| pts(&mv))
                     .unwrap();
                 let mut m = crate::clearsim::ClearedModel::bounded(r, region.clone());
                 m.seed_disc(raw[0]);
@@ -1301,7 +2111,7 @@ mod tests {
     /// enclose the same area.
     #[test]
     fn the_frontier_does_not_emit_the_same_closing_lap_twice() {
-        let path = front_advance_path(&square(40.0), R, 0.0, E, Some([20.0, 20.0])).unwrap();
+        let path = pts(&front_advance_path(&square(40.0), R, 0.0, E, Some([20.0, 20.0])).unwrap());
         // The closing lap is the exact tool-centre square; cutting it twice would put two
         // separate visits to the same corner in the path.
         let visits = path.iter().filter(|p| p.distance(Point::new(37.0, 37.0)) < 1e-6).count();
@@ -1335,8 +2145,8 @@ mod tests {
             ("square 40", square(40.0), [20.0, 20.0]),
             ("square 24", square(24.0), [12.0, 12.0]),
         ] {
-            let path = front_advance_path(&region, r, 0.0, e, Some(ctr))
-                .unwrap_or_else(|| panic!("{name}: front-advance produces a path"));
+            let path = pts(&front_advance_path(&region, r, 0.0, e, Some(ctr))
+                .unwrap_or_else(|| panic!("{name}: front-advance produces a path")));
             cases.push((name.to_string(), region, path));
         }
         // The case the old formula was structurally blind to: driving into virgin stock.

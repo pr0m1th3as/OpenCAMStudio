@@ -81,11 +81,34 @@ fn cut_ring(prog: &mut Program, pts: &[Point], feed: f64, tag: Tag, lead_overlap
     exit
 }
 
-/// Rapid over `p`, down through cleared air to `from_z`, then straight-plunge to
-/// `z`. Used for level re-entries and lift-reposition re-entries, which only ever
-/// drop one stepdown into a layer already cleared above.
+/// Rapid over `p`, down through cleared air to `from_z`, then enter `z` **with the
+/// operator's plunge strategy**.
+///
+/// This used to plunge straight here regardless, justified as "only ever one stepdown
+/// into a layer already cleared above". That reasoning does not hold: it is one
+/// stepdown of *depth*, but the material at this XY is **uncut** — a lift-reposition
+/// exists precisely because the next ring is somewhere the tool has not been — and at
+/// the first level there is no cleared layer above at all. So an operator who selected
+/// a helix got a straight drop into solid at every island loop and pinched lobe. What
+/// is cleared above only bounds how *far* it drops, not what it drops into.
+///
+/// The rule everywhere else in CAM is that the entry strategy is chosen by what is
+/// under the tool, not by whether it is the first entry of the level; that is what this
+/// now does. `tan`/`out` orient the helix or ramp, as at a level entry.
 #[allow(clippy::too_many_arguments)]
-fn enter_straight(prog: &mut Program, p: Point, from_z: f64, z: f64, h: &Heights, plunge_feed: f64, id: u32) {
+fn enter_with_plunge(
+    prog: &mut Program,
+    p: Point,
+    tan: (f64, f64),
+    out: (f64, f64),
+    from_z: f64,
+    z: f64,
+    h: &Heights,
+    plunge: Plunge,
+    plunge_feed: f64,
+    feed: f64,
+    id: u32,
+) {
     prog.push(Step::Rapid {
         to: Point3::new(p.x, p.y, h.clearance),
         tag: Tag::new(id, MoveKind::Link),
@@ -94,11 +117,18 @@ fn enter_straight(prog: &mut Program, p: Point, from_z: f64, z: f64, h: &Heights
         to: Point3::new(p.x, p.y, from_z),
         tag: Tag::new(id, MoveKind::Link),
     });
-    prog.push(Step::Linear {
-        to: Point3::new(p.x, p.y, z),
-        feed: plunge_feed,
-        tag: Tag::new(id, MoveKind::Plunge),
-    });
+    crate::profile::emit_plunge(
+        prog,
+        p,
+        tan,
+        out,
+        from_z,
+        z,
+        plunge,
+        plunge_feed,
+        feed,
+        Tag::new(id, MoveKind::Plunge),
+    );
 }
 
 /// The normal toward the **cleared** side of a wall loop — where the tool has been,
@@ -124,9 +154,12 @@ fn approach(
     prog: &mut Program,
     prev_end: Point,
     p: Point,
+    tan: (f64, f64),
+    out: (f64, f64),
     from_z: f64,
     z: f64,
     h: &Heights,
+    plunge: Plunge,
     feed: f64,
     plunge_feed: f64,
     id: u32,
@@ -144,7 +177,7 @@ fn approach(
             to: Point3::new(prev_end.x, prev_end.y, h.clearance),
             tag: Tag::new(id, MoveKind::Link),
         });
-        enter_straight(prog, p, from_z, z, h, plunge_feed, id);
+        enter_with_plunge(prog, p, tan, out, from_z, z, h, plunge, plunge_feed, feed, id);
     }
 }
 
@@ -173,6 +206,7 @@ fn emit_wall_ring(
     guard: &[Polygon],
     reversed: bool,
     h: &Heights,
+    plunge: Plunge,
     link_threshold: f64,
 ) -> Point {
     let ri = crate::profile::rotate_to_start(pts, Some([prev_end.x, prev_end.y]));
@@ -190,7 +224,10 @@ fn emit_wall_ring(
 
     let lead = Tag::new(id, MoveKind::LeadIn);
     let cut = Tag::new(id, MoveKind::Cutting);
-    approach(prog, prev_end, entry, from_z, z, h, feed, plunge_feed, id, link_threshold);
+    approach(
+        prog, prev_end, entry, tan_in, cin, from_z, z, h, plunge, feed, plunge_feed, id,
+        link_threshold,
+    );
     crate::leads::emit_lead(prog, entry, start, start, cin, eff_in, z, feed, lead);
     crate::emit::cut_polyline(prog, &loop_pts, feed, cut, z);
     crate::leads::emit_lead(prog, exit_on, exit, exit_on, cout, eff_out, z, feed, lead);
@@ -286,6 +323,7 @@ pub(crate) fn emit_stay_down(
                     guard,
                     reversed,
                     h,
+                    plunge,
                     link_threshold,
                 );
                 continue;
@@ -293,13 +331,23 @@ pub(crate) fn emit_stay_down(
             // Begin this ring at the point nearest where the last one ended, so the
             // hop is the shortest possible — a clean radial step for adjacent rings.
             let ri = crate::profile::rotate_to_start(&ring.pts, Some([prev_end.x, prev_end.y]));
+            // Orient a helix/ramp toward the **cleared** side. Not `-outward_normal`:
+            // that is relative to each loop's own winding, so on an island ring — which
+            // is wound CW precisely so the pocket stays on the left — it points *into
+            // the island*, and the helix would swing through material meant to survive.
+            // [`cleared_normal`] is the function that already knows this, and it handles
+            // conventional milling's flipped windings too.
+            let rtan = crate::profile::start_tangent(&ri);
             approach(
                 prog,
                 prev_end,
                 ri[0],
+                rtan,
+                cleared_normal(rtan, reversed),
                 from_z,
                 z,
                 h,
+                plunge,
                 feed,
                 plunge_feed,
                 id,
