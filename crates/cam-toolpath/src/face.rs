@@ -109,16 +109,32 @@ impl Strategy for FaceStrategy {
         // Travel ends: `overshoot` is the clearance between the cutter **edge** and the
         // material edge at the plunge and turnarounds, so the tool always plunges clear
         // and feeds in — the centre therefore sits a radius plus the overshoot outside
-        // each end. `overshoot = 0` is tangent (just clears); a **negative** overshoot
-        // plunges into the stock. That's the user's prerogative (a soft or pre-cleared
-        // top), so we warn rather than forbid.
+        // each end. `overshoot = 0` is tangent (just clears) — note that is a coincidence
+        // of geometry, not a margin, which is why the entry below keeps a vertical one
+        // regardless. A **negative** overshoot plunges into the stock. That's the user's
+        // prerogative (a soft or pre-cleared top), so we warn rather than forbid.
         let u_lo = u_min - r - op.overshoot;
         let u_hi = u_max + r + op.overshoot;
         if env.stock.is_some() && op.overshoot < 0.0 {
+            // Say where the tool *is* and by how much, not just that a number is
+            // negative — the operator's next question is always "by how much", and the
+            // answer is not on screen anywhere else.
+            //
+            // It is the **plunge** that enters material, not the descent: the approach
+            // rapid now stops `FLOOR_CLEARANCE` above the cutting plane (see the entry
+            // below), so with the usual `start_offset` = stock top it comes to rest in
+            // air and the feed below it does the cutting. Worth being exact about, since
+            // a warning that named the wrong move would send someone looking at the
+            // wrong line of the program.
+            //
+            // Deliberately still a warning: a soft or pre-cleared top is the user's
+            // prerogative, and `overshoot` is never clamped.
             diagnostics.push(Diagnostic::warning(format!(
-                "operation {}: overshoot is negative — the face mill plunges into the \
-                 stock rather than clearing it first",
-                op.id
+                "operation {}: overshoot {:.3} mm is negative — the cutter edge starts \
+                 that far inside the stock edge, so the tool enters over material and \
+                 feeds down into it instead of entering clear of the edge",
+                op.id,
+                -op.overshoot
             )));
         }
 
@@ -175,18 +191,42 @@ impl Strategy for FaceStrategy {
                 to_world(u_hi, v_first)
             };
             if li == 0 {
-                // Approach over the first pass at clearance, then rapid down to the
-                // **retract plane** — never to the bare cutting plane. Ending a rapid
-                // exactly on the top plane leaves no margin (slightly proud stock or a
-                // Z-zero error would rapid into material); the plunge below feeds from
-                // the retract plane to the first level. `max` keeps it never lower than
-                // the cutting plane, matching every other strategy.
+                // Approach over the first pass at clearance, then rapid down — but never
+                // onto the top cutting plane itself, which for facing is normally the
+                // stock surface exactly (`start_offset` is set to where the material
+                // starts).
+                //
+                // `retract.max(top)` was not enough. Whenever `start_offset >= retract`
+                // the `max` picks `top` and the rapid comes to rest precisely on the
+                // skin — stock standing 3 mm proud with a 2 mm retract is enough to do
+                // it. What kept that safe was purely *horizontal*: the descent sits at
+                // `u_lo`, a radius plus `overshoot` outside the stock edge. But the two
+                // margins are independent, so at `overshoot = 0` — documented as
+                // "tangent (just clears)" — both are zero at once, and the tool arrives
+                // at the stock's top corner at rapid speed with clearance in neither
+                // axis. Tangency is a coincidence, not a margin.
+                //
+                // So the vertical margin is now unconditional: stop `FLOOR_CLEARANCE`
+                // above the cutting plane and let the plunge below feed the rest. Same
+                // number and the same argument as `emit::rapid_floor`, which the five
+                // stepdown descents use. Note this could *not* be delegated to
+                // `emit::descend_to`: that helper clamps `.max(from_z)` because it ends
+                // at a floor it is about to cut, so it would return this very Z.
+                //
+                // Costs one short feed per facing operation (not per pass), and only
+                // when `top + FLOOR_CLEARANCE` clears the retract plane at all — in the
+                // ordinary `start_offset = 0` setup the retract plane still wins and
+                // nothing changes.
                 program.push(Step::Rapid {
                     to: Point3::new(s0.x, s0.y, env.heights.clearance),
                     tag: link,
                 });
                 program.push(Step::Rapid {
-                    to: Point3::new(s0.x, s0.y, env.heights.retract.max(top)),
+                    to: Point3::new(
+                        s0.x,
+                        s0.y,
+                        env.heights.retract.max(top + crate::emit::FLOOR_CLEARANCE),
+                    ),
                     tag: link,
                 });
             }
@@ -429,6 +469,56 @@ mod tests {
             .expect("a plunge move")
     }
 
+    /// The Z the approach rapid comes to rest at — the first rapid that leaves the
+    /// clearance plane. (`run_stock` uses clearance 5, retract 2.)
+    fn approach_rapid_z(r: &StrategyResult) -> f64 {
+        r.program
+            .steps()
+            .iter()
+            .find_map(|s| match s {
+                Step::Rapid { to, .. } if to.z < 5.0 - 1e-9 => Some(to.z),
+                _ => None,
+            })
+            .expect("a descending approach rapid")
+    }
+
+    #[test]
+    fn the_approach_rapid_never_lands_on_the_top_cutting_plane() {
+        // The hazard this guards: whenever `start_offset >= retract` the old
+        // `retract.max(top)` picked `top`, and for facing the top cutting plane *is* the
+        // stock surface — so the rapid came to rest exactly on the skin. What kept that
+        // safe was only that the descent sits outside the stock in XY, which at
+        // `overshoot = 0` is itself a zero margin. Two zero margins at once is not a
+        // margin.
+        //
+        // Retract 2, start_offset 3: the old rule gave 3.000, the plane itself.
+        let mut op = face_op();
+        op.start_offset = 3.0;
+        op.depth = 1.0;
+        op.overshoot = 0.0; // the horizontal margin gone too — the worst case
+        let r = run_stock(op, ([-5.0, -5.0], [65.0, 45.0]));
+        let z = approach_rapid_z(&r);
+        assert!(
+            z >= 3.0 + crate::emit::FLOOR_CLEARANCE - 1e-9,
+            "the approach rapid stopped at Z{z:.3}, on or under the 3.000 cutting plane"
+        );
+    }
+
+    #[test]
+    fn the_ordinary_facing_setup_still_stops_at_the_retract_plane() {
+        // The other half: the new floor must not lift every facing job. With
+        // `start_offset = 0` and a 2 mm retract the retract plane is still the higher of
+        // the two, so nothing moves — which is why no golden changed.
+        let mut op = face_op();
+        op.start_offset = 0.0;
+        let r = run_stock(op, ([-5.0, -5.0], [65.0, 45.0]));
+        assert!(
+            (approach_rapid_z(&r) - 2.0).abs() < 1e-9,
+            "expected the 2 mm retract plane, got {}",
+            approach_rapid_z(&r)
+        );
+    }
+
     #[test]
     fn overshoot_is_measured_from_the_cutter_edge_to_the_stock_edge() {
         // Stock spans x=[-5,65] (proud of the 0..60 boundary). The r=5 mill plunges with
@@ -459,10 +549,23 @@ mod tests {
         op.overshoot = -2.0;
         let r = run_stock(op, ([-5.0, -5.0], [65.0, 45.0]));
         assert!(!r.has_errors(), "a warning, not an error: {:?}", r.diagnostics);
+        // Checked for substance rather than a phrase: the operator needs to be told
+        // *how far* inside the edge the cutter starts, and that the whole entry is over
+        // material — not merely that a number was negative.
+        let warning = r
+            .diagnostics
+            .iter()
+            .find(|d| d.message.contains("overshoot"))
+            .unwrap_or_else(|| panic!("an overshoot warning: {:?}", r.diagnostics));
         assert!(
-            r.diagnostics.iter().any(|d| d.message.contains("plunges into the stock")),
-            "warns that the plunge is not clear: {:?}",
-            r.diagnostics
+            warning.message.contains("2.000"),
+            "names the distance inside the edge: {}",
+            warning.message
+        );
+        assert!(
+            warning.message.contains("inside the stock edge"),
+            "says where the cutter starts: {}",
+            warning.message
         );
         // Edge 2 mm *inside* the stock edge (-5): centre = -5 - r - (-2) = -8.
         assert!((first_plunge_x(&r) - (-8.0)).abs() < 1e-6);
