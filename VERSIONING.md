@@ -17,6 +17,24 @@ contractually signals. So the number's only job is to encode *how much changed*.
 - **App version ≠ file compatibility.** `SCHEMA_VERSION` (in `cam-model`) governs
   "can this build open that file"; it moves independently of the app version. Never
   overload the app version with compat semantics — let each number do one job.
+- **Old files are migrated forward, never sideways or back.** Since v10 the version
+  drives `cam_model::migrate`, which rewrites a saved document's JSON to the current
+  shape *before* it is deserialized. The contract:
+  - **Forward only.** A file older than the current schema is brought up to it, one
+    step per version, and re-saved at the current version. There is no downgrade.
+  - **A newer file is refused, not opened.** Opening it would drop every field this
+    build does not understand on the next save, silently deleting the newer version's
+    work. The user is told to upgrade.
+  - **Every version in `OLDEST_SUPPORTED..SCHEMA_VERSION` has a step**, even when that
+    step does nothing (v1–v9 are identity: they were additive bumps that serde's
+    defaults already absorbed). Bumping `SCHEMA_VERSION` without adding one is a test
+    failure, not a surprise on a user's file.
+  - **The version numbers the save-file as a whole**, not the document alone — v11
+    added the machine and post to the project wrapper and bumped even though the
+    document did not change. A format change that leaves the version alone is the one
+    that bites later.
+  - Retiring old versions (raising `OLDEST_SUPPORTED`) is a **breaking change** for the
+    files it drops, and belongs in a MAJOR bump with a release note naming them.
 - **The manifest bumps at release time, and git provenance covers the gap.** The
   workspace `version` stays at the last *released* value through a dev cycle and is
   bumped to match the tag in the release commit (so a published artifact never

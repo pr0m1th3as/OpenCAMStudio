@@ -624,6 +624,10 @@ impl AppController {
             open_paths: self.open_paths.clone(),
             defaults: self.defaults,
             source_name: self.source_name.clone(),
+            // Always written (v11): a saved job records the machine and control it was
+            // built for. Only a *pre*-v11 file can be silent about them.
+            machine: Some(self.machine.clone()),
+            post: Some(self.post_kind),
         };
         // Written through the tagged `.ocam` union (§3.1) so the file self-describes.
         let json = OcamFile::Project(project)
@@ -649,6 +653,16 @@ impl AppController {
         self.open_paths = project.open_paths;
         self.defaults = project.defaults;
         self.source_name = project.source_name;
+        // Adopt what the file states and only what it states (v11). A pre-v11 project
+        // carries neither, and keeping the session's own machine and post is the right
+        // reading of that silence — the alternative would reset a configured machine to
+        // a default every time an older job was opened.
+        if let Some(machine) = project.machine {
+            self.machine = machine;
+        }
+        if let Some(post) = project.post {
+            self.post_kind = post;
+        }
         self.document = History::new(project.document);
         self.excluded.clear();
         self.disabled_origins.clear();
@@ -3115,6 +3129,8 @@ mod tests {
             open_paths: app.open_paths().to_vec(),
             defaults: *app.defaults(),
             source_name: app.source_name().to_string(),
+            machine: None,
+            post: None,
         };
         let json = project.to_json().unwrap();
         let back = Project::from_json(&json).unwrap();
@@ -3134,6 +3150,8 @@ mod tests {
             open_paths: Vec::new(),
             defaults: *app.defaults(),
             source_name: app.source_name().to_string(),
+            machine: None,
+            post: None,
         };
         let mut v: serde_json::Value = serde_json::from_str(&project.to_json().unwrap()).unwrap();
         v.as_object_mut().unwrap().remove("open_paths");
@@ -3510,6 +3528,80 @@ mod tests {
     }
 
     #[test]
+    fn a_project_reopens_with_the_machine_and_post_it_was_saved_for() {
+        // Both were session-only until v11, so a job built for an Okuma on a big VMC
+        // reopened posting grbl for whatever machine the app last held — and the
+        // envelope and feed ceilings are exactly what gate an export, so the re-check
+        // was being made against the wrong machine.
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        app.set_post_kind(PostKind::Okuma);
+        app.edit_machine(|m| {
+            m.name = "Okuma MB-46VAE".into();
+            m.max_feed = 15_000.0;
+            m.envelope = Envelope::new(
+                Point3::new(0.0, 0.0, -400.0),
+                Point3::new(762.0, 460.0, 0.0),
+            );
+        });
+        let saved_machine = app.machine().clone();
+
+        let path = temp_path("machine.ocam");
+        app.save_project(&path).unwrap();
+
+        // A fresh session on a different machine, posting somewhere else.
+        let mut other = AppController::new(machine());
+        other.set_post_kind(PostKind::Fanuc);
+        other.open_project(&path).unwrap();
+
+        assert_eq!(other.post_kind(), PostKind::Okuma);
+        assert_eq!(other.machine(), &saved_machine);
+        assert_eq!(
+            other.machine().envelope.max.z,
+            0.0,
+            "the envelope round-trips through its [x, y, z] on-disk form"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_pre_v11_project_leaves_the_sessions_machine_and_post_alone() {
+        // The half that is easy to get wrong. An older file records neither, and absence
+        // must not be read as "use the default" — that would quietly reset a configured
+        // machine to the built-in one every time an old job was opened, and silently
+        // widen or narrow the limits an export is checked against.
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        let project = Project {
+            schema_version: cam_model::SCHEMA_VERSION,
+            document: app.document().clone(),
+            regions: app.regions().to_vec(),
+            open_paths: Vec::new(),
+            defaults: *app.defaults(),
+            source_name: app.source_name().to_string(),
+            machine: None,
+            post: None,
+        };
+        // Strip the fields entirely, the way a genuine pre-v11 file has them.
+        let mut v: serde_json::Value =
+            serde_json::from_str(&OcamFile::Project(project).to_json().unwrap()).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("machine");
+        obj.remove("post");
+        let path = temp_path("pre_v11.ocam");
+        std::fs::write(&path, v.to_string()).unwrap();
+
+        let mut session = AppController::new(machine());
+        session.edit_machine(|m| m.name = "the operator's own mill".into());
+        session.set_post_kind(PostKind::LinuxCnc);
+        session.open_project(&path).unwrap();
+
+        assert_eq!(session.post_kind(), PostKind::LinuxCnc);
+        assert_eq!(session.machine().name, "the operator's own mill");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn legacy_untagged_project_still_opens() {
         // A `.ocam` written before the `OcamFile` tag existed is a bare Project object.
         let mut app = AppController::new(machine());
@@ -3521,6 +3613,8 @@ mod tests {
             open_paths: app.open_paths().to_vec(),
             defaults: *app.defaults(),
             source_name: app.source_name().to_string(),
+            machine: None,
+            post: None,
         };
         let path = temp_path("legacy.ocam");
         std::fs::write(&path, project.to_json().unwrap()).unwrap(); // untagged, on purpose
@@ -3556,6 +3650,8 @@ mod tests {
             open_paths: app.open_paths().to_vec(),
             defaults: *app.defaults(),
             source_name: app.source_name().to_string(),
+            machine: None,
+            post: None,
         };
         let json = project.to_json().unwrap();
         assert_eq!(Project::from_json(&json).unwrap(), project);
@@ -3971,6 +4067,89 @@ mod tests {
         assert_eq!(app.origin_indices(), vec![1, 2, 3]);
         app.delete_origin(2);
         assert_eq!(app.origin_indices(), vec![1, 3], "delete removes just that origin");
+    }
+
+    #[test]
+    fn reassigning_an_operation_moves_it_between_origin_groups_and_reaches_the_gcode() {
+        // Multi-datum v1 shipped with no way across groups: a new op joined the active
+        // origin and the only correction was delete-and-recreate, which loses the op's
+        // parameters. `set_operation_origin` existed but nothing called it.
+        //
+        // Asserted through to the *posted words*, not just the model field, because that
+        // is the claim an operator cares about — the op runs under the other fixture's
+        // work offset. The model field agreeing while the emitted program did not would
+        // be exactly the kind of near-miss that reaches a machine.
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        app.set_post_kind(PostKind::Fanuc);
+        // One of the operations the import seeded, so it carries real geometry and
+        // actually posts. A freshly created op is pending until its geometry is picked
+        // and would export nothing to inspect.
+        let id = app.document().setup.operations[0].id();
+        let offset_of = |app: &AppController, id: u32| {
+            app.document()
+                .setup
+                .operations
+                .iter()
+                .find(|o| o.id() == id)
+                .expect("the operation is still there")
+                .work_offset()
+        };
+        assert_eq!(offset_of(&app, id), 1, "starts on the base origin");
+
+        app.add_origin(); // origin 2, active
+        app.edit_active_origin(|o| *o = [60.0, 0.0, 0.0]);
+        app.set_operation_origin(id, 2);
+        assert_eq!(
+            offset_of(&app, id),
+            2,
+            "the operation joined the second origin's group"
+        );
+
+        app.run(&CancelToken::new());
+        let nc = app.export_nc().expect("posts").to_string();
+        assert!(
+            nc.contains("G55"),
+            "the op should now post under the second work offset:\n{nc}"
+        );
+
+        // ...and back again, which must leave no trace of the detour: a single-datum
+        // job states only the preamble's own offset.
+        app.set_operation_origin(id, 1);
+        app.run(&CancelToken::new());
+        let back = app.export_nc().expect("posts").to_string();
+        assert!(
+            !back.contains("G55"),
+            "moving back should leave a plain single-datum program:\n{back}"
+        );
+    }
+
+    #[test]
+    fn reassigning_an_operation_is_one_undoable_step() {
+        // It goes through `document.edit`, so Ctrl-Z restores the previous group rather
+        // than leaving the op stranded under an origin the operator was undoing away.
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        app.new_operation(OpKind::Profile);
+        let id = app.selected_operation().expect("an operation").id();
+        let offset_of = |app: &AppController, id: u32| {
+            app.document()
+                .setup
+                .operations
+                .iter()
+                .find(|o| o.id() == id)
+                .expect("the operation is still there")
+                .work_offset()
+        };
+        app.add_origin();
+        app.set_operation_origin(id, 2);
+        assert_eq!(offset_of(&app, id), 2);
+        app.undo();
+        assert_eq!(
+            offset_of(&app, id),
+            1,
+            "undo put the operation back in its original group"
+        );
     }
 
     #[test]

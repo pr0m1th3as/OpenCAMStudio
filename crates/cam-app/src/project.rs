@@ -147,6 +147,21 @@ pub struct Project {
     pub defaults: JobParams,
     /// The source CAD file name the geometry came from (display only).
     pub source_name: String,
+    /// The machine this project was built for (schema v11).
+    ///
+    /// `None` — every project written before v11 — means the file says nothing, so
+    /// opening it leaves the session's machine alone. That is the only honest reading:
+    /// a file that never recorded a machine cannot be taken to prefer one.
+    ///
+    /// When it *is* present it is adopted, which is the point of saving it: the envelope
+    /// and the feed/spindle ceilings are what gate an export, so a job must be re-checked
+    /// against the machine it was written for rather than whatever was last selected.
+    #[serde(default)]
+    pub machine: Option<cam_model::Machine>,
+    /// The post/controller dialect this project exports through (schema v11). `None`
+    /// on pre-v11 files; see [`machine`](Self::machine) for why absence is not a default.
+    #[serde(default)]
+    pub post: Option<cam_post::PostKind>,
 }
 
 impl Project {

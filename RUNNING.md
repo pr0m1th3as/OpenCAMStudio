@@ -95,6 +95,12 @@ right-to-left; a collapsed group opens as a popup under its button).
     the toolpath and simulation — it stays in the tree, marked *(excluded)*),
     inline **↑ / ↓** reorder arrows, and a **right-click menu** with **Duplicate**,
     **Delete** and **Reinitialize**.
+  - On a job with more than one **workpiece origin**, that same right-click menu also
+    lists **Move to Origin *n*** — one row per origin the operation is not already in,
+    named the way the selected post will write it (`Origin 2 · G55`, or `· H2` on
+    Okuma). This moves the operation into that origin's group in the tree, so it posts
+    under that work offset. The ↑ / ↓ arrows reorder *within* a group; this is how an
+    operation crosses between them.
   - **Reinitialize** re-runs the creation wizard for that operation and replaces it
     **in place**, keeping its id and its position in the job. This is the *only* way
     to change an existing operation's tool: the tool is bound at creation, alongside
@@ -240,6 +246,12 @@ Cross-project and persistent, stored in the platform config directory
 Application Support` on macOS). Seeded with a few default end mills on first run.
 A project **embeds copies** of the tools it uses, so `.ocam` files stay
 self-contained; the library is the template you pick from.
+
+A saved project also records **the machine it was built for and the post it exports
+through**, so reopening a job restores both rather than leaving it pointed at whatever
+was last selected — which matters, because the machine's envelope and its feed/spindle
+ceilings are what an export is checked against. A project saved before this existed
+records neither, and opening one leaves your current machine and post alone.
 
 - **Tool Library pane** (replaces Project while the Tooling tab is active): every
   library tool, in two views — **Ordered** (by number, `T1: ⌀6 …`) or **Grouped**

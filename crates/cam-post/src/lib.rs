@@ -30,7 +30,14 @@ use cam_model::Machine;
 
 /// A selectable post/controller dialect, for the export picker. Each maps to a
 /// [`dialect::Dialect`] that drives emission.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+///
+/// Serialized by variant name (`"Fanuc"`, `"Okuma"`) so a project reopens posting for
+/// the control it was built for. The names are therefore **on disk** from schema v11:
+/// renaming a variant is a file-format change and needs a migration step, not just a
+/// find-and-replace.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum PostKind {
     /// grbl (Arduino/ESP32 hobby control).
     #[default]

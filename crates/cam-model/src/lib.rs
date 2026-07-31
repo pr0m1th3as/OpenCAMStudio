@@ -28,12 +28,54 @@ pub use history::History;
 pub use reconcile::{reconcile_tool_numbers, ReconcileReport, ToolIdentity};
 
 /// An axis-aligned working volume, in millimetres, in the machine/WCS frame.
-#[derive(Clone, Copy, Debug, PartialEq)]
+///
+/// Saved as `{"min": [x, y, z], "max": [x, y, z]}`. The corners are [`Point3`], which
+/// carries no serde derives of its own — `cam-cldata` is the one crate in the workspace
+/// with no dependencies at all, the neutral waist the whole design narrows through, and
+/// a save format is not reason enough to widen it. Writing the corners as three-element
+/// arrays also keeps them spelled the way [`Setup::origin`] and [`Origin::position`]
+/// already are, so a `.ocam` file says a 3-vector one way throughout.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(from = "EnvelopeRepr", into = "EnvelopeRepr")]
 pub struct Envelope {
     /// The minimum corner (smallest X, Y, Z).
     pub min: Point3,
     /// The maximum corner (largest X, Y, Z).
     pub max: Point3,
+}
+
+/// The on-disk spelling of an [`Envelope`]. Private: the array form is a serialization
+/// detail, not a second public description of a working volume.
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+struct EnvelopeRepr {
+    min: [f64; 3],
+    max: [f64; 3],
+}
+
+fn to_xyz(p: Point3) -> [f64; 3] {
+    [p.x, p.y, p.z]
+}
+
+fn from_xyz([x, y, z]: [f64; 3]) -> Point3 {
+    Point3::new(x, y, z)
+}
+
+impl From<EnvelopeRepr> for Envelope {
+    fn from(r: EnvelopeRepr) -> Self {
+        Envelope {
+            min: from_xyz(r.min),
+            max: from_xyz(r.max),
+        }
+    }
+}
+
+impl From<Envelope> for EnvelopeRepr {
+    fn from(e: Envelope) -> Self {
+        EnvelopeRepr {
+            min: to_xyz(e.min),
+            max: to_xyz(e.max),
+        }
+    }
 }
 
 impl Envelope {
@@ -69,7 +111,11 @@ impl Envelope {
 /// The physical machine a post drives. Its fields are the questions a post (or a
 /// verification pass) asks: how fast may I rapid, how high may the spindle spin,
 /// does this coordinate fit, where is it safe to be.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// Serializable since schema v11, so a project remembers what it was built for rather
+/// than adopting whatever machine the session happens to hold.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(from = "MachineRepr", into = "MachineRepr")]
 pub struct Machine {
     /// Human-readable machine name.
     pub name: String,
@@ -88,6 +134,47 @@ pub struct Machine {
     /// Where the machine parks for a (manual) tool change, if it has a fixed
     /// position.
     pub tool_change_pos: Option<Point3>,
+}
+
+/// The on-disk spelling of a [`Machine`] — identical but for the tool-change position,
+/// written as `[x, y, z]` for the reason given on [`Envelope`].
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct MachineRepr {
+    name: String,
+    rapid_rate: f64,
+    max_spindle_rpm: f64,
+    max_feed: f64,
+    envelope: Envelope,
+    safe_z: f64,
+    tool_change_pos: Option<[f64; 3]>,
+}
+
+impl From<MachineRepr> for Machine {
+    fn from(r: MachineRepr) -> Self {
+        Machine {
+            name: r.name,
+            rapid_rate: r.rapid_rate,
+            max_spindle_rpm: r.max_spindle_rpm,
+            max_feed: r.max_feed,
+            envelope: r.envelope,
+            safe_z: r.safe_z,
+            tool_change_pos: r.tool_change_pos.map(from_xyz),
+        }
+    }
+}
+
+impl From<Machine> for MachineRepr {
+    fn from(m: Machine) -> Self {
+        MachineRepr {
+            name: m.name,
+            rapid_rate: m.rapid_rate,
+            max_spindle_rpm: m.max_spindle_rpm,
+            max_feed: m.max_feed,
+            envelope: m.envelope,
+            safe_z: m.safe_z,
+            tool_change_pos: m.tool_change_pos.map(to_xyz),
+        }
+    }
 }
 
 impl Machine {

@@ -2055,6 +2055,10 @@ enum Message {
     /// Open the right-click context menu for operation `id` (anchored under the
     /// cursor), and select that operation.
     OpMenu(u32),
+    /// Move the context-menu's operation to the workpiece origin with this index —
+    /// i.e. into that origin's group in the project tree, and so under its work offset
+    /// at post time. Until this existed the only way across was delete-and-recreate.
+    MoveOpToOrigin(u32),
     /// Dismiss the operation context menu.
     CloseOpMenu,
     /// Track the window-absolute cursor position (global subscription) so overlays
@@ -2709,6 +2713,19 @@ impl App {
             Message::MoveOp(id, up) => {
                 self.controller.move_operation(id, up);
                 self.rerun();
+            }
+            Message::MoveOpToOrigin(origin) => {
+                if let Some(id) = self.open_op_menu.take() {
+                    self.controller.set_operation_origin(id, origin);
+                    // The op keeps its identity and moves group; re-focus it so the
+                    // tree scrolls/highlights where it landed rather than leaving the
+                    // eye at the row it left.
+                    self.focus_selected_op();
+                    self.refresh_fields();
+                    self.rerun();
+                    let name = self.origin_menu_label(origin);
+                    self.status = format!("Operation {id} moved to {name}.");
+                }
             }
             Message::ToggleStock => {
                 self.show_stock = !self.show_stock;
@@ -4515,31 +4532,77 @@ impl App {
         )
     }
 
+    /// The origins operation `id` could be moved to. Thin wrapper over
+    /// [`origin_move_targets`], which holds the rule and can be tested without an app.
+    fn origin_move_targets_for(&self, id: u32) -> Vec<u32> {
+        let current = self
+            .controller
+            .document()
+            .setup
+            .operations
+            .iter()
+            .find(|op| op.id() == id)
+            .map(|op| op.work_offset());
+        origin_move_targets(
+            &self.controller.origin_indices(),
+            current,
+            self.controller.base_origin_index(),
+        )
+    }
+
+    /// How an origin reads wherever it is named — `"Origin 2 · G55"`, or plain
+    /// `"Origin 7"` when the selected post has no word for that datum (the case the tree
+    /// marks with a ⚠). The vocabulary comes from the post, never from a `match` here.
+    ///
+    /// Used by the tree header, the move-to menu and the status line, so a job cannot
+    /// call the same origin two different things depending on where you read it.
+    fn origin_menu_label(&self, index: u32) -> String {
+        match self.controller.datum_label(index) {
+            Some(word) => format!("Origin {index} · {word}"),
+            None => format!("Origin {index}"),
+        }
+    }
+
     /// The operation right-click context menu (Delete / Duplicate), its top-left
     /// anchored exactly under the cursor. `None` unless a menu is open. Reuses the
     /// ribbon-popup overlay pattern: positioned in the top-level view stack over a
     /// click-off catcher.
     fn op_menu_overlay(&self) -> Option<Element<'_, Message>> {
-        self.open_op_menu?;
-        let item = |icon: Icon, label: &str, msg: Message| {
+        let id = self.open_op_menu?;
+        // The rows are as wide as the widest label, and a "Move to Origin 2 · G55" row
+        // is much wider than "Duplicate". Sized once for the whole menu so the items
+        // stay a column rather than a ragged edge.
+        let targets = self.origin_move_targets_for(id);
+        let width = if targets.is_empty() { 130.0 } else { 190.0 };
+        let item = move |icon: Icon, label: &str, msg: Message| {
             button(
                 row![icon_svg(icon, 14.0), text(label.to_string()).size(13)]
                     .spacing(6)
                     .align_y(Alignment::Center),
             )
-            .width(Length::Fixed(130.0))
+            .width(Length::Fixed(width))
             .padding(Padding::from([4.0, 8.0]))
             .on_press(msg)
             .style(|_theme, status| command_button_style(status))
         };
-        let menu = container(
-            column![
-                item(Icon::Delete, "Delete", Message::DeleteOp),
-                item(Icon::Duplicate, "Duplicate", Message::DuplicateOp),
-                item(Icon::Redo, "Reinitialize", Message::ReinitOp),
-            ]
-            .spacing(2),
-        )
+        let mut items = column![
+            item(Icon::Delete, "Delete", Message::DeleteOp),
+            item(Icon::Duplicate, "Duplicate", Message::DuplicateOp),
+            item(Icon::Redo, "Reinitialize", Message::ReinitOp),
+        ]
+        .spacing(2);
+        // Cross-group reassignment. One row per *other* origin — no submenu, because
+        // the list is bounded by what the controls carry (six work offsets on the ISO
+        // families) and a flat list is one click instead of two. Absent entirely on a
+        // single-origin job, where there is nowhere to move to.
+        for index in &targets {
+            items = items.push(item(
+                Icon::SetOrigin,
+                &format!("Move to {}", self.origin_menu_label(*index)),
+                Message::MoveOpToOrigin(*index),
+            ));
+        }
+        let menu = container(items)
         .padding(4)
         .style(|_theme| container::Style {
             background: Some(Background::Color(palette::RIBBON_BG)),
@@ -5117,10 +5180,7 @@ impl App {
         // The datum word joins the index when the post has one; when it does not, the
         // ⚠ below says so rather than the row saying it twice.
         let datum = self.controller.datum_label(index);
-        let named = match &datum {
-            Some(d) => format!("Origin {index} · {d}"),
-            None => format!("Origin {index}"),
-        };
+        let named = self.origin_menu_label(index);
         let label = text(format!(
             "{named} — X{} Y{} Z{}",
             fmt_num(pos[0]),
@@ -7330,6 +7390,25 @@ fn in_resize_band(pos: iced::Point, bounds: iced::Rectangle) -> bool {
         || bounds.y + bounds.height - pos.y < RESIZE_BAND
 }
 
+/// The origins an operation could be moved to: every origin in `indices` except the one
+/// the operation already sits under, keeping `indices`' order so the menu matches the
+/// tree. Empty on a single-origin job, which is what hides the menu section entirely.
+///
+/// `current` is the operation's stored `work_offset`, which need not name a live origin
+/// — deleting an origin leaves its operations pointing at an index that is gone. The
+/// tree groups such an operation under `base`, so this treats it as being there. Reading
+/// the stale index literally would offer the base as a destination for a row already
+/// drawn under the base, and moving it there would look like nothing happened.
+///
+/// A free function, not a method: it is the whole rule, and this way it can be tested
+/// without standing up an application.
+fn origin_move_targets(indices: &[u32], current: Option<u32>, base: u32) -> Vec<u32> {
+    let here = current
+        .filter(|wo| indices.contains(wo))
+        .unwrap_or(base);
+    indices.iter().copied().filter(|i| *i != here).collect()
+}
+
 /// The orientation cube's square rectangle, anchored to the top-right of a
 /// `w × h` viewport. `size` and `margin` are given in the same units as `w,h`
 /// (logical px for the click hit-test, physical px for drawing), so the cube is a
@@ -8258,6 +8337,47 @@ impl canvas::Program<Message> for ToolCanvas {
         }
 
         vec![frame.into_geometry()]
+    }
+}
+
+#[cfg(test)]
+mod origin_move_tests {
+    use super::origin_move_targets;
+
+    #[test]
+    fn a_single_origin_job_offers_nowhere_to_move() {
+        // What keeps the menu section off an ordinary job: with one origin there is no
+        // destination, and a "Move to Origin 1" row on the operation already in origin 1
+        // would be a control that does nothing.
+        assert!(origin_move_targets(&[1], Some(1), 1).is_empty());
+    }
+
+    #[test]
+    fn every_other_origin_is_offered_in_tree_order() {
+        // Order matters: the menu reads down the same sequence as the project tree, so
+        // "the third one" means the same thing in both.
+        assert_eq!(origin_move_targets(&[1, 2, 3], Some(2), 1), vec![1, 3]);
+        assert_eq!(origin_move_targets(&[1, 2, 3], Some(1), 1), vec![2, 3]);
+    }
+
+    #[test]
+    fn a_raised_base_is_not_assumed_to_be_origin_one() {
+        // The base origin's `H<n>` is editable, so the indices need not start at 1 and
+        // "the base" is whatever the setup says. Hard-coding 1 anywhere here would offer
+        // an operation a move to the group it is already in.
+        assert_eq!(origin_move_targets(&[4, 5], Some(4), 4), vec![5]);
+        assert_eq!(origin_move_targets(&[4, 5], Some(5), 4), vec![4]);
+    }
+
+    #[test]
+    fn an_operation_pointing_at_a_deleted_origin_counts_as_being_on_the_base() {
+        // Deleting an origin leaves its operations carrying an index that no longer
+        // exists; the tree draws them under the base. If that stale index were read
+        // literally the base would be offered as a destination for a row already shown
+        // under the base — a move that appears to do nothing.
+        assert_eq!(origin_move_targets(&[1, 3], Some(2), 1), vec![3]);
+        // Same for an operation with no origin recorded at all.
+        assert_eq!(origin_move_targets(&[1, 3], None, 1), vec![3]);
     }
 }
 

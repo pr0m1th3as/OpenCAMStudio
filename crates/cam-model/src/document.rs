@@ -49,7 +49,17 @@ use crate::Tool;
 ///     inside a `clear` object, which no serde attribute expresses. `schema_version` had
 ///     been written into every save since v1 and read by nothing; from here it drives
 ///     [`crate::migrate`], which rewrites the JSON tree before it is deserialized.
-pub const SCHEMA_VERSION: u32 = 10;
+/// v11: the saved project gained the **machine** it was built for and the **post** it
+///     was built to export through, both previously session-only, so reopening a job
+///     does not silently retarget it at whatever control the application last had
+///     selected. Both are `Option`, defaulting to absent — a pre-v11 project says
+///     nothing about either and leaves the session's own choices alone, which is the
+///     only honest reading of a file that never recorded them.
+///     Additive, so the step is an identity; the bump is a record of a **file-format**
+///     change, since the version numbers the save-file as a whole and not the
+///     [`Document`] alone. [`Machine`](crate::Machine) and `PostKind` became
+///     serializable to carry it.
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// The safety planes for a setup, all **absolute Z in millimetres**. By
 /// convention WCS Z0 is the top of stock, so `top_of_stock` is usually `0.0`.

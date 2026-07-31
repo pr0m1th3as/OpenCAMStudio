@@ -167,6 +167,12 @@ fn step(from: u32, doc: &mut Value) -> Result<(), MigrationError> {
         // a step is a `MissingStep` error, not a silent no-op.
         1..=8 => Ok(()),
         9 => v9_to_v10(doc),
+        // v10→v11 added the machine and the post to the *project wrapper*, not to the
+        // document — additive, `Option`, absent in every earlier file. Nothing in the
+        // document moved, so there is nothing here to move. The version still bumped
+        // because it numbers the save-file as a whole, and a format change that leaves
+        // the version alone is the one that bites later.
+        10 => Ok(()),
         _ => Err(MigrationError::MissingStep { from }),
     }
 }
