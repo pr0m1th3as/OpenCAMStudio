@@ -5,8 +5,8 @@
 use cam_cldata::SpindleDir;
 use cam_geo::{Contour, Point};
 use cam_model::{
-    Comp, Document, Heights, Lead, Operation, Plunge, PocketOp, ProfileOp, Setup, Side, Stock,
-    Tool, ToolKind,
+    ClearParams, Comp, Document, Heights, Lead, Operation, Plunge, PocketOp, ProfileOp, Setup,
+    Side, Stock, Tool, ToolKind,
 };
 use cam_sim::{check_gouge, simulate, Heightfield, SimOptions};
 use cam_toolpath::{build_job, CancelToken};
@@ -99,22 +99,24 @@ fn a_pocket_clears_its_floor_without_collisions() {
     let op = PocketOp {
         spindle_rpm: 0.0,
         work_offset: 1,
-        clearing: cam_model::Clearing::default(),
         id: 0,
         tool: 1,
         boundary: square(5.0, 5.0, 35.0, 35.0),
         islands: vec![],
         depth: 4.0,
-        stepdown: 2.0,
-        overlap: 0.5,
-        offset: 0.0,
-        feed: 300.0,
-        plunge_feed: 100.0,
-        plunge: Plunge::Straight,
         start: None,
-        lead_overlap: 0.0,
-        lead_in: Lead::None,
-        lead_out: Lead::None,
+        clear: ClearParams {
+            clearing: cam_model::Clearing::default(),
+            stepdown: 2.0,
+            overlap: 0.5,
+            offset: 0.0,
+            feed: 300.0,
+            plunge_feed: 100.0,
+            plunge: Plunge::Straight,
+            lead_overlap: 0.0,
+            lead_in: Lead::None,
+            lead_out: Lead::None,
+        },
     };
     let sim = run(&setup(vec![Operation::Pocket(op)]));
 
@@ -166,22 +168,24 @@ fn pocket_op() -> PocketOp {
     PocketOp {
         spindle_rpm: 0.0,
         work_offset: 1,
-        clearing: cam_model::Clearing::default(),
         id: 0,
         tool: 1,
         boundary: square(5.0, 5.0, 35.0, 35.0),
         islands: vec![],
         depth: 4.0,
-        stepdown: 2.0,
-        overlap: 0.5,
-        offset: 0.0,
-        feed: 300.0,
-        plunge_feed: 100.0,
-        plunge: Plunge::Straight,
         start: None,
-        lead_overlap: 0.0,
-        lead_in: Lead::None,
-        lead_out: Lead::None,
+        clear: ClearParams {
+            clearing: cam_model::Clearing::default(),
+            stepdown: 2.0,
+            overlap: 0.5,
+            offset: 0.0,
+            feed: 300.0,
+            plunge_feed: 100.0,
+            plunge: Plunge::Straight,
+            lead_overlap: 0.0,
+            lead_in: Lead::None,
+            lead_out: Lead::None,
+        },
     }
 }
 

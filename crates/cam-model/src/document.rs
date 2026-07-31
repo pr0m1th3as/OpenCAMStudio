@@ -40,7 +40,16 @@ use crate::Tool;
 ///     unconditional lift-to-tool-change-height then descend-to-clearance that now opens
 ///     every operation group. Old files still open — serde drops the now-unknown field,
 ///     so a saved start point becomes "start straight into the first op" (a safe no-op).
-pub const SCHEMA_VERSION: u32 = 9;
+/// v10: `PocketOp`'s flat clearing fields (`stepdown`/`overlap`/`offset`/`feed`/
+///     `plunge_feed`/`plunge`/`lead_in`/`lead_out`/`lead_overlap`/`clearing`) moved into
+///     a nested [`ClearParams`] under `clear`, the struct [`CarveOp`] already used, so
+///     one type states what an area-clearing pass takes.
+///     **The first bump that is not additive**, and so the first a saved file cannot
+///     absorb by serde defaults alone — a flat `stepdown` has to become a `stepdown`
+///     inside a `clear` object, which no serde attribute expresses. `schema_version` had
+///     been written into every save since v1 and read by nothing; from here it drives
+///     [`crate::migrate`], which rewrites the JSON tree before it is deserialized.
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// The safety planes for a setup, all **absolute Z in millimetres**. By
 /// convention WCS Z0 is the top of stock, so `top_of_stock` is usually `0.0`.
@@ -352,9 +361,16 @@ impl Default for Clearing {
 /// set of `clear_*` scalars copied beside it would drift from the real thing the first
 /// time either gained a control the other did not.
 ///
-/// [`PocketOp`] still carries these flat, and should adopt this struct as a deliberate
-/// schema bump with a migration — its fields are already on disk in saved projects,
-/// which this struct's first user ([`CarveOp`]) is not.
+/// Both [`PocketOp`] and [`CarveOp`] carry one of these (v10; see
+/// [`SCHEMA_VERSION`]) — a control added here reaches both by construction, which is
+/// the whole point of the type.
+///
+/// It is **not** what the clearing engine consumes. `cam-toolpath`'s `ClearJob` adds the
+/// derived geometry a run needs (tool radius, first-ring offset, nominal spacing, the
+/// lead guard region) and is built per call site from these plus the tool. Collapsing
+/// the two would push tool geometry into the document model; keeping them separate means
+/// this struct stays *what the operator asked for* and `ClearJob` stays *what that works
+/// out to*.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ClearParams {
     /// Maximum depth removed per pass, mm. `0` clears the full depth in one pass.
@@ -443,17 +459,6 @@ pub struct PocketOp {
     /// Pocket depth below the reference plane (Z=0), as a positive magnitude (mm).
     /// The floor sits at absolute Z `-depth`.
     pub depth: f64,
-    /// Maximum depth removed per pass (mm, > 0).
-    pub stepdown: f64,
-    /// Fraction of the tool diameter that adjacent concentric rings overlap (0..1),
-    /// as on the face op. The radial ring spacing is `diameter * (1 - overlap)`.
-    pub overlap: f64,
-    /// Finishing allowance left on every wall (mm): the rings stop this far short of
-    /// the boundary and each island, so a later profile finishes the walls to size.
-    /// `0.0` (the default) clears to the boundary/island edges. Applied on top of
-    /// the tool radius.
-    #[serde(default)]
-    pub offset: f64,
     /// Spindle speed for this operation, rpm (`M3 S<rpm>`). Seeded from the tool's
     /// nominal RPM when the operation is created; `0.0` falls back to the job default.
     #[serde(default)]
@@ -463,34 +468,28 @@ pub struct PocketOp {
     /// fixtures/setups emit under different work coordinate systems.
     #[serde(default = "default_work_offset")]
     pub work_offset: u32,
-    /// Cutting feed, mm/min.
-    pub feed: f64,
-    /// Plunge feed, mm/min.
-    pub plunge_feed: f64,
-    /// How the tool enters the material in Z at each pass.
-    pub plunge: Plunge,
     /// Preferred lead-in location (part XY): the clearing begins on the ring point
     /// nearest here, so the plunge/entry witness mark lands where the machinist
     /// chose. `None` uses the strategy's default entry.
+    ///
+    /// Stays on the operation rather than joining [`ClearParams`]: it names a place on
+    /// *this* pocket's geometry, so it has no meaning for the derived region a carve
+    /// clears.
     pub start: Option<[f64; 2]>,
-    /// Distance (mm, >= 0) each ring keeps cutting past its plunge/start point
-    /// before retracting, so the loop-closure junction is re-machined and leaves
-    /// no witness dent. `0.0` (the default) closes exactly at the start, as before.
-    #[serde(default)]
-    pub lead_overlap: f64,
-    /// Lead-in onto the finished walls (boundary and islands), eased in from the
-    /// cleared interior so a one-pass wall finish leaves no witness. `None` (the
-    /// default) plunges/links straight onto the wall, as before.
-    #[serde(default)]
-    pub lead_in: Lead,
-    /// Lead-out off the walls after the finishing pass. `None` (the default) leaves
-    /// in place.
-    #[serde(default)]
-    pub lead_out: Lead,
-    /// Constant-engagement clearing parameters. `engagement <= 0` (the default)
-    /// keeps the plain concentric clearing.
-    #[serde(default)]
-    pub clearing: Clearing,
+    /// How this pocket is cleared — stepdown, ring overlap, wall allowance, feeds,
+    /// plunge style, leads, and the engagement cap.
+    ///
+    /// The same [`ClearParams`] a [`CarveOp`]'s clearing pass carries (v10; before that
+    /// these were ten flat fields here, and a control added to one op could silently
+    /// miss the other).
+    ///
+    /// Deliberately **not** `#[serde(default)]`, unlike almost every field added since
+    /// v5. A default here would make [`crate::migrate`] optional in the worst possible
+    /// way: a v9 pocket, whose clearing parameters are all still flat, would load
+    /// without complaint as a pocket with **zero feed and zero stepdown** — a silently
+    /// broken operation rather than a refusal. Requiring the field means a document that
+    /// reached the deserializer un-migrated fails there, loudly, with the field named.
+    pub clear: ClearParams,
 }
 
 /// A principal axis in the XY plane — used to orient facing passes.

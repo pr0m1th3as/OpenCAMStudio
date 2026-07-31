@@ -15,6 +15,7 @@
 
 mod document;
 mod history;
+pub mod migrate;
 mod reconcile;
 
 pub use cam_cldata::Point3;

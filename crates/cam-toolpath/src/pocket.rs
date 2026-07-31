@@ -58,10 +58,10 @@ impl Strategy for PocketStrategy {
         if !op.boundary.is_valid() {
             fail!("operation {}: pocket boundary is not a closed area", op.id);
         }
-        if !(0.0..1.0).contains(&op.overlap) {
+        if !(0.0..1.0).contains(&op.clear.overlap) {
             fail!("operation {}: overlap must be a fraction in [0, 1)", op.id);
         }
-        if op.stepdown <= 0.0 {
+        if op.clear.stepdown <= 0.0 {
             fail!("operation {}: stepdown must be positive", op.id);
         }
         // `depth` is a positive magnitude below the reference; the floor sits at Z = -depth.
@@ -86,34 +86,34 @@ impl Strategy for PocketStrategy {
         // the finishing allowance (so the skin is left on the boundary and every
         // island), then by the ring spacing set by the overlap.
         let r = tool.radius();
-        let spacing = tool.diameter * (1.0 - op.overlap);
+        let spacing = tool.diameter * (1.0 - op.clear.overlap);
         if spacing <= 1e-9 {
             fail!("operation {}: overlap leaves no stepover", op.id);
         }
-        let first = r + op.offset;
+        let first = r + op.clear.offset;
 
         // The cleared region the wall leads must stay inside: the region held back by
         // the wall ring's own offset. A lead-in/out that would swing past this (a
         // pocket narrower than the lead) is dropped to a plain wall pass.
         let guard = offset(std::slice::from_ref(&region), -first, JoinStyle::Round).unwrap_or_default();
 
-        let levels = depth_levels(env.heights.top_of_stock, floor, op.stepdown);
+        let levels = depth_levels(env.heights.top_of_stock, floor, op.clear.stepdown);
         let mut program = Program::new();
         // Clear through the shared engine: engagement-spaced, climb-oriented,
         // stay-down inside-out rings, with the finishing wall leads.
         let job = crate::clearing::ClearJob {
             id: op.id,
             radius: r,
-            finish: op.offset,
+            finish: op.clear.offset,
             first,
             spacing,
-            clearing: op.clearing,
-            plunge: op.plunge,
-            feed: op.feed,
-            plunge_feed: op.plunge_feed,
-            lead_overlap: op.lead_overlap,
-            lead_in: op.lead_in,
-            lead_out: op.lead_out,
+            clearing: op.clear.clearing,
+            plunge: op.clear.plunge,
+            feed: op.clear.feed,
+            plunge_feed: op.clear.plunge_feed,
+            lead_overlap: op.clear.lead_overlap,
+            lead_in: op.clear.lead_in,
+            lead_out: op.clear.lead_out,
             start: op.start,
             guard: &guard,
         };
@@ -149,7 +149,7 @@ mod tests {
     use super::*;
     use cam_cldata::{MoveKind, Step};
     use cam_geo::{Contour, Point, Polygon};
-    use cam_model::{Clearing, Heights, Lead, Plunge, Tool, ToolKind};
+    use cam_model::{ClearParams, Clearing, Heights, Lead, Plunge, Tool, ToolKind};
 
     fn square(side: f64) -> Contour {
         Contour::new(vec![
@@ -206,22 +206,24 @@ mod tests {
         let op = PocketOp {
             spindle_rpm: 0.0,
             work_offset: 1,
-            clearing: cam_model::Clearing::default(),
             id: 0,
             tool: 1,
             boundary: square(40.0),
             islands: vec![],
             depth: 3.0,
-            stepdown: 1.5,
-            overlap: 0.5,
-            offset: 0.0,
-            feed: 300.0,
-            plunge_feed: 100.0,
-            plunge: Plunge::Straight,
             start: None,
-            lead_overlap: 0.0,
-            lead_in: Lead::None,
-            lead_out: Lead::None,
+            clear: ClearParams {
+                clearing: cam_model::Clearing::default(),
+                stepdown: 1.5,
+                overlap: 0.5,
+                offset: 0.0,
+                feed: 300.0,
+                plunge_feed: 100.0,
+                plunge: Plunge::Straight,
+                lead_overlap: 0.0,
+                lead_in: Lead::None,
+                lead_out: Lead::None,
+            },
         };
         let ts = tools(8.0);
         let env = JobEnv {
@@ -244,25 +246,27 @@ mod tests {
         let op = PocketOp {
             spindle_rpm: 0.0,
             work_offset: 1,
-            clearing: cam_model::Clearing::default(),
             id: 0,
             tool: 1,
             boundary: square(40.0),
             islands: vec![],
             depth: 3.0,
-            stepdown: 1.5,
-            overlap: 0.5,
-            offset: 0.0,
-            feed: 300.0,
-            plunge_feed: 100.0,
-            plunge: Plunge::Helix {
+            start: None,
+            clear: ClearParams {
+                clearing: cam_model::Clearing::default(),
+                stepdown: 1.5,
+                overlap: 0.5,
+                offset: 0.0,
+                feed: 300.0,
+                plunge_feed: 100.0,
+                plunge: Plunge::Helix {
                 radius: 1.0,
                 pitch: 0.5,
             },
-            start: None,
-            lead_overlap: 0.0,
-            lead_in: Lead::None,
-            lead_out: Lead::None,
+                lead_overlap: 0.0,
+                lead_in: Lead::None,
+                lead_out: Lead::None,
+            },
         };
         let ts = tools(8.0);
         let env = JobEnv {
@@ -297,22 +301,24 @@ mod tests {
         let op = PocketOp {
             spindle_rpm: 0.0,
             work_offset: 1,
-            clearing: cam_model::Clearing::default(),
             id: 0,
             tool: 1,
             boundary: square(10.0),
             islands: vec![],
             depth: 3.0,
-            stepdown: 1.5,
-            overlap: 0.5,
-            offset: 0.0,
-            feed: 300.0,
-            plunge_feed: 100.0,
-            plunge: Plunge::Straight,
             start: None,
-            lead_overlap: 0.0,
-            lead_in: Lead::None,
-            lead_out: Lead::None,
+            clear: ClearParams {
+                clearing: cam_model::Clearing::default(),
+                stepdown: 1.5,
+                overlap: 0.5,
+                offset: 0.0,
+                feed: 300.0,
+                plunge_feed: 100.0,
+                plunge: Plunge::Straight,
+                lead_overlap: 0.0,
+                lead_in: Lead::None,
+                lead_out: Lead::None,
+            },
         };
         let ts = tools(12.0); // radius 6 > half of 10 ⇒ cannot enter
         let env = JobEnv {
@@ -347,24 +353,26 @@ mod tests {
             let mut op = PocketOp {
                 spindle_rpm: 0.0,
                 work_offset: 1,
-                clearing: cam_model::Clearing::default(),
                 id: 0,
                 tool: 1,
                 boundary: square(40.0),
                 islands: vec![],
                 depth: 1.5,
-                stepdown: 1.5,
-                overlap,
-                offset: 0.0,
-                feed: 300.0,
-                plunge_feed: 100.0,
-                plunge: Plunge::Straight,
                 start: None,
-                lead_overlap: 0.0,
-                lead_in: Lead::None,
-                lead_out: Lead::None,
+                clear: ClearParams {
+                    clearing: cam_model::Clearing::default(),
+                    stepdown: 1.5,
+                    overlap,
+                    offset: 0.0,
+                    feed: 300.0,
+                    plunge_feed: 100.0,
+                    plunge: Plunge::Straight,
+                    lead_overlap: 0.0,
+                    lead_in: Lead::None,
+                    lead_out: Lead::None,
+                },
             };
-            op.overlap = overlap;
+            op.clear.overlap = overlap;
             let ts = tools(8.0);
             let env = JobEnv {
                 heights: Heights::new(5.0, 2.0, 0.0),
@@ -386,22 +394,24 @@ mod tests {
             let op = PocketOp {
                 spindle_rpm: 0.0,
                 work_offset: 1,
-                clearing: cam_model::Clearing::default(),
                 id: 0,
                 tool: 1,
                 boundary: square(40.0),
                 islands: vec![],
                 depth: 1.5,
-                stepdown: 1.5,
-                overlap: 0.5,
-                offset,
-                feed: 300.0,
-                plunge_feed: 100.0,
-                plunge: Plunge::Straight,
                 start: None,
-                lead_overlap: 0.0,
-                lead_in: Lead::None,
-                lead_out: Lead::None,
+                clear: ClearParams {
+                    clearing: cam_model::Clearing::default(),
+                    stepdown: 1.5,
+                    overlap: 0.5,
+                    offset,
+                    feed: 300.0,
+                    plunge_feed: 100.0,
+                    plunge: Plunge::Straight,
+                    lead_overlap: 0.0,
+                    lead_in: Lead::None,
+                    lead_out: Lead::None,
+                },
             };
             let ts = tools(8.0);
             let env = JobEnv {
@@ -444,22 +454,24 @@ mod tests {
         PocketOp {
             spindle_rpm: 0.0,
             work_offset: 1,
-            clearing: cam_model::Clearing::default(),
             id: 0,
             tool: 1,
             boundary: square(40.0),
             islands,
             depth: 1.5,
-            stepdown: 1.5,
-            overlap: 0.5,
-            offset: 0.0,
-            feed: 300.0,
-            plunge_feed: 100.0,
-            plunge: Plunge::Straight,
             start: None,
-            lead_overlap: 0.0,
-            lead_in: Lead::Arc { radius: 2.0 },
-            lead_out: Lead::Arc { radius: 2.0 },
+            clear: ClearParams {
+                clearing: cam_model::Clearing::default(),
+                stepdown: 1.5,
+                overlap: 0.5,
+                offset: 0.0,
+                feed: 300.0,
+                plunge_feed: 100.0,
+                plunge: Plunge::Straight,
+                lead_overlap: 0.0,
+                lead_in: Lead::Arc { radius: 2.0 },
+                lead_out: Lead::Arc { radius: 2.0 },
+            },
         }
     }
 
@@ -488,8 +500,8 @@ mod tests {
 
         // No leads emitted when unset.
         let mut plain = leaded_op(vec![]);
-        plain.lead_in = Lead::None;
-        plain.lead_out = Lead::None;
+        plain.clear.lead_in = Lead::None;
+        plain.clear.lead_out = Lead::None;
         let r2 = PocketStrategy::new(plain).compute(&env, &CancelToken::new());
         assert!(leadin_arcs(&r2).is_empty(), "no leads when unset");
     }
@@ -523,9 +535,9 @@ mod tests {
         // alone would space them 4 mm — so more rings, more cutting moves.
         let run = |engagement: f64| {
             let mut op = leaded_op(vec![]);
-            op.lead_in = Lead::None;
-            op.lead_out = Lead::None;
-            op.clearing = Clearing { engagement, climb: true };
+            op.clear.lead_in = Lead::None;
+            op.clear.lead_out = Lead::None;
+            op.clear.clearing = Clearing { engagement, climb: true };
             let ts = tools(8.0);
             let env = JobEnv {
                 heights: Heights::new(5.0, 2.0, 0.0),
@@ -559,22 +571,25 @@ mod tests {
         let op = PocketOp {
             spindle_rpm: 0.0,
             work_offset: 1,
-            clearing: Clearing { engagement: 2.0, climb: true },
             id: 0,
             tool: 1,
             boundary: square(40.0),
             islands: vec![],
             depth: 2.0,
-            stepdown: 2.0, // one depth level
-            overlap: 0.5,
-            offset: 0.0,
-            feed: 300.0,
-            plunge_feed: 100.0,
-            plunge: Plunge::Straight,
             start: None,
-            lead_overlap: 0.0,
-            lead_in: Lead::None,
-            lead_out: Lead::None,
+            clear: ClearParams {
+                clearing: Clearing { engagement: 2.0, climb: true },
+                // one depth level
+                stepdown: 2.0,
+                overlap: 0.5,
+                offset: 0.0,
+                feed: 300.0,
+                plunge_feed: 100.0,
+                plunge: Plunge::Straight,
+                lead_overlap: 0.0,
+                lead_in: Lead::None,
+                lead_out: Lead::None,
+            },
         };
         let ts = tools(6.0);
         let env = JobEnv {
@@ -638,16 +653,16 @@ mod tests {
         // Same pocket, climb vs conventional: the overall travel winding flips sign.
         let climb = {
             let mut op = leaded_op(vec![]);
-            op.lead_in = Lead::None;
-            op.lead_out = Lead::None;
-            op.clearing = Clearing { engagement: 0.0, climb: true };
+            op.clear.lead_in = Lead::None;
+            op.clear.lead_out = Lead::None;
+            op.clear.clearing = Clearing { engagement: 0.0, climb: true };
             PocketStrategy::new(op).compute(&env, &CancelToken::new())
         };
         let conv = {
             let mut op = leaded_op(vec![]);
-            op.lead_in = Lead::None;
-            op.lead_out = Lead::None;
-            op.clearing = Clearing { engagement: 0.0, climb: false };
+            op.clear.lead_in = Lead::None;
+            op.clear.lead_out = Lead::None;
+            op.clear.clearing = Clearing { engagement: 0.0, climb: false };
             PocketStrategy::new(op).compute(&env, &CancelToken::new())
         };
         let a_climb = cutting_path_signed_area(&climb);
@@ -661,7 +676,7 @@ mod tests {
         // the cleared interior (not swing onto the wall) — the reversal is threaded
         // through to the lead's cleared-side normal.
         let mut leaded = leaded_op(vec![]);
-        leaded.clearing = Clearing { engagement: 0.0, climb: false };
+        leaded.clear.clearing = Clearing { engagement: 0.0, climb: false };
         let r = PocketStrategy::new(leaded).compute(&env, &CancelToken::new());
         assert!(!r.has_errors(), "{:?}", r.diagnostics);
         let arcs = leadin_arcs(&r);
@@ -686,22 +701,24 @@ mod tests {
         let small = PocketOp {
             spindle_rpm: 0.0,
             work_offset: 1,
-            clearing: cam_model::Clearing::default(),
             id: 0,
             tool: 1,
             boundary: square(10.0),
             islands: vec![],
             depth: 1.5,
-            stepdown: 1.5,
-            overlap: 0.9,
-            offset: 0.0,
-            feed: 300.0,
-            plunge_feed: 100.0,
-            plunge: Plunge::Straight,
             start: None,
-            lead_overlap: 0.0,
-            lead_in: Lead::Arc { radius: 3.0 },
-            lead_out: Lead::Arc { radius: 3.0 },
+            clear: ClearParams {
+                clearing: cam_model::Clearing::default(),
+                stepdown: 1.5,
+                overlap: 0.9,
+                offset: 0.0,
+                feed: 300.0,
+                plunge_feed: 100.0,
+                plunge: Plunge::Straight,
+                lead_overlap: 0.0,
+                lead_in: Lead::Arc { radius: 3.0 },
+                lead_out: Lead::Arc { radius: 3.0 },
+            },
         };
         let ts = tools(6.0);
         let env = JobEnv {

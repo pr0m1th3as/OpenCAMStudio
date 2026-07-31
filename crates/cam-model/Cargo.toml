@@ -12,6 +12,6 @@ repository.workspace = true
 cam-cldata = { path = "../cam-cldata" }
 cam-geo = { path = "../cam-geo" }
 serde = { workspace = true }
-
-[dev-dependencies]
+# Not just for tests: `migrate` rewrites a saved document as a JSON tree *before*
+# it is deserialized, which is the only stage at which a field can change shape.
 serde_json = { workspace = true }

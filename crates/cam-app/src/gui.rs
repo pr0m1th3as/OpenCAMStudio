@@ -2850,7 +2850,7 @@ impl App {
                 self.controller.edit_selected_operation(|op| match op {
                     Operation::Profile(p) => p.lead_in = kind.to_lead(p.lead_in),
                     Operation::Chamfer(c) => c.lead_in = kind.to_lead(c.lead_in),
-                    Operation::Pocket(p) => p.lead_in = kind.to_lead(p.lead_in),
+                    Operation::Pocket(p) => p.clear.lead_in = kind.to_lead(p.clear.lead_in),
                     _ => {}
                 });
                 self.refresh_fields();
@@ -2860,7 +2860,7 @@ impl App {
                 self.controller.edit_selected_operation(|op| match op {
                     Operation::Profile(p) => p.lead_out = kind.to_lead(p.lead_out),
                     Operation::Chamfer(c) => c.lead_out = kind.to_lead(c.lead_out),
-                    Operation::Pocket(p) => p.lead_out = kind.to_lead(p.lead_out),
+                    Operation::Pocket(p) => p.clear.lead_out = kind.to_lead(p.clear.lead_out),
                     _ => {}
                 });
                 self.refresh_fields();
@@ -2869,7 +2869,7 @@ impl App {
             Message::PlungeKindChanged(kind) => {
                 self.controller.edit_selected_operation(|op| match op {
                     Operation::Profile(p) => p.plunge = kind.to_plunge(),
-                    Operation::Pocket(p) => p.plunge = kind.to_plunge(),
+                    Operation::Pocket(p) => p.clear.plunge = kind.to_plunge(),
                     _ => {}
                 });
                 self.refresh_fields();
@@ -2895,7 +2895,7 @@ impl App {
             }
             Message::ClearingClimbToggled(on) => {
                 self.controller.edit_selected_operation(|op| match op {
-                    Operation::Pocket(p) => p.clearing.climb = on,
+                    Operation::Pocket(p) => p.clear.clearing.climb = on,
                     Operation::Profile(p) => p.clearing.climb = on,
                     _ => {}
                 });
@@ -3965,13 +3965,13 @@ impl App {
                         Field::PlungeFeed,
                         Field::LeadOverlap,
                     ];
-                    if p.lead_in != Lead::None {
+                    if p.clear.lead_in != Lead::None {
                         fields.push(Field::LeadInSize);
                     }
-                    if p.lead_out != Lead::None {
+                    if p.clear.lead_out != Lead::None {
                         fields.push(Field::LeadOutSize);
                     }
-                    match p.plunge {
+                    match p.clear.plunge {
                         Plunge::Straight => {}
                         Plunge::Ramp { .. } => fields.push(Field::PlungeA),
                         Plunge::Helix { .. } | Plunge::ZigZag { .. } => {
@@ -5954,14 +5954,14 @@ impl App {
                         "Plunge",
                         help::PLUNGE,
                         self.tooltips,
-                        PlungeKind::of(p.plunge),
+                        PlungeKind::of(p.clear.plunge),
                         &PlungeKind::ALL[..],
                         Message::PlungeKindChanged,
                     ));
                     list = list.push(
                         row![
                             label_help("Climb", help::CLIMB, self.tooltips),
-                            checkbox(p.clearing.climb)
+                            checkbox(p.clear.clearing.climb)
                                 .size(15)
                                 .on_toggle(Message::ClearingClimbToggled),
                         ]
@@ -5972,7 +5972,7 @@ impl App {
                         "Wall lead-in",
                         help::LEAD_IN,
                         self.tooltips,
-                        LeadKind::of(p.lead_in),
+                        LeadKind::of(p.clear.lead_in),
                         &LeadKind::ALL[..],
                         Message::LeadInKindChanged,
                     ));
@@ -5980,7 +5980,7 @@ impl App {
                         "Wall lead-out",
                         help::LEAD_OUT,
                         self.tooltips,
-                        LeadKind::of(p.lead_out),
+                        LeadKind::of(p.clear.lead_out),
                         &LeadKind::ALL[..],
                         Message::LeadOutKindChanged,
                     ));
@@ -6757,17 +6757,17 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Profile(o), Field::PlungeA) => Some(plunge_params(o.plunge).0),
         (Operation::Profile(o), Field::PlungeB) => Some(plunge_params(o.plunge).1),
         (Operation::Pocket(o), Field::Depth) => Some(o.depth),
-        (Operation::Pocket(o), Field::Stepdown) => Some(o.stepdown),
-        (Operation::Pocket(o), Field::Overlap) => Some(o.overlap * 100.0),
-        (Operation::Pocket(o), Field::ProfileOffset) => Some(o.offset),
-        (Operation::Pocket(o), Field::LeadInSize) => Some(lead_size(o.lead_in)),
-        (Operation::Pocket(o), Field::LeadOutSize) => Some(lead_size(o.lead_out)),
-        (Operation::Pocket(o), Field::Feed) => Some(o.feed),
-        (Operation::Pocket(o), Field::PlungeFeed) => Some(o.plunge_feed),
-        (Operation::Pocket(o), Field::LeadOverlap) => Some(o.lead_overlap),
-        (Operation::Pocket(o), Field::Engagement) => Some(o.clearing.engagement),
-        (Operation::Pocket(o), Field::PlungeA) => Some(plunge_params(o.plunge).0),
-        (Operation::Pocket(o), Field::PlungeB) => Some(plunge_params(o.plunge).1),
+        (Operation::Pocket(o), Field::Stepdown) => Some(o.clear.stepdown),
+        (Operation::Pocket(o), Field::Overlap) => Some(o.clear.overlap * 100.0),
+        (Operation::Pocket(o), Field::ProfileOffset) => Some(o.clear.offset),
+        (Operation::Pocket(o), Field::LeadInSize) => Some(lead_size(o.clear.lead_in)),
+        (Operation::Pocket(o), Field::LeadOutSize) => Some(lead_size(o.clear.lead_out)),
+        (Operation::Pocket(o), Field::Feed) => Some(o.clear.feed),
+        (Operation::Pocket(o), Field::PlungeFeed) => Some(o.clear.plunge_feed),
+        (Operation::Pocket(o), Field::LeadOverlap) => Some(o.clear.lead_overlap),
+        (Operation::Pocket(o), Field::Engagement) => Some(o.clear.clearing.engagement),
+        (Operation::Pocket(o), Field::PlungeA) => Some(plunge_params(o.clear.plunge).0),
+        (Operation::Pocket(o), Field::PlungeB) => Some(plunge_params(o.clear.plunge).1),
         (Operation::Face(o), Field::FaceStartOffset) => Some(o.start_offset),
         (Operation::Face(o), Field::Depth) => Some(o.depth),
         (Operation::Face(o), Field::Stepdown) => Some(o.stepdown),
@@ -6855,36 +6855,36 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
                 o.depth = v;
             }
             if let Some(v) = get(Field::Stepdown) {
-                o.stepdown = v;
+                o.clear.stepdown = v;
             }
             if let Some(v) = get(Field::Overlap) {
-                o.overlap = (v / 100.0).clamp(0.0, 0.99);
+                o.clear.overlap = (v / 100.0).clamp(0.0, 0.99);
             }
             if let Some(v) = get(Field::Engagement) {
-                o.clearing.engagement = v.max(0.0);
+                o.clear.clearing.engagement = v.max(0.0);
             }
             if let Some(v) = get(Field::ProfileOffset) {
-                o.offset = v.max(0.0);
+                o.clear.offset = v.max(0.0);
             }
             if let Some(v) = get(Field::Feed) {
-                o.feed = v;
+                o.clear.feed = v;
             }
             if let Some(v) = get(Field::PlungeFeed) {
-                o.plunge_feed = v;
+                o.clear.plunge_feed = v;
             }
             if let Some(v) = get(Field::LeadOverlap) {
-                o.lead_overlap = v.max(0.0);
+                o.clear.lead_overlap = v.max(0.0);
             }
             if let Some(v) = get(Field::LeadInSize) {
-                o.lead_in = set_lead_size(o.lead_in, v);
+                o.clear.lead_in = set_lead_size(o.clear.lead_in, v);
             }
             if let Some(v) = get(Field::LeadOutSize) {
-                o.lead_out = set_lead_size(o.lead_out, v);
+                o.clear.lead_out = set_lead_size(o.clear.lead_out, v);
             }
-            let (a, b) = plunge_params(o.plunge);
+            let (a, b) = plunge_params(o.clear.plunge);
             let a = get(Field::PlungeA).unwrap_or(a);
             let b = get(Field::PlungeB).unwrap_or(b);
-            o.plunge = set_plunge_params(o.plunge, a, b);
+            o.clear.plunge = set_plunge_params(o.clear.plunge, a, b);
         }
         Operation::Face(o) => {
             if let Some(v) = get(Field::FaceStartOffset) {

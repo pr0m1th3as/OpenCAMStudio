@@ -18,8 +18,8 @@
 use cam_cldata::{MoveKind, Program, SpindleDir, Step};
 use cam_geo::{Contour, Point};
 use cam_model::{
-    Axis, CarveOp, Clearing, Comp, Document, FaceOp, Heights, Lead, Machine, Operation, Plunge,
-    PocketOp, ProfileOp, Setup, Side, Stock, Tool, ToolKind,
+    Axis, CarveOp, ClearParams, Clearing, Comp, Document, FaceOp, Heights, Lead, Machine,
+    Operation, Plunge, PocketOp, ProfileOp, Setup, Side, Stock, Tool, ToolKind,
 };
 use cam_post::{GrblPost, Post, PostOptions};
 use cam_toolpath::{build_job, CancelToken};
@@ -172,22 +172,24 @@ fn pocket_doc() -> Document {
     let op = PocketOp {
         spindle_rpm: 0.0,
         work_offset: 1,
-        clearing: Clearing::default(),
         id: 0,
         tool: 1,
         boundary: rect(0.0, 0.0, 60.0, 40.0),
         islands: vec![rect(25.0, 15.0, 35.0, 25.0)],
         depth: 3.0,
-        stepdown: 2.0,
-        overlap: 0.5,
-        offset: 0.0,
-        feed: 300.0,
-        plunge_feed: 100.0,
-        plunge: Plunge::Straight,
         start: None,
-        lead_overlap: 0.0,
-        lead_in: Lead::None,
-        lead_out: Lead::None,
+        clear: ClearParams {
+            clearing: Clearing::default(),
+            stepdown: 2.0,
+            overlap: 0.5,
+            offset: 0.0,
+            feed: 300.0,
+            plunge_feed: 100.0,
+            plunge: Plunge::Straight,
+            lead_overlap: 0.0,
+            lead_in: Lead::None,
+            lead_out: Lead::None,
+        },
     };
     setup(vec![Operation::Pocket(op)], vec![end_mill(1, 6.0)])
 }
@@ -346,7 +348,7 @@ fn a_deep_pocket_stays_safe_at_every_level() {
     let mut doc = pocket_doc();
     if let Operation::Pocket(p) = &mut doc.setup.operations[0] {
         p.depth = 6.0;
-        p.stepdown = 0.5;
+        p.clear.stepdown = 0.5;
     }
     let (program, _) = post(&doc, "deep");
     assert_no_rapid_onto_uncut_stock(&program, RETRACT.max(TOP));
@@ -393,7 +395,7 @@ fn an_adaptively_cleared_island_pocket_simulates_clean() {
         other => panic!("expected a pocket, got {other:?}"),
     };
     // An engagement cap + climb is what routes a holed region to the steered clearer.
-    op.clearing = Clearing { engagement: 2.0, climb: true };
+    op.clear.clearing = Clearing { engagement: 2.0, climb: true };
     let doc = setup(vec![Operation::Pocket(op)], vec![end_mill(1, 6.0)]);
 
     let (program, diags) = build_job(
@@ -441,7 +443,7 @@ fn a_steered_clear_traverses_the_stock_it_has_already_removed() {
         Operation::Pocket(p) => p,
         other => panic!("expected a pocket, got {other:?}"),
     };
-    op.clearing = Clearing { engagement: 2.0, climb: true };
+    op.clear.clearing = Clearing { engagement: 2.0, climb: true };
     let doc = setup(vec![Operation::Pocket(op)], vec![end_mill(1, 6.0)]);
     let (program, _) = build_job(
         &doc,

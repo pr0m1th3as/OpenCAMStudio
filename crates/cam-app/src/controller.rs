@@ -16,9 +16,9 @@ use cam_import::{read_cad_file, read_dxf_str, ImportError, ImportOptions};
 use crate::project::{OcamFile, Project};
 use cam_model::{
     CarveOp, EngraveOp,
-    reconcile_tool_numbers, Axis, ChamferOp, Comp, Document, DrillOp, FaceOp, Hand, Heights,
-    History, Lead, Machine, Operation, Origin, Plunge, PocketOp, ProfileOp, ReconcileReport, Setup,
-    Side, Stock, ThreadOp, Tool, ToolKind,
+    reconcile_tool_numbers, Axis, ChamferOp, ClearParams, Comp, Document, DrillOp, FaceOp, Hand,
+    Heights, History, Lead, Machine, Operation, Origin, Plunge, PocketOp, ProfileOp,
+    ReconcileReport, Setup, Side, Stock, ThreadOp, Tool, ToolKind,
 };
 use cam_post::{PostError, PostKind, PostOptions};
 use cam_render::{mesh_vertices, MeshVertex, Scene, PART};
@@ -325,6 +325,14 @@ pub enum ProjectError {
     Io(String),
     /// The project JSON could not be produced or parsed.
     Json(String),
+    /// The file parsed, but its schema version could not be brought to this build's —
+    /// too new to understand, too old to still be migrated, or damaged in a way a
+    /// migration step could name.
+    ///
+    /// Separate from [`Json`](Self::Json) because the two ask the user for different
+    /// things: a format error means the file is broken, while a schema refusal usually
+    /// means the file is *fine* and this build is the wrong one to open it with.
+    Schema(cam_model::migrate::MigrationError),
     /// The `.ocam` opened as a project is actually a **tool library**.
     NotAProject,
 }
@@ -334,9 +342,21 @@ impl std::fmt::Display for ProjectError {
         match self {
             ProjectError::Io(e) => write!(f, "file error: {e}"),
             ProjectError::Json(e) => write!(f, "project format error: {e}"),
+            // The migration error already reads as a sentence to a user; prefixing it
+            // with a category would only bury the part that says what to do.
+            ProjectError::Schema(e) => write!(f, "{e}"),
             ProjectError::NotAProject => {
                 write!(f, "this .ocam file is a tool library, not a project")
             }
+        }
+    }
+}
+
+impl From<crate::project::LoadError> for ProjectError {
+    fn from(e: crate::project::LoadError) -> Self {
+        match e {
+            crate::project::LoadError::Json(e) => ProjectError::Json(e),
+            crate::project::LoadError::Migration(e) => ProjectError::Schema(e),
         }
     }
 }
@@ -619,9 +639,9 @@ impl AppController {
     pub fn open_project(&mut self, path: impl AsRef<Path>) -> Result<(), ProjectError> {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path).map_err(|e| ProjectError::Io(e.to_string()))?;
-        // Route through the tagged union; a legacy untagged project still parses (§3.1).
-        let project = match OcamFile::from_json(&text).map_err(|e| ProjectError::Json(e.to_string()))?
-        {
+        // Route through the tagged union; a legacy untagged project still parses (§3.1)
+        // and is migrated to the current schema on the way through.
+        let project = match OcamFile::from_json(&text).map_err(ProjectError::from)? {
             OcamFile::Project(p) => p,
             OcamFile::Library(_) => return Err(ProjectError::NotAProject),
         };
@@ -1190,24 +1210,26 @@ impl AppController {
                     .filter_map(|l| self.loop_contour(*l).cloned())
                     .collect();
                 Operation::Pocket(PocketOp {
-                    clearing: cam_model::Clearing::default(),
                     id: 0,
                     tool,
                     boundary: chain,
                     islands: island_contours,
                     depth: p.depth,
-                    stepdown: p.stepdown,
-                    overlap: 0.5,
-                    offset: 0.0,
                     spindle_rpm,
                     work_offset: 1,
-                    feed,
-                    plunge_feed,
-                    plunge: Plunge::Straight,
                     start,
-                    lead_overlap: 0.0,
-                    lead_in: Lead::None,
-                    lead_out: Lead::None,
+                    clear: ClearParams {
+                        clearing: cam_model::Clearing::default(),
+                        stepdown: p.stepdown,
+                        overlap: 0.5,
+                        offset: 0.0,
+                        feed,
+                        plunge_feed,
+                        plunge: Plunge::Straight,
+                        lead_overlap: 0.0,
+                        lead_in: Lead::None,
+                        lead_out: Lead::None,
+                    },
                 })
             }
             OpKind::Drill => Operation::Drill(DrillOp {
@@ -2114,24 +2136,26 @@ impl AppController {
                         }));
                     } else {
                         operations.push(Operation::Pocket(PocketOp {
-                            clearing: cam_model::Clearing::default(),
                             id,
                             tool: 1,
                             boundary: hole.clone(),
                             islands: Vec::new(),
                             depth: p.depth,
-                            stepdown: p.stepdown,
-                            overlap: 0.5,
-                            offset: 0.0,
                             spindle_rpm: 0.0,
                             work_offset: 1,
-                            feed: p.feed,
-                            plunge_feed: p.plunge_feed,
-                            plunge: Plunge::Straight,
                             start: None,
-                            lead_overlap: 0.0,
-                            lead_in: Lead::None,
-                            lead_out: Lead::None,
+                            clear: ClearParams {
+                                clearing: cam_model::Clearing::default(),
+                                stepdown: p.stepdown,
+                                overlap: 0.5,
+                                offset: 0.0,
+                                feed: p.feed,
+                                plunge_feed: p.plunge_feed,
+                                plunge: Plunge::Straight,
+                                lead_overlap: 0.0,
+                                lead_in: Lead::None,
+                                lead_out: Lead::None,
+                            },
                         }));
                     }
                     id += 1;
@@ -2910,7 +2934,7 @@ mod tests {
         match app.selected_operation() {
             Some(Operation::Pocket(o)) => {
                 assert!(o.islands.is_empty(), "no islands by default");
-                assert!((0.0..1.0).contains(&o.overlap), "a sane default overlap");
+                assert!((0.0..1.0).contains(&o.clear.overlap), "a sane default overlap");
             }
             other => panic!("expected pocket, got {other:?}"),
         }

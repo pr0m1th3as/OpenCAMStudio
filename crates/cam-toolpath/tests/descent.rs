@@ -16,8 +16,8 @@
 use cam_cldata::{MoveKind, Step};
 use cam_geo::{Contour, Point};
 use cam_model::{
-    ChamferOp, Clearing, Comp, Document, Envelope, Heights, Lead, Machine, Operation, Plunge,
-    Point3, PocketOp, ProfileOp, Setup, Side, Stock, Tool, ToolKind,
+    ChamferOp, ClearParams, Clearing, Comp, Document, Envelope, Heights, Lead, Machine, Operation,
+    Plunge, Point3, PocketOp, ProfileOp, Setup, Side, Stock, Tool, ToolKind,
 };
 use cam_toolpath::{build_job, CancelToken};
 
@@ -237,17 +237,19 @@ fn pocket() -> Operation {
         boundary: rect(10.0, 10.0, 70.0, 50.0),
         islands: vec![],
         depth: 6.0,
-        stepdown: 2.0,
-        overlap: 0.4,
-        offset: 0.0,
-        feed: 300.0,
-        plunge_feed: 100.0,
-        clearing: Clearing::default(),
-        plunge: Plunge::Straight,
         start: None,
-        lead_overlap: 0.0,
-        lead_in: Lead::None,
-        lead_out: Lead::None,
+        clear: ClearParams {
+            stepdown: 2.0,
+            overlap: 0.4,
+            offset: 0.0,
+            feed: 300.0,
+            plunge_feed: 100.0,
+            clearing: Clearing::default(),
+            plunge: Plunge::Straight,
+            lead_overlap: 0.0,
+            lead_in: Lead::None,
+            lead_out: Lead::None,
+        },
     })
 }
 
