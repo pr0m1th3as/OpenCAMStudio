@@ -403,6 +403,26 @@ impl AppController {
         self.nc = None;
     }
 
+    /// The options every export posts with. One construction, so anything that needs
+    /// to *predict* the output (see [`datum_label`](Self::datum_label)) reads the same
+    /// settings the file is actually written from.
+    fn post_options(&self) -> PostOptions {
+        PostOptions {
+            program_name: Some(self.program_name()),
+            ..Default::default()
+        }
+    }
+
+    /// What the selected post will call work datum `index` — `"G55"`, `"H2"` — or
+    /// `None` when that control has no word for it, in which case an export would
+    /// refuse. The vocabulary belongs to the post (Okuma counts `H<n>` literally, the
+    /// ISO families count up from the program's work offset), so it is asked rather
+    /// than re-derived here.
+    pub fn datum_label(&self, index: u32) -> Option<String> {
+        self.post_kind
+            .datum_label(index, self.post_options().work_offset)
+    }
+
     /// Edit the machine (envelope/name/limits). No re-run needed: the backplot is
     /// independent of the machine, and `export_nc` always re-posts against the
     /// current machine, so limit changes are re-checked at the next export.
@@ -1944,10 +1964,7 @@ impl AppController {
         if rapids > 0 {
             return Err(ExportError::RapidThroughStock(rapids));
         }
-        let options = PostOptions {
-            program_name: Some(self.program_name()),
-            ..Default::default()
-        };
+        let options = self.post_options();
         // Re-reference each group to its own workpiece origin (datum): shift every
         // coordinate by −origin so that group's chosen part point becomes G-code
         // (0,0,0), matched by the operator's touch-off for `G15 H<n>`. Operations under
@@ -3988,5 +4005,39 @@ mod tests {
         assert!(app.document().setup.tools.is_empty());
         app.begin_operation(OpKind::Profile);
         assert!(app.pending_op().is_some(), "no tool is fine now");
+    }
+
+    #[test]
+    fn the_datum_label_follows_the_selected_post() {
+        // The tree names an origin by what the *chosen* post will call it, so switching
+        // post relabels every origin. Two different number spaces, not one renaming:
+        // Okuma takes the index literally, the ISO families count up from `G54`.
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        app.add_origin(); // origin 2
+        app.set_post_kind(PostKind::Fanuc);
+        assert_eq!(app.datum_label(1).as_deref(), Some("G54"));
+        assert_eq!(app.datum_label(2).as_deref(), Some("G55"));
+        app.set_post_kind(PostKind::Okuma);
+        assert_eq!(app.datum_label(1).as_deref(), Some("H1"));
+        assert_eq!(app.datum_label(2).as_deref(), Some("H2"));
+    }
+
+    #[test]
+    fn an_origin_the_iso_posts_cannot_express_has_no_label() {
+        // A seventh fixture: `G54`-`G59` runs out, so the tree can mark it before the
+        // job is built rather than leaving it to fail at export. Okuma, whose `H<n>` has
+        // no such ceiling, still names it — which is the whole reason the label is the
+        // post's to give.
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        for _ in 0..6 {
+            app.add_origin(); // origins 2..=7
+        }
+        app.set_post_kind(PostKind::Haas);
+        assert_eq!(app.datum_label(6).as_deref(), Some("G59"), "the last ISO offset");
+        assert_eq!(app.datum_label(7), None, "and nothing past it");
+        app.set_post_kind(PostKind::Okuma);
+        assert_eq!(app.datum_label(7).as_deref(), Some("H7"));
     }
 }

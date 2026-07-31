@@ -3,6 +3,9 @@
 //! that operation's tool change so a post can state `G15 H<n>` in the tool-section
 //! head. Datum 1 is the default, so a single-datum job emits none — every post's
 //! output is then byte-identical to before multi-WCS existed.
+//!
+//! The same neutral step reaches the ISO families as a `G54`-`G59` change; both
+//! renderings are pinned end-to-end below.
 
 use cam_cldata::{SpindleDir, Step};
 use cam_geo::{Contour, Point};
@@ -44,8 +47,8 @@ fn two_origin_doc() -> Document {
 }
 
 /// The export path exactly as the app wires it (`controller.rs`): plan, re-reference
-/// each group to its own origin, then post.
-fn okuma_nc(d: &Document) -> String {
+/// each group to its own origin, then post through `kind`.
+fn nc(d: &Document, kind: PostKind) -> String {
     let (program, _) = build_job(
         d,
         1000.0,
@@ -59,16 +62,19 @@ fn okuma_nc(d: &Document) -> String {
         let o = setup.origin_position(idx);
         [-o[0], -o[1], -o[2]]
     });
-    PostKind::Okuma
-        .post(
-            &translated,
-            &machine(),
-            &PostOptions {
-                program_name: Some("two_origins".into()),
-                ..Default::default()
-            },
-        )
-        .expect("posts")
+    kind.post(
+        &translated,
+        &machine(),
+        &PostOptions {
+            program_name: Some("two_origins".into()),
+            ..Default::default()
+        },
+    )
+    .expect("posts")
+}
+
+fn okuma_nc(d: &Document) -> String {
+    nc(d, PostKind::Okuma)
 }
 
 #[test]
@@ -155,6 +161,40 @@ fn golden_multi_datum_reorientation() {
     assert_eq!(
         okuma_nc(&two_origin_doc()),
         include_str!("golden/multi_datum_okuma.min")
+    );
+}
+
+/// The same two-origin job through Fanuc, where the datum lands as `G55` rather than
+/// `G15 H2`. Pinned for the same reason as the Okuma golden and read line-by-line once
+/// against the ISO word definitions — we have no Fanuc shop programs to audit house
+/// *style* against (the 16 `.MIN` files are Okuma), so this pins what we believe and
+/// makes any later drift visible rather than silent. Regenerate as for the Okuma
+/// golden above, into `/tests/golden/multi_datum_fanuc.nc`.
+#[test]
+fn golden_multi_datum_reorientation_fanuc() {
+    assert_eq!(
+        nc(&two_origin_doc(), PostKind::Fanuc),
+        include_str!("golden/multi_datum_fanuc.nc")
+    );
+}
+
+#[test]
+fn the_iso_families_state_the_reorientation_as_a_work_offset_change() {
+    // The behaviour the golden pins, stated as a property so it survives a
+    // regeneration: the second fixture runs under `G55`, and the `M0` re-fixture halt
+    // comes first — the operator must not be asked to flip the part after the frame
+    // has already moved.
+    let g = nc(&two_origin_doc(), PostKind::Fanuc);
+    let halt = g.lines().position(|l| l.trim() == "M0").expect("the re-fixture halt");
+    let select = g
+        .lines()
+        .position(|l| l.split_whitespace().any(|w| w == "G55"))
+        .expect("the second datum");
+    assert!(halt < select, "the halt precedes the datum select:\n{g}");
+    assert_eq!(
+        g.lines().filter(|l| l.split_whitespace().any(|w| w == "G55")).count(),
+        1,
+        "the modal offset is stated once, not per move:\n{g}"
     );
 }
 

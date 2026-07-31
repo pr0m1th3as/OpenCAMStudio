@@ -120,6 +120,11 @@ pub(crate) fn emit(
     // still emitted rather than silently disappearing.
     let mut header_dedupe = header_name.is_some();
 
+    // The work coordinate system in force. The preamble has just stated the program's
+    // base, which is datum 1 by definition, so a program that never leaves it restates
+    // nothing (see the `Datum` arm).
+    let mut current_offset = options.work_offset;
+
     for step in program.steps() {
         match step {
             Step::Comment(text) => {
@@ -152,14 +157,44 @@ pub(crate) fn emit(
             Step::ToolChange { tool } => w.line(format!("T{tool} M6")),
             Step::Stop => w.line("M0".to_string()),
             Step::Datum(n) => {
-                // Per-operation multi-WCS is Okuma-only so far (O2). Datum 1 is this
-                // family's single preamble work offset — a no-op here — but a change to
-                // any other datum must not silently collapse onto it and miscut a
-                // multi-fixture job; refuse it, mirroring the cutter-comp rejection.
-                if *n != 1 {
+                // Per-operation multi-WCS. Datum `n` is the (n-1)-th work coordinate
+                // system after the program's base (`options.work_offset`), so datum 1
+                // *is* the base the preamble already selected — a single-datum program
+                // is byte-identical to before multi-WCS existed. Counting from the base
+                // rather than fixing datum 1 at `G54` keeps a raised base coherent: with
+                // `G55` chosen, datums 1..3 are G55/G56/G57, not a preamble that
+                // disagrees with the first datum select.
+                //
+                // Placement follows the CL-data. Okuma defers `G15 H<n>` to the
+                // tool-section head because its shop programs show that house style; we
+                // have no such reference for the ISO families, so the word is stated
+                // plainly where the planner put it — immediately before the operation's
+                // tool change, and so before all motion in the new frame, which is what
+                // correctness requires.
+                let Some(steps_up) = n.checked_sub(1) else {
+                    return Err(PostError::Unsupported(
+                        "work datum 0 — datum indices start at 1".to_string(),
+                    ));
+                };
+                let Some(offset) = options.work_offset.advanced_by(steps_up as usize) else {
                     return Err(PostError::Unsupported(format!(
-                        "per-operation work datum (work_offset {n}); only the Okuma post emits multi-WCS so far"
+                        "work datum {n}: {} carries six work coordinate systems \
+                         (G54-G59) and this program's base is {}, leaving {} usable; \
+                         extended offsets (G54.1 P on Fanuc/Haas, G59.1-G59.3 on \
+                         LinuxCNC) are not emitted",
+                        dialect.name,
+                        options.work_offset.code(),
+                        options.work_offset.remaining(),
                     )));
+                };
+                if offset != current_offset {
+                    w.line(offset.code().to_string());
+                    // The frame has shifted: forget the tracked position and motion word
+                    // so the first move in the new datum re-states X/Y/Z and its G-word
+                    // rather than gliding there at a stale Z.
+                    w.reset_modal();
+                    w.reset_position();
+                    current_offset = offset;
                 }
             }
             Step::CutterComp(c) => {

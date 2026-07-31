@@ -814,7 +814,8 @@ enum Field {
     OriginX,
     OriginY,
     OriginZ,
-    /// The active origin's machine work-coordinate index (`G15 H<n>`).
+    /// The active origin's machine work-coordinate index (`G54`-`G59`, or
+    /// `G15 H<n>` on Okuma — see `PostKind::datum_label`).
     OriginIndex,
     ToolDiameter,
     ToolLength,
@@ -1066,9 +1067,10 @@ impl Field {
             Field::OriginY => "Part-space Y of the workpiece datum (see Origin X).",
             Field::OriginZ => "Part-space Z of the workpiece datum (see Origin X).",
             Field::OriginIndex => {
-                "The machine work-coordinate index (G15 H<n>) this origin selects — the \
-                 index you've taught on the control. Choosing an index another origin \
-                 already uses swaps the two."
+                "The machine work-coordinate index this origin selects — the fixture \
+                 offset you've taught on the control. How it is written depends on the \
+                 post: G54-G59 on ISO controls (so only six exist), G15 H<n> on Okuma. \
+                 Choosing an index another origin already uses swaps the two."
             }
             Field::ToolDiameter => "The tool's cutting diameter (mm).",
             Field::ToolLength => {
@@ -1938,7 +1940,7 @@ enum Message {
     ViewportCursor(iced::Point),
     /// Toggle a viewport object-snap on/off during operation picking.
     ToggleSnap(SnapKind),
-    /// Focus a workpiece origin (`H<n>`) — makes it active + selects it.
+    /// Focus a workpiece origin — makes it active + selects it.
     SelectOrigin(u32),
     /// Add a new workpiece origin (a reorientation group).
     AddOrigin,
@@ -5092,10 +5094,18 @@ impl App {
     /// (read-only), and the operations. Rows are plain selectable text (the selected
     /// row is highlighted, not a button). Each operation row carries inline controls
     /// (include checkbox + reorder arrows) and a right-click menu (Duplicate/Delete).
-    /// A workpiece-origin group header in the operation list: `Origin H<n>` with its
-    /// position, a freeze checkbox (drops the group's ops from the run/viewport), and a
-    /// delete button (extras only — the base H1 is not removable). Clicking the row
-    /// makes the origin active so new ops join it and the inspector edits it.
+    /// A workpiece-origin group header in the operation list: `Origin <n> · <datum>`
+    /// with its position, a freeze checkbox (drops the group's ops from the run/
+    /// viewport), and a delete button (extras only — the base origin is not
+    /// removable). Clicking the row makes the origin active so new ops join it and the
+    /// inspector edits it.
+    ///
+    /// The index is the identity — it is what each operation stores and what the
+    /// reorder arrows move — and the datum word beside it is the *selected post's*
+    /// name for it (`G55` on Fanuc, `H2` on Okuma), so switching post relabels every
+    /// row. A post with no word for this datum (a seventh fixture on an ISO control,
+    /// which carries only `G54`-`G59`) is marked ⚠ here rather than left to fail at
+    /// export, after the job has been built.
     fn origin_header_row(&self, index: u32) -> Element<'_, Message> {
         let pos = self.controller.origin_position(index);
         let disabled = self.controller.is_origin_disabled(index);
@@ -5104,8 +5114,15 @@ impl App {
         let freeze = checkbox(!disabled)
             .size(15)
             .on_toggle(move |on| Message::ToggleOriginDisabled(index, !on));
+        // The datum word joins the index when the post has one; when it does not, the
+        // ⚠ below says so rather than the row saying it twice.
+        let datum = self.controller.datum_label(index);
+        let named = match &datum {
+            Some(d) => format!("Origin {index} · {d}"),
+            None => format!("Origin {index}"),
+        };
         let label = text(format!(
-            "Origin H{index} — X{} Y{} Z{}",
+            "{named} — X{} Y{} Z{}",
             fmt_num(pos[0]),
             fmt_num(pos[1]),
             fmt_num(pos[2])
@@ -5118,6 +5135,17 @@ impl App {
             palette::GROUP_LABEL
         });
         let mut controls = row![freeze, label].spacing(6).align_y(Alignment::Center);
+        if datum.is_none() {
+            // Glyph, not colour — the meaning has to survive colour-vision deficiency.
+            controls = controls.push(
+                text(format!(
+                    "⚠ no {} work offset",
+                    self.controller.post_kind()
+                ))
+                .size(11)
+                .color(palette::WARN),
+            );
+        }
         if index != self.controller.base_origin_index() {
             controls = controls.push(
                 button(text("✕").size(12)).on_press(Message::DeleteOrigin(index)),
@@ -5753,7 +5781,13 @@ impl App {
         }
         let heading = match self.controller.selection() {
             Selection::Setup => "Setup".to_string(),
-            Selection::Origin => format!("Workpiece origin H{}", self.controller.active_origin()),
+            Selection::Origin => {
+                let index = self.controller.active_origin();
+                match self.controller.datum_label(index) {
+                    Some(d) => format!("Workpiece origin {index} · {d}"),
+                    None => format!("Workpiece origin {index} · no work offset"),
+                }
+            }
             Selection::Stock => "Stock".to_string(),
             Selection::Machine => "Machine".to_string(),
             Selection::Tool(i) => format!("Tool {}", i + 1),

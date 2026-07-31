@@ -86,6 +86,33 @@ impl PostKind {
         }
     }
 
+    /// How this control names work datum `datum` (1-based) in a program based at
+    /// `base` — `Some("G55")`, `Some("H2")` — or `None` when the datum has no word on
+    /// this control, which is exactly when [`post`](Self::post) would refuse it.
+    ///
+    /// This exists so the UI can *show* the datum an origin will become without
+    /// re-deriving it: the ISO arm runs the same [`WorkOffset::advanced_by`] the shared
+    /// walker emits from, so a label and the posted file cannot disagree. Two rules,
+    /// not one — Okuma's `G15 H<n>` takes the index literally and is independent of
+    /// `base`, while the ISO families count up from the program's own work offset —
+    /// which is why a `match` written a second time in the GUI would be wrong.
+    pub fn datum_label(self, datum: u32, base: WorkOffset) -> Option<String> {
+        let steps_up = datum.checked_sub(1)?;
+        match self {
+            // OSP work-coordinate select; the emitter states any index it is given, so
+            // no ceiling is claimed here that the post would not honour.
+            PostKind::Okuma => Some(format!("H{datum}")),
+            PostKind::Grbl
+            | PostKind::FluidNc
+            | PostKind::GrblHal
+            | PostKind::LinuxCnc
+            | PostKind::Fanuc
+            | PostKind::Haas => base
+                .advanced_by(steps_up as usize)
+                .map(|o| o.code().to_string()),
+        }
+    }
+
     /// The conventional file extension(s) for this dialect's programs, for the
     /// export dialog's filter. Okuma OSP programs are `.MIN`; the rest are `.nc`.
     pub fn file_extensions(self) -> &'static [&'static str] {
@@ -163,6 +190,19 @@ pub enum WorkOffset {
 }
 
 impl WorkOffset {
+    /// The six work coordinate systems in machine order. Every ISO-family control we
+    /// target carries exactly these; past them the families diverge — `G54.1 P<n>` on
+    /// Fanuc/Haas (an *option*, not always fitted), `G59.1`–`G59.3` on LinuxCNC,
+    /// nothing at all on grbl — so a per-operation datum stops here rather than guess.
+    pub const ALL: [WorkOffset; 6] = [
+        WorkOffset::G54,
+        WorkOffset::G55,
+        WorkOffset::G56,
+        WorkOffset::G57,
+        WorkOffset::G58,
+        WorkOffset::G59,
+    ];
+
     /// The G-code word for this work offset.
     pub fn code(self) -> &'static str {
         match self {
@@ -174,12 +214,67 @@ impl WorkOffset {
             WorkOffset::G59 => "G59",
         }
     }
+
+    /// This offset's position in [`WorkOffset::ALL`] — 0 for `G54`.
+    pub fn index(self) -> usize {
+        match self {
+            WorkOffset::G54 => 0,
+            WorkOffset::G55 => 1,
+            WorkOffset::G56 => 2,
+            WorkOffset::G57 => 3,
+            WorkOffset::G58 => 4,
+            WorkOffset::G59 => 5,
+        }
+    }
+
+    /// The work offset `steps` beyond this one, or `None` past `G59`.
+    ///
+    /// This is how a per-operation work datum reaches a G-code word: datum *n* is the
+    /// (*n*−1)-th offset after the program's base, so datum 1 *is* the base and a
+    /// single-datum program states nothing beyond its preamble.
+    pub fn advanced_by(self, steps: usize) -> Option<WorkOffset> {
+        WorkOffset::ALL.get(self.index() + steps).copied()
+    }
+
+    /// How many work offsets are reachable from this one, itself included.
+    pub fn remaining(self) -> usize {
+        WorkOffset::ALL.len() - self.index()
+    }
+}
+
+#[cfg(test)]
+mod work_offset_tests {
+    use super::WorkOffset;
+
+    #[test]
+    fn all_and_index_agree() {
+        // `index` is a hand-written match, `ALL` a hand-written array; nothing but this
+        // keeps them in step, and `advanced_by` is wrong in silence if they drift.
+        for (i, o) in WorkOffset::ALL.iter().enumerate() {
+            assert_eq!(o.index(), i, "{} sits at {i} in ALL", o.code());
+        }
+    }
+
+    #[test]
+    fn advancing_walks_the_table_and_stops_at_g59() {
+        assert_eq!(WorkOffset::G54.advanced_by(0), Some(WorkOffset::G54));
+        assert_eq!(WorkOffset::G54.advanced_by(5), Some(WorkOffset::G59));
+        assert_eq!(WorkOffset::G54.advanced_by(6), None);
+        // From a raised base the ceiling arrives sooner — six offsets exist, not six
+        // *beyond* wherever the program started.
+        assert_eq!(WorkOffset::G57.advanced_by(2), Some(WorkOffset::G59));
+        assert_eq!(WorkOffset::G57.advanced_by(3), None);
+        assert_eq!(WorkOffset::G57.remaining(), 3);
+    }
 }
 
 /// Knobs that shape a post's output without changing its meaning.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PostOptions {
-    /// Work coordinate system to select in the preamble.
+    /// Work coordinate system to select in the preamble — and, for a multi-fixture
+    /// job, the *base* the per-operation datums count up from: datum 1 is this
+    /// offset, datum 2 the next, and so on to `G59`. (Okuma is unaffected; its
+    /// `G15 H<n>` is a separate number space and takes the datum index directly.)
     pub work_offset: WorkOffset,
     /// Number of decimal places for coordinates.
     pub precision: usize,
