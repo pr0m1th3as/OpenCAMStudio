@@ -47,7 +47,7 @@ X19.041
 G0 Z5.000
 T1 M6
 (Carve: 15 rings at 0.500 mm wall / 0.183 mm floor, to 1.000 mm deep with a 90 deg V-bit, 6 lifts)
-X0.500 Y39.500
+G0 X0.500 Y39.500
 Z2.000
 G1 Z-0.459 F100
 Y0.500 F300

@@ -154,7 +154,25 @@ pub(crate) fn emit(
                 }
                 .to_string(),
             ),
-            Step::ToolChange { tool } => w.line(format!("T{tool} M6")),
+            Step::ToolChange { tool } => {
+                w.line(format!("T{tool} M6"));
+                // Force the next move to re-state its motion word and feed. Relying on
+                // `G0`/`F` carrying across `M6` is a modal assumption about the *control*,
+                // not about the program: the tool change may pass through a change
+                // position under the control's own logic, and a control that resets the
+                // interpolation group would read a bare `X Y` as an unintended feed move
+                // into the part. Fanuc/Haas do keep the motion group modal across `M6`,
+                // so for those families this is belt-and-braces — but the same walker
+                // serves grbl/FluidNC/grblHAL and LinuxCNC, where `M6` is a macro or a
+                // pause whose side effects are the integrator's business. The cost is one
+                // redundant `G0` per tool change. The same reasoning fixed the Okuma post
+                // (`OKUMA_PLAN` Finding 1); this brings the shared walker in line.
+                //
+                // Position is deliberately *not* reset: unlike a datum change, a tool
+                // change does not move the frame, so the tracked coordinates stay true
+                // and there is nothing to re-state.
+                w.reset_modal();
+            }
             Step::Stop => w.line("M0".to_string()),
             Step::Datum(n) => {
                 // Per-operation multi-WCS. Datum `n` is the (n-1)-th work coordinate
