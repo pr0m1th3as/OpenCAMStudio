@@ -42,10 +42,27 @@ use crate::SCHEMA_VERSION;
 
 /// The oldest schema version this build can still open.
 ///
-/// v1 — nothing has ever been dropped. Kept as a named constant rather than a literal
-/// `1` so that retiring old versions is a deliberate, greppable edit with a note about
-/// which files stop opening, not a quiet change to a loop bound.
-pub const OLDEST_SUPPORTED: u32 = 1;
+/// **v3**, because v2→v3 replaced `Stock::Box { min, max }` — an absolute pair of corners
+/// — with the part-relative `Stock::BoundingBox { x_offset, y_offset, top, thickness }`,
+/// and that change shipped with the decision *"no migration — early stage"* on the
+/// record. No released build has ever opened a v1 or v2 file; the schema was already
+/// past v3 when v0.1.0 shipped.
+///
+/// This constant briefly said `1`, which was simply false: a v1 document reaching serde
+/// failed on `unknown variant 'Box', expected 'BoundingBox'` — a parse error blaming the
+/// file's contents for what is really an unsupported version. Found by opening a real
+/// v1 project, not by the fixtures, which is the lesson: `every_supported_version_has_a_step`
+/// only proves a step *exists*, never that an identity step is *honest*.
+///
+/// Converting a v2 stock faithfully is possible but not from here — the offsets are
+/// measured from the part's XY bounds, which live in the project's `regions`, outside the
+/// document this module migrates. It would need the whole project, and is worth doing
+/// only if a v1/v2 file ever turns out to matter.
+///
+/// Kept as a named constant rather than a literal so that retiring old versions is a
+/// deliberate, greppable edit with a note about which files stop opening, not a quiet
+/// change to a loop bound.
+pub const OLDEST_SUPPORTED: u32 = 3;
 
 /// Why a saved document could not be brought up to the current schema.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -152,20 +169,21 @@ pub fn document(value: &mut Value, from: u32) -> Result<(), MigrationError> {
 /// Apply the single step that takes a document from `from` to `from + 1`.
 fn step(from: u32, doc: &mut Value) -> Result<(), MigrationError> {
     match from {
-        // v1→v9 were all additive: a new field carrying `#[serde(default)]`, which an
+        // v3→v9 were all additive: a new field carrying `#[serde(default)]`, which an
         // older file lacks and serde fills in. There is nothing to rewrite — the old
-        // JSON *is* valid new JSON. Two of them are worth naming because they look like
-        // they should need work and do not:
+        // JSON *is* valid new JSON. One is worth naming because it looks like it should
+        // need work and does not: **v9** *removed* the per-origin program start point,
+        // and serde ignores unknown fields, so the stale value is dropped on read, which
+        // is exactly the intent.
         //
-        // - **v2** turned `ToolKind` into a data-carrying enum. Serde's default external
-        //   tagging leaves parameter-free variants as bare strings, so `"EndMill"` still
-        //   parses (pinned by `parameter_free_kinds_are_wire_compatible_with_v1`).
-        // - **v9** *removed* the per-origin program start point. Serde ignores unknown
-        //   fields, so the stale value is dropped on read, which is exactly the intent.
+        // The range starts at 3 rather than 1 because v2→v3 was **not** additive — it
+        // replaced `Stock::Box` with `Stock::BoundingBox` and shipped without a
+        // migration. See [`OLDEST_SUPPORTED`]; those versions are refused before any
+        // step runs.
         //
-        // Listed as an explicit range rather than a catch-all so that adding v11 without
+        // Listed as an explicit range rather than a catch-all so that adding v12 without
         // a step is a `MissingStep` error, not a silent no-op.
-        1..=8 => Ok(()),
+        3..=8 => Ok(()),
         9 => v9_to_v10(doc),
         // v10→v11 added the machine and the post to the *project wrapper*, not to the
         // document — additive, `Option`, absent in every earlier file. Nothing in the
@@ -471,6 +489,64 @@ mod tests {
                 file: OLDEST_SUPPORTED - 1,
                 oldest: OLDEST_SUPPORTED,
             })
+        );
+    }
+
+    /// A **real** v1 document, taken from a project file written before `Stock` was
+    /// part-relative: `Stock::Box { min, max }`, a bare `"EndMill"` tool kind, no origin.
+    fn v1_document_with_an_absolute_stock_box() -> Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "setup": {
+                "name": "part",
+                "heights": { "clearance": 5.0, "retract": 2.0, "top_of_stock": 0.0 },
+                "stock": { "Box": {
+                    "min": [-26.775_638_580_322_266, -12.197_252_273_559_57, -4.0],
+                    "max": [11.419_734_954_833_984, 6.171_515_941_619_873, 0.0]
+                }},
+                "tools": [{
+                    "number": 1, "diameter": 3.0, "length": 20.0,
+                    "flutes": 2, "kind": "EndMill"
+                }],
+                "operations": []
+            }
+        })
+    }
+
+    #[test]
+    fn a_v1_stock_box_is_refused_by_version_rather_than_failing_to_parse() {
+        // The regression this constant exists for. `OLDEST_SUPPORTED` was `1` when this
+        // module shipped, which claimed a v1 file would open; it does not, because v2→v3
+        // replaced `Stock::Box` with `Stock::BoundingBox` and shipped with "no migration
+        // — early stage" on the record.
+        //
+        // The distinction is the whole point. Migrating and letting serde fail gives the
+        // user `unknown variant 'Box', expected 'BoundingBox'` — a message that blames
+        // the file's contents for what is really an unsupported version, and that no
+        // amount of editing the file could act on. Refusing by version says the true
+        // thing.
+        let mut doc = v1_document_with_an_absolute_stock_box();
+        assert_eq!(
+            document(&mut doc, 1),
+            Err(MigrationError::TooOld {
+                file: 1,
+                oldest: OLDEST_SUPPORTED
+            })
+        );
+
+        // And prove the premise rather than asserting it: run the steps this version
+        // *would* have taken and confirm the result really cannot be deserialized. If
+        // some later change made `Stock::Box` loadable again, this fails and the
+        // refusal above should be revisited rather than left as folklore.
+        let mut forced = v1_document_with_an_absolute_stock_box();
+        for v in 1..SCHEMA_VERSION {
+            let _ = step(v, &mut forced);
+        }
+        let err = serde_json::from_value::<Document>(forced)
+            .expect_err("a v1 stock must not parse as the current Stock");
+        assert!(
+            err.to_string().contains("Box"),
+            "expected the stock variant to be what fails, got: {err}"
         );
     }
 

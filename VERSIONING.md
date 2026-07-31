@@ -26,9 +26,18 @@ contractually signals. So the number's only job is to encode *how much changed*.
     build does not understand on the next save, silently deleting the newer version's
     work. The user is told to upgrade.
   - **Every version in `OLDEST_SUPPORTED..SCHEMA_VERSION` has a step**, even when that
-    step does nothing (v1–v9 are identity: they were additive bumps that serde's
+    step does nothing (v3–v9 are identity: they were additive bumps that serde's
     defaults already absorbed). Bumping `SCHEMA_VERSION` without adding one is a test
-    failure, not a surprise on a user's file.
+    failure, not a surprise on a user's file. Note what that test can and cannot prove:
+    it checks a step *exists*, never that an identity step is *honest*. Only opening a
+    real file of that vintage shows the difference — which is how `OLDEST_SUPPORTED`
+    came to be 3 rather than 1.
+  - **`OLDEST_SUPPORTED` is 3.** v2→v3 replaced `Stock::Box { min, max }` with the
+    part-relative `Stock::BoundingBox`, and shipped deliberately without a migration
+    ("early stage"). No released build has ever opened a v1 or v2 file. Such a file is
+    refused **by version**, with a message saying so, rather than being carried into
+    serde to fail on `unknown variant 'Box'` — a parse error blames the file's contents
+    for what is really an unsupported version, and the user can act on neither.
   - **The version numbers the save-file as a whole**, not the document alone — v11
     added the machine and post to the project wrapper and bumped even though the
     document did not change. A format change that leaves the version alone is the one
