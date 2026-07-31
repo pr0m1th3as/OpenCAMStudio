@@ -139,12 +139,25 @@ fn assert_no_rapid_onto_uncut_stock(program: &Program, floor: f64) {
                 if to.z >= floor - 1e-9 {
                     continue; // at or above the retract plane: always safe
                 }
-                let seen = cut.get(&tag.op_id).is_some_and(|s| s.contains(&key(to.z)));
+                // The op must already have cut *at least* this deep: a rapid ending
+                // anywhere above its own deepest cut is in the column it has opened.
+                //
+                // This used to demand the rapid land on a depth exactly cut, which read
+                // as "in cleared air" but actually required the tool to come to rest on
+                // a cut floor with no margin — the very thing `emit::rapid_floor` now
+                // stops it doing, so the proxy had to go. What it still catches is the
+                // real fault: a `G0` to a depth deeper than anything cut, into solid.
+                let deepest = cut
+                    .get(&tag.op_id)
+                    .and_then(|s| s.iter().min().copied())
+                    .map(|z| z as f64 / 1000.0);
                 assert!(
-                    seen,
+                    deepest.is_some_and(|d| to.z >= d - 1e-9),
                     "step {i}: operation {} rapids to Z{:.3}, below the {floor:.3} retract \
-                     plane, at a depth it has not yet cut — a G0 into solid stock",
-                    tag.op_id, to.z
+                     plane and deeper than anything it has cut ({:?}) — a G0 into solid stock",
+                    tag.op_id,
+                    to.z,
+                    deepest
                 );
             }
             _ => {}

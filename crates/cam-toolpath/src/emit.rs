@@ -1,10 +1,83 @@
-//! Shared move emission: cut a closed loop, refitting flattened corners to arcs.
+//! Shared move emission: cut a closed loop, refitting flattened corners to arcs,
+//! and the one rule every strategy's descent obeys ([`descend_to`]).
 
-use cam_cldata::{ArcDir, Point3, Program, Step, Tag};
+use cam_cldata::{MoveKind, Point3, Program, Step, Tag};
+use cam_cldata::ArcDir;
 use cam_geo::{fit_arcs, PathSeg, Point};
+use cam_model::Heights;
 
 /// Tolerance for recognising arcs in flattened offset loops (mm).
 const ARCFIT_TOL: f64 = 0.01;
+
+/// How far above a cut floor a rapid must stop, mm.
+///
+/// A descent that ends a **rapid** exactly on the surface cut by the previous pass has
+/// no margin at all: an uncut cusp left by the last pass, stock that sprang back, a
+/// pass that ran fractionally shallow, or a small Z-zero error, and the rapid ends in
+/// metal. The geometry model cannot see any of those — to it, the air below really is
+/// empty, which is why `cam-sim` rightly calls such a path clean.
+///
+/// It is the same reasoning already applied one level up (approach stops at the retract
+/// plane rather than on the stock surface) and the same number as `PECK_CLEARANCE` in
+/// `cam-post`, which stops a peck short of the previous peck's bottom for this reason.
+pub(crate) const FLOOR_CLEARANCE: f64 = 0.5;
+
+/// The lowest Z a **rapid** may end at when the cut floor beneath it is `floor_z`.
+///
+/// Two bounds, whichever is higher up: never below the **stock top**, since above the
+/// surface there is definitionally nothing to hit, and never within
+/// [`FLOOR_CLEARANCE`] of the **floor** the tool is returning to.
+///
+/// Note this may return a Z *above* `floor_z` — that is the point — and also one below
+/// it when `floor_z` sits above the stock top (the first level starts at the retract
+/// plane, and descending by rapid to the surface is free). Callers that stop at
+/// `floor_z` rather than continuing past it must therefore clamp with `.max(floor_z)`;
+/// [`descend_to`] does.
+pub(crate) fn rapid_floor(floor_z: f64, h: &Heights) -> f64 {
+    h.top_of_stock.min(floor_z + FLOOR_CLEARANCE)
+}
+
+/// Descend over `p` to `from_z` — the height an entry strategy starts from — rapiding
+/// only as far as [`rapid_floor`] permits and **feeding** the remainder at cutting
+/// feed.
+///
+/// Cutting feed, not plunge feed: what is being crossed is air the tool has already
+/// cut, and plunge feed is for cutting downward into material (the measured cost of
+/// getting that backwards was 4.7 minutes on a real export — see `clearing::clear`).
+/// The feed is at most [`FLOOR_CLEARANCE`] long, so the time is negligible; what it
+/// buys is that the move which *might* meet material is one the control can cut with
+/// rather than crash on.
+///
+/// Leaves the tool at `p`/`from_z`, ready for the plunge strategy.
+pub(crate) fn descend_to(
+    prog: &mut Program,
+    p: Point,
+    from_z: f64,
+    h: &Heights,
+    feed: f64,
+    id: u32,
+) {
+    // `.max`: this descent ends *at* `from_z`, so the free-air allowance above the
+    // stock top must not drag the rapid below where it is going. On the first level
+    // `from_z` is the retract plane and the whole descent stays a rapid, as before.
+    let floor = rapid_floor(from_z, h).max(from_z);
+    prog.push(Step::Rapid {
+        to: Point3::new(p.x, p.y, floor),
+        tag: Tag::new(id, MoveKind::Link),
+    });
+    if floor > from_z {
+        // `Link`, not `Plunge`: `Plunge` means a vertical entry *into material*, and
+        // both the chamfer and clearing suites read it that way — one plunge per pass,
+        // and "with a helix selected no entry may be a bare straight drop". This move
+        // is neither. It is a reposition that happens to be fed rather than rapided,
+        // which is what `Link` already documents ("usually a rapid").
+        prog.push(Step::Linear {
+            to: Point3::new(p.x, p.y, from_z),
+            feed,
+            tag: Tag::new(id, MoveKind::Link),
+        });
+    }
+}
 
 /// Emit an open cutting polyline at height `z` exactly as given, converting runs
 /// of flattened segments back into `G2`/`G3` arcs where they fit. Assumes the tool

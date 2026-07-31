@@ -291,11 +291,12 @@ impl Strategy for ChamferStrategy {
             // One pass per cumulative width, shallow to deep. Each: rapid over the
             // entry at clearance and down through the already-cut air, plunge to the
             // pass depth, lead on, cut the loop (+ overlap), lead off, retract.
-            // The first pass rapids down to the **retract plane**, not to the stock top:
-    // ending a rapid exactly on the surface leaves no margin, so slightly proud
-    // stock or a small Z-zero error means rapiding into material. Taking the higher
-    // of the two is never lower than the old behaviour. Later passes still rapid to
-    // the previous depth — that is through air the tool has already cut.
+            // The first pass rapids down to the **retract plane**, not to the stock
+            // top: ending a rapid exactly on the surface leaves no margin, so slightly
+            // proud stock or a small Z-zero error means rapiding into material. Later
+            // passes return to the previous width's depth, which is the same no-margin
+            // case one pass down — `emit::descend_to` stops the rapid short of it and
+            // feeds the last fraction.
             let mut prev_z = env.heights.retract.max(op.top);
             for &wk in &widths {
                 let z = op.top - (wk / tan_a + delta);
@@ -303,10 +304,14 @@ impl Strategy for ChamferStrategy {
                     to: Point3::new(entry.x, entry.y, env.heights.clearance),
                     tag: link,
                 });
-                program.push(Step::Rapid {
-                    to: Point3::new(entry.x, entry.y, prev_z),
-                    tag: link,
-                });
+                crate::emit::descend_to(
+                    &mut program,
+                    entry,
+                    prev_z,
+                    &env.heights,
+                    op.feed,
+                    op.id,
+                );
                 program.push(Step::Linear {
                     to: Point3::new(entry.x, entry.y, z),
                     feed: op.plunge_feed,

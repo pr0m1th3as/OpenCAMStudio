@@ -274,10 +274,7 @@ fn emit_adaptive_moves(
             to: Point3::new(start.x, start.y, h.clearance),
             tag: link,
         });
-        prog.push(Step::Rapid {
-            to: Point3::new(start.x, start.y, from_z),
-            tag: link,
-        });
+        crate::emit::descend_to(prog, start, from_z, h, job.feed, job.id);
         crate::profile::emit_plunge(
             prog, start, tan, out, from_z, z, job.plunge, job.plunge_feed, job.feed, plunge_tag,
         );
@@ -357,8 +354,13 @@ fn emit_adaptive_moves(
                 // material lies just outside the tool's disc, so a descending rapid grazes it.
                 // It cost a `RapidThroughStock` collision on every island pocket and blocked
                 // export. A feed is not checked, because a feed may cut.
+                //
+                // What *has* changed since that was written: the rapid no longer ends
+                // exactly on the previous floor either. `emit::rapid_floor` stops it
+                // `FLOOR_CLEARANCE` short — the cleared air is only cleared in the
+                // model, and a cusp the last pass left standing is invisible to it.
                 prog.push(Step::Rapid {
-                    to: Point3::new(p.x, p.y, from_z.min(h.top_of_stock)),
+                    to: Point3::new(p.x, p.y, crate::emit::rapid_floor(from_z, h)),
                     tag: link,
                 });
                 prog.push(Step::Linear {

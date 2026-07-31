@@ -447,18 +447,26 @@ fn emit_loop_rich(
     // The first pass rapids down to the **retract plane**, not to the stock top:
     // ending a rapid exactly on the surface leaves no margin, so slightly proud
     // stock or a small Z-zero error means rapiding into material. Taking the higher
-    // of the two is never lower than the old behaviour. Later passes still rapid to
-    // the previous depth — that is through air the tool has already cut.
+    // of the two is never lower than the old behaviour. Later passes return through
+    // air the tool has already cut — but *that* rapid used to end exactly on the
+    // previous floor, which is the identical no-margin case one pass down, so it now
+    // goes through `emit::descend_to` like every other strategy's entry.
+    //
+    // The lift between passes is only there to reposition: with a lead-in the pass
+    // ends at the lead-*out* point, somewhere else. When the two coincide — no leads,
+    // the common case — there is nothing to reposition to, and the tool stays down and
+    // plunges to the next level exactly as the unleaded path does. That is not merely
+    // faster: a descent that never happens cannot end in metal.
+    let repositions = (exit.x - entry.x).abs() > 1e-9 || (exit.y - entry.y).abs() > 1e-9;
     let mut prev_z = h.retract.max(h.top_of_stock);
-    for &z in levels {
-        prog.push(Step::Rapid {
-            to: Point3::new(entry.x, entry.y, h.clearance),
-            tag: link,
-        });
-        prog.push(Step::Rapid {
-            to: Point3::new(entry.x, entry.y, prev_z),
-            tag: link,
-        });
+    for (i, &z) in levels.iter().enumerate() {
+        if i == 0 || repositions {
+            prog.push(Step::Rapid {
+                to: Point3::new(entry.x, entry.y, h.clearance),
+                tag: link,
+            });
+            crate::emit::descend_to(prog, entry, prev_z, h, op.feed, op.id);
+        }
 
         emit_plunge(
             prog,
@@ -487,10 +495,14 @@ fn emit_loop_rich(
         // Lead off the contour at depth: exit_on (start, or the overlap point) → exit.
         crate::leads::emit_lead(prog, exit_on, exit, exit_on, out_exit, lead_out, z, op.feed, lead);
 
-        prog.push(Step::Rapid {
-            to: Point3::new(exit.x, exit.y, h.clearance),
-            tag: retract,
-        });
+        // Lift only when the next pass has somewhere else to start from; the final
+        // retract is unconditional (the operation must leave the tool clear).
+        if repositions || i + 1 == levels.len() {
+            prog.push(Step::Rapid {
+                to: Point3::new(exit.x, exit.y, h.clearance),
+                tag: retract,
+            });
+        }
         prev_z = z;
     }
 }

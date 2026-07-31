@@ -113,10 +113,10 @@ fn enter_with_plunge(
         to: Point3::new(p.x, p.y, h.clearance),
         tag: Tag::new(id, MoveKind::Link),
     });
-    prog.push(Step::Rapid {
-        to: Point3::new(p.x, p.y, from_z),
-        tag: Tag::new(id, MoveKind::Link),
-    });
+    // The rapid stops short of `from_z` when that is a cut floor: what is under the
+    // tool decides the *strategy* (above), and the same question decides how the tool
+    // may arrive at all.
+    crate::emit::descend_to(prog, p, from_z, h, feed, id);
     crate::profile::emit_plunge(
         prog,
         p,
@@ -288,10 +288,7 @@ pub(crate) fn emit_stay_down(
             to: Point3::new(r0[0].x, r0[0].y, h.clearance),
             tag: link,
         });
-        prog.push(Step::Rapid {
-            to: Point3::new(r0[0].x, r0[0].y, from_z),
-            tag: link,
-        });
+        crate::emit::descend_to(prog, r0[0], from_z, h, feed, id);
         crate::profile::emit_plunge(
             prog,
             r0[0],
