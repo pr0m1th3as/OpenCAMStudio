@@ -123,6 +123,49 @@ fn an_unleaded_profile_does_not_lift_between_passes_at_all() {
 }
 
 #[test]
+fn an_unleaded_chamfer_does_not_lift_between_passes_either() {
+    // Every chamfer pass runs the same XY loop at a deeper Z, so without a lead or a
+    // closure overlap the lift between passes returns the tool to exactly where it
+    // already was. Same reasoning as the profile above, and the same benefit twice
+    // over: fewer moves, and no descent to get wrong.
+    let steps = steps_of(&doc(vec![chamfer()]));
+    let below_stock = steps
+        .iter()
+        .filter(|s| matches!(s, Step::Rapid { to, .. } if to.z < 0.0))
+        .count();
+    assert_eq!(
+        below_stock, 0,
+        "an unleaded chamfer has no business rapiding below the stock top:\n{steps:#?}"
+    );
+    // The operation's own rapids to clearance are now just its approach and its final
+    // retract — not one pair per pass. (The planner's Traverse descent from the
+    // tool-change height also lands at clearance and is not the operation's doing.)
+    let to_clearance = steps
+        .iter()
+        .filter(|s| {
+            matches!(s, Step::Rapid { to, tag }
+                if (to.z - 5.0).abs() < 1e-9 && tag.kind != MoveKind::Traverse)
+        })
+        .count();
+    assert_eq!(
+        to_clearance, 2,
+        "three passes, but only one approach and one retract:\n{steps:#?}"
+    );
+}
+
+#[test]
+fn a_leaded_chamfer_still_lifts_and_still_descends_safely() {
+    // With a lead the exit is elsewhere, so the lift is real work — and then the
+    // descent rule has to hold, which is what this checks.
+    let mut op = chamfer();
+    if let cam_model::Operation::Chamfer(c) = &mut op {
+        c.lead_in = Lead::Arc { radius: 2.0 };
+        c.lead_out = Lead::Arc { radius: 2.0 };
+    }
+    assert_no_rapid_lands_on_a_cut_floor(&steps_of(&doc(vec![op])), "leaded chamfer");
+}
+
+#[test]
 fn a_pocket_never_rapids_onto_its_previous_floor() {
     // Area clearing re-enters constantly — it is where the pattern was most expensive.
     let d = doc(vec![pocket()]);

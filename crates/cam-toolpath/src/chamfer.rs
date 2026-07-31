@@ -288,30 +288,42 @@ impl Strategy for ChamferStrategy {
             let entry = crate::leads::lead_start_point(start, tan_in, out, lead_in);
             let exit = crate::leads::lead_end_point(exit_on, tan_out, out_exit, lead_out);
 
-            // One pass per cumulative width, shallow to deep. Each: rapid over the
-            // entry at clearance and down through the already-cut air, plunge to the
-            // pass depth, lead on, cut the loop (+ overlap), lead off, retract.
+            // One pass per cumulative width, shallow to deep, every pass over the same
+            // XY loop — only Z changes, which is what widens the bevel. Each: plunge to
+            // the pass depth, lead on, cut the loop (+ overlap), lead off.
+            //
             // The first pass rapids down to the **retract plane**, not to the stock
             // top: ending a rapid exactly on the surface leaves no margin, so slightly
             // proud stock or a small Z-zero error means rapiding into material. Later
             // passes return to the previous width's depth, which is the same no-margin
             // case one pass down — `emit::descend_to` stops the rapid short of it and
             // feeds the last fraction.
+            //
+            // Better still is not to leave. The lift-and-return between passes exists
+            // only to reposition, and since the loop is identical at every width there
+            // is somewhere to reposition *to* only when a lead or a closure overlap puts
+            // the exit somewhere other than the entry. Without one the tool stays down
+            // and plunges to the next width, as the unleaded profile path does — and a
+            // descent that never happens cannot end in metal.
+            let repositions =
+                (exit.x - entry.x).abs() > 1e-9 || (exit.y - entry.y).abs() > 1e-9;
             let mut prev_z = env.heights.retract.max(op.top);
-            for &wk in &widths {
+            for (i, &wk) in widths.iter().enumerate() {
                 let z = op.top - (wk / tan_a + delta);
-                program.push(Step::Rapid {
-                    to: Point3::new(entry.x, entry.y, env.heights.clearance),
-                    tag: link,
-                });
-                crate::emit::descend_to(
-                    &mut program,
-                    entry,
-                    prev_z,
-                    &env.heights,
-                    op.feed,
-                    op.id,
-                );
+                if i == 0 || repositions {
+                    program.push(Step::Rapid {
+                        to: Point3::new(entry.x, entry.y, env.heights.clearance),
+                        tag: link,
+                    });
+                    crate::emit::descend_to(
+                        &mut program,
+                        entry,
+                        prev_z,
+                        &env.heights,
+                        op.feed,
+                        op.id,
+                    );
+                }
                 program.push(Step::Linear {
                     to: Point3::new(entry.x, entry.y, z),
                     feed: op.plunge_feed,
@@ -340,10 +352,14 @@ impl Strategy for ChamferStrategy {
                     op.feed,
                     lead,
                 );
-                program.push(Step::Rapid {
-                    to: Point3::new(exit.x, exit.y, env.heights.clearance),
-                    tag: retract,
-                });
+                // Lift only when the next pass starts somewhere else; the final retract
+                // is unconditional (the operation must leave the tool clear).
+                if repositions || i + 1 == widths.len() {
+                    program.push(Step::Rapid {
+                        to: Point3::new(exit.x, exit.y, env.heights.clearance),
+                        tag: retract,
+                    });
+                }
                 prev_z = z;
             }
         }
