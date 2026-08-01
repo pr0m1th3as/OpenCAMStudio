@@ -458,32 +458,51 @@ fn emit_loop_rich(
     // the common case — there is nothing to reposition to, and the tool stays down and
     // plunges to the next level exactly as the unleaded path does. That is not merely
     // faster: a descent that never happens cannot end in metal.
-    let repositions = (exit.x - entry.x).abs() > 1e-9 || (exit.y - entry.y).abs() > 1e-9;
+    // A contour ramp starts somewhere else on the loop, and how far back depends on
+    // the descent, which differs at the first level (it begins at the retract plane).
+    // So it always ends the pass away from where the next one begins — the same
+    // condition a lead already creates.
+    let ramps = matches!(op.plunge, Plunge::Ramp { angle_deg } if angle_deg > 0.0 && angle_deg < 90.0);
+    let repositions =
+        ramps || (exit.x - entry.x).abs() > 1e-9 || (exit.y - entry.y).abs() > 1e-9;
     let mut prev_z = h.retract.max(h.top_of_stock);
     for (i, &z) in levels.iter().enumerate() {
+        // The ramp path for *this* level: it arrives at `start` at depth `z`, so the
+        // tool must come down at its far end rather than at the lead-in point.
+        let ramp = contour_ramp_len(op.plunge, prev_z - z)
+            .map(|len| approach_along_loop(pts, len))
+            .filter(|path| path.len() > 1);
+        let down_at = ramp.as_ref().map_or(entry, |path| path[0]);
+
         if i == 0 || repositions {
             prog.push(Step::Rapid {
-                to: Point3::new(entry.x, entry.y, h.clearance),
+                to: Point3::new(down_at.x, down_at.y, h.clearance),
                 tag: link,
             });
-            crate::emit::descend_to(prog, entry, prev_z, h, op.feed, op.id);
+            crate::emit::descend_to(prog, down_at, prev_z, h, op.feed, op.id);
         }
 
-        emit_plunge(
-            prog,
-            entry,
-            tan_in,
-            out,
-            prev_z,
-            z,
-            op.plunge,
-            op.plunge_feed,
-            op.feed,
-            plunge_tag,
-        );
+        if let Some(path) = &ramp {
+            // The ramp *is* the entry: it arrives on the contour at `start`, already at
+            // depth and already tangent, so a lead-in would have nothing left to ease.
+            emit_descending_path(prog, path, prev_z, z, op.feed, plunge_tag);
+        } else {
+            emit_plunge(
+                prog,
+                entry,
+                tan_in,
+                out,
+                prev_z,
+                z,
+                op.plunge,
+                op.plunge_feed,
+                op.feed,
+                plunge_tag,
+            );
 
-        // Lead onto the contour at depth: entry → start.
-        crate::leads::emit_lead(prog, entry, start, start, out, lead_in, z, op.feed, lead);
+            // Lead onto the contour at depth: entry → start.
+            crate::leads::emit_lead(prog, entry, start, start, out, lead_in, z, op.feed, lead);
+        }
 
         if let Some(c) = comp {
             prog.push(Step::CutterComp(c));
@@ -614,17 +633,12 @@ pub(crate) fn emit_plunge(
                 });
             }
         }
-        Plunge::Ramp { angle_deg } if angle_deg > 0.0 && angle_deg < 90.0 => emit_oscillating_ramp(
-            prog,
-            p,
-            tan,
-            from_z,
-            to_z,
-            angle_deg,
-            f64::INFINITY,
-            cut_feed,
-            tag,
-        ),
+        // `Plunge::Ramp` is deliberately absent: it is not a point entry. It travels
+        // along the contour and therefore *starts* somewhere else, which is a fact the
+        // caller has to know before it rapids anywhere — see `contour_ramp_len` and
+        // `approach_along_loop`. Callers that own a contour handle it before reaching
+        // here; the fallthrough below keeps a caller that does not from emitting
+        // nothing at all.
         Plunge::ZigZag { length, angle_deg }
             if length > 0.0 && angle_deg > 0.0 && angle_deg < 90.0 =>
         {
@@ -636,8 +650,13 @@ pub(crate) fn emit_plunge(
 }
 
 /// Oscillate along `[p, p + tan·L]` descending from `from_z` to `to_z`, ending back
-/// at `p`. `max_len` caps the reach (`INFINITY` for a single V); the number of
-/// out-and-back passes is chosen so each stays within the reach and the angle holds.
+/// at `p`. `max_len` caps the reach; the number of out-and-back passes is chosen so
+/// each stays within the reach and the angle holds.
+///
+/// [`Plunge::ZigZag`] alone: the oscillation exists for the slot too narrow to ramp
+/// along, and nothing else. [`Plunge::Ramp`] used to come through here with an
+/// infinite reach — one V along the straight start tangent — which is why its
+/// documented "along the toolpath" was never true.
 #[allow(clippy::too_many_arguments)]
 fn emit_oscillating_ramp(
     prog: &mut Program,
@@ -672,6 +691,178 @@ fn emit_oscillating_ramp(
         z -= dz_v / 2.0;
         prog.push(Step::Linear {
             to: Point3::new(p.x, p.y, z),
+            feed,
+            tag,
+        });
+    }
+}
+
+/// How far the tool must travel along the contour to descend `dz` at the ramp's
+/// angle. `None` for every plunge style that is not a contour ramp, and for a
+/// degenerate angle or a non-descent — both of which fall back to the plain plunge,
+/// exactly as an invalid helix always has.
+pub(crate) fn contour_ramp_len(plunge: Plunge, dz: f64) -> Option<f64> {
+    match plunge {
+        Plunge::Ramp { angle_deg } if angle_deg > 0.0 && angle_deg < 90.0 && dz > 0.0 => {
+            Some(dz / angle_deg.to_radians().tan())
+        }
+        _ => None,
+    }
+}
+
+/// Most laps a contour ramp may take around a loop before it is steepened to fit.
+///
+/// A shallow angle on a small loop is otherwise unbounded: 0.5° needs 115 mm of
+/// travel per millimetre of descent, so a 20 mm circle takes nearly two laps per
+/// millimetre and the emitted vertex count grows with it. Beyond the cap the ramp
+/// descends over 32 laps instead of the requested length, which is *steeper* than
+/// asked — the safe direction to err, since the alternative is an unbounded buffer.
+pub(crate) const MAX_RAMP_LAPS: usize = 32;
+
+/// The stretch of the closed loop `pts` that **arrives at `pts[0]`** after `len` mm
+/// of travel, found by walking backwards from the start and wrapping as often as
+/// needed. Returned in travel order, so the last point is always `pts[0]`.
+///
+/// Backwards, so that the ramp ends where the pass begins. The stretch it leaves
+/// sloped is then the loop's own final stretch, which the pass re-machines at full
+/// depth as it closes — no extra motion, and nothing stranded. A ramp running
+/// *forward* from the start would leave that wedge uncut, and would move the point
+/// the cut begins at, which is the operator's (possibly snapped) choice.
+pub(crate) fn approach_along_loop(pts: &[Point], len: f64) -> Vec<Point> {
+    let n = pts.len();
+    if n < 2 || len.is_nan() || len <= 0.0 {
+        return vec![pts[0]];
+    }
+    // Collected against the direction of travel, then reversed.
+    let mut back = vec![pts[0]];
+    let mut remaining = len;
+    let mut from = pts[0];
+    let mut i = 0usize;
+    // Bounded by construction rather than by the arithmetic working out: see
+    // MAX_RAMP_LAPS. One step per edge, so `n` steps is one lap.
+    for _ in 0..n.saturating_mul(MAX_RAMP_LAPS) {
+        if remaining <= 0.0 {
+            break;
+        }
+        let prev = (i + n - 1) % n;
+        let to = pts[prev];
+        let (dx, dy) = (to.x - from.x, to.y - from.y);
+        let seg = (dx * dx + dy * dy).sqrt();
+        if seg <= 1e-12 {
+            i = prev; // coincident vertices contribute no length
+            continue;
+        }
+        if seg >= remaining {
+            let t = remaining / seg;
+            back.push(Point::new(from.x + dx * t, from.y + dy * t));
+            break;
+        }
+        remaining -= seg;
+        back.push(to);
+        from = to;
+        i = prev;
+    }
+    back.reverse();
+    back
+}
+
+/// The first `len` mm of an **open** path, from `path[0]` forward, truncated at the
+/// path's end. Unlike [`approach_along_loop`] there is nothing to wrap around, so a
+/// path shorter than `len` yields all of it — the ramp then descends over what
+/// travel exists, which is steeper than asked and never a vertical drop.
+pub(crate) fn advance_along_path(path: &[Point], len: f64) -> Vec<Point> {
+    let mut out = vec![path[0]];
+    if path.len() < 2 || len.is_nan() || len <= 0.0 {
+        return out;
+    }
+    let mut remaining = len;
+    for w in path.windows(2) {
+        let (dx, dy) = (w[1].x - w[0].x, w[1].y - w[0].y);
+        let seg = (dx * dx + dy * dy).sqrt();
+        if seg <= 1e-12 {
+            continue;
+        }
+        if seg >= remaining {
+            let t = remaining / seg;
+            out.push(Point::new(w[0].x + dx * t, w[0].y + dy * t));
+            return out;
+        }
+        remaining -= seg;
+        out.push(w[1]);
+    }
+    out
+}
+
+/// Descend along an **open** path and retrace it: the tool ramps forward from
+/// `path[0]` to depth, then returns along the same stretch at full depth, ending
+/// where it began.
+///
+/// The return leg is not decoration, and it is not the oscillating entry this
+/// replaced. A closed loop needs no return because the pass ends where the ramp
+/// began, so the loop's last stretch re-machines the slope for free. An open path
+/// never comes back, so the wedge would simply be left standing at the entry.
+/// Retracing at depth is the cheapest honest answer, and it still follows the
+/// toolpath rather than cutting across it.
+pub(crate) fn emit_open_ramp(
+    prog: &mut Program,
+    path: &[Point],
+    from_z: f64,
+    to_z: f64,
+    feed: f64,
+    tag: Tag,
+) {
+    emit_descending_path(prog, path, from_z, to_z, feed, tag);
+    // Back along the same points at depth. Skipping the last (we are on it) and
+    // walking in reverse leaves the tool at `path[0]`, which is the entry contract
+    // every other plunge strategy keeps.
+    for p in path.iter().rev().skip(1) {
+        prog.push(Step::Linear {
+            to: Point3::new(p.x, p.y, to_z),
+            feed,
+            tag,
+        });
+    }
+}
+
+/// Emit `path` as fed moves descending linearly **in arc length** from `from_z`,
+/// reaching exactly `to_z` at the last point. The tool must already sit at `path[0]`.
+///
+/// Linear in arc length, not in vertex index: a loop's edges differ in length, and
+/// interpolating per vertex would tilt the ramp differently on every edge.
+pub(crate) fn emit_descending_path(
+    prog: &mut Program,
+    path: &[Point],
+    from_z: f64,
+    to_z: f64,
+    feed: f64,
+    tag: Tag,
+) {
+    let seg_len = |a: Point, b: Point| ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
+    let total: f64 = path.windows(2).map(|w| seg_len(w[0], w[1])).sum();
+    let last = path[path.len() - 1];
+    if total.is_nan() || total <= 1e-12 {
+        // Degenerate path: there is nowhere to ramp, so drop straight to depth rather
+        // than emit a descent that never descends.
+        prog.push(Step::Linear {
+            to: Point3::new(last.x, last.y, to_z),
+            feed,
+            tag,
+        });
+        return;
+    }
+    let mut acc = 0.0;
+    let n = path.len();
+    for (k, w) in path.windows(2).enumerate() {
+        acc += seg_len(w[0], w[1]);
+        // The final vertex takes `to_z` outright: the running sum is within a few ULP
+        // of `total`, and "reaches the exact depth" is a property worth not rounding.
+        let z = if k + 2 == n {
+            to_z
+        } else {
+            from_z + (to_z - from_z) * (acc / total)
+        };
+        prog.push(Step::Linear {
+            to: Point3::new(w[1].x, w[1].y, z),
             feed,
             tag,
         });
@@ -788,8 +979,11 @@ mod tests {
         }
     }
 
+    /// `Plunge::Ramp` is absent by design, not by oversight: it is the one entry that
+    /// does *not* end at the footprint it began at, because it travels along the
+    /// contour. Its equivalent properties are asserted in the contour-ramp tests below.
     #[test]
-    fn every_plunge_strategy_descends_monotonically_to_exact_depth() {
+    fn every_point_plunge_strategy_descends_monotonically_to_exact_depth() {
         let p = Point::new(0.0, 0.0);
         let tan = (1.0, 0.0);
         let out = (0.0, 1.0);
@@ -800,7 +994,6 @@ mod tests {
                 radius: 2.0,
                 pitch: 1.0,
             },
-            Plunge::Ramp { angle_deg: 20.0 },
             Plunge::ZigZag {
                 length: 3.0,
                 angle_deg: 15.0,
@@ -823,6 +1016,119 @@ mod tests {
                 "{plunge:?} must end at the entry footprint"
             );
         }
+    }
+
+    /// A 100 mm square loop, used by the contour-ramp tests below. Perimeter 400 mm.
+    fn square() -> Vec<Point> {
+        vec![
+            Point::new(0.0, 0.0),
+            Point::new(100.0, 0.0),
+            Point::new(100.0, 100.0),
+            Point::new(0.0, 100.0),
+        ]
+    }
+
+    fn path_len(p: &[Point]) -> f64 {
+        p.windows(2)
+            .map(|w| ((w[1].x - w[0].x).powi(2) + (w[1].y - w[0].y).powi(2)).sqrt())
+            .sum()
+    }
+
+    #[test]
+    fn the_contour_ramp_travels_the_length_its_angle_requires() {
+        // 5 mm of descent at 45° is 5 mm of travel; at ~26.57° (tan = 0.5) it is 10.
+        assert!(
+            (contour_ramp_len(Plunge::Ramp { angle_deg: 45.0 }, 5.0).unwrap() - 5.0).abs() < 1e-9
+        );
+        let shallow = contour_ramp_len(Plunge::Ramp { angle_deg: 26.565_051_2 }, 5.0).unwrap();
+        assert!((shallow - 10.0).abs() < 1e-6, "got {shallow}");
+        // Not a ramp, a degenerate angle, or no descent to make: the plain plunge.
+        assert!(contour_ramp_len(Plunge::Straight, 5.0).is_none());
+        assert!(contour_ramp_len(Plunge::Ramp { angle_deg: 90.0 }, 5.0).is_none());
+        assert!(contour_ramp_len(Plunge::Ramp { angle_deg: 0.0 }, 5.0).is_none());
+        assert!(contour_ramp_len(Plunge::Ramp { angle_deg: 20.0 }, 0.0).is_none());
+    }
+
+    /// The ramp must arrive **at** the pass's start point, entering the loop behind it.
+    /// That direction is the whole reason no extra motion is needed to clean the slope:
+    /// the wedge it leaves is the loop's final stretch, which the pass then re-cuts.
+    #[test]
+    fn the_contour_ramp_arrives_at_the_start_from_behind_it() {
+        let pts = square();
+        let path = approach_along_loop(&pts, 30.0);
+        let last = path[path.len() - 1];
+        assert!(
+            (last.x - pts[0].x).abs() < 1e-9 && (last.y - pts[0].y).abs() < 1e-9,
+            "the ramp must end where the pass begins, got {last:?}"
+        );
+        assert!((path_len(&path) - 30.0).abs() < 1e-9, "got {}", path_len(&path));
+        // Backwards from (0,0) is along the *last* edge, (0,100) → (0,0): so the ramp
+        // starts 30 mm up the left-hand side, not 30 mm along the bottom.
+        assert!(
+            (path[0].x).abs() < 1e-9 && (path[0].y - 30.0).abs() < 1e-9,
+            "ramp entered forward, not behind the start: {:?}",
+            path[0]
+        );
+    }
+
+    #[test]
+    fn a_contour_ramp_longer_than_the_loop_wraps_instead_of_giving_up() {
+        let pts = square();
+        // 950 mm on a 400 mm perimeter: two full laps and 150 mm.
+        let path = approach_along_loop(&pts, 950.0);
+        assert!((path_len(&path) - 950.0).abs() < 1e-6, "got {}", path_len(&path));
+        let last = path[path.len() - 1];
+        assert!((last.x - pts[0].x).abs() < 1e-9 && (last.y - pts[0].y).abs() < 1e-9);
+    }
+
+    /// A shallow enough angle asks for unbounded travel. The cap steepens the ramp
+    /// rather than sizing a buffer off the arithmetic — the same lesson as the dashed
+    /// backplot's walk: bound the output, do not trust the numbers to stay sane.
+    #[test]
+    fn an_absurdly_shallow_ramp_is_bounded_by_the_lap_cap() {
+        let pts = square();
+        let path = approach_along_loop(&pts, 1.0e9);
+        assert!(
+            path_len(&path) <= 400.0 * MAX_RAMP_LAPS as f64 + 1e-6,
+            "ramp ran {} mm, past the {MAX_RAMP_LAPS}-lap cap",
+            path_len(&path)
+        );
+        assert!(path.len() <= 4 * MAX_RAMP_LAPS + 2, "{} vertices", path.len());
+        let last = path[path.len() - 1];
+        assert!((last.x - pts[0].x).abs() < 1e-9 && (last.y - pts[0].y).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_descending_path_falls_monotonically_and_reaches_the_exact_depth() {
+        let pts = square();
+        let path = approach_along_loop(&pts, 30.0);
+        let mut prog = Program::new();
+        emit_descending_path(
+            &mut prog,
+            &path,
+            0.0,
+            -5.0,
+            300.0,
+            Tag::new(0, MoveKind::Plunge),
+        );
+        let zs: Vec<f64> = prog.steps.iter().map(step_end_z).collect();
+        assert_eq!(zs.len(), path.len() - 1, "one move per segment");
+        for w in zs.windows(2) {
+            assert!(w[1] <= w[0] + 1e-12, "the ramp must descend monotonically");
+        }
+        assert!(
+            (zs.last().unwrap() + 5.0).abs() < 1e-12,
+            "must reach exact depth, got {}",
+            zs.last().unwrap()
+        );
+        // Descent is linear in arc length: halfway along is halfway down.
+        let half = prog
+            .steps
+            .iter()
+            .map(step_end_z)
+            .find(|_| true)
+            .expect("at least one move");
+        assert!(half < 0.0, "the first move must already be descending");
     }
 
     #[test]
@@ -1108,6 +1414,86 @@ mod tests {
             spindle: cam_cldata::SpindleDir::Cw,
         };
         ProfileStrategy::new(op).compute(&env, &crate::CancelToken::new())
+    }
+
+    /// The point of the whole exercise: with a ramp selected, the tool must never drop
+    /// straight down into material. A vertical `Plunge` move is exactly the entry a
+    /// ramp exists to avoid, and it is what a silent fallback would produce.
+    #[test]
+    fn a_contour_ramp_never_drops_vertically_into_material() {
+        let mut op = outside_rough_op(0.0);
+        op.stepdown = 0.5; // four levels, so later entries start from a cut floor
+        op.plunge = Plunge::Ramp { angle_deg: 15.0 };
+        let r = run_outside_rough(op);
+        assert!(
+            r.diagnostics
+                .iter()
+                .all(|d| d.severity != crate::Severity::Error),
+            "{:?}",
+            r.diagnostics
+        );
+
+        let mut pos = Point3::new(0.0, 0.0, 0.0);
+        let mut vertical = 0;
+        let mut ramped = 0;
+        for s in r.program.steps() {
+            let (to, kind) = match s {
+                Step::Linear { to, tag, .. } => (*to, Some(tag.kind)),
+                Step::Rapid { to, .. } => (*to, None),
+                Step::Arc { end, .. } => (*end, None),
+                _ => continue,
+            };
+            if kind == Some(MoveKind::Plunge) {
+                let flat = (to.x - pos.x).hypot(to.y - pos.y);
+                if to.z < pos.z - 1e-9 {
+                    if flat <= 1e-9 {
+                        vertical += 1;
+                    } else {
+                        ramped += 1;
+                    }
+                }
+            }
+            pos = to;
+        }
+        assert_eq!(vertical, 0, "a ramped profile emitted {vertical} vertical plunges");
+        assert!(ramped > 0, "no descending ramp moves were emitted at all");
+    }
+
+    /// The ramp arrives at the pass's start, so the loop's own final stretch re-cuts
+    /// the slope. Which means the cut still covers the whole contour — a ramp must not
+    /// quietly shorten the pass.
+    #[test]
+    fn a_ramped_pass_still_cuts_the_whole_contour() {
+        let mut straight_op = outside_rough_op(0.0);
+        straight_op.stepover = 0.0; // a plain contour pass, no roughing rings
+        let mut ramp_op = straight_op.clone();
+        ramp_op.plunge = Plunge::Ramp { angle_deg: 15.0 };
+
+        let cut_len = |r: &StrategyResult| -> f64 {
+            let mut pos = Point3::new(0.0, 0.0, 0.0);
+            let mut total = 0.0;
+            for s in r.program.steps() {
+                let to = match s {
+                    Step::Linear { to, tag, .. } => {
+                        if tag.kind == MoveKind::Cutting {
+                            total += (to.x - pos.x).hypot(to.y - pos.y);
+                        }
+                        *to
+                    }
+                    Step::Rapid { to, .. } => *to,
+                    Step::Arc { end, .. } => *end,
+                    _ => continue,
+                };
+                pos = to;
+            }
+            total
+        };
+        let plain = cut_len(&run_outside_rough(straight_op));
+        let ramped = cut_len(&run_outside_rough(ramp_op));
+        assert!(
+            (ramped - plain).abs() < 1e-6,
+            "the ramp changed the cut length: {plain} plain vs {ramped} ramped"
+        );
     }
 
     fn plunge_count(r: &StrategyResult) -> usize {

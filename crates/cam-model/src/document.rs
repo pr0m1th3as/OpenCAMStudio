@@ -217,11 +217,23 @@ pub enum Plunge {
     /// A straight vertical plunge (the default; fine for drills/centre-cutting mills).
     #[default]
     Straight,
-    /// Descend at `angle_deg` from horizontal along the toolpath (linear ramp).
+    /// Descend at `angle_deg` from horizontal **along the toolpath itself** — a
+    /// one-way ramp, arriving on the contour at full depth.
+    ///
+    /// The tool enters the loop *before* its start point and descends as it travels,
+    /// reaching depth exactly where the pass begins. That direction is deliberate: the
+    /// stretch the ramp leaves sloped is then the loop's own final stretch, so the pass
+    /// re-machines it at full depth without any extra motion. A ramp running forward
+    /// from the start would strand that wedge.
+    ///
+    /// Use [`ZigZag`](Self::ZigZag) instead where there is no room to travel — that is
+    /// what an oscillating entry is for.
     Ramp { angle_deg: f64 },
     /// Spiral down on a helix of `radius` mm, `pitch` mm of descent per turn.
     Helix { radius: f64, pitch: f64 },
-    /// Back-and-forth ramp of `length` mm at `angle_deg`, for narrow slots.
+    /// Back-and-forth ramp of `length` mm at `angle_deg`, for narrow slots — an
+    /// oscillation in place, for the case [`Ramp`](Self::Ramp) cannot serve because the
+    /// tool has nowhere to travel.
     ZigZag { length: f64, angle_deg: f64 },
 }
 

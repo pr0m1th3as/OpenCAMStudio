@@ -305,9 +305,22 @@ fn emit_adaptive_moves(
             tag: link,
         });
         crate::emit::descend_to(prog, start, from_z, h, job.feed, job.id);
-        crate::profile::emit_plunge(
-            prog, start, tan, out, from_z, z, job.plunge, job.plunge_feed, job.feed, plunge_tag,
-        );
+        // A steered clearing path is **open**: it never returns to its entry, so a
+        // one-way contour ramp would strand the wedge it leaves. Here the ramp runs
+        // forward along the path and retraces it at depth — still along the toolpath,
+        // but ending where it began, which is the contract the rest of this loop
+        // assumes. A closed loop (profile, carve rings) needs no such return.
+        match crate::profile::contour_ramp_len(job.plunge, from_z - z) {
+            Some(len) => {
+                let path: Vec<_> = moves.iter().map(|&(p, _)| p).collect();
+                let ramp = crate::profile::advance_along_path(&path, len);
+                crate::profile::emit_open_ramp(prog, &ramp, from_z, z, job.feed, plunge_tag);
+            }
+            None => crate::profile::emit_plunge(
+                prog, start, tan, out, from_z, z, job.plunge, job.plunge_feed, job.feed,
+                plunge_tag,
+            ),
+        }
 
         for i in 1..moves.len() {
             let (p, is_cut) = moves[i];

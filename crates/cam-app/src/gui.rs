@@ -573,7 +573,7 @@ impl std::fmt::Display for PlungeKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             PlungeKind::Straight => "Straight",
-            PlungeKind::Ramp => "Ramp",
+            PlungeKind::Ramp => "Ramp along path",
             PlungeKind::Helix => "Helix",
             PlungeKind::ZigZag => "Zig-zag",
         })
@@ -1391,8 +1391,9 @@ mod help {
     pub const LEAD_OUT: &str = "How the tool eases off the wall at the end of a pass (see lead-in).";
     pub const PLUNGE: &str =
         "How the tool enters downward at each level. Straight drops vertically (needs a \
-         centre-cutting tool or pre-drilled hole); Ramp and Zig-zag oscillate down; Helix \
-         spirals down — all gentler than a straight plunge.";
+         centre-cutting tool or pre-drilled hole); Ramp descends along the toolpath itself, \
+         arriving on the contour at full depth; Zig-zag oscillates in place, for a slot too \
+         narrow to ramp along; Helix spirals down — all gentler than a straight plunge.";
     pub const CLIMB: &str =
         "Milling direction. Climb (recommended) gives a cleaner finish and is required for \
          adaptive clearing; unticking it is conventional milling, which reverses the pass \

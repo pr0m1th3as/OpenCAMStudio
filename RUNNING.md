@@ -331,6 +331,29 @@ records neither, and opening one leaves your current machine and post alone.
     and a length of cut, drawn as one 60° tooth on a long reduced neck. Full-form
     has a cutting ⌀, thread length, and pitch, drawn as a stack of 60° threads.
 
+### Plunge styles — how the tool gets down
+
+Set per operation in the Inspector. All four reach exactly the requested depth; they
+differ in how the tool gets there, and only **Straight** puts the tool's tip into
+solid material with nowhere to go.
+
+- **Straight** — a vertical drop. Needs a centre-cutting tool or a pre-drilled hole.
+- **Ramp along path** — descends **along the toolpath itself**, one way, arriving on
+  the contour at full depth. It enters the loop *before* the pass's start point, so
+  the stretch it leaves sloped is the loop's own final stretch, which the pass then
+  re-machines at full depth: no extra motion, and nothing left standing. The angle is
+  from horizontal — shallower is gentler and travels further. A very shallow angle on
+  a small loop wraps around it repeatedly; past 32 laps the ramp steepens to fit
+  rather than growing without bound.
+- **Zig-zag** — oscillates back and forth in place, for a slot too narrow to ramp
+  along. This is the one case an oscillating entry is actually for.
+- **Helix** — spirals down on its own radius, clear of the wall.
+
+A clearing pass is the exception to "one way": its path is **open** — it never returns
+to where it entered — so a one-way ramp there would strand the wedge it leaves. The
+ramp runs forward along the path and retraces it at depth instead. A closed contour
+(profile, carve wall rings) needs no such return.
+
 ### Run / export
 
 - **Home → Run** recomputes for the current document. The backplot is coloured by

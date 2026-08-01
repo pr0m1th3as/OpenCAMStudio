@@ -95,6 +95,12 @@ fn cut_ring(prog: &mut Program, pts: &[Point], feed: f64, tag: Tag, lead_overlap
 /// The rule everywhere else in CAM is that the entry strategy is chosen by what is
 /// under the tool, not by whether it is the first entry of the level; that is what this
 /// now does. `tan`/`out` orient the helix or ramp, as at a level entry.
+///
+/// `ring` is the closed loop about to be cut, beginning at the point the cut begins
+/// at. A contour ramp travels along it and therefore comes down at its *far* end
+/// rather than at `p`; it arrives at `ring[0]`, which is where the cut starts, so the
+/// entry contract every other strategy keeps still holds. Returns whether it ramped —
+/// the caller's lead-in has nothing left to ease if it did.
 #[allow(clippy::too_many_arguments)]
 fn enter_with_plunge(
     prog: &mut Program,
@@ -108,15 +114,32 @@ fn enter_with_plunge(
     plunge_feed: f64,
     feed: f64,
     id: u32,
-) {
+    ring: &[Point],
+) -> bool {
+    let ramp = crate::profile::contour_ramp_len(plunge, from_z - z)
+        .map(|len| crate::profile::approach_along_loop(ring, len))
+        .filter(|path| path.len() > 1);
+    // Where the tool comes down: the ramp's far end, or the entry footprint itself.
+    let down_at = ramp.as_ref().map_or(p, |path| path[0]);
     prog.push(Step::Rapid {
-        to: Point3::new(p.x, p.y, h.clearance),
+        to: Point3::new(down_at.x, down_at.y, h.clearance),
         tag: Tag::new(id, MoveKind::Link),
     });
     // The rapid stops short of `from_z` when that is a cut floor: what is under the
     // tool decides the *strategy* (above), and the same question decides how the tool
     // may arrive at all.
-    crate::emit::descend_to(prog, p, from_z, h, feed, id);
+    crate::emit::descend_to(prog, down_at, from_z, h, feed, id);
+    if let Some(path) = &ramp {
+        crate::profile::emit_descending_path(
+            prog,
+            path,
+            from_z,
+            z,
+            feed,
+            Tag::new(id, MoveKind::Plunge),
+        );
+        return true;
+    }
     crate::profile::emit_plunge(
         prog,
         p,
@@ -129,6 +152,7 @@ fn enter_with_plunge(
         feed,
         Tag::new(id, MoveKind::Plunge),
     );
+    false
 }
 
 /// The normal toward the **cleared** side of a wall loop — where the tool has been,
@@ -164,7 +188,8 @@ fn approach(
     plunge_feed: f64,
     id: u32,
     link_threshold: f64,
-) {
+    ring: &[Point],
+) -> bool {
     let hop = (p.x - prev_end.x).hypot(p.y - prev_end.y);
     if hop <= link_threshold {
         prog.push(Step::Linear {
@@ -172,13 +197,15 @@ fn approach(
             feed,
             tag: Tag::new(id, MoveKind::Cutting),
         });
-    } else {
-        prog.push(Step::Rapid {
-            to: Point3::new(prev_end.x, prev_end.y, h.clearance),
-            tag: Tag::new(id, MoveKind::Link),
-        });
-        enter_with_plunge(prog, p, tan, out, from_z, z, h, plunge, plunge_feed, feed, id);
+        return false;
     }
+    prog.push(Step::Rapid {
+        to: Point3::new(prev_end.x, prev_end.y, h.clearance),
+        tag: Tag::new(id, MoveKind::Link),
+    });
+    enter_with_plunge(
+        prog, p, tan, out, from_z, z, h, plunge, plunge_feed, feed, id, ring,
+    )
 }
 
 /// Cut a finished-wall ring with a lead-in/out eased from the cleared side, and
@@ -224,11 +251,15 @@ fn emit_wall_ring(
 
     let lead = Tag::new(id, MoveKind::LeadIn);
     let cut = Tag::new(id, MoveKind::Cutting);
-    approach(
+    let ramped = approach(
         prog, prev_end, entry, tan_in, cin, from_z, z, h, plunge, feed, plunge_feed, id,
-        link_threshold,
+        link_threshold, &ri,
     );
-    crate::leads::emit_lead(prog, entry, start, start, cin, eff_in, z, feed, lead);
+    // A contour ramp arrives on the wall at `start`, at depth and already tangent, so
+    // the lead-in has nothing left to ease.
+    if !ramped {
+        crate::leads::emit_lead(prog, entry, start, start, cin, eff_in, z, feed, lead);
+    }
     crate::emit::cut_polyline(prog, &loop_pts, feed, cut, z);
     crate::leads::emit_lead(prog, exit_on, exit, exit_on, cout, eff_out, z, feed, lead);
     exit
@@ -270,7 +301,8 @@ pub(crate) fn emit_stay_down(
     if rings.is_empty() {
         return;
     }
-    let link = Tag::new(id, MoveKind::Link);
+    // The level entry's own Link rapid now belongs to `enter_with_plunge`, which is
+    // the only thing that knows where the tool must come down.
     let cut = Tag::new(id, MoveKind::Cutting);
     let retract = Tag::new(id, MoveKind::Retract);
     let leaded = lead_in != Lead::None || lead_out != Lead::None;
@@ -284,22 +316,19 @@ pub(crate) fn emit_stay_down(
         let r0 = crate::profile::rotate_to_start(&rings[0].pts, start);
         let tan = crate::profile::start_tangent(&r0);
         let out = crate::profile::outward_normal(&r0);
-        prog.push(Step::Rapid {
-            to: Point3::new(r0[0].x, r0[0].y, h.clearance),
-            tag: link,
-        });
-        crate::emit::descend_to(prog, r0[0], from_z, h, feed, id);
-        crate::profile::emit_plunge(
+        enter_with_plunge(
             prog,
             r0[0],
             tan,
             (-out.0, -out.1),
             from_z,
             z,
+            h,
             plunge,
             plunge_feed,
             feed,
-            Tag::new(id, MoveKind::Plunge),
+            id,
+            &r0,
         );
         let mut prev_end = cut_ring(prog, &r0, feed, cut, lead_overlap, z);
 
@@ -349,6 +378,7 @@ pub(crate) fn emit_stay_down(
                 plunge_feed,
                 id,
                 link_threshold,
+                &ri,
             );
             prev_end = cut_ring(prog, &ri, feed, cut, lead_overlap, z);
         }
