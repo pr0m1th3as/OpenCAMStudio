@@ -21,6 +21,20 @@ cargo test  --workspace          # the full test suite
 cargo run   -p cam-app           # prints how to launch the GUI
 ```
 
+### A note on the debug profile
+
+The workspace `Cargo.toml` sets `[profile.dev.package."*"] debug = false` — debug
+info is **off for dependencies**, on for our own crates. This is not a micro-
+optimisation: with it on, a `--features gui` debug binary is 435 MiB of which
+335 MiB is DWARF, each link costs the linker ~1.7 GiB of RSS, and
+`cargo build --workspace --all-targets` links a dozen of those at once. That
+reliably exhausted a 31 GiB machine. With it off the binary is 168 MiB and a cold
+`--all-targets` build peaks around 7 GiB.
+
+You keep breakpoints, variables and line numbers in `cam-*` code, and dependency
+frames still carry symbol names in backtraces. If you genuinely need to step *into*
+`wgpu`/`iced`/`naga`, comment those two lines out for that session.
+
 ## The desktop GUI
 
 The interactive app lives behind the `gui` feature (which also enables

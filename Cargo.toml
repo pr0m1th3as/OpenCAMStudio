@@ -15,3 +15,17 @@ repository = "https://github.com/pr0m1th3as/OpenCAMStudio"
 serde = { version = "1", features = ["derive"] }
 # float_roundtrip: parse f64 back bit-for-bit, so saved geometry never drifts.
 serde_json = { version = "1", features = ["float_roundtrip"] }
+
+# Keep the linker's memory in bounds. A `--features gui` debug build of
+# `opencamstudio` was 435 MiB, of which 335 MiB was DWARF — the code itself is
+# 41 MiB of .text. Merging that much `.debug_str` costs the linker ~1.7 GiB of
+# RSS for a single binary, and `cargo test --workspace` links a dozen of them
+# concurrently: measured peak 29.8 GiB on a 31 GiB machine, which is why builds
+# were getting OOM-killed.
+#
+# The 461 dependencies (wgpu, naga, iced) contribute nearly all of that DWARF and
+# are not what we debug. Dropping their debug info leaves our own crates fully
+# debuggable — breakpoints, variables, the lot — and still yields readable
+# backtraces through dependency frames, since symbol names survive.
+[profile.dev.package."*"]
+debug = false
