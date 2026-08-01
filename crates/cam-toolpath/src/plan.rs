@@ -45,6 +45,24 @@ pub fn build_job(
     let mut program = Program::new();
     let mut diagnostics = Vec::new();
 
+    // Every use of this value assumes it is *above* the work: `lift_to_tool_change`
+    // is named for what it is supposed to do, and the cross that follows travels at
+    // it. Nothing validated that. A setup whose Tool Change Height sits below the
+    // clearance plane would turn the lift into a descent and cross the part below
+    // clearance — so raise it, and say so rather than silently overruling the value
+    // the operator typed.
+    let tool_change_height = if tool_change_height < setup.heights.clearance {
+        diagnostics.push(Diagnostic::warning(format!(
+            "tool-change height {tool_change_height:.3} mm is below the clearance plane \
+             {:.3} mm; using the clearance plane instead — a tool change or re-fixture \
+             must not bring the tool down.",
+            setup.heights.clearance
+        )));
+        setup.heights.clearance
+    } else {
+        tool_change_height
+    };
+
     program.push(Step::Comment(setup.name.clone()));
 
     // Compute every operation's fragment once. Coordinates are in the part frame; the
@@ -115,9 +133,14 @@ pub fn build_job(
         );
     }
 
+    // The same shutdown as a re-fixture halt, and for the same reason: the operator is
+    // about to put hands on the work — here to take the part out. It used to be two
+    // lines in a different order with no lift, because it was written at first light
+    // and the re-fixture path was written eight weeks later; nothing ever produced
+    // both in one program until a multi-datum job with a tool change did.
     if st.spindle_started {
-        program.push(Step::Coolant(Coolant::Off));
-        program.push(Step::SpindleOff);
+        let last_op = planned.last().map(|pl| pl.op_id).unwrap_or(0);
+        shut_down(&mut program, tool_change_height, last_op);
     }
 
     (program, diagnostics)
@@ -189,9 +212,7 @@ fn emit_instance(
         // re-fixture from). Force spindle and coolant to be re-commanded for the new
         // group by clearing their running state.
         if st.spindle_started {
-            program.push(Step::SpindleOff);
-            program.push(Step::Coolant(Coolant::Off));
-            lift_to_tool_change(program, tool_change_height, pl.op_id);
+            shut_down(program, tool_change_height, pl.op_id);
             program.push(Step::Stop);
             st.current_rpm = None;
             st.spindle_started = false;
@@ -242,12 +263,39 @@ fn emit_instance(
     }
 }
 
+/// Bring the machine to a state a person can safely approach: spindle stopped,
+/// coolant off, tool lifted clear of the work.
+///
+/// **One function, two callers, because they are one physical situation** — the
+/// re-fixture halt and the end of the program both end with the operator reaching in,
+/// to flip the part or to take it out. They were written eight weeks apart and had
+/// drifted: the end of the program stopped coolant before the spindle and never
+/// lifted at all, so a finished job left the tool sitting at clearance over the part.
+/// Neither was wrong in isolation; nothing had ever emitted both in one program.
+///
+/// **Spindle before coolant**, deliberately: the spindle is the half that hurts, so it
+/// is the half that stops first.
+fn shut_down(program: &mut Program, tool_change_height: f64, op_id: u32) {
+    program.push(Step::SpindleOff);
+    program.push(Step::Coolant(Coolant::Off));
+    lift_to_tool_change(program, tool_change_height, op_id);
+}
+
 /// Rapid straight up to the tool-change height, in place (X/Y unchanged), so a tool
 /// change or manual re-fixture happens with the tool clear of the work. Tagged
 /// [`MoveKind::Traverse`] so the backplot renders it apart from an operation's own
 /// rapids. A no-op if nothing has moved yet — there is no prior position to lift from.
+///
+/// **Never descends.** The name is a promise: a "lift" that moved the tool down would
+/// be the exact opposite of what every caller wants it for. `build_job` already raises
+/// a below-clearance tool-change height, so this is the second line of defence rather
+/// than the first — but a lift that can go the wrong way is not worth leaving to one
+/// guard.
 fn lift_to_tool_change(program: &mut Program, z: f64, op_id: u32) {
     if let Some(p) = last_position(program) {
+        if p.z >= z {
+            return;
+        }
         program.push(Step::Rapid {
             to: Point3::new(p.x, p.y, z),
             tag: Tag::new(op_id, MoveKind::Traverse),

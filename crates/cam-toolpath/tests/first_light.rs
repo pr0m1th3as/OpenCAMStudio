@@ -920,3 +920,21 @@ fn a_single_tool_carve_behaves_like_every_other_operation() {
     let (program, _) = build_job(&doc, 1000.0, SpindleDir::Cw, None, machine().envelope.max.z, &CancelToken::new());
     assert_eq!(tool_changes(&program), vec![1, 2]);
 }
+
+/// Rewrite this file's goldens after an intentional change.
+///
+/// `cargo test -p cam-toolpath --test first_light -- --ignored regen_goldens`, then **read the
+/// diff** before committing — that is the whole value of a golden. Ignored by default
+/// so a normal run never rewrites the thing it is meant to be checking against.
+#[test]
+#[ignore = "regeneration helper"]
+fn regen_goldens() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/");
+    let (program, nc, _) = plan_and_post();
+    std::fs::write(format!("{dir}first_light.nc"), nc).unwrap();
+    std::fs::write(
+        format!("{dir}first_light.txt"),
+        format!("{}\n", ascii_backplot(&program, 54, 22)),
+    )
+    .unwrap();
+}

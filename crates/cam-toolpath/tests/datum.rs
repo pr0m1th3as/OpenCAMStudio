@@ -77,6 +77,95 @@ fn okuma_nc(d: &Document) -> String {
     nc(d, PostKind::Okuma)
 }
 
+/// The re-fixture halt and the end of the program are the same physical situation —
+/// the operator is about to reach in — so they must emit the same sequence. They did
+/// not: the end of the program stopped coolant before the spindle and never lifted,
+/// having been written at first light, months before the re-fixture path existed.
+/// Nothing produced both in one program until a multi-datum job with a tool change.
+#[test]
+fn every_shutdown_stops_the_spindle_first_then_coolant_then_lifts() {
+    use cam_cldata::{Coolant, MoveKind};
+    // Two origins, so the program contains a re-fixture halt *and* an ending.
+    let mut d = doc(vec![
+        profile(0, rect(10.0, 10.0, 70.0, 50.0), Side::Outside, 1, 1),
+        profile(1, rect(20.0, 20.0, 60.0, 40.0), Side::Outside, 1, 2),
+    ]);
+    d.setup.extra_origins = vec![cam_model::Origin {
+        index: 2,
+        position: [0.0, 0.0, 0.0],
+    }];
+    let (program, _) = build_job(&d, 1000.0, SpindleDir::Cw, None, 42.0, &CancelToken::new());
+    let s = program.steps();
+
+    // Each shutdown: SpindleOff, Coolant(Off), then the Traverse lift to 42.
+    let starts: Vec<usize> = s
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| matches!(x, Step::SpindleOff))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(starts.len(), 2, "one shutdown per re-fixture, plus the ending:\n{s:#?}");
+
+    for i in starts {
+        assert!(
+            matches!(s[i + 1], Step::Coolant(Coolant::Off)),
+            "coolant must stop *after* the spindle — the spindle is the half that hurts"
+        );
+        match &s[i + 2] {
+            Step::Rapid { to, tag } => {
+                assert_eq!(tag.kind, MoveKind::Traverse);
+                assert_eq!(to.z, 42.0, "the tool must be lifted clear of the work");
+            }
+            other => panic!("every shutdown must lift the tool clear, got {other:?}"),
+        }
+    }
+}
+
+/// A tool-change height below the clearance plane would turn every "lift" into a
+/// descent, and send the cross across the part below clearance. Raised, with a warning
+/// — not silently obeyed, and not silently ignored either.
+#[test]
+fn a_tool_change_height_below_clearance_is_raised_and_reported() {
+    let d = doc(vec![
+        profile(0, rect(10.0, 10.0, 70.0, 50.0), Side::Outside, 1, 1),
+        profile(1, rect(35.0, 25.0, 45.0, 35.0), Side::Inside, 2, 1),
+    ]);
+    let clearance = d.setup.heights.clearance;
+    // Well below the clearance plane.
+    let (program, diags) = build_job(
+        &d,
+        1000.0,
+        SpindleDir::Cw,
+        None,
+        clearance - 10.0,
+        &CancelToken::new(),
+    );
+    assert!(
+        diags.iter().any(|x| x.message.contains("below the clearance plane")),
+        "the operator must be told their value was overruled: {diags:?}"
+    );
+    // And nothing labelled a lift may descend.
+    let mut z = f64::NAN;
+    for st in program.steps() {
+        if let Step::Rapid { to, tag } = st {
+            if tag.kind == cam_cldata::MoveKind::Traverse && !z.is_nan() {
+                assert!(
+                    to.z >= z - 1e-9 || (to.x, to.y) != (z, z),
+                    "a traverse descended below where it started"
+                );
+            }
+            z = to.z;
+        }
+    }
+    assert!(
+        program.steps().iter().all(|st| !matches!(
+            st,
+            Step::Rapid { to, tag } if tag.kind == cam_cldata::MoveKind::Traverse && to.z < clearance
+        )),
+        "no traverse may sit below the clearance plane"
+    );
+}
+
 #[test]
 fn a_same_datum_tool_change_is_a_full_planner_owned_transition() {
     use cam_cldata::MoveKind;
@@ -113,9 +202,17 @@ fn a_same_datum_tool_change_is_a_full_planner_owned_transition() {
             _ => None,
         })
         .collect();
-    assert_eq!(traverses.len(), 2, "a cross then a descent after the M6:\n{s:#?}");
+    assert_eq!(
+        traverses.len(),
+        3,
+        "a cross then a descent after the M6, then the end-of-program lift:\n{s:#?}"
+    );
     assert_eq!(traverses[0].z, 42.0, "cross to the next op at tool-change height");
     assert_eq!(traverses[1].z, 5.0, "then descend to clearance");
+    assert_eq!(
+        traverses[2].z, 42.0,
+        "and the job ends with the tool lifted clear, not parked over the part"
+    );
     assert_eq!(
         (traverses[0].x, traverses[0].y),
         (traverses[1].x, traverses[1].y),
@@ -144,18 +241,19 @@ fn same_tool_consecutive_ops_get_no_transition() {
         .collect();
     assert_eq!(
         traverse_ops,
-        vec![0, 0],
-        "only the first op opens from TCH (cross + descend); the second adds none"
+        vec![0, 0, 1],
+        "only the first op opens from TCH (cross + descend); the second adds none. The \
+         trailing entry is the end-of-program lift, tagged to the last op — the program \
+         must not finish with the tool parked over the part."
     );
 }
 
 /// Byte-pinned end-to-end golden (O5): a two-origin job planned and posted through
 /// Okuma, the whole Case-1 reorientation frame in one file. A tripwire against drift
 /// in *either* the planner's group emission or the post's rendering — the audit above
-/// checked each fragment; this pins the composition. To regenerate after an
-/// intentional change, `std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"),
-/// "/tests/golden/multi_datum_okuma.min"), okuma_nc(&two_origin_doc()))` once, then
-/// re-read the diff. Not a substitute for the O6 line-audit against real posted words.
+/// checked each fragment; this pins the composition. To regenerate after an intentional
+/// change, run `regen_goldens` (below) and **read the diff**. Not a substitute for the
+/// O6 line-audit against real posted words.
 #[test]
 fn golden_multi_datum_reorientation() {
     assert_eq!(
@@ -395,4 +493,21 @@ fn the_datum_step_precedes_the_tool_change_for_that_operation() {
     assert!(datum_at < tc2_at, "datum select precedes the tool change:\n{s:#?}");
     // Nothing is emitted between them — they form the section head together.
     assert_eq!(datum_at + 1, tc2_at, "datum sits immediately before the tool change");
+}
+
+/// Rewrite this file's goldens after an intentional change.
+///
+/// `cargo test -p cam-toolpath --test datum -- --ignored regen_goldens`, then **read the
+/// diff** before committing — that is the whole value of a golden. Ignored by default
+/// so a normal run never rewrites the thing it is meant to be checking against.
+#[test]
+#[ignore = "regeneration helper"]
+fn regen_goldens() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/");
+    std::fs::write(format!("{dir}multi_datum_okuma.min"), okuma_nc(&two_origin_doc())).unwrap();
+    std::fs::write(
+        format!("{dir}multi_datum_fanuc.nc"),
+        nc(&two_origin_doc(), PostKind::Fanuc),
+    )
+    .unwrap();
 }

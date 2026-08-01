@@ -220,3 +220,19 @@ fn assert_gcode_is_sound(gcode: &str, m: &Machine, stock_top: f64) {
     assert!(!spindle_on, "spindle off at end");
     assert!(ended && last == "M30", "clean M30 end");
 }
+
+/// Rewrite this file's golden after an intentional change.
+///
+/// `cargo test -p cam-import --test pipeline -- --ignored regen_goldens`, then **read
+/// the diff** before committing — that is the whole value of a golden. Ignored by
+/// default so a normal run never rewrites the thing it is meant to be checking against.
+#[test]
+#[ignore = "regeneration helper"]
+fn regen_goldens() {
+    let (nc, _, _, _) = import_and_plan();
+    std::fs::write(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/part.nc"),
+        nc,
+    )
+    .unwrap();
+}

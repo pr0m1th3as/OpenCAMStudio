@@ -477,3 +477,23 @@ fn a_steered_clear_traverses_the_stock_it_has_already_removed() {
         "a steered island clear should traverse its cleared ground, got {traversed:.0} mm"
     );
 }
+
+/// Rewrite this file's goldens after an intentional change.
+///
+/// `cargo test -p cam-toolpath --test clearing -- --ignored regen_goldens`, then **read the
+/// diff** before committing — that is the whole value of a golden. Ignored by default
+/// so a normal run never rewrites the thing it is meant to be checking against.
+#[test]
+#[ignore = "regeneration helper"]
+fn regen_goldens() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/");
+    for (name, doc) in [
+        ("pocket", pocket_doc()),
+        ("roughing", roughing_doc()),
+        ("face", face_doc(2.0)),
+        ("carve", carve_doc()),
+    ] {
+        let (_, nc) = post(&doc, name);
+        std::fs::write(format!("{dir}{name}.nc"), nc).unwrap();
+    }
+}
