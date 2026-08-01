@@ -400,13 +400,19 @@ impl Pane {
 
     /// This pane's minimum size (px) along whichever axis it is split — enforced
     /// individually while resizing (see `App::clamp_resize`).
-    fn min_size(self) -> f32 {
+    /// The size this pane may not shrink past, from the user's preferences.
+    ///
+    /// Was a hard-coded match. The shipped defaults still fit real content — the
+    /// Project pane's Duplicate/Delete row, the Inspector's field rows — but they were
+    /// chosen on one monitor, and a value picked on one display is a bug on another
+    /// (a 240 px Inspector plus a 200 px Project eats a third of a 1366-wide screen).
+    fn min_size(self, prefs: &crate::PanePrefs) -> f32 {
         match self {
-            Pane::Project => 200.0,   // fits the Duplicate/Delete row
-            Pane::Library => 200.0,   // fits the Serial/Family tabs + rows
-            Pane::Viewport => 200.0,  // the main view stays usable
-            Pane::Inspector => 240.0, // fits the field rows
-            Pane::Output => 60.0,     // a short console is fine
+            Pane::Project => prefs.min_project_px,
+            Pane::Library => prefs.min_library_px,
+            Pane::Viewport => prefs.min_viewport_px,
+            Pane::Inspector => prefs.min_inspector_px,
+            Pane::Output => prefs.min_output_px,
         }
     }
 
@@ -1616,20 +1622,11 @@ struct App {
     status: String,
 }
 
-/// The pickbox aperture, px — its half-size is the vertex-snap tolerance.
-const PICKBOX_PX: f32 = 12.0;
-/// The object-snap catch aperture, px — larger than the pickbox so snaps engage
-/// from a comfortable distance (and the marker, sized from it, reads clearly).
-///
-/// **Deliberately not its own preference** (Andreas, 2026-08-01). The exposed knob is
-/// `PICKBOX_PX`, and this stays derived from it: the two are physically related — a
-/// bigger aperture should catch from further away — and two absolute controls would
-/// let a user set a catch distance *smaller* than the pickbox feeding it. Do not
-/// "finish the job" by adding a second knob; see `Settings::snap_catch_px`.
-const SNAP_PICK_PX: f32 = crate::SNAP_CATCH_MULTIPLE * PICKBOX_PX;
-/// Snap marker size as a multiple of the snap aperture.
-/// TODO(prefs): expose this (snap-shape size) in user preferences.
-const SNAP_MARK_SCALE: f32 = 1.2;
+// The pickbox aperture, the object-snap catch distance derived from it, and the snap
+// marker's size are all preferences now (`Settings::snapping`) — see `SnapPrefs`.
+// The catch distance is deliberately not its own control: it stays a fixed multiple
+// of the pickbox, because two absolute knobs would let a user set a catch distance
+// smaller than the pickbox feeding it.
 
 /// Whether an operation kind uses a start/lead-in point, and so honours object
 /// snaps. Face/Drill/Thread have no start, so snaps are inert (and hidden) there.
@@ -1732,11 +1729,11 @@ fn add_origin_marker(scene: &mut Scene, origin: [f64; 3], z: f32, r: f32) {
 /// Draw the object-snap marker at `hit.point` as a glyph specific to the snap
 /// kind (AutoCAD idiom: square = End, triangle = Mid, diamond = Quadrant,
 /// hourglass = Nearest), sized by the pickbox `aperture` so it reads at any zoom.
-fn add_snap_marker(scene: &mut Scene, hit: SnapHit, aperture: f64, z: f32) {
+fn add_snap_marker(scene: &mut Scene, hit: SnapHit, aperture: f64, scale: f32, z: f32) {
     let (cx, cy) = (hit.point[0] as f32, hit.point[1] as f32);
     // A touch larger than the (already doubled) snap aperture, so the engaged
     // marker reads clearly in place of the pickbox.
-    let h = (aperture as f32 * SNAP_MARK_SCALE).max(0.01);
+    let h = (aperture as f32 * scale).max(0.01);
     let p = |dx: f32, dy: f32| [cx + dx * h, cy + dy * h, z];
     let strip: Vec<[f32; 3]> = match hit.kind {
         // Square.
@@ -3351,8 +3348,9 @@ impl App {
         if dim <= 1.0 {
             return ratio;
         }
-        let lo = (subtree_min(a, &self.panes, axis) / dim).clamp(0.0, 0.95);
-        let hi = (1.0 - subtree_min(b, &self.panes, axis) / dim).clamp(lo, 1.0);
+        let mins = &self.settings.panes;
+        let lo = (subtree_min(a, &self.panes, axis, mins) / dim).clamp(0.0, 0.95);
+        let hi = (1.0 - subtree_min(b, &self.panes, axis, mins) / dim).clamp(lo, 1.0);
         ratio.clamp(lo, hi)
     }
 
@@ -3425,7 +3423,7 @@ impl App {
         if dim <= 1.0 {
             return;
         }
-        let frac = (px.max(pane.min_size()) / dim).clamp(0.0, 1.0);
+        let frac = (px.max(pane.min_size(&self.settings.panes)) / dim).clamp(0.0, 1.0);
         let ratio = if in_a { frac } else { 1.0 - frac };
         let ratio = self.clamp_resize(split, ratio);
         self.panes.resize(split, ratio);
@@ -4673,10 +4671,11 @@ impl App {
             return None;
         }
         let c = self.cursor?;
-        let half = PICKBOX_PX / 2.0;
+        let px = self.settings.snapping.pickbox_px;
+        let half = px / 2.0;
         let square = container(Space::new())
-            .width(Length::Fixed(PICKBOX_PX))
-            .height(Length::Fixed(PICKBOX_PX))
+            .width(Length::Fixed(px))
+            .height(Length::Fixed(px))
             .style(|_theme| container::Style {
                 border: Border {
                     color: palette::ACCENT_BLUE,
@@ -5066,6 +5065,7 @@ impl App {
                         self.view,
                         self.show_gizmo,
                         self.gizmo_size,
+                        &self.settings.snapping,
                         &self.focus_ops.iter().copied().collect::<Vec<_>>(),
                         self.snap_hover.map(|h| (h, self.snap_aperture)),
                         self.hover_loop,
@@ -6552,9 +6552,10 @@ fn subtree_min(
     node: &pane_grid::Node,
     panes: &pane_grid::State<Pane>,
     axis: pane_grid::Axis,
+    mins: &crate::PanePrefs,
 ) -> f32 {
     match node {
-        pane_grid::Node::Pane(p) => panes.get(*p).map_or(0.0, |pane| pane.min_size()),
+        pane_grid::Node::Pane(p) => panes.get(*p).map_or(0.0, |pane| pane.min_size(mins)),
         pane_grid::Node::Split {
             axis: sub_axis,
             a,
@@ -6562,7 +6563,7 @@ fn subtree_min(
             ratio,
             ..
         } => {
-            let (ma, mb) = (subtree_min(a, panes, axis), subtree_min(b, panes, axis));
+            let (ma, mb) = (subtree_min(a, panes, axis, mins), subtree_min(b, panes, axis, mins));
             if *sub_axis == axis {
                 let r = ratio.clamp(0.05, 0.95);
                 PANE_SPACING + (ma / r).max(mb / (1.0 - r))
@@ -7577,6 +7578,13 @@ struct Viewport {
     show_gizmo: bool,
     /// On-screen cube size, logical px (fixed; independent of window size).
     gizmo_size: f32,
+    /// The object-snap catch aperture, logical px. Carried per frame like `gizmo_size`
+    /// rather than read from a constant, because it is a user preference now.
+    ///
+    /// The marker *scale* is not held here: the marker is built into the scene during
+    /// [`Viewport::new`], where the preferences are still in scope, so storing it
+    /// would be a copy with no reader.
+    snap_catch_px: f32,
     /// Geometry-pick mode (a new-operation wizard is awaiting a region click).
     picking: bool,
     /// "Set origin" pick mode — a click drops the workpiece datum.
@@ -7599,6 +7607,7 @@ impl Viewport {
         controls: ViewControls,
         show_gizmo: bool,
         gizmo_size: f32,
+        snap_prefs: &crate::SnapPrefs,
         focus_ops: &[u32],
         snap: Option<(SnapHit, f64)>,
         hover_loop: Option<LoopRef>,
@@ -7680,7 +7689,7 @@ impl Viewport {
         }
         // The object-snap marker under the cursor (op pick *or* set-origin).
         if let Some((hit, aperture)) = snap {
-            add_snap_marker(&mut scene, hit, aperture, pick_z);
+            add_snap_marker(&mut scene, hit, aperture, snap_prefs.marker_scale, pick_z);
         }
         // When one or more operations are focused, dim every *other* operation's
         // toolpath so the focused ones stand out — vital when a part has dozens of
@@ -7716,6 +7725,7 @@ impl Viewport {
             controls,
             show_gizmo,
             gizmo_size,
+            snap_catch_px: snap_prefs.pickbox_px * crate::SNAP_CATCH_MULTIPLE,
             picking,
             set_origin,
             snap_engaged: snap.is_some(),
@@ -7813,7 +7823,8 @@ impl shader::Program<Message> for Viewport {
                     let v = 1.0 - 2.0 * (pos.y - bounds.y) / bounds.height;
                     let cam = self.camera();
                     if let Some(w) = cam.pick_plane(u, v, aspect, self.pick_z) {
-                        let aperture = 0.5 * SNAP_PICK_PX * cam.world_per_pixel(bounds.height);
+                        let aperture =
+                            0.5 * self.snap_catch_px * cam.world_per_pixel(bounds.height);
                         let msg = if self.set_origin {
                             Message::OriginPointPicked(w, aperture)
                         } else {
@@ -7886,7 +7897,8 @@ impl shader::Program<Message> for Viewport {
                     let cam = self.camera();
                     let msg = match cam.pick_plane(u, v, aspect, self.pick_z) {
                         Some(w) => {
-                            let aperture = 0.5 * SNAP_PICK_PX * cam.world_per_pixel(bounds.height);
+                            let aperture =
+                                0.5 * self.snap_catch_px * cam.world_per_pixel(bounds.height);
                             Message::HoverWorld(*position, w, aperture)
                         }
                         None => Message::ViewportCursor(*position),
@@ -8524,37 +8536,19 @@ mod origin_move_tests {
     }
 }
 
-/// The other half of the "this change is inert" proof.
+/// What is left of the migration's scaffolding.
 ///
-/// `settings.rs` pins its defaults against literal numbers, but it cannot see these
-/// constants — it is deliberately outside the `gui` module so it tests without the
-/// feature. This module is inside, and asserts the two agree *today*, before anything
-/// starts reading `Settings` instead of the constants (`PREFS_PLAN.md` step 3).
-///
-/// If one of these fails, do not "fix" it by editing the expected number: decide
-/// which side is right, because a preference whose default silently differs from the
-/// value the app actually used is worse than no preference at all.
+/// This module existed to assert that `Settings`'s defaults equalled the constants the
+/// GUI actually used, while the two coexisted. They no longer do: `PICKBOX_PX`,
+/// `SNAP_PICK_PX`, `SNAP_MARK_SCALE`, `GIZMO_SIZE_DEFAULT` and `Pane::min_size`'s
+/// hard-coded match are all gone, and `Settings` is the only place those values are
+/// written. **A cross-check deleted because the duplication went away is the good
+/// outcome** — the remaining one guards a value that genuinely still lives in two
+/// places, because the slider needs literal bounds.
 #[cfg(test)]
 mod settings_agree_with_constants {
     use super::*;
-    use crate::Settings;
 
-    #[test]
-    fn the_snapping_defaults_match() {
-        let d = Settings::default();
-        assert_eq!(d.snapping.pickbox_px, PICKBOX_PX);
-        assert_eq!(d.snapping.marker_scale, SNAP_MARK_SCALE);
-        // The catch aperture is derived from the pickbox rather than stored, so this
-        // is the assertion that the derivation reproduces the old constant exactly.
-        assert_eq!(d.snap_catch_px(), SNAP_PICK_PX);
-        // The armed-snap set has no counterpart here any more: the session reads it
-        // from `Settings`, so `settings.rs` is the only place it is written. That is
-        // the duplication this module exists to catch, removed rather than checked.
-    }
-
-    /// The cube's *default* size is no longer duplicated here — the session reads it
-    /// from `Settings`. Its **range** still is, because the slider needs literal
-    /// bounds, so that is what this checks.
     #[test]
     fn the_gizmo_slider_range_is_the_preferences_range() {
         assert_eq!(
@@ -8564,37 +8558,33 @@ mod settings_agree_with_constants {
         );
     }
 
+    /// Every pane must take its minimum from preferences — a `min_size` arm that
+    /// ignored `prefs` and returned a constant would silently pin one pane, and the
+    /// symptom (one divider that will not go past a size) reads as a layout quirk
+    /// rather than a bug.
     #[test]
-    fn the_pane_minimums_match() {
-        let d = Settings::default();
-        assert_eq!(d.panes.min_project_px, Pane::Project.min_size());
-        assert_eq!(d.panes.min_library_px, Pane::Library.min_size());
-        assert_eq!(d.panes.min_viewport_px, Pane::Viewport.min_size());
-        assert_eq!(d.panes.min_inspector_px, Pane::Inspector.min_size());
-        assert_eq!(d.panes.min_output_px, Pane::Output.min_size());
-    }
-
-    /// Every pane minimum must be expressible as a preference — a shipped default
-    /// outside its own permitted range would be unreachable once the panel exists.
-    #[test]
-    fn every_shipped_default_lies_inside_its_own_bounds() {
-        let d = Settings::default();
-        let inside = |v: f32, (lo, hi): (f32, f32)| v >= lo && v <= hi;
-        assert!(inside(d.view.gizmo_size, crate::GIZMO_SIZE_RANGE));
-        assert!(inside(d.snapping.pickbox_px, crate::PICKBOX_RANGE));
-        assert!(inside(d.snapping.marker_scale, crate::MARKER_SCALE_RANGE));
-        for m in [
-            d.panes.min_project_px,
-            d.panes.min_library_px,
-            d.panes.min_viewport_px,
-            d.panes.min_inspector_px,
-            d.panes.min_output_px,
+    fn every_pane_reads_its_minimum_from_the_preferences() {
+        let mut prefs = crate::PanePrefs {
+            min_project_px: 111.0,
+            min_library_px: 122.0,
+            min_viewport_px: 133.0,
+            min_inspector_px: 144.0,
+            min_output_px: 155.0,
+            ..Default::default()
+        };
+        for (pane, want) in [
+            (Pane::Project, 111.0),
+            (Pane::Library, 122.0),
+            (Pane::Viewport, 133.0),
+            (Pane::Inspector, 144.0),
+            (Pane::Output, 155.0),
         ] {
-            assert!(inside(m, crate::PANE_MIN_RANGE), "{m} outside PANE_MIN_RANGE");
+            assert_eq!(pane.min_size(&prefs), want, "{pane:?} ignored the preference");
         }
-        for s in [d.panes.project_px, d.panes.inspector_px, d.panes.output_px] {
-            assert!(inside(s, crate::PANE_SIZE_RANGE), "{s} outside PANE_SIZE_RANGE");
-        }
+        // And they must not be reading a *shared* field either.
+        prefs.min_inspector_px = 999.0;
+        assert_eq!(Pane::Project.min_size(&prefs), 111.0);
+        assert_eq!(Pane::Inspector.min_size(&prefs), 999.0);
     }
 }
 
