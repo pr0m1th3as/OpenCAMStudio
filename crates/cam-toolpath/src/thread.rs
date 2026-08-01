@@ -17,14 +17,17 @@
 //! Two independent choices define the motion: the **orbit direction** (G2/G3) and
 //! the **Z travel sense** (cut up vs. down).
 //!
-//! - **Orbit direction** sets climb vs. conventional. Assuming a standard `M3`
-//!   (CW-from-`+Z`) spindle, the textbook rule is `CCW ⇔ climb == internal`
-//!   (internal climb → G3; external climb → G2).
+//! - **Orbit direction** sets climb vs. conventional, *together with the spindle*.
+//!   For a standard `M3` (CW-from-`+Z`) spindle the textbook rule is
+//!   `CCW ⇔ climb == internal` (internal climb → G3; external climb → G2); an `M4`
+//!   spindle mirrors it, because reversing the cutter's rotation exchanges climb and
+//!   conventional for the same path. The direction is read from
+//!   [`JobEnv::climb_follows_winding`] rather than assumed.
 //! - **Z sense** is then forced by the thread **hand** so the helix chirality is
 //!   right: a right-hand thread is `(CCW, up)` or `(CW, down)`; left-hand is the
 //!   mirror. Because the hand is enforced from the chosen orbit direction, **the
-//!   hand is always geometrically correct** — only the climb/conventional
-//!   *labelling* depends on the `M3` spindle assumption noted above.
+//!   hand is always geometrically correct** whichever way the spindle turns — the
+//!   spindle only ever moves which orbit counts as climb.
 
 use std::f64::consts::PI;
 
@@ -223,9 +226,14 @@ impl Strategy for ThreadStrategy {
             orbits.push(orbit_of(cut_final));
         }
 
-        // Orbit direction (climb vs conventional under an M3 spindle) and, from
-        // it, the Z sense that keeps the thread hand correct. See the module docs.
-        let arc_dir = if op.climb == op.internal {
+        // Orbit direction (climb vs conventional) and, from it, the Z sense that keeps
+        // the thread hand correct. See the module docs.
+        //
+        // Reversing the spindle exchanges climb and conventional for the same orbit,
+        // so the rule is stated against `env`, not assumed: with `M3` the climb orbit
+        // is CCW exactly when the thread is internal, and `M4` mirrors that.
+        let climb_is_ccw = (op.climb == op.internal) == env.climb_follows_winding();
+        let arc_dir = if climb_is_ccw {
             ArcDir::Ccw
         } else {
             ArcDir::Cw
@@ -501,13 +509,81 @@ mod tests {
     }
 
     fn run(op: ThreadOp, tool: Tool) -> StrategyResult {
+        run_with(op, tool, cam_cldata::SpindleDir::Cw)
+    }
+
+    fn run_with(op: ThreadOp, tool: Tool, spindle: cam_cldata::SpindleDir) -> StrategyResult {
         let tools = [tool];
         let env = JobEnv {
             heights: Heights::new(10.0, 2.0, 0.0),
             tools: &tools,
             stock: None,
+            spindle,
         };
         ThreadStrategy::new(op).compute(&env, &CancelToken::new())
+    }
+
+    /// Reversing the spindle exchanges climb and conventional, so the *same* request
+    /// must orbit the other way — and the thread must still come out the right hand.
+    ///
+    /// This is what the module docs used to only assert: the truth table above was
+    /// pinned "assuming an M3 spindle", and nothing checked what happened otherwise
+    /// because nothing could ask. The rule now lives in `JobEnv`, so it can be.
+    #[test]
+    fn reversing_the_spindle_swaps_which_orbit_is_climb_but_never_the_hand() {
+        use cam_cldata::SpindleDir;
+        for internal in [true, false] {
+            for hand in [Hand::Right, Hand::Left] {
+                for climb in [true, false] {
+                    let m3 = run_with(op(internal, hand, climb), tool(5.0), SpindleDir::Cw);
+                    let m4 = run_with(op(internal, hand, climb), tool(5.0), SpindleDir::Ccw);
+                    assert!(!m3.has_errors() && !m4.has_errors());
+                    let (a, b) = (cutting_arcs(&m3.program), cutting_arcs(&m4.program));
+                    assert_ne!(
+                        a[0].2, b[0].2,
+                        "{internal} {hand:?} climb={climb}: the orbit must flip with the spindle"
+                    );
+
+                    // The hand is geometry, not convention: the same request must still
+                    // cut the same chirality. A right-hand thread advances +Z per CCW
+                    // turn either way, so the *pair* (orbit, Z sense) flips together.
+                    let chirality = |arcs: &[(Point3, Point3, ArcDir)]| {
+                        let up = arcs.last().unwrap().0.z > arcs.first().unwrap().0.z;
+                        (arcs[0].2 == ArcDir::Ccw) == up
+                    };
+                    assert_eq!(
+                        chirality(&a),
+                        chirality(&b),
+                        "{internal} {hand:?} climb={climb}: the thread hand must not change"
+                    );
+                    assert_eq!(
+                        chirality(&a),
+                        hand == Hand::Right,
+                        "{internal} {hand:?}: chirality must follow the requested hand"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Under M4 the truth table is exactly the M3 one with `climb` inverted — which is
+    /// what "the spindle exchanges climb and conventional" means, stated as an identity
+    /// rather than as prose.
+    #[test]
+    fn an_m4_climb_cut_is_the_m3_conventional_path() {
+        use cam_cldata::SpindleDir;
+        for internal in [true, false] {
+            for hand in [Hand::Right, Hand::Left] {
+                for climb in [true, false] {
+                    let m4 = run_with(op(internal, hand, climb), tool(5.0), SpindleDir::Ccw);
+                    let m3 = run_with(op(internal, hand, !climb), tool(5.0), SpindleDir::Cw);
+                    assert_eq!(
+                        m4.program.steps, m3.program.steps,
+                        "{internal} {hand:?} climb={climb}"
+                    );
+                }
+            }
+        }
     }
 
     /// The `(end, center, dir)` of every material-removing arc, in order.

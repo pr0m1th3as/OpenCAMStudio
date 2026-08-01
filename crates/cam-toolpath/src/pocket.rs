@@ -116,6 +116,7 @@ impl Strategy for PocketStrategy {
             lead_out: op.clear.lead_out,
             start: op.start,
             guard: &guard,
+                    spindle: env.spindle,
         };
         match crate::clearing::clear(&mut program, &region, &job, &env.heights, &levels, cancel) {
             Ok(0) => fail!(
@@ -230,6 +231,7 @@ mod tests {
             heights: Heights::new(5.0, 2.0, 0.0),
             tools: &ts,
             stock: None,
+            spindle: cam_cldata::SpindleDir::Cw,
         };
         let result = PocketStrategy::new(op).compute(&env, &CancelToken::new());
         assert!(!result.has_errors(), "{:?}", result.diagnostics);
@@ -273,6 +275,7 @@ mod tests {
             heights: Heights::new(5.0, 2.0, 0.0),
             tools: &ts,
             stock: None,
+            spindle: cam_cldata::SpindleDir::Cw,
         };
         let result = PocketStrategy::new(op).compute(&env, &CancelToken::new());
         assert!(!result.has_errors(), "{:?}", result.diagnostics);
@@ -325,6 +328,7 @@ mod tests {
             heights: Heights::new(5.0, 2.0, 0.0),
             tools: &ts,
             stock: None,
+            spindle: cam_cldata::SpindleDir::Cw,
         };
         let result = PocketStrategy::new(op).compute(&env, &CancelToken::new());
         assert!(result.has_errors());
@@ -378,6 +382,7 @@ mod tests {
                 heights: Heights::new(5.0, 2.0, 0.0),
                 tools: &ts,
                 stock: None,
+                spindle: cam_cldata::SpindleDir::Cw,
             };
             let r = PocketStrategy::new(op).compute(&env, &CancelToken::new());
             assert!(!r.has_errors(), "{:?}", r.diagnostics);
@@ -418,6 +423,7 @@ mod tests {
                 heights: Heights::new(5.0, 2.0, 0.0),
                 tools: &ts,
                 stock: None,
+                spindle: cam_cldata::SpindleDir::Cw,
             };
             let r = PocketStrategy::new(op).compute(&env, &CancelToken::new());
             assert!(!r.has_errors(), "{:?}", r.diagnostics);
@@ -482,6 +488,7 @@ mod tests {
             heights: Heights::new(5.0, 2.0, 0.0),
             tools: &ts,
             stock: None,
+            spindle: cam_cldata::SpindleDir::Cw,
         };
         let result = PocketStrategy::new(leaded_op(vec![])).compute(&env, &CancelToken::new());
         assert!(!result.has_errors(), "{:?}", result.diagnostics);
@@ -543,6 +550,7 @@ mod tests {
                 heights: Heights::new(5.0, 2.0, 0.0),
                 tools: &ts,
                 stock: None,
+                spindle: cam_cldata::SpindleDir::Cw,
             };
             let r = PocketStrategy::new(op).compute(&env, &CancelToken::new());
             assert!(!r.has_errors(), "{:?}", r.diagnostics);
@@ -596,6 +604,7 @@ mod tests {
             heights: Heights::new(5.0, 2.0, 0.0),
             tools: &ts,
             stock: None,
+            spindle: cam_cldata::SpindleDir::Cw,
         };
         let result = PocketStrategy::new(op).compute(&env, &CancelToken::new());
         assert!(!result.has_errors(), "{:?}", result.diagnostics);
@@ -649,6 +658,7 @@ mod tests {
             heights: Heights::new(5.0, 2.0, 0.0),
             tools: &ts,
             stock: None,
+            spindle: cam_cldata::SpindleDir::Cw,
         };
         // Same pocket, climb vs conventional: the overall travel winding flips sign.
         let climb = {
@@ -725,6 +735,7 @@ mod tests {
             heights: Heights::new(5.0, 2.0, 0.0),
             tools: &ts,
             stock: None,
+            spindle: cam_cldata::SpindleDir::Cw,
         };
         let result = PocketStrategy::new(small).compute(&env, &CancelToken::new());
         assert!(!result.has_errors(), "{:?}", result.diagnostics);
@@ -766,6 +777,7 @@ mod tests {
             heights: Heights::new(5.0, 2.0, 0.0),
             tools: &ts,
             stock: None,
+            spindle: cam_cldata::SpindleDir::Cw,
         };
         let result =
             PocketStrategy::new(leaded_op(vec![island])).compute(&env, &CancelToken::new());

@@ -481,6 +481,7 @@ mod tests {
             heights: Heights::new(5.0, 2.0, 0.0),
             tools: &tools,
             stock: None,
+            spindle: cam_cldata::SpindleDir::Cw,
         };
         ChamferStrategy::new(op).compute(&env, &CancelToken::new())
     }

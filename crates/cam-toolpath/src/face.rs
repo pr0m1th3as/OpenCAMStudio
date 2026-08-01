@@ -371,6 +371,7 @@ mod tests {
             heights: Heights::new(5.0, 2.0, 0.0),
             tools: &tools,
             stock: None,
+            spindle: cam_cldata::SpindleDir::Cw,
         };
         FaceStrategy::new(op).compute(&env, &CancelToken::new())
     }
@@ -454,6 +455,7 @@ mod tests {
             heights: Heights::new(5.0, 2.0, 0.0),
             tools: &tools,
             stock: Some(stock),
+            spindle: cam_cldata::SpindleDir::Cw,
         };
         FaceStrategy::new(op).compute(&env, &CancelToken::new())
     }

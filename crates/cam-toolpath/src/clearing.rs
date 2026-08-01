@@ -11,9 +11,11 @@
 //!   still bounded only by the spacing; flattening the corner spikes with trochoidal
 //!   loops is the next step, and slots in behind this same entry point.)
 //! - **Climb / conventional** — the rings are wound so climb milling keeps the
-//!   cleared side on the left of travel; conventional reverses every loop.
+//!   cleared side on the left of travel; conventional reverses every loop. Which
+//!   winding *is* climb depends on the spindle, so the job carries its direction
+//!   rather than assuming the usual `M3`.
 
-use cam_cldata::{MoveKind, Point3, Program, Step, Tag};
+use cam_cldata::{MoveKind, Point3, Program, SpindleDir, Step, Tag};
 use cam_geo::{Point, Polygon};
 use cam_model::{Clearing, Heights, Lead, Plunge};
 
@@ -35,6 +37,8 @@ pub(crate) struct ClearJob<'a> {
     pub spacing: f64,
     /// Engagement cap + climb/conventional.
     pub clearing: Clearing,
+    /// Which way the spindle turns; decides which winding counts as climb.
+    pub spindle: SpindleDir,
     /// How the tool enters Z at each level.
     pub plunge: Plunge,
     /// Cutting feed, mm/min.
@@ -64,6 +68,29 @@ impl ClearJob<'_> {
             self.spacing
         }
     }
+
+    /// Whether every loop must be reversed from the offset winding to cut the way
+    /// the operation asked for.
+    ///
+    /// Climb is not a property of the path alone — it is the relation between the
+    /// direction of travel and the direction the cutting edge moves where it meets
+    /// the material, so an `M4` spindle makes the *other* winding the climb one.
+    /// Under the usual `M3` this is exactly the old `!climb`, so no shipped path
+    /// moves.
+    fn reversed(&self) -> bool {
+        self.clearing.climb != (self.spindle == SpindleDir::Cw)
+    }
+
+    /// Whether the adaptive generators may be tried at all.
+    ///
+    /// They inherit the offset winding as the climb direction by construction and
+    /// have no radial-order-preserving flip (see the dispatch note below), so they
+    /// are only valid when climb *is* that winding. Conventional already fell
+    /// through to concentric; a reversed spindle now falls through the same way,
+    /// rather than emitting a path whose whole premise is inverted.
+    fn adaptive_may_run(&self) -> bool {
+        self.clearing.climb && self.spindle == SpindleDir::Cw
+    }
 }
 
 /// Clear `region`: generate the rings, orient them for climb/conventional, and emit
@@ -88,9 +115,11 @@ pub(crate) fn clear(
     //
     // Three gates before we even try, all by construction:
     //
-    // - **Climb only.** Adaptive clearing inherits the offset winding = climb; there is no
-    //   radial-order-preserving rotation flip, and conventional defeats constant-engagement
-    //   HSM anyway. Conventional falls through to concentric, which honours it.
+    // - **Climb only, and only on an `M3` spindle.** Adaptive clearing inherits the offset
+    //   winding = climb; there is no radial-order-preserving rotation flip, and conventional
+    //   defeats constant-engagement HSM anyway. Conventional falls through to concentric,
+    //   which honours it — and so does a reversed spindle, for which that same winding is
+    //   *conventional*, not climb. See [`ClearJob::adaptive_may_run`].
     // - **Islands and hole-free regions take different generators.** A region with an island
     //   goes to [`crate::steer`], which holds the width of cut by searching the turn angle
     //   each step; a hole-free one stays on [`crate::frontadvance`], which offsets a frontier
@@ -137,7 +166,7 @@ pub(crate) fn clear(
     // clearer. Front-advance kills the *slots* (the machine-and-tool hazard); the benign
     // floor is a per-loop feedrate matter. See [`crate::frontadvance::CERT_ENGAGEMENT_SLACK`].
     if job.clearing.engagement > 0.0
-        && job.clearing.climb
+        && job.adaptive_may_run()
         && job.lead_in == Lead::None
         && job.lead_out == Lead::None
         && !region.holes().is_empty()
@@ -167,7 +196,7 @@ pub(crate) fn clear(
     }
 
     if job.clearing.engagement > 0.0
-        && job.clearing.climb
+        && job.adaptive_may_run()
         && region.holes().is_empty()
         && job.lead_in == Lead::None
         && job.lead_out == Lead::None
@@ -194,8 +223,9 @@ pub(crate) fn clear(
     let n = rings.len();
 
     // Conventional milling reverses every loop's travel; the wall-lead geometry is
-    // told via `reversed` so the leads still sit on the cleared side.
-    let reversed = !job.clearing.climb;
+    // told via `reversed` so the leads still sit on the cleared side. Which winding
+    // is which depends on the spindle — see `ClearJob::reversed`.
+    let reversed = job.reversed();
     if reversed {
         for r in &mut rings {
             r.pts.reverse();
@@ -429,6 +459,7 @@ mod tests {
             lead_out: Lead::None,
             start: None,
             guard: &[],
+            spindle: cam_cldata::SpindleDir::Cw,
         }
     }
 
@@ -634,6 +665,79 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Reversing the spindle exchanges climb and conventional, so a **climb** request on an
+    /// `M4` spindle must wind the way an `M3` **conventional** one does — the same path, not a
+    /// path that merely calls itself climb.
+    ///
+    /// This is the assumption the module header used to carry in prose ("the rings are wound so
+    /// climb milling keeps the cleared side on the left of travel"), true only for `M3`.
+    #[test]
+    fn a_reversed_spindle_exchanges_climb_and_conventional_windings() {
+        use cam_cldata::SpindleDir;
+        let region = frame_region();
+        let heights = Heights::new(5.0, 2.0, 0.0);
+        let levels = [-1.0];
+        let run = |climb: bool, spindle: SpindleDir| {
+            // A finishing lead holds both windings on the concentric path, so the two are
+            // comparable at all — the adaptive generators emit a single fixed winding.
+            let mut job = frame_clearjob(Clearing { engagement: 2.0, climb });
+            job.spindle = spindle;
+            job.lead_in = Lead::Arc { radius: 1.0 };
+            let mut prog = Program::new();
+            let Ok(_) = clear(&mut prog, &region, &job, &heights, &levels, &CancelToken::new())
+            else {
+                panic!("clear should succeed")
+            };
+            prog
+        };
+        for climb in [true, false] {
+            assert_eq!(
+                run(climb, SpindleDir::Ccw).steps,
+                run(!climb, SpindleDir::Cw).steps,
+                "climb={climb} on M4 must be the M3 conventional path"
+            );
+        }
+    }
+
+    /// The adaptive generators emit one fixed winding and have no radial-order-preserving
+    /// flip, so on a reversed spindle that winding is *conventional* — they must decline and
+    /// let the concentric clearer, which honours either, answer instead.
+    ///
+    /// Measured through the emitted path rather than by inspecting the gate: the steered
+    /// generator's output is nothing like a set of concentric rings, and the ring count is
+    /// what tells them apart.
+    #[test]
+    fn the_adaptive_clearer_declines_a_reversed_spindle() {
+        use cam_cldata::SpindleDir;
+        let region = frame_region();
+        let heights = Heights::new(5.0, 2.0, 0.0);
+        let levels = [-1.0];
+        let run = |spindle: SpindleDir| {
+            let mut job = frame_clearjob(Clearing { engagement: 2.0, climb: true });
+            job.spindle = spindle;
+            let mut prog = Program::new();
+            let Ok(n) = clear(&mut prog, &region, &job, &heights, &levels, &CancelToken::new())
+            else {
+                panic!("clear should succeed")
+            };
+            (n, prog)
+        };
+        // M3 + climb + a cap on a holed region is exactly the steered generator's dispatch.
+        // It reports `1` — one continuous certified path, not a ring count — where the
+        // concentric clearer reports the rings it actually laid.
+        let (adaptive, adaptive_prog) = run(SpindleDir::Cw);
+        let (concentric, concentric_prog) = run(SpindleDir::Ccw);
+        assert_eq!(adaptive, 1, "M3 climb + cap must reach the steered generator");
+        assert!(
+            concentric > 1,
+            "M4 must fall through to the concentric clearer, got {concentric}"
+        );
+        assert_ne!(
+            adaptive_prog.steps, concentric_prog.steps,
+            "the two generators must not coincidentally agree"
+        );
     }
 
     /// The two controls the **concentric** clearer honours. Both are exercised *through* the

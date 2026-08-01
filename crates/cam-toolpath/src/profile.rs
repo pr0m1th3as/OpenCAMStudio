@@ -156,6 +156,7 @@ impl Strategy for ProfileStrategy {
                     lead_out: Lead::None,
                     start: op.start,
                     guard: &[],
+                                    spindle: env.spindle,
                 };
                 match crate::clearing::clear(
                     &mut program,
@@ -978,6 +979,7 @@ mod tests {
             heights: Heights::new(5.0, 2.0, 0.0),
             tools: &ts,
             stock: None,
+            spindle: cam_cldata::SpindleDir::Cw,
         };
         ProfileStrategy::new(op).compute(&env, &crate::CancelToken::new())
     }
@@ -1103,6 +1105,7 @@ mod tests {
             heights: Heights::new(5.0, 2.0, 0.0),
             tools: &ts,
             stock: Some(([0.0, 0.0], [60.0, 60.0])),
+            spindle: cam_cldata::SpindleDir::Cw,
         };
         ProfileStrategy::new(op).compute(&env, &crate::CancelToken::new())
     }

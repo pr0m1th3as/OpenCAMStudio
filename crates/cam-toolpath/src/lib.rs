@@ -38,7 +38,7 @@ mod thread;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use cam_cldata::Program;
+use cam_cldata::{Program, SpindleDir};
 use cam_model::{Heights, Tool};
 
 pub use carve::{carve_shape, CarveShape, CarveStrategy};
@@ -171,8 +171,8 @@ impl CancelToken {
 }
 
 /// Everything a strategy needs from the surrounding job that is not part of the
-/// operation itself: the setup's safety heights, its tool list, and the resolved
-/// stock extent.
+/// operation itself: the setup's safety heights, its tool list, the resolved stock
+/// extent, and which way the spindle turns.
 #[derive(Clone, Copy, Debug)]
 pub struct JobEnv<'a> {
     /// The setup's safety planes.
@@ -184,12 +184,30 @@ pub struct JobEnv<'a> {
     /// `None` when the caller has no stock bounds; such strategies then skip
     /// roughing and cut a single pass.
     pub stock: Option<([f64; 2], [f64; 2])>,
+    /// Which way the spindle turns — `Cw` for the usual `M3`.
+    ///
+    /// **Climb versus conventional is not a property of the toolpath alone.** It is
+    /// the relation between the direction of travel and the direction the cutting
+    /// edge is moving where it meets the material, so reversing the spindle
+    /// exchanges the two for the same geometry. Every strategy that turns a
+    /// climb/conventional *request* into a winding or an arc direction therefore
+    /// needs this, and until now each simply assumed `M3` in a comment.
+    pub spindle: SpindleDir,
 }
 
 impl<'a> JobEnv<'a> {
     /// Look up a tool by its number.
     pub fn tool(&self, number: u32) -> Option<&'a Tool> {
         self.tools.iter().find(|t| t.number == number)
+    }
+
+    /// Whether a **climb** cut runs the tool the same way round the material as the
+    /// geometry's own winding — true for the ordinary `M3` spindle, false for `M4`.
+    ///
+    /// The single place the spindle's sense is turned into a path decision, so a
+    /// strategy states its intent (`climb`) and never re-derives the convention.
+    pub fn climb_follows_winding(&self) -> bool {
+        self.spindle == SpindleDir::Cw
     }
 }
 

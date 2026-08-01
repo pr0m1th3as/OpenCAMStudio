@@ -37,6 +37,9 @@ pub fn build_job(
         heights: setup.heights,
         tools: &setup.tools,
         stock,
+        // The same direction the job's `Step::Spindle` will command, so a strategy's
+        // climb/conventional choice and the spindle it is cut with cannot disagree.
+        spindle: dir,
     };
 
     let mut program = Program::new();

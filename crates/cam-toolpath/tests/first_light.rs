@@ -208,6 +208,7 @@ fn tool_too_large_for_hole_reports_error() {
         heights: Heights::new(5.0, 2.0, 0.0),
         tools: &tools,
         stock: None,
+        spindle: cam_cldata::SpindleDir::Cw,
     };
     let result = ProfileStrategy::new(op).compute(&env, &CancelToken::new());
     assert!(result.has_errors(), "expected a tool-too-large error");
@@ -250,6 +251,7 @@ fn cancellation_stops_before_emitting() {
         heights: Heights::new(5.0, 2.0, 0.0),
         tools: &tools,
         stock: None,
+        spindle: cam_cldata::SpindleDir::Cw,
     };
     let cancel = CancelToken::new();
     cancel.cancel();
@@ -300,6 +302,7 @@ fn lead_overlap_recuts_past_the_start() {
         heights: Heights::new(5.0, 2.0, 0.0),
         tools: &tools,
         stock: None,
+        spindle: cam_cldata::SpindleDir::Cw,
     };
     let result = ProfileStrategy::new(op).compute(&env, &CancelToken::new());
     assert!(!result.has_errors(), "{:?}", result.diagnostics);
@@ -385,6 +388,7 @@ fn offset_leaves_stock_on_the_wall() {
             heights: Heights::new(5.0, 2.0, 0.0),
             tools: &tools,
             stock: None,
+            spindle: cam_cldata::SpindleDir::Cw,
         };
         let result = ProfileStrategy::new(op).compute(&env, &CancelToken::new());
         assert!(!result.has_errors(), "{:?}", result.diagnostics);
@@ -462,6 +466,7 @@ fn inside_profile_ignores_stepover_and_warns_on_uncut_core() {
         heights: Heights::new(5.0, 2.0, 0.0),
         tools: &tools,
         stock: None,
+        spindle: cam_cldata::SpindleDir::Cw,
     };
     let r = ProfileStrategy::new(op).compute(&env, &CancelToken::new());
     assert!(!r.has_errors(), "{:?}", r.diagnostics);
@@ -490,6 +495,7 @@ fn stepover_roughs_outside_frame_to_the_stock() {
         heights: Heights::new(5.0, 2.0, 0.0),
         tools: &tools,
         stock: Some(([0.0, 0.0], [60.0, 60.0])),
+        spindle: cam_cldata::SpindleDir::Cw,
     };
     let r = ProfileStrategy::new(op).compute(&env, &CancelToken::new());
     assert!(!r.has_errors(), "{:?}", r.diagnostics);
@@ -540,6 +546,7 @@ fn outside_stepover_without_stock_is_a_single_pass() {
         heights: Heights::new(5.0, 2.0, 0.0),
         tools: &tools,
         stock: None,
+        spindle: cam_cldata::SpindleDir::Cw,
     };
     let r = ProfileStrategy::new(op).compute(&env, &CancelToken::new());
     assert!(!r.has_errors(), "{:?}", r.diagnostics);

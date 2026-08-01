@@ -441,6 +441,7 @@ impl Strategy for CarveStrategy {
                             lead_out: cp.lead_out,
                             start: op.start,
                             guard: &guards,
+                                                    spindle: env.spindle,
                         };
                         match crate::clearing::clear(
                             &mut clear_body,
@@ -1333,6 +1334,7 @@ mod tests {
             heights: Heights::new(5.0, 2.0, 0.0),
             tools,
             stock: None,
+            spindle: cam_cldata::SpindleDir::Cw,
         };
         CarveStrategy::new(op).compute(&env, &CancelToken::new())
     }
