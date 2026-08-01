@@ -443,6 +443,21 @@ mod tests {
         assert_eq!(lib.machines.len(), 2);
     }
 
+    /// A rename onto a name already taken comes back disambiguated, and the caller is
+    /// expected to adopt what it returns — otherwise the inspector shows one name while
+    /// the library holds another, and the selection is remembered by the library's.
+    #[test]
+    fn replace_reports_the_name_it_actually_used() {
+        let mut lib = MachineLibrary::default();
+        lib.add(named("Router"));
+        lib.add(named("Mill"));
+        let settled = lib.replace("Router", named("Mill"));
+        assert_eq!(settled, "Mill (2)", "the caller must be told, not left guessing");
+        assert!(lib.by_name("Mill (2)").is_some());
+        assert!(lib.by_name("Router").is_none());
+        assert_eq!(lib.machines.len(), 2);
+    }
+
     #[test]
     fn default_is_empty_and_seeded_is_the_starter_machine() {
         assert!(MachineLibrary::default().machines.is_empty());

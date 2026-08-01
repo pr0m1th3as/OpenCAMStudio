@@ -89,12 +89,17 @@ Across the top is a tabbed **icon ribbon**; below it are three docked panes —
   Renumber · Import Library · Export Library). While this tab is active the
   **Tool Library pane** replaces the Project pane, the Inspector becomes the tool
   editor, and the Viewport shows a **2D cross-section** of the selected tool.
+- **Machinery** — the shop's machines: **New** · **Delete**. Opening the tab puts the
+  Inspector on the active machine, the way Tooling does for tools, so the tab is the way
+  in and needs no button of its own. It sits beside Tooling because both are
+  *installation* scope — neither a machine nor the tool library belongs to a project, and
+  a machine deliberately **cannot** be set by one.
 - **View** — Show stock · Reset view · Cube on/off · Origin · Tips, then the
   orientation-cube **size slider**, then **Panes** — the pane show/hide checkboxes
   (the Tool Library is listed as *Tools* to keep the band narrow).
 
 Tabs read left to right in workflow order: **Home → Edit → Operations → Tooling →
-View**.
+Machinery → View** — set up, edit, cut, tools, machines, look.
 
 The ribbon collapses responsively as the window narrows (groups degrade
 right-to-left; a collapsed group opens as a popup under its button).
@@ -370,7 +375,7 @@ that have no other control:
   where the shipped values can leave the viewport too narrow to work in.
 The **machine** is not here either, and for a stronger reason. Your machines live in a
 **local library** (`machines.json`), picked from the *Active* row at the top of the
-Machine inspector, with **Add** / **Delete** in the Machine ribbon group. Everything
+Machine inspector, with **New** / **Delete** on the **Machinery** ribbon tab. Everything
 below that row edits the machine you have selected. **Each machine carries its own
 control**, so picking a machine picks its post — a shop with a Haas and a grbl router
 should not have to remember to switch the post as well, and "right machine, wrong

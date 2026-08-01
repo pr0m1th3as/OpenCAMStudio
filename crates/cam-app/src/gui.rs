@@ -463,16 +463,22 @@ enum RibbonTab {
     Operations,
     Edit,
     Tooling,
+    /// The shop's machines. Beside **Tooling** deliberately: both are *installation*
+    /// scope, not document scope — a machine is never stored in a project (a file that
+    /// could set yours could disarm the travel check), exactly as the tool library is
+    /// not. `Edit` is the document, which is why Machine did not belong there.
+    Machinery,
     View,
 }
 
 impl RibbonTab {
     /// The tabs shown in the strip, left to right.
-    const ALL: [RibbonTab; 5] = [
+    const ALL: [RibbonTab; 6] = [
         RibbonTab::Home,
         RibbonTab::Edit,
         RibbonTab::Operations,
         RibbonTab::Tooling,
+        RibbonTab::Machinery,
         RibbonTab::View,
     ];
 
@@ -482,6 +488,7 @@ impl RibbonTab {
             RibbonTab::Operations => "Operations",
             RibbonTab::Edit => "Edit",
             RibbonTab::Tooling => "Tooling",
+            RibbonTab::Machinery => "Machinery",
             RibbonTab::View => "View",
         }
     }
@@ -3434,6 +3441,13 @@ impl App {
                     self.set_pane_visible(Pane::Library, false);
                     self.set_pane_visible(Pane::Project, true);
                 }
+                // Entering Machinery puts the Inspector on the machine, the same idiom
+                // Tooling uses for tools — which is why the tab needs no "Machine" button
+                // of its own: the tab *is* the button.
+                if tab == RibbonTab::Machinery {
+                    self.controller.select(Selection::Machine);
+                    self.refresh_fields();
+                }
                 // The Tooling tab turns the Inspector into the library editor, so the
                 // field buffers (and the working-copy baseline) must reload for context.
                 self.reload_tool_edit();
@@ -3587,7 +3601,14 @@ impl App {
             machine: self.controller.machine().clone(),
             post: self.controller.post_kind(),
         };
-        self.active_machine = self.machines.replace(&self.active_machine, entry);
+        let settled = self.machines.replace(&self.active_machine, entry);
+        // `replace` keeps names unique, so a rename onto a name already taken comes back
+        // disambiguated. Push that back, or the inspector would show one name while the
+        // library held another — and the selection is remembered by the library's.
+        if settled != self.controller.machine().name {
+            self.controller.edit_machine(|m| m.name = settled.clone());
+        }
+        self.active_machine = settled;
         self.machines.save();
         self.remember();
     }
@@ -5231,25 +5252,31 @@ impl App {
                         ),
                     ],
                 },
-                GroupSpec {
-                    title: "Machine",
-                    commands: vec![
-                        cmd(
-                            Icon::Machine,
-                            "Machine",
-                            Some(Message::Select(Selection::Machine)),
-                        ),
-                        cmd(Icon::NewTool, "Add", Some(Message::NewMachine)),
-                        cmd(
-                            Icon::Delete,
-                            "Delete",
-                            // Never the last: an empty library has nothing to gate an
-                            // export against.
-                            (self.machines.machines.len() > 1).then_some(Message::DeleteMachine),
-                        ),
-                    ],
-                },
             ],
+            RibbonTab::Machinery => vec![GroupSpec {
+                title: "Machines",
+                commands: vec![
+                    // Its own icon, not the tool's — borrowing one is what made "Add
+                    // machine" read "Add a new tool to the library".
+                    cmd_help(
+                        Icon::Machine,
+                        "New",
+                        Some(Message::NewMachine),
+                        "Add a machine to this installation, copied from the active one. \
+                         Machines are local: a project records the machine it was built \
+                         for but never sets yours, because an export is checked against \
+                         the active machine's travel.",
+                    ),
+                    cmd_help(
+                        Icon::Delete,
+                        "Delete",
+                        // Never the last: an export has to be checked against something.
+                        (self.machines.machines.len() > 1).then_some(Message::DeleteMachine),
+                        "Remove the active machine. The last one cannot be removed — an \
+                         export has to be checked against something.",
+                    ),
+                ],
+            }],
             RibbonTab::Tooling => vec![GroupSpec {
                 title: "Library",
                 commands: vec![
@@ -6237,22 +6264,20 @@ impl App {
             // edits *this* one. The library is local: a machine is a property of your
             // shop, and a project file records the one it was built for as provenance
             // only (it can never set yours, or it could disarm the travel check).
-            if self.machines.machines.len() > 1 {
-                list = list.push(
-                    row![
-                        label_help("Active", help::ACTIVE_MACHINE, self.tooltips),
-                        pick_list(
-                            self.machines.names(),
-                            Some(self.active_machine.clone()),
-                            Message::ActiveMachineChanged,
-                        )
-                        .text_size(12)
-                        .width(INSPECTOR_PICKER_W),
-                    ]
-                    .spacing(8)
-                    .align_y(Alignment::Center),
-                );
-            }
+            list = list.push(
+                row![
+                    label_help("Active", help::ACTIVE_MACHINE, self.tooltips),
+                    pick_list(
+                        self.machines.names(),
+                        Some(self.active_machine.clone()),
+                        Message::ActiveMachineChanged,
+                    )
+                    .text_size(12)
+                    .width(INSPECTOR_PICKER_W),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
             // Machine name (a free-text tag), above the travel fields. Committed on
             // change so multiple machines can be told apart later.
             list = list.push(
@@ -7220,6 +7245,12 @@ struct Command {
     action: Option<Message>,
     /// `Some(on)` renders a toggle (accent-tinted while on); `None` is a plain action.
     toggle: Option<bool>,
+    /// Tooltip for *this* command, when the icon's own words do not fit.
+    ///
+    /// Help used to be keyed by icon alone, which is right while an icon means one
+    /// thing. The moment one is reused — the tool icon standing in for "add a machine" —
+    /// it silently describes the wrong action, which is worse than no tooltip.
+    help: Option<&'static str>,
 }
 
 /// A ribbon group's data model.
@@ -7241,6 +7272,24 @@ fn cmd(icon: Icon, label: &'static str, action: Option<Message>) -> Command {
         label,
         action,
         toggle: None,
+        help: None,
+    }
+}
+
+/// A command whose tooltip is its own, because it borrows an icon that means something
+/// else elsewhere.
+///
+/// Help keyed by icon alone silently describes the wrong action the moment an icon is
+/// reused — which is how "Add machine" came to read "Add a new tool to the library".
+fn cmd_help(
+    icon: Icon,
+    label: &'static str,
+    action: Option<Message>,
+    help: &'static str,
+) -> Command {
+    Command {
+        help: Some(help),
+        ..cmd(icon, label, action)
     }
 }
 
@@ -7249,6 +7298,7 @@ fn toggle_cmd(icon: Icon, label: &'static str, on: bool, msg: Message) -> Comman
         icon,
         label,
         action: Some(msg),
+        help: None,
         toggle: Some(on),
     }
 }
@@ -7291,7 +7341,7 @@ fn render_command(command: &Command, compact: bool, show: bool) -> Element<'stat
     }
     tooltip(
         btn,
-        container(text(command.icon.help()).size(12))
+        container(text(command.help.unwrap_or_else(|| command.icon.help())).size(12))
             .padding(8)
             .max_width(300.0)
             .style(container::rounded_box),
@@ -9532,12 +9582,18 @@ mod ribbon_tests {
 
     #[test]
     fn tabs_read_left_to_right_in_workflow_order() {
-        // Home -> Edit -> Operations -> Tooling -> View: set up, then edit, then cut,
-        // then tools, then look. Windows is gone — its pane toggles live in View.
+        // Home -> Edit -> Operations -> Tooling -> Machinery -> View: set up, then edit,
+        // then cut, then tools, then machines, then look. Windows is gone — its pane
+        // toggles live in View.
+        //
+        // **Machinery sits beside Tooling, not in Edit.** Both are *installation* scope:
+        // neither a machine nor the tool library is stored in a project, and a machine
+        // deliberately cannot be set by one (a file that could would disarm the travel
+        // check). Edit is the document — which is why Machine was in the wrong place.
         let labels: Vec<&str> = RibbonTab::ALL.iter().map(|t| t.label()).collect();
         assert_eq!(
             labels,
-            vec!["Home", "Edit", "Operations", "Tooling", "View"]
+            vec!["Home", "Edit", "Operations", "Tooling", "Machinery", "View"]
         );
     }
 
