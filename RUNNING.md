@@ -344,10 +344,20 @@ that have no other control:
 - **Snap marker size** — how large the engaged snap glyph draws. Unlike the catch
   distance this *is* its own control: it is a visual size, not a tolerance, so a large
   marker with a tight aperture is a reasonable thing to want.
-- **Smallest a pane may be** — the five per-pane minimums. These are **logical**
-  pixels, so a high-DPI screen with display scaling is already handled; raise them on a
-  large screen, lower them on a small or unscaled one where the shipped values can
-  leave the viewport too narrow to work in.
+- **Origin marker size** — the workpiece-datum cross-and-ring. It is sized from the
+  scene (6% of its extent), so it already stays legible on a 20 mm part and a 500 mm
+  one; this scales that, for a louder or quieter datum against a busy backplot.
+- **Smallest a pane may be** — the five per-pane minimums. **Project, Tools, Viewport
+  and Inspector are widths; Output is a height** — they dock to the sides and the
+  bottom respectively, so the same number bounds a different axis. The labels say
+  which. These are **logical** pixels, so a high-DPI screen with display scaling is
+  already handled; raise them on a large screen, lower them on a small or unscaled one
+  where the shipped values can leave the viewport too narrow to work in.
+- **New projects → Post / controller** — the post a project you *create* will target.
+  This is the only preference that touches a project, and it applies at creation only:
+  **opening** a project always uses the post saved in the file, and a file saved before
+  posts were recorded leaves your current choice alone. An existing job is never
+  retargeted behind your back.
 
 Changes apply as you drag, and are written when you let go. **Restore defaults** puts
 everything back — including the pane sizes and minimums, since it is the way out of a
@@ -427,7 +437,10 @@ things worth eyeballing:
   confirm that divider now refuses to go past it. Then the escape hatch: push every
   pane minimum to maximum until the viewport is unusable, and confirm **Restore
   defaults** gets you back in one click without a confirmation step you might not be
-  able to reach.
+  able to reach. Check the pane rows name their axis — **Output (height)**, the rest
+  **(width)**. Drag **Origin marker size** and watch the datum cross grow. Set **New
+  projects → Post**, then **File ▸ New** and confirm the new job targets it — and that
+  re-**opening** an existing `.ocam` does *not* change to it.
 - **Preferences that stick:** change the View-tab toggles (Stock / Cube / Origin /
   Tips), drag the cube-size slider, arm or disarm a couple of object snaps, and drag
   the pane dividers. **Restart.** All of it should come back as you left it — they are

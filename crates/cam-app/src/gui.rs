@@ -2035,6 +2035,10 @@ enum Message {
     SetMarkerScale(f32),
     /// The smallest `pane` may be dragged to, logical px.
     SetPaneMin(Pane, f32),
+    /// Workpiece-origin marker size, as a multiple of the shipped size.
+    SetOriginMarker(f32),
+    /// The post a *newly created* project targets. Never applied to an opened one.
+    SetDefaultPost(PostKind),
     /// Put every preference back to its shipped value.
     RestoreDefaults,
     PaneResized(pane_grid::ResizeEvent),
@@ -2321,7 +2325,10 @@ impl App {
                 }
             }
             Message::NewProject => {
-                self.controller.new_project();
+                // The one project-affecting preference, and it applies *here* only —
+                // the rule lives in the controller so it can be tested without an app.
+                self.controller
+                    .new_project_with_post(self.settings.defaults.post);
                 self.focus_ops.clear();
                 self.refresh_fields();
                 self.status = "New project.".to_string();
@@ -2867,6 +2874,18 @@ impl App {
                 let (lo, hi) = crate::MARKER_SCALE_RANGE;
                 self.settings.snapping.marker_scale = v.clamp(lo, hi);
             }
+            Message::SetOriginMarker(v) => {
+                let (lo, hi) = crate::ORIGIN_MARKER_RANGE;
+                self.settings.view.origin_marker_scale = v.clamp(lo, hi);
+            }
+            Message::SetDefaultPost(kind) => {
+                // A preference for the *next* new project. Deliberately does not touch
+                // the open one: changing what new jobs target must not retarget the job
+                // in front of you.
+                self.settings.defaults.post = kind;
+                self.settings.save();
+                self.status = format!("New projects will target {kind}.");
+            }
             Message::SetPaneMin(pane, v) => {
                 let (lo, hi) = crate::PANE_MIN_RANGE;
                 let v = v.clamp(lo, hi);
@@ -2894,6 +2913,8 @@ impl App {
                 self.tooltips = s.view.tooltips;
                 self.gizmo_size = s.view.gizmo_size;
                 self.snaps = s.snapping.default_snaps.clone();
+                // origin_marker_scale and the default post are read straight from
+                // `settings` wherever they are used, so resetting the struct is enough.
                 self.project_px = s.panes.project_px;
                 self.inspector_px = s.panes.inspector_px;
                 self.output_px = s.panes.output_px;
@@ -3503,6 +3524,9 @@ impl App {
                 show_origin: self.show_origin,
                 tooltips: self.tooltips,
                 gizmo_size: self.gizmo_size,
+                // Not mirrored on `App` — the panel writes it straight into `settings`,
+                // so carry the current value through rather than a default.
+                origin_marker_scale: self.settings.view.origin_marker_scale,
                 extra: Default::default(),
             },
             self.snaps.clone(),
@@ -4485,13 +4509,28 @@ impl App {
                 format!("{:.1}×", self.settings.snapping.marker_scale),
                 Message::SetMarkerScale,
             ),
+            row_for(
+                "Origin marker size",
+                crate::ORIGIN_MARKER_RANGE,
+                self.settings.view.origin_marker_scale,
+                0.1,
+                format!("{:.1}×", self.settings.view.origin_marker_scale),
+                Message::SetOriginMarker,
+            ),
         ]
         .spacing(6);
 
         let p = &self.settings.panes;
         let pane_row = |pane: Pane, value: f32| -> Element<'_, Message> {
+            // Project / Library / Viewport / Inspector are docked left, centre and
+            // right, so their minimum is a **width**; Output is docked along the
+            // bottom, so its minimum is a **height**. Same number, different axis —
+            // and nothing on screen says so unless the label does.
+            let axis = if pane == Pane::Output { "height" } else { "width" };
             row![
-                text(pane.name()).size(12).width(Length::Fixed(150.0)),
+                text(format!("{} ({axis})", pane.name()))
+                    .size(12)
+                    .width(Length::Fixed(150.0)),
                 slider(crate::PANE_MIN_RANGE.0..=crate::PANE_MIN_RANGE.1, value, move |v| {
                     Message::SetPaneMin(pane, v)
                 })
@@ -4508,10 +4547,10 @@ impl App {
         let panes = column![
             heading("Smallest a pane may be"),
             note(
-                "These are logical pixels, so a high-DPI screen with display scaling is \
-                 already handled. Raise them on a large screen; lower them on a small or \
-                 unscaled one, where the shipped values can leave the viewport too narrow \
-                 to work in."
+                "Widths for the side panes, height for Output. These are logical pixels, \
+                 so a high-DPI screen with display scaling is already handled. Raise them \
+                 on a large screen; lower them on a small or unscaled one, where the \
+                 shipped values can leave the viewport too narrow to work in."
                     .to_string()
             ),
             pane_row(Pane::Project, p.min_project_px),
@@ -4543,6 +4582,29 @@ impl App {
                 ),
                 snapping,
                 panes,
+                column![
+                    heading("New projects"),
+                    row![
+                        text("Post / controller").size(12).width(Length::Fixed(150.0)),
+                        pick_list(
+                            &PostKind::ALL[..],
+                            Some(self.settings.defaults.post),
+                            Message::SetDefaultPost,
+                        )
+                        .text_size(12)
+                        .width(Length::Fixed(190.0)),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                    note(
+                        "Applies to projects you create from now on. Opening a project \
+                         always uses the post saved in the file, and a file saved before \
+                         posts were recorded leaves your current choice alone — an \
+                         existing job is never retargeted behind your back."
+                            .to_string()
+                    ),
+                ]
+                .spacing(6),
                 row![
                     // Left, away from Close: it is destructive, and the two should not
                     // be adjacent when one of them is the escape from an unusable layout.
@@ -5295,7 +5357,7 @@ impl App {
                         self.view,
                         self.show_gizmo,
                         self.gizmo_size,
-                        &self.settings.snapping,
+                        &self.settings,
                         &self.focus_ops.iter().copied().collect::<Vec<_>>(),
                         self.snap_hover.map(|h| (h, self.snap_aperture)),
                         self.hover_loop,
@@ -7837,7 +7899,7 @@ impl Viewport {
         controls: ViewControls,
         show_gizmo: bool,
         gizmo_size: f32,
-        snap_prefs: &crate::SnapPrefs,
+        prefs: &crate::Settings,
         focus_ops: &[u32],
         snap: Option<(SnapHit, f64)>,
         hover_loop: Option<LoopRef>,
@@ -7898,7 +7960,8 @@ impl Viewport {
         // loaded — never on an empty document at startup — and sized to the scene.
         if show_origin && controller.has_geometry() {
             if let Some((mn, mx)) = bounds {
-                let base_r = ((mx[0] - mn[0]).max(mx[1] - mn[1]) * 0.06).max(1.0);
+                let scale = prefs.view.origin_marker_scale;
+                let base_r = ((mx[0] - mn[0]).max(mx[1] - mn[1]) * 0.06 * scale).max(1.0);
                 let active = controller.active_origin();
                 // One marker per origin so every datum is visible; the active origin
                 // (the one the pick flow and inspector edit) is drawn larger, so it
@@ -7913,13 +7976,16 @@ impl Viewport {
         // The first point captured in two-point origin mode (awaiting the second).
         if let Some(first) = origin_first {
             let r = bounds
-                .map(|(mn, mx)| ((mx[0] - mn[0]).max(mx[1] - mn[1]) * 0.04).max(1.0))
+                .map(|(mn, mx)| {
+                    ((mx[0] - mn[0]).max(mx[1] - mn[1]) * 0.04 * prefs.view.origin_marker_scale)
+                        .max(1.0)
+                })
                 .unwrap_or(3.0);
             add_origin_marker(&mut scene, first, pick_z, r);
         }
         // The object-snap marker under the cursor (op pick *or* set-origin).
         if let Some((hit, aperture)) = snap {
-            add_snap_marker(&mut scene, hit, aperture, snap_prefs.marker_scale, pick_z);
+            add_snap_marker(&mut scene, hit, aperture, prefs.snapping.marker_scale, pick_z);
         }
         // When one or more operations are focused, dim every *other* operation's
         // toolpath so the focused ones stand out — vital when a part has dozens of
@@ -7955,7 +8021,7 @@ impl Viewport {
             controls,
             show_gizmo,
             gizmo_size,
-            snap_catch_px: snap_prefs.pickbox_px * crate::SNAP_CATCH_MULTIPLE,
+            snap_catch_px: prefs.snapping.pickbox_px * crate::SNAP_CATCH_MULTIPLE,
             picking,
             set_origin,
             snap_engaged: snap.is_some(),

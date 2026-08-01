@@ -596,6 +596,75 @@ mod tests {
         assert!((drawn - 6.8).abs() < 1e-3, "phase did not carry: drew {drawn}");
     }
 
+    /// A same-orientation tool change must stay **connected** in the backplot: lift,
+    /// horizontal cross at tool-change height, descend. A fixture reorientation is the
+    /// one that breaks (the pen-lift at `Step::Datum`). That contrast is how an
+    /// operator tells the two apart at a glance, so the cross surviving all the way
+    /// into the vertex buffer is the property — not merely being in the `Program`,
+    /// which is separately tested in `cam-toolpath`.
+    #[test]
+    fn a_same_orientation_tool_change_keeps_its_horizontal_cross() {
+        let prog = ProgramBuilder::new()
+            .op(0)
+            .rapid(Point3::new(10.0, 10.0, 5.0), MoveKind::Link)
+            .linear(Point3::new(10.0, 10.0, -1.0), MoveKind::Cutting)
+            // The planner's transition: up, across, down. No Datum between them.
+            .rapid(Point3::new(10.0, 10.0, 42.0), MoveKind::Traverse)
+            .rapid(Point3::new(60.0, 40.0, 42.0), MoveKind::Traverse)
+            .rapid(Point3::new(60.0, 40.0, 5.0), MoveKind::Traverse)
+            .build();
+        let scene = Scene::from_program(&prog);
+
+        let horizontal: Vec<&LineStrip> = scene
+            .strips
+            .iter()
+            .filter(|s| {
+                s.points.len() == 2
+                    && (s.points[0][2] - s.points[1][2]).abs() < 1e-6
+                    && (s.points[0][0] - s.points[1][0]).abs() > 1e-6
+            })
+            .collect();
+        assert!(
+            horizontal.iter().any(|s| s.color == TRAVERSE),
+            "the cross between the lift and the descent must be drawn: {:?}",
+            scene.strips
+        );
+
+        // And it must reach the buffer — a dash pattern that swallowed a whole strip
+        // would leave the operator with the same broken look a reorientation has.
+        let cross = horizontal.iter().find(|s| s.color == TRAVERSE).unwrap();
+        let mut only = Scene::new();
+        only.add_strip_styled(cross.points.clone(), cross.color, cross.op, cross.dashed);
+        let vs = only.line_vertices_dashed(scene.dash_period());
+        assert!(!vs.is_empty(), "the cross drew nothing at all");
+        let drawn = drawn_length(&vs);
+        assert!(
+            drawn > 0.25 * 58.31,
+            "the cross drew only {drawn} mm of its ~58 mm — it would read as absent"
+        );
+    }
+
+    /// The contrast the test above depends on: a reorientation *does* break, because
+    /// `Step::Datum` lifts the pen. If this ever stopped being true the two transitions
+    /// would look alike and the dash would be carrying the whole distinction.
+    #[test]
+    fn a_reorientation_breaks_where_a_tool_change_does_not() {
+        let prog = ProgramBuilder::new()
+            .op(0)
+            .rapid(Point3::new(10.0, 10.0, 42.0), MoveKind::Traverse)
+            .datum(2)
+            .rapid(Point3::new(60.0, 40.0, 42.0), MoveKind::Traverse)
+            .rapid(Point3::new(60.0, 40.0, 5.0), MoveKind::Traverse)
+            .build();
+        let scene = Scene::from_program(&prog);
+        let horizontal = scene.strips.iter().any(|s| {
+            s.points.len() == 2
+                && (s.points[0][2] - s.points[1][2]).abs() < 1e-6
+                && (s.points[0][0] - s.points[1][0]).abs() > 1e-6
+        });
+        assert!(!horizontal, "a reorientation's cross must stay broken: {:?}", scene.strips);
+    }
+
     /// The two tests above pick their periods by hand, and both happen to be periods
     /// the walk survives. That is not a property of the code — it is luck. This sweeps
     /// the whole range [`Scene::dash_period`] can return, against several lengths.

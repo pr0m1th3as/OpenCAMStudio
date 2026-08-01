@@ -89,6 +89,13 @@ pub struct ViewPrefs {
     pub tooltips: bool,
     /// Orientation-cube size, logical px.
     pub gizmo_size: f32,
+    /// Workpiece-origin marker size, as a multiple of the shipped size.
+    ///
+    /// The marker is sized from the scene's extent (6% of it) rather than in
+    /// millimetres, so it stays legible on a 20 mm part and a 500 mm one alike. This
+    /// scales that, for operators who want the datum louder or quieter against a busy
+    /// backplot.
+    pub origin_marker_scale: f32,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -178,6 +185,7 @@ impl Default for ViewPrefs {
             show_origin: true,
             tooltips: true,
             gizmo_size: 110.0,
+            origin_marker_scale: 1.0,
             extra: Default::default(),
         }
     }
@@ -235,6 +243,8 @@ impl Default for Settings {
 
 /// Orientation-cube size range (logical px) — the slider's existing range.
 pub const GIZMO_SIZE_RANGE: (f32, f32) = (60.0, 220.0);
+/// Workpiece-origin marker size, as a multiple of the shipped size.
+pub const ORIGIN_MARKER_RANGE: (f32, f32) = (0.3, 3.0);
 /// Pickbox aperture range (logical px). Below ~4 px nothing can be clicked; above
 /// ~40 the box catches things the operator did not point at.
 pub const PICKBOX_RANGE: (f32, f32) = (4.0, 40.0);
@@ -265,6 +275,11 @@ impl Settings {
         let d = Settings::default();
         let v = &mut self.view;
         v.gizmo_size = clamp(v.gizmo_size, GIZMO_SIZE_RANGE, d.view.gizmo_size);
+        v.origin_marker_scale = clamp(
+            v.origin_marker_scale,
+            ORIGIN_MARKER_RANGE,
+            d.view.origin_marker_scale,
+        );
 
         let s = &mut self.snapping;
         s.pickbox_px = clamp(s.pickbox_px, PICKBOX_RANGE, d.snapping.pickbox_px);
@@ -461,6 +476,7 @@ mod tests {
         assert!(d.view.show_origin);
         assert!(d.view.tooltips);
         assert_eq!(d.view.gizmo_size, 110.0);
+        assert_eq!(d.view.origin_marker_scale, 1.0, "the shipped marker size is 1x");
 
         assert_eq!(d.snapping.pickbox_px, 12.0);
         assert_eq!(d.snapping.marker_scale, 1.2);
@@ -642,6 +658,7 @@ mod tests {
                 for pane_min in [PANE_MIN_RANGE.0, PANE_MIN_RANGE.1] {
                     for gizmo in [GIZMO_SIZE_RANGE.0, GIZMO_SIZE_RANGE.1] {
                         let mut s = Settings::default();
+                        s.view.origin_marker_scale = ORIGIN_MARKER_RANGE.1;
                         s.snapping.pickbox_px = pick;
                         s.snapping.marker_scale = scale;
                         s.view.gizmo_size = gizmo;

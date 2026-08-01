@@ -617,6 +617,20 @@ impl AppController {
         self.invalidate();
     }
 
+    /// Reset to a fresh, empty project targeting `post`.
+    ///
+    /// The post here is a **preference for new work**, and this is the only path it
+    /// travels. [`open_project`](Self::open_project) always takes the post from the
+    /// file, and a file predating schema v11 records none and leaves the session's
+    /// choice alone — reading absence as "use the preference" would retarget an old job
+    /// on open, which is exactly what v11 exists to prevent. Keeping the two paths
+    /// separate is the whole point; a single "apply the default" helper shared between
+    /// them would erase the distinction.
+    pub fn new_project_with_post(&mut self, post: PostKind) {
+        self.new_project();
+        self.set_post_kind(post);
+    }
+
     /// The `.ocam` file this project was last saved to / opened from, if any.
     pub fn current_path(&self) -> Option<&Path> {
         self.current_path.as_deref()
@@ -3607,6 +3621,34 @@ mod tests {
 
         assert_eq!(session.post_kind(), PostKind::LinuxCnc);
         assert_eq!(session.machine().name, "the operator's own mill");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The preference applies to a **new** project and to nothing else. Paired with
+    /// `a_pre_v11_project_leaves_the_sessions_machine_and_post_alone`, these two pin
+    /// Andreas's rule: "existing projects opened respect `.ocam`, we never retarget
+    /// unless the user explicitly does so".
+    #[test]
+    fn a_new_project_adopts_the_preferred_post_but_an_opened_one_never_does() {
+        let mut app = AppController::new(machine());
+        app.set_post_kind(PostKind::Grbl);
+
+        app.new_project_with_post(PostKind::Okuma);
+        assert_eq!(app.post_kind(), PostKind::Okuma, "a new project takes the preference");
+
+        // Save it as a v11 file that records Fanuc, then reopen: the *file* wins.
+        app.set_post_kind(PostKind::Fanuc);
+        let path = temp_path("prefers_post.ocam");
+        app.save_project(&path).unwrap();
+
+        let mut session = AppController::new(machine());
+        session.set_post_kind(PostKind::LinuxCnc);
+        session.open_project(&path).unwrap();
+        assert_eq!(
+            session.post_kind(),
+            PostKind::Fanuc,
+            "opening must take the file's post, not the session's and not a preference"
+        );
         std::fs::remove_file(&path).ok();
     }
 
