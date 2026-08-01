@@ -463,29 +463,77 @@ fn emit_loop_rich(
     // So it always ends the pass away from where the next one begins — the same
     // condition a lead already creates.
     let ramps = matches!(op.plunge, Plunge::Ramp { angle_deg } if angle_deg > 0.0 && angle_deg < 90.0);
+    let perimeter = loop_perimeter(pts);
+    // A ramped pass ends further round the loop than an unramped one (it must re-cut
+    // the stretch it descended over), so its exit — and the lead-off with it — is a
+    // per-level quantity rather than a fixed one.
     let repositions =
         ramps || (exit.x - entry.x).abs() > 1e-9 || (exit.y - entry.y).abs() > 1e-9;
     let mut prev_z = h.retract.max(h.top_of_stock);
     for (i, &z) in levels.iter().enumerate() {
-        // The ramp path for *this* level: it arrives at `start` at depth `z`, so the
-        // tool must come down at its far end rather than at the lead-in point.
-        let ramp = contour_ramp_len(op.plunge, prev_z - z)
-            .map(|len| approach_along_loop(pts, len))
-            .filter(|path| path.len() > 1);
-        let down_at = ramp.as_ref().map_or(entry, |path| path[0]);
+        // **The ramp never travels through air.** Its height is measured from the top
+        // of material — the stock surface on the first level, the previous floor after
+        // that — not from the retract plane. Descending from the retract plane made two
+        // thirds of the first pass's ramp a slow feed through nothing, and dragged the
+        // tool around the contour's corners to spend the length.
+        let ramp_top = prev_z.min(h.top_of_stock);
+        let ramp_len = contour_ramp_len(op.plunge, ramp_top - z);
 
+        // The ramp descends along the lead-in first, and only then along the contour:
+        // the lead exists to keep the entry off the finished wall, so it is exactly
+        // where a descending tool belongs. A lead long enough (or an angle steep
+        // enough) to absorb the whole stepdown keeps the wall untouched entirely —
+        // which is how the operator controls this.
+        let ramp = ramp_len.map(|len| {
+            let lead_path = lead_in_path(start, entry, out, lead_in);
+            let lead_len = path_length(&lead_path);
+            let on_contour = (len - lead_len).max(0.0);
+            let mut path = lead_path;
+            // `walk_loop` starts at the contour point the lead already reached.
+            path.extend(walk_loop(pts, 0.0, on_contour).into_iter().skip(1));
+            (path, on_contour)
+        });
+
+        // Where the pass begins cutting at depth: the arc position the ramp ended at.
+        let cut_from = ramp.as_ref().map_or(0.0, |(_, on_contour)| *on_contour);
+        // A full perimeter from there, so the ramped stretch is re-machined, plus the
+        // operator's overlap.
+        let (loop_pts, exit_on, tan_out) = if ramps {
+            let walked = walk_loop(pts, cut_from, perimeter + op.lead_overlap);
+            let last = walked[walked.len() - 1];
+            let prev = walked[walked.len().saturating_sub(2)];
+            (walked, last, unit(last.x - prev.x, last.y - prev.y))
+        } else {
+            (loop_pts.clone(), exit_on, tan_out)
+        };
+        let out_exit = {
+            let o = outward_normal_at(tan_out, signed_area2(pts) > 0.0);
+            (o.0 * air_sign, o.1 * air_sign)
+        };
+        let lead_out = crate::leads::guard_lead(&guard, exit_on, tan_out, out_exit, op.lead_out, false);
+        let exit = crate::leads::lead_end_point(exit_on, tan_out, out_exit, lead_out);
+
+        // The tool comes down where the entry begins — the lead-in's own start, which
+        // when ramping now sits *above* the cutting plane by exactly the ramp's height,
+        // so the descent that follows lands on the contour at depth.
+        //
+        // A ramp stops at the top of material and feeds from there; every other plunge
+        // style still comes down to `prev_z` and descends from it, unchanged.
+        let arrive_at = if ramp.is_some() {
+            ramp_top.max(z)
+        } else {
+            prev_z
+        };
         if i == 0 || repositions {
             prog.push(Step::Rapid {
-                to: Point3::new(down_at.x, down_at.y, h.clearance),
+                to: Point3::new(entry.x, entry.y, h.clearance),
                 tag: link,
             });
-            crate::emit::descend_to(prog, down_at, prev_z, h, op.feed, op.id);
+            crate::emit::descend_to(prog, entry, arrive_at, h, op.feed, op.id);
         }
 
-        if let Some(path) = &ramp {
-            // The ramp *is* the entry: it arrives on the contour at `start`, already at
-            // depth and already tangent, so a lead-in would have nothing left to ease.
-            emit_descending_path(prog, path, prev_z, z, op.feed, plunge_tag);
+        if let Some((path, _)) = &ramp {
+            emit_descending_path(prog, path, ramp_top, z, op.feed, plunge_tag);
         } else {
             emit_plunge(
                 prog,
@@ -512,7 +560,7 @@ fn emit_loop_rich(
             prog.push(Step::CutterComp(CutterComp::Off));
         }
 
-        // Lead off the contour at depth: exit_on (start, or the overlap point) → exit.
+        // Lead off the contour at depth — **flat**. Only the lead-in descends.
         crate::leads::emit_lead(prog, exit_on, exit, exit_on, out_exit, lead_out, z, op.feed, lead);
 
         // Lift only when the next pass has somewhere else to start from; the final
@@ -718,6 +766,105 @@ pub(crate) fn contour_ramp_len(plunge: Plunge, dz: f64) -> Option<f64> {
 /// descends over 32 laps instead of the requested length, which is *steeper* than
 /// asked — the safe direction to err, since the alternative is an unbounded buffer.
 pub(crate) const MAX_RAMP_LAPS: usize = 32;
+
+/// Total length of an open polyline.
+pub(crate) fn path_length(pts: &[Point]) -> f64 {
+    pts.windows(2).map(|w| (w[1].x - w[0].x).hypot(w[1].y - w[0].y)).sum()
+}
+
+/// The perimeter of the closed loop through `pts`.
+pub(crate) fn loop_perimeter(pts: &[Point]) -> f64 {
+    let n = pts.len();
+    (0..n)
+        .map(|i| {
+            let (a, b) = (pts[i], pts[(i + 1) % n]);
+            (b.x - a.x).hypot(b.y - a.y)
+        })
+        .sum()
+}
+
+/// Walk the closed loop `pts` **forward** from arc position `from`, for `len` mm,
+/// wrapping as often as needed. The first returned point is the position at `from`.
+///
+/// One walker for both halves of a ramped entry: the stretch the ramp descends over,
+/// and the full-perimeter cut that follows it from wherever the ramp ended.
+pub(crate) fn walk_loop(pts: &[Point], from: f64, len: f64) -> Vec<Point> {
+    let n = pts.len();
+    if n < 2 {
+        return pts.to_vec();
+    }
+    let perim = loop_perimeter(pts);
+    if perim <= 1e-12 {
+        return vec![pts[0]];
+    }
+    // Where `from` lands: the edge it falls on, and how far along that edge.
+    let mut start_at = from.rem_euclid(perim);
+    let mut i = 0usize;
+    loop {
+        let e = (pts[(i + 1) % n].x - pts[i].x).hypot(pts[(i + 1) % n].y - pts[i].y);
+        if start_at <= e || i + 1 == n {
+            break;
+        }
+        start_at -= e;
+        i += 1;
+    }
+    let at = |i: usize, d: f64| {
+        let (a, b) = (pts[i], pts[(i + 1) % n]);
+        let e = (b.x - a.x).hypot(b.y - a.y);
+        if e <= 1e-12 {
+            a
+        } else {
+            Point::new(a.x + (b.x - a.x) * d / e, a.y + (b.y - a.y) * d / e)
+        }
+    };
+
+    let mut out = vec![at(i, start_at)];
+    let mut remaining = len;
+    let mut edge_left = {
+        let (a, b) = (pts[i], pts[(i + 1) % n]);
+        (b.x - a.x).hypot(b.y - a.y) - start_at
+    };
+    // Bounded like the ramp itself: a caller asking for many perimeters gets many
+    // laps, but never an unbounded buffer.
+    for _ in 0..n.saturating_mul(MAX_RAMP_LAPS) + 2 {
+        if remaining <= 0.0 {
+            break;
+        }
+        if edge_left > remaining {
+            let (a, b) = (pts[i], pts[(i + 1) % n]);
+            let e = (b.x - a.x).hypot(b.y - a.y);
+            let d = e - edge_left + remaining;
+            out.push(at(i, d));
+            break;
+        }
+        remaining -= edge_left;
+        i = (i + 1) % n;
+        out.push(pts[i]);
+        let (a, b) = (pts[i], pts[(i + 1) % n]);
+        edge_left = (b.x - a.x).hypot(b.y - a.y);
+    }
+    out
+}
+
+/// The lead-in as a path **from the lead's start point to the contour**, inclusive of
+/// both ends — the reverse of [`leads::lead_samples`], which samples outward from the
+/// contour. Empty lead ⇒ just the contour point.
+///
+/// The ramp descends along this before it touches the contour, which is the whole
+/// point: the lead exists to keep the entry off the finished wall, so it is where a
+/// descending tool belongs.
+pub(crate) fn lead_in_path(start: Point, entry: Point, out: (f64, f64), lead: Lead) -> Vec<Point> {
+    let mut pts = crate::leads::lead_samples(start, entry, out, lead);
+    pts.reverse();
+    match pts.last() {
+        Some(p) if (p.x - start.x).abs() < 1e-9 && (p.y - start.y).abs() < 1e-9 => {}
+        _ => pts.push(start),
+    }
+    if pts.is_empty() {
+        pts.push(start);
+    }
+    pts
+}
 
 /// The stretch of the closed loop `pts` that **arrives at `pts[0]`** after `len` mm
 /// of travel, found by walking backwards from the start and wrapping as often as
@@ -1414,6 +1561,122 @@ mod tests {
             spindle: cam_cldata::SpindleDir::Cw,
         };
         ProfileStrategy::new(op).compute(&env, &crate::CancelToken::new())
+    }
+
+    /// **The ramp never travels through air.** Its height is the *material* it has to
+    /// get through — one stepdown — not the drop from the retract plane. Measured
+    /// rather than asserted about: the ramp's own length is `dz / tan(angle)`, so a
+    /// ramp that started at the retract plane would be visibly longer on the first
+    /// level than on the second.
+    #[test]
+    fn the_first_levels_ramp_is_no_longer_than_any_others() {
+        let mut op = outside_rough_op(0.0);
+        op.stepover = 0.0;
+        op.depth = 2.0;
+        op.stepdown = 1.0; // two levels, both one stepdown of material
+        op.plunge = Plunge::Ramp { angle_deg: 5.0 };
+        let r = run_outside_rough(op);
+
+        // Length of each run of consecutive descending Plunge moves.
+        let mut pos = Point3::new(0.0, 0.0, 0.0);
+        let mut runs: Vec<f64> = Vec::new();
+        let mut cur = 0.0;
+        for st in r.program.steps() {
+            let (to, ramping) = match st {
+                Step::Linear { to, tag, .. } => (*to, tag.kind == MoveKind::Plunge),
+                Step::Rapid { to, .. } => (*to, false),
+                Step::Arc { end, .. } => (*end, false),
+                _ => continue,
+            };
+            if ramping && to.z < pos.z - 1e-9 {
+                cur += (to.x - pos.x).hypot(to.y - pos.y);
+            } else if cur > 0.0 {
+                runs.push(cur);
+                cur = 0.0;
+            }
+            pos = to;
+        }
+        if cur > 0.0 {
+            runs.push(cur);
+        }
+        assert!(runs.len() >= 2, "expected a ramp per level, got {runs:?}");
+        let want = 1.0 / 5.0_f64.to_radians().tan(); // one stepdown at 5°
+        for (i, l) in runs.iter().enumerate() {
+            assert!(
+                (l - want).abs() < 0.5,
+                "level {i} ramped {l:.2} mm; one stepdown at 5° is {want:.2} mm. A ramp \
+                 starting at the retract plane would be far longer on the first level."
+            );
+        }
+    }
+
+    /// The ramp descends along the **lead-in** before it touches the contour — that is
+    /// where a descending tool belongs, because the lead exists to keep the entry off
+    /// the finished wall. With a lead long enough to absorb the whole stepdown, the
+    /// wall is never touched by a descending tool at all.
+    #[test]
+    fn a_ramp_descends_down_the_lead_in_before_the_contour() {
+        let mut op = outside_rough_op(0.0);
+        op.stepover = 0.0;
+        op.depth = 0.2;
+        op.stepdown = 0.2; // a shallow step, so a modest lead can absorb it
+        op.plunge = Plunge::Ramp { angle_deg: 5.0 };
+        op.lead_in = Lead::Arc { radius: 3.0 };
+        op.lead_out = Lead::Arc { radius: 3.0 };
+        let r = run_outside_rough(op);
+
+        // The contour's own vertices, to tell "on the wall" from "on the lead".
+        let on_contour = |p: Point3| {
+            let pts = [
+                (20.0, 20.0),
+                (40.0, 20.0),
+                (40.0, 40.0),
+                (20.0, 40.0),
+            ];
+            pts.iter().any(|&(x, y)| (p.x - x).abs() < 1e-6 && (p.y - y).abs() < 1e-6)
+        };
+        let first_plunge = r
+            .program
+            .steps()
+            .iter()
+            .position(|st| matches!(st, Step::Linear { tag, .. } if tag.kind == MoveKind::Plunge))
+            .expect("a ramp");
+        // Nothing before the ramp may already be at depth, and the ramp itself must
+        // begin away from the contour's corners (it is on the lead arc).
+        let before: Vec<_> = r.program.steps()[..first_plunge].to_vec();
+        assert!(
+            !before.iter().any(|st| matches!(st,
+                Step::Linear { to, .. } | Step::Rapid { to, .. } if to.z < -1e-9)),
+            "nothing may reach cutting depth before the ramp"
+        );
+        assert!(!on_contour(match &r.program.steps()[first_plunge] {
+            Step::Linear { to, .. } => *to,
+            _ => unreachable!(),
+        }), "the ramp's first move should be along the lead, not the contour");
+    }
+
+    /// Only the lead-**in** descends. The lead-out stays at the cutting plane.
+    #[test]
+    fn the_lead_out_stays_flat_at_the_cutting_plane() {
+        let mut op = outside_rough_op(0.0);
+        op.stepover = 0.0;
+        op.depth = 1.0;
+        op.stepdown = 1.0;
+        op.plunge = Plunge::Ramp { angle_deg: 5.0 };
+        op.lead_in = Lead::Arc { radius: 3.0 };
+        op.lead_out = Lead::Arc { radius: 3.0 };
+        let r = run_outside_rough(op);
+        for st in r.program.steps() {
+            if let Step::Arc { end, tag, .. } = st {
+                if tag.kind == MoveKind::LeadIn {
+                    assert!(
+                        (end.z + 1.0).abs() < 1e-9,
+                        "a lead arc ended at {} — the lead-out must stay at depth",
+                        end.z
+                    );
+                }
+            }
+        }
     }
 
     /// The point of the whole exercise: with a ramp selected, the tool must never drop

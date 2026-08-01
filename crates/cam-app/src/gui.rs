@@ -1022,12 +1022,14 @@ impl Field {
             Field::ClearLeadOverlap => "Clear lead overlap (mm)",
             Field::ClearLeadInSize => "Clear lead-in size (mm)",
             Field::ClearLeadOutSize => "Clear lead-out size (mm)",
-            Field::ClearPlungeA => "Clear plunge A",
-            Field::ClearPlungeB => "Clear plunge B",
+            Field::ClearPlungeA => "Clearing plunge parameter 1",
+            Field::ClearPlungeB => "Clearing plunge parameter 2",
             Field::ClearOffset => "Clear allowance (mm)",
             Field::Scallop => "Floor scallop (mm, 0=auto)",
-            Field::PlungeA => "Plunge angle/radius",
-            Field::PlungeB => "Plunge length/pitch",
+            // Fallbacks only: `plunge_label` names these per style (a ramp's is an
+            // angle, a helix's a radius — never both).
+            Field::PlungeA => "Plunge parameter 1",
+            Field::PlungeB => "Plunge parameter 2",
         }
     }
 
@@ -3691,6 +3693,51 @@ impl App {
         idx
     }
 
+    /// The plunge style an operation enters with, and (separately) the one its clearing
+    /// pass uses — the two are independent settings on a carve.
+    fn op_plunge_styles(op: &Operation) -> (Option<Plunge>, Option<Plunge>) {
+        match op {
+            Operation::Profile(p) => (Some(p.plunge), None),
+            Operation::Pocket(p) => (Some(p.clear.plunge), None),
+            Operation::Carve(c) => (None, c.clear.as_ref().map(|cl| cl.params.plunge)),
+            _ => (None, None),
+        }
+    }
+
+    /// The label for a plunge parameter, named for what it actually **is** under the
+    /// selected style. `None` when the field is not a plunge parameter.
+    ///
+    /// These were positional — "Plunge angle/radius" and "Plunge length/pitch" — one
+    /// slot standing for two physically distinct quantities depending on the style, and
+    /// the label had to say so because it could not name them. An angle and a radius
+    /// are not the same kind of thing (Andreas, 2026-08-01): **a ramp is always an
+    /// angle in degrees, never a radius; a helix is always a radius and a pitch, both
+    /// in millimetres.** The tool inspector has been kind-aware for a long time; this
+    /// is the same treatment for the entry styles.
+    fn plunge_label(&self, field: Field) -> Option<&'static str> {
+        let op = self.controller.selected_operation()?;
+        let (own, clear) = Self::op_plunge_styles(op);
+        let (plunge, clearing) = match field {
+            Field::PlungeA | Field::PlungeB => (own?, false),
+            Field::ClearPlungeA | Field::ClearPlungeB => (clear?, true),
+            _ => return None,
+        };
+        let first = matches!(field, Field::PlungeA | Field::ClearPlungeA);
+        Some(match (plunge, first, clearing) {
+            (Plunge::Ramp { .. }, true, false) => "Ramp angle (°)",
+            (Plunge::Ramp { .. }, true, true) => "Clearing ramp angle (°)",
+            (Plunge::Helix { .. }, true, false) => "Helix radius (mm)",
+            (Plunge::Helix { .. }, false, false) => "Helix pitch (mm)",
+            (Plunge::Helix { .. }, true, true) => "Clearing helix radius (mm)",
+            (Plunge::Helix { .. }, false, true) => "Clearing helix pitch (mm)",
+            (Plunge::ZigZag { .. }, true, false) => "Zig-zag angle (°)",
+            (Plunge::ZigZag { .. }, false, false) => "Zig-zag length (mm)",
+            (Plunge::ZigZag { .. }, true, true) => "Clearing zig-zag angle (°)",
+            (Plunge::ZigZag { .. }, false, true) => "Clearing zig-zag length (mm)",
+            _ => return None,
+        })
+    }
+
     /// The kind of the tool the inspector is editing (library entry or project tool).
     fn inspected_tool_kind(&self) -> Option<ToolKind> {
         if self.library_mode() {
@@ -3736,7 +3783,7 @@ impl App {
                 "Thread length (mm)"
             }
             (Some(ToolKind::ThreadMill { .. }), Field::NeckDiameter) => "Neck diameter (mm)",
-            _ => field.label(),
+            _ => self.plunge_label(field).unwrap_or_else(|| field.label()),
         }
     }
 
