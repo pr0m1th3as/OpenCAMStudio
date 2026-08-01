@@ -1615,8 +1615,20 @@ struct App {
 const PICKBOX_PX: f32 = 12.0;
 /// The object-snap catch aperture, px — larger than the pickbox so snaps engage
 /// from a comfortable distance (and the marker, sized from it, reads clearly).
-/// TODO(prefs): expose this (snap distance) in user preferences — see WORKSTATE.
-const SNAP_PICK_PX: f32 = 1.5 * PICKBOX_PX;
+///
+/// **Deliberately not its own preference** (Andreas, 2026-08-01). The exposed knob is
+/// `PICKBOX_PX`, and this stays derived from it: the two are physically related — a
+/// bigger aperture should catch from further away — and two absolute controls would
+/// let a user set a catch distance *smaller* than the pickbox feeding it. Do not
+/// "finish the job" by adding a second knob; see `Settings::snap_catch_px`.
+const SNAP_PICK_PX: f32 = crate::SNAP_CATCH_MULTIPLE * PICKBOX_PX;
+/// The object snaps armed in a fresh session: End + Mid + Quadrant, with Nearest
+/// opt-in (AutoCAD-style). A function rather than an inline literal so the settings
+/// default can be asserted against it — see `settings_agree_with_constants`.
+fn initial_snaps() -> Vec<SnapKind> {
+    vec![SnapKind::End, SnapKind::Mid, SnapKind::Quadrant]
+}
+
 /// Snap marker size as a multiple of the snap aperture.
 /// TODO(prefs): expose this (snap-shape size) in user preferences.
 const SNAP_MARK_SCALE: f32 = 1.2;
@@ -2181,8 +2193,7 @@ impl App {
             window_cursor: iced::Point::ORIGIN,
             focus_ops: BTreeSet::new(),
             modifiers: iced::keyboard::Modifiers::default(),
-            // End + Mid + Quadrant on by default; Nearest is opt-in (AutoCAD-style).
-            snaps: vec![SnapKind::End, SnapKind::Mid, SnapKind::Quadrant],
+            snaps: initial_snaps(),
             snap_hover: None,
             snap_aperture: 1.0,
             hover_loop: None,
@@ -8447,6 +8458,77 @@ mod origin_move_tests {
         assert_eq!(origin_move_targets(&[1, 3], Some(2), 1), vec![3]);
         // Same for an operation with no origin recorded at all.
         assert_eq!(origin_move_targets(&[1, 3], None, 1), vec![3]);
+    }
+}
+
+/// The other half of the "this change is inert" proof.
+///
+/// `settings.rs` pins its defaults against literal numbers, but it cannot see these
+/// constants — it is deliberately outside the `gui` module so it tests without the
+/// feature. This module is inside, and asserts the two agree *today*, before anything
+/// starts reading `Settings` instead of the constants (`PREFS_PLAN.md` step 3).
+///
+/// If one of these fails, do not "fix" it by editing the expected number: decide
+/// which side is right, because a preference whose default silently differs from the
+/// value the app actually used is worse than no preference at all.
+#[cfg(test)]
+mod settings_agree_with_constants {
+    use super::*;
+    use crate::Settings;
+
+    #[test]
+    fn the_snapping_defaults_match() {
+        let d = Settings::default();
+        assert_eq!(d.snapping.pickbox_px, PICKBOX_PX);
+        assert_eq!(d.snapping.marker_scale, SNAP_MARK_SCALE);
+        // The catch aperture is derived from the pickbox rather than stored, so this
+        // is the assertion that the derivation reproduces the old constant exactly.
+        assert_eq!(d.snap_catch_px(), SNAP_PICK_PX);
+        assert_eq!(d.snapping.default_snaps, initial_snaps());
+    }
+
+    #[test]
+    fn the_view_defaults_match() {
+        let d = Settings::default();
+        assert_eq!(d.view.gizmo_size, GIZMO_SIZE_DEFAULT);
+        assert_eq!(
+            crate::GIZMO_SIZE_RANGE,
+            (GIZMO_SIZE_MIN, GIZMO_SIZE_MAX),
+            "the preference's range must be the slider's range"
+        );
+    }
+
+    #[test]
+    fn the_pane_minimums_match() {
+        let d = Settings::default();
+        assert_eq!(d.panes.min_project_px, Pane::Project.min_size());
+        assert_eq!(d.panes.min_library_px, Pane::Library.min_size());
+        assert_eq!(d.panes.min_viewport_px, Pane::Viewport.min_size());
+        assert_eq!(d.panes.min_inspector_px, Pane::Inspector.min_size());
+        assert_eq!(d.panes.min_output_px, Pane::Output.min_size());
+    }
+
+    /// Every pane minimum must be expressible as a preference — a shipped default
+    /// outside its own permitted range would be unreachable once the panel exists.
+    #[test]
+    fn every_shipped_default_lies_inside_its_own_bounds() {
+        let d = Settings::default();
+        let inside = |v: f32, (lo, hi): (f32, f32)| v >= lo && v <= hi;
+        assert!(inside(d.view.gizmo_size, crate::GIZMO_SIZE_RANGE));
+        assert!(inside(d.snapping.pickbox_px, crate::PICKBOX_RANGE));
+        assert!(inside(d.snapping.marker_scale, crate::MARKER_SCALE_RANGE));
+        for m in [
+            d.panes.min_project_px,
+            d.panes.min_library_px,
+            d.panes.min_viewport_px,
+            d.panes.min_inspector_px,
+            d.panes.min_output_px,
+        ] {
+            assert!(inside(m, crate::PANE_MIN_RANGE), "{m} outside PANE_MIN_RANGE");
+        }
+        for s in [d.panes.project_px, d.panes.inspector_px, d.panes.output_px] {
+            assert!(inside(s, crate::PANE_SIZE_RANGE), "{s} outside PANE_SIZE_RANGE");
+        }
     }
 }
 

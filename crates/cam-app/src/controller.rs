@@ -275,7 +275,9 @@ pub struct PendingOp {
 /// A viewport object-snap: which kind of point on the geometry the cursor
 /// resolves to during an operation pick. Priority runs End → Mid → Quadrant →
 /// Nearest (Nearest is the always-catches fallback when enabled).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum SnapKind {
     /// A real corner (segment endpoint at an angle).
     End,

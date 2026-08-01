@@ -10,7 +10,13 @@
 //!   not in headless tests.
 
 mod controller;
+// Where per-user files live. One resolver, shared by the tool library and the
+// settings file — two copies of a platform convention drift silently.
+mod paths;
 mod project;
+// Not GUI-gated, deliberately: `cam-app` builds and tests without the `gui` feature
+// by default, so preferences living in `gui.rs` would be untestable.
+mod settings;
 // Not GUI-gated: the library type and the `.ocam` file union are plain serializable
 // data + config-dir I/O (only their *use* is GUI). Phase 3 (`TOOLING_PLAN.md`) lets
 // the ungated `project` module reference `ToolLibrary` for the `OcamFile` union.
@@ -23,6 +29,12 @@ pub use controller::{
     Selection, SnapHit, SnapKind,
 };
 pub use project::{OcamFile, Project};
+pub use settings::{
+    load as load_settings, load_from as load_settings_from, settings_path, LoadOutcome,
+    NewProjectPrefs, PanePrefs, Settings, SnapPrefs, ViewPrefs, GIZMO_SIZE_RANGE,
+    MARKER_SCALE_RANGE, PANE_MIN_RANGE, PANE_SIZE_RANGE, PICKBOX_RANGE, SETTINGS_VERSION,
+    SNAP_CATCH_MULTIPLE,
+};
 pub use tool_library::{families_for, ToolKindPick, ToolLibrary};
 
 /// The human-facing version string, including git provenance on a dev build.
