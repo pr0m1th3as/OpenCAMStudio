@@ -22,8 +22,7 @@ use iced::widget::{
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
 use cam_model::{
-    Axis, CarveClearing, ClearParams, CutDir, Envelope, Hand, Lead, Machine, Operation, Plunge,
-    Point3, Side, ToolKind,
+    Axis, CarveClearing, ClearParams, CutDir, Hand, Lead, Operation, Plunge, Side, ToolKind,
 };
 use cam_post::PostKind;
 
@@ -2128,21 +2127,6 @@ enum Message {
     ModifiersChanged(iced::keyboard::Modifiers),
 }
 
-fn default_machine() -> Machine {
-    Machine {
-        name: "desktop".into(),
-        rapid_rate: 2000.0,
-        max_spindle_rpm: 10_000.0,
-        max_feed: 800.0,
-        envelope: Envelope::new(
-            Point3::new(0.0, 0.0, -50.0),
-            Point3::new(300.0, 180.0, 50.0),
-        ),
-        safe_z: 5.0,
-        tool_change_pos: None,
-    }
-}
-
 /// Grab leeway (px) for the pane_grid resize dividers. Shared with the viewport
 /// so it can ignore presses in the same band (see [`in_resize_band`]).
 const PANE_RESIZE_LEEWAY: f32 = 8.0;
@@ -2188,7 +2172,7 @@ impl App {
         // layout, not their tools.
         let (settings, _) = crate::load_settings();
         let mut app = Self {
-            controller: AppController::new(default_machine()),
+            controller: AppController::new(crate::default_machine()),
             panes: initial_panes(),
             show_license: false,
             show_prefs: false,
@@ -9109,7 +9093,7 @@ mod inspector_field_tests {
 
     /// One operation of every kind, built the way the app builds them.
     fn one_of_every_kind() -> Vec<Operation> {
-        let mut app = AppController::new(default_machine());
+        let mut app = AppController::new(crate::default_machine());
         app.open_dxf(SAMPLE_DXF, "sample.dxf").expect("sample loads");
         for kind in [
             OpKind::Profile,

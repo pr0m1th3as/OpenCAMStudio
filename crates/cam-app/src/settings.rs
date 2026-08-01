@@ -50,19 +50,31 @@ use crate::SnapKind;
 /// shop-local and the machine library took over nominating a default.
 pub const SETTINGS_VERSION: u32 = 2;
 
-/// What happened when the settings file was read. Returned rather than swallowed so
-/// the caller can say something in the Output pane instead of the user wondering why
-/// their preferences reverted.
+/// What happened when the settings file was read — the public face of
+/// [`crate::config::ConfigLoad`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LoadOutcome {
-    /// No file yet. Defaults are in force and **nothing has been written** — the
-    /// file appears the first time the user changes something.
+    /// No file yet. Defaults are in force and **nothing has been written**.
     Fresh,
     /// Read, migrated if needed, and clamped.
     Loaded,
-    /// A file exists but could not be used. Defaults are in force and **the file was
-    /// left exactly as it was**; the string says why.
+    /// A file exists but could not be used. Defaults are in force, **the file was left
+    /// exactly as it was**, and a `.bak` copy sits beside it; the string says why.
     Rejected(String),
+}
+
+impl From<crate::config::ConfigLoad> for LoadOutcome {
+    fn from(c: crate::config::ConfigLoad) -> Self {
+        match c {
+            // Settings never seed, so `Seeded` cannot arise; fold it in rather than
+            // widen this enum with a variant nothing can produce.
+            crate::config::ConfigLoad::Fresh | crate::config::ConfigLoad::Seeded => {
+                LoadOutcome::Fresh
+            }
+            crate::config::ConfigLoad::Loaded => LoadOutcome::Loaded,
+            crate::config::ConfigLoad::Rejected(w) => LoadOutcome::Rejected(w),
+        }
+    }
 }
 
 /// How the tool draws and catches in the viewport, and what the panes may not shrink
@@ -391,122 +403,65 @@ impl Settings {
 }
 
 // ---------------------------------------------------------------------------
-// Disk
+// Disk — the contract lives in `crate::config`, shared with the tool and machine
+// libraries. Writing it a third time is how two copies come to disagree.
 // ---------------------------------------------------------------------------
+
+impl crate::config::ConfigFile for Settings {
+    const FILE_NAME: &'static str = "settings.json";
+    const VERSION: u32 = SETTINGS_VERSION;
+    /// Nothing appears on disk until the user changes something — unlike a library,
+    /// empty settings are perfectly usable.
+    const SEED_ON_MISSING: bool = false;
+    const WHAT: &'static str = "settings JSON";
+
+    fn stated_version(&self) -> u32 {
+        self.settings_version
+    }
+
+    fn migrate(&mut self, from: u32) {
+        Settings::migrate(self, from)
+    }
+
+    fn normalise(&mut self) {
+        self.clamp_all()
+    }
+}
 
 /// `<config-dir>/OpenCAMStudio/settings.json`.
 pub fn settings_path() -> Option<PathBuf> {
     crate::paths::config_file("settings.json")
 }
 
-/// Read the user's settings, or the defaults.
-///
-/// See [`load_from`] for the failure contract — it is the part that matters.
+/// Read the user's settings, or the defaults. See [`crate::config`] for the failure
+/// contract — it is the part that matters.
 pub fn load() -> (Settings, LoadOutcome) {
-    match settings_path() {
-        Some(p) => load_from(&p),
-        // No config dir on this machine: defaults, and nothing to write.
-        None => (Settings::default(), LoadOutcome::Fresh),
-    }
+    let (s, outcome) = crate::config::load::<Settings>();
+    (s, outcome.into())
 }
 
 /// Read settings from `path`.
-///
-/// **A file we could not read is never rewritten.** That is the whole contract, and
-/// it is deliberately *unlike* [`ToolLibrary::load`](crate::ToolLibrary::load), which
-/// falls back to defaults **and immediately saves them** — so a format change there
-/// would silently overwrite a real tool library with the stock set. Here a file that
-/// will not parse, or that a newer build wrote, is left exactly as it is: the user
-/// runs the older build with defaults, then goes back to the newer one and finds
-/// their preferences intact.
 pub fn load_from(path: &Path) -> (Settings, LoadOutcome) {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        // Missing is the ordinary first-run case, not a failure.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return (Settings::default(), LoadOutcome::Fresh)
-        }
-        Err(e) => {
-            return (
-                Settings::default(),
-                LoadOutcome::Rejected(format!("could not be read ({e})")),
-            )
-        }
-    };
-    let mut s: Settings = match serde_json::from_str(&text) {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                Settings::default(),
-                LoadOutcome::Rejected(format!("is not valid settings JSON ({e})")),
-            )
-        }
-    };
-    if s.settings_version > SETTINGS_VERSION {
-        return (
-            Settings::default(),
-            LoadOutcome::Rejected(format!(
-                "was written by a newer version (format {}, this build understands {SETTINGS_VERSION})",
-                s.settings_version
-            )),
-        );
-    }
-    s.migrate(s.settings_version);
-    s.clamp_all();
-    (s, LoadOutcome::Loaded)
+    let (s, outcome) = crate::config::load_from::<Settings>(path);
+    (s, outcome.into())
 }
 
 impl Settings {
-    /// Persist to the config directory. Best-effort: a read-only config dir simply
-    /// means changes do not survive the run, which is already the tool library's
-    /// behaviour and is not worth interrupting the user over.
+    /// Persist to the config directory (best-effort).
     pub fn save(&self) {
-        if let Some(path) = settings_path() {
-            let _ = self.save_to(&path);
-        }
+        crate::config::save(self)
     }
 
     /// Persist to `path`, creating the directory if needed.
     pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let text = serde_json::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(path, text)
+        crate::config::save_to(self, path)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    /// A scratch directory that removes itself. No `tempfile` dependency for the sake
-    /// of a handful of tests.
-    struct Scratch(PathBuf);
-
-    impl Scratch {
-        fn new() -> Self {
-            static N: AtomicU32 = AtomicU32::new(0);
-            let d = std::env::temp_dir().join(format!(
-                "ocam-settings-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&d).expect("scratch dir");
-            Self(d)
-        }
-        fn file(&self) -> PathBuf {
-            self.0.join("settings.json")
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::config::tests::Scratch;
 
     /// **The test that proves this whole module is inert until someone edits
     /// something.** These literals are what the GUI hard-codes today; a
@@ -556,12 +511,12 @@ mod tests {
 
     #[test]
     fn a_missing_file_yields_defaults_and_writes_nothing() {
-        let s = Scratch::new();
-        let (got, outcome) = load_from(&s.file());
+        let s = Scratch::new("settings");
+        let (got, outcome) = load_from(&s.file("settings.json"));
         assert_eq!(outcome, LoadOutcome::Fresh);
         assert_eq!(got, Settings::default());
         assert!(
-            !s.file().exists(),
+            !s.file("settings.json").exists(),
             "first run must not write a settings file until something is changed"
         );
     }
@@ -570,15 +525,15 @@ mod tests {
     /// them**, overwriting whatever it could not read. Here the bytes must survive.
     #[test]
     fn an_unparseable_file_is_left_exactly_as_it_was() {
-        let s = Scratch::new();
+        let s = Scratch::new("settings");
         let junk = "{ this is not json at all";
-        std::fs::write(s.file(), junk).unwrap();
+        std::fs::write(s.file("settings.json"), junk).unwrap();
 
-        let (got, outcome) = load_from(&s.file());
+        let (got, outcome) = load_from(&s.file("settings.json"));
         assert!(matches!(outcome, LoadOutcome::Rejected(_)), "{outcome:?}");
         assert_eq!(got, Settings::default());
         assert_eq!(
-            std::fs::read_to_string(s.file()).unwrap(),
+            std::fs::read_to_string(s.file("settings.json")).unwrap(),
             junk,
             "a file we could not read must never be rewritten"
         );
@@ -586,18 +541,18 @@ mod tests {
 
     #[test]
     fn a_file_from_a_newer_build_is_left_alone() {
-        let s = Scratch::new();
+        let s = Scratch::new("settings");
         let newer = format!(
             r#"{{"settings_version": {}, "view": {{"gizmo_size": 200.0}}}}"#,
             SETTINGS_VERSION + 7
         );
-        std::fs::write(s.file(), &newer).unwrap();
+        std::fs::write(s.file("settings.json"), &newer).unwrap();
 
-        let (got, outcome) = load_from(&s.file());
+        let (got, outcome) = load_from(&s.file("settings.json"));
         assert!(matches!(outcome, LoadOutcome::Rejected(_)), "{outcome:?}");
         assert_eq!(got, Settings::default(), "defaults, not the newer values");
         assert_eq!(
-            std::fs::read_to_string(s.file()).unwrap(),
+            std::fs::read_to_string(s.file("settings.json")).unwrap(),
             newer,
             "running an older build must not cost the user their preferences"
         );
@@ -605,9 +560,9 @@ mod tests {
 
     #[test]
     fn a_partial_file_fills_the_rest_from_defaults() {
-        let s = Scratch::new();
-        std::fs::write(s.file(), r#"{"view": {"tooltips": false}}"#).unwrap();
-        let (got, outcome) = load_from(&s.file());
+        let s = Scratch::new("settings");
+        std::fs::write(s.file("settings.json"), r#"{"view": {"tooltips": false}}"#).unwrap();
+        let (got, outcome) = load_from(&s.file("settings.json"));
         assert_eq!(outcome, LoadOutcome::Loaded);
         assert!(!got.view.tooltips, "the stated value wins");
         assert_eq!(got.view.gizmo_size, 110.0, "the rest are defaults");
@@ -616,36 +571,36 @@ mod tests {
 
     #[test]
     fn unknown_keys_are_ignored_on_read_and_kept_on_write() {
-        let s = Scratch::new();
+        let s = Scratch::new("settings");
         std::fs::write(
-            s.file(),
+            s.file("settings.json"),
             r#"{"settings_version": 1, "future_thing": {"a": 1},
                 "view": {"tooltips": false, "future_toggle": true}}"#,
         )
         .unwrap();
 
-        let (got, outcome) = load_from(&s.file());
+        let (got, outcome) = load_from(&s.file("settings.json"));
         assert_eq!(outcome, LoadOutcome::Loaded);
         assert!(!got.view.tooltips);
 
-        got.save_to(&s.file()).unwrap();
-        let text = std::fs::read_to_string(s.file()).unwrap();
+        got.save_to(&s.file("settings.json")).unwrap();
+        let text = std::fs::read_to_string(s.file("settings.json")).unwrap();
         assert!(text.contains("future_thing"), "top-level key dropped: {text}");
         assert!(text.contains("future_toggle"), "nested key dropped: {text}");
     }
 
     #[test]
     fn hand_edited_nonsense_is_clamped_into_range() {
-        let s = Scratch::new();
+        let s = Scratch::new("settings");
         std::fs::write(
-            s.file(),
+            s.file("settings.json"),
             r#"{"snapping": {"pickbox_px": 0.0, "marker_scale": 900.0},
                 "view": {"gizmo_size": 100000.0},
                 "panes": {"min_inspector_px": 5000.0, "min_viewport_px": -3.0}}"#,
         )
         .unwrap();
 
-        let (got, _) = load_from(&s.file());
+        let (got, _) = load_from(&s.file("settings.json"));
         assert_eq!(got.snapping.pickbox_px, PICKBOX_RANGE.0);
         assert_eq!(got.snapping.marker_scale, MARKER_SCALE_RANGE.1);
         assert_eq!(got.view.gizmo_size, GIZMO_SIZE_RANGE.1);
@@ -774,15 +729,15 @@ mod tests {
     /// available to move.
     #[test]
     fn a_v1_file_carries_its_post_across_the_rename() {
-        let s = Scratch::new();
+        let s = Scratch::new("settings");
         std::fs::write(
-            s.file(),
+            s.file("settings.json"),
             r#"{"settings_version": 1, "defaults": {"post": "Okuma"},
                 "view": {"tooltips": false}}"#,
         )
         .unwrap();
 
-        let (got, outcome) = load_from(&s.file());
+        let (got, outcome) = load_from(&s.file("settings.json"));
         assert_eq!(outcome, LoadOutcome::Loaded);
         assert_eq!(
             got.session.post,
@@ -799,7 +754,7 @@ mod tests {
 
     #[test]
     fn a_saved_file_reloads_identically() {
-        let s = Scratch::new();
+        let s = Scratch::new("settings");
         let mut written = Settings::default();
         written.view.tooltips = false;
         written.view.gizmo_size = 175.0;
@@ -808,9 +763,9 @@ mod tests {
         written.panes.project_px = 310.0;
         written.panes.min_inspector_px = 180.0;
         written.session.post = PostKind::Okuma;
-        written.save_to(&s.file()).unwrap();
+        written.save_to(&s.file("settings.json")).unwrap();
 
-        let (got, outcome) = load_from(&s.file());
+        let (got, outcome) = load_from(&s.file("settings.json"));
         assert_eq!(outcome, LoadOutcome::Loaded);
         assert_eq!(got, written);
     }

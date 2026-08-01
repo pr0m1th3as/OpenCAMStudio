@@ -8,7 +8,7 @@
 //! presentation is GUI. Keeping them here is what lets the headless tests assert
 //! that a fresh install can actually start all eight operations.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use cam_model::{Tool, ToolKind};
 
@@ -77,6 +77,42 @@ pub const LIBRARY_VERSION: u32 = 1;
 /// because the format changed — so reading it as v1 is the truth, not a guess.
 fn unversioned_is_v1() -> u32 {
     1
+}
+
+impl crate::config::ConfigFile for ToolLibrary {
+    const FILE_NAME: &'static str = "tools.json";
+    const VERSION: u32 = LIBRARY_VERSION;
+    /// A library seeds itself: an empty tool list leaves five of the eight operations
+    /// impossible to start, so first run gets the catalogue-grounded starter set.
+    const SEED_ON_MISSING: bool = true;
+    const WHAT: &'static str = "a tool library";
+
+    fn stated_version(&self) -> u32 {
+        self.library_version
+    }
+
+    fn migrate(&mut self, _from: u32) {
+        // v1 is the first version and every file predating the field *is* the v1 shape,
+        // so there is nothing to step through yet.
+        self.library_version = LIBRARY_VERSION;
+    }
+
+    fn seed() -> Self {
+        Self::defaults()
+    }
+}
+
+impl From<crate::config::ConfigLoad> for LibraryLoad {
+    fn from(c: crate::config::ConfigLoad) -> Self {
+        match c {
+            // A library always seeds, so `Fresh` cannot arise.
+            crate::config::ConfigLoad::Fresh | crate::config::ConfigLoad::Seeded => {
+                LibraryLoad::Seeded
+            }
+            crate::config::ConfigLoad::Loaded => LibraryLoad::Loaded,
+            crate::config::ConfigLoad::Rejected(w) => LibraryLoad::Rejected(w),
+        }
+    }
 }
 
 /// What happened when the library file was read. Returned rather than swallowed so
@@ -306,79 +342,30 @@ impl ToolLibrary {
 
     /// Load the library from the config directory.
     ///
-    /// See [`load_from`](Self::load_from) — the failure contract is the point.
+    /// The failure contract lives in [`crate::config`], shared with the settings and
+    /// machine files: a library that will not parse is **never overwritten**, and a
+    /// `.bak` copy is left beside it. This function used to fall back to the starter set
+    /// *and immediately save it*, so a parse failure silently destroyed a hand-built
+    /// library — the reason the contract exists at all.
     pub fn load() -> (Self, LibraryLoad) {
-        match library_path() {
-            Some(path) => Self::load_from(&path),
-            // Nowhere to persist on this machine: the starter set, and no file.
-            None => (Self::defaults(), LibraryLoad::Seeded),
-        }
+        let (lib, outcome) = crate::config::load::<ToolLibrary>();
+        (lib, outcome.into())
     }
 
     /// Load the library from `path`.
-    ///
-    /// **A file we could not read is never overwritten.** This function used to fall
-    /// back to the starter set *and immediately save it*, so a parse failure — a
-    /// future format change, a truncated write, a bad hand-edit — silently replaced a
-    /// real tool library with the stock 36, with no error and no way back. A tool
-    /// library is hand-built over time; it is some of the most expensive data the app
-    /// holds.
-    ///
-    /// So now: missing seeds and saves (that is first-run, and correct), but
-    /// unreadable, unparseable or newer-than-us leaves the file **exactly** as it is
-    /// and puts a copy beside it as `.bak`. The user meets the starter set with an
-    /// explanation, and their own file is still on disk.
-    ///
-    /// The residual case, which no load contract can prevent: once the user
-    /// *deliberately* edits a tool, saving writes over that file. Hence the `.bak`
-    /// copy and the message — the recovery has to exist before they touch anything.
     pub fn load_from(path: &Path) -> (Self, LibraryLoad) {
-        let reject = |why: String| {
-            // Preserve what we could not read, before anything can overwrite it.
-            let bak = path.with_extension("json.bak");
-            let _ = std::fs::copy(path, &bak);
-            (Self::defaults(), LibraryLoad::Rejected(why))
-        };
-        let text = match std::fs::read_to_string(path) {
-            Ok(t) => t,
-            // Missing is first run, not a failure: seed and persist.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let lib = Self::defaults();
-                let _ = lib.save_to(path);
-                return (lib, LibraryLoad::Seeded);
-            }
-            Err(e) => return reject(format!("could not be read ({e})")),
-        };
-        let lib: ToolLibrary = match serde_json::from_str(&text) {
-            Ok(l) => l,
-            Err(e) => return reject(format!("is not a valid tool library ({e})")),
-        };
-        if lib.library_version > LIBRARY_VERSION {
-            return reject(format!(
-                "was written by a newer version (format {}, this build understands \
-                 {LIBRARY_VERSION})",
-                lib.library_version
-            ));
-        }
-        (lib, LibraryLoad::Loaded)
+        let (lib, outcome) = crate::config::load_from::<ToolLibrary>(path);
+        (lib, outcome.into())
     }
 
-    /// Persist the library to the config directory (best-effort; errors are ignored
-    /// — a read-only config dir simply means changes don't persist across runs).
+    /// Persist the library to the config directory (best-effort).
     pub fn save(&self) {
-        if let Some(path) = library_path() {
-            let _ = self.save_to(&path);
-        }
+        crate::config::save(self)
     }
 
     /// Persist to `path`, creating the directory if needed.
     pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let text = serde_json::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(path, text)
+        crate::config::save_to(self, path)
     }
 
     /// The library tool to seed a newly-created operation of `kind` with — a
@@ -547,11 +534,6 @@ impl ToolLibrary {
     }
 }
 
-/// `<config-dir>/OpenCAMStudio/tools.json`, or `None` if no config dir is known.
-/// The platform convention lives in [`crate::paths`], shared with the settings file.
-fn library_path() -> Option<PathBuf> {
-    crate::paths::config_file("tools.json")
-}
 
 /// The tool-geometry class as a plain discriminant, for the inspector picker
 /// (a friendlier face on the data-carrying [`ToolKind`], mirroring `PlungeKind`).
@@ -658,34 +640,7 @@ impl std::fmt::Display for ToolKindPick {
 #[cfg(test)]
 mod library_file_tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    struct Scratch(PathBuf);
-
-    impl Scratch {
-        fn new() -> Self {
-            static N: AtomicU32 = AtomicU32::new(0);
-            let d = std::env::temp_dir().join(format!(
-                "ocam-library-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&d).expect("scratch dir");
-            Self(d)
-        }
-        fn file(&self) -> PathBuf {
-            self.0.join("tools.json")
-        }
-        fn bak(&self) -> PathBuf {
-            self.0.join("tools.json.bak")
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::config::tests::Scratch;
 
     /// **The hazard this fix exists for.** The old `load()` fell back to the starter
     /// set *and immediately saved it*, so a library that failed to parse was replaced
@@ -693,20 +648,20 @@ mod library_file_tests {
     /// among the most expensive data the app holds.
     #[test]
     fn an_unreadable_library_is_never_overwritten_and_is_backed_up() {
-        let s = Scratch::new();
+        let s = Scratch::new("library");
         let precious = r#"{"tools": [ this is corrupt but it is THEIRS"#;
-        std::fs::write(s.file(), precious).unwrap();
+        std::fs::write(s.file("tools.json"), precious).unwrap();
 
-        let (lib, outcome) = ToolLibrary::load_from(&s.file());
+        let (lib, outcome) = ToolLibrary::load_from(&s.file("tools.json"));
         assert!(matches!(outcome, LibraryLoad::Rejected(_)), "{outcome:?}");
         assert_eq!(lib, ToolLibrary::defaults(), "the starter set is in force");
         assert_eq!(
-            std::fs::read_to_string(s.file()).unwrap(),
+            std::fs::read_to_string(s.file("tools.json")).unwrap(),
             precious,
             "the user's library must survive a failed load"
         );
         assert_eq!(
-            std::fs::read_to_string(s.bak()).unwrap(),
+            std::fs::read_to_string(s.file("tools.json.bak")).unwrap(),
             precious,
             "and a copy must exist before anything can overwrite it"
         );
@@ -714,29 +669,29 @@ mod library_file_tests {
 
     #[test]
     fn a_library_from_a_newer_build_is_refused_not_read_leniently() {
-        let s = Scratch::new();
+        let s = Scratch::new("library");
         let newer = format!(r#"{{"library_version": {}, "tools": []}}"#, LIBRARY_VERSION + 3);
-        std::fs::write(s.file(), &newer).unwrap();
+        std::fs::write(s.file("tools.json"), &newer).unwrap();
 
-        let (lib, outcome) = ToolLibrary::load_from(&s.file());
+        let (lib, outcome) = ToolLibrary::load_from(&s.file("tools.json"));
         assert!(matches!(outcome, LibraryLoad::Rejected(_)), "{outcome:?}");
         assert_eq!(lib, ToolLibrary::defaults());
-        assert_eq!(std::fs::read_to_string(s.file()).unwrap(), newer);
+        assert_eq!(std::fs::read_to_string(s.file("tools.json")).unwrap(), newer);
         // An empty `tools` list read leniently would have looked like "you have no
         // tools" — indistinguishable from a real empty library.
     }
 
     #[test]
     fn a_missing_library_seeds_the_starter_set_and_persists_it() {
-        let s = Scratch::new();
-        let (lib, outcome) = ToolLibrary::load_from(&s.file());
+        let s = Scratch::new("library");
+        let (lib, outcome) = ToolLibrary::load_from(&s.file("tools.json"));
         assert_eq!(outcome, LibraryLoad::Seeded);
         assert_eq!(lib, ToolLibrary::defaults());
-        assert!(s.file().exists(), "first run must seed the library");
-        assert!(!s.bak().exists(), "a first run has nothing to back up");
+        assert!(s.file("tools.json").exists(), "first run must seed the library");
+        assert!(!s.file("tools.json.bak").exists(), "a first run has nothing to back up");
 
         // And it reloads as itself.
-        let (again, outcome) = ToolLibrary::load_from(&s.file());
+        let (again, outcome) = ToolLibrary::load_from(&s.file("tools.json"));
         assert_eq!(outcome, LibraryLoad::Loaded);
         assert_eq!(again, lib);
     }
@@ -746,28 +701,28 @@ mod library_file_tests {
     /// self-inflicted data loss on upgrade.
     #[test]
     fn a_library_written_before_the_version_field_loads_as_v1() {
-        let s = Scratch::new();
+        let s = Scratch::new("library");
         let old = ToolLibrary::defaults();
         let mut value = serde_json::to_value(&old).unwrap();
         value.as_object_mut().unwrap().remove("library_version");
         assert!(value.get("library_version").is_none());
-        std::fs::write(s.file(), serde_json::to_string_pretty(&value).unwrap()).unwrap();
+        std::fs::write(s.file("tools.json"), serde_json::to_string_pretty(&value).unwrap()).unwrap();
 
-        let (lib, outcome) = ToolLibrary::load_from(&s.file());
+        let (lib, outcome) = ToolLibrary::load_from(&s.file("tools.json"));
         assert_eq!(outcome, LibraryLoad::Loaded);
         assert_eq!(lib.library_version, 1);
         assert_eq!(lib.tools, old.tools, "the tools must survive untouched");
-        assert!(!s.bak().exists(), "an unversioned file is valid, not rejected");
+        assert!(!s.file("tools.json.bak").exists(), "an unversioned file is valid, not rejected");
     }
 
     #[test]
     fn a_saved_library_round_trips_with_its_version() {
-        let s = Scratch::new();
+        let s = Scratch::new("library");
         let lib = ToolLibrary::defaults();
-        lib.save_to(&s.file()).unwrap();
-        let text = std::fs::read_to_string(s.file()).unwrap();
+        lib.save_to(&s.file("tools.json")).unwrap();
+        let text = std::fs::read_to_string(s.file("tools.json")).unwrap();
         assert!(text.contains("library_version"), "the version must be written");
-        let (back, outcome) = ToolLibrary::load_from(&s.file());
+        let (back, outcome) = ToolLibrary::load_from(&s.file("tools.json"));
         assert_eq!(outcome, LibraryLoad::Loaded);
         assert_eq!(back, lib);
     }

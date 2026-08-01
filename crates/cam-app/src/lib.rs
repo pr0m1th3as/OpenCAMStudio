@@ -9,9 +9,11 @@
 //!   needs a windowing/graphics stack, so it is compiled and run on the desktop,
 //!   not in headless tests.
 
+mod config;
 mod controller;
 // Where per-user files live. One resolver, shared by the tool library and the
 // settings file — two copies of a platform convention drift silently.
+mod machines;
 mod paths;
 mod project;
 // Not GUI-gated, deliberately: `cam-app` builds and tests without the `gui` feature
@@ -28,6 +30,8 @@ pub use controller::{
     JobParams, LoopPart, LoopRef, OpKind, PendingOp, PickResult, ProjectError, RunOutcome,
     Selection, SnapHit, SnapKind,
 };
+pub use machines::{default_machine, load as load_machines, load_from as load_machines_from,
+    MachineLibrary, MachineLoad, MACHINES_VERSION};
 pub use project::{OcamFile, Project};
 pub use settings::{
     load as load_settings, load_from as load_settings_from, settings_path, LoadOutcome,
