@@ -151,6 +151,34 @@ right-to-left; a collapsed group opens as a popup under its button).
 8. Select the operation and edit its fields / Side / lead / plunge in the Inspector;
    **Apply** to recompute. The **tool is not editable here** — use Reinitialize.
 
+### Adaptive stepover — and why it is not a hard maximum
+
+A Pocket, and an outside Profile's roughing, can clear the bulk **adaptively**: instead
+of concentric rings at a fixed spacing, the tool advances a front that keeps its radial
+width of cut roughly constant. Set **Adaptive stepover** above `0` to turn it on (`0` is
+plain concentric clearing); it is **climb-only**, and requesting a lead-in/out sends the
+whole clear back to concentric.
+
+The number you type is the **straight-wall stepover** — the width the tool takes where
+the path runs straight. It is *not* a ceiling the toolpath will never exceed, and the
+reason is geometry rather than a shortcoming of the generator:
+
+- Where the path curves tightly, the swept disc overlaps the uncut region by more than
+  it does on a straight run. The floor is
+  `a_e(ρ) = e·(ρ + r)/ρ − e²/(2ρ)` for a path of radius `ρ` with tool radius `r` and
+  requested stepover `e` — which exceeds `e` at **every** finite radius, and reaches
+  about **1.4·e** on the tight loops near a pocket's centre.
+- No spiral clearer can beat that bound; it is a property of the shape, not of the
+  strategy. Asking for a smaller stepover lowers the floor proportionally but never
+  removes it.
+
+What adaptive clearing actually buys you is the elimination of the **full-diameter
+slot** — the pass that engages the tool on both flanks at once, which is the condition
+that breaks cutters. Those are gone. The residual rise on tight loops is a **feed-rate**
+matter: if the tool complains in the corners, slow the feed rather than chasing the
+stepover down. (Automatic per-loop feed compensation is not implemented; it is the
+natural next step and is logged.)
+
 ### Engraving
 
 Engraving cuts a V-section groove with the tool centred **on** the path — no side, no

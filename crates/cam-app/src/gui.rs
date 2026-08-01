@@ -903,8 +903,9 @@ enum Field {
     Overlap,
     /// Face: overshoot past the stock edge before the turnaround (mm).
     FaceOvershoot,
-    /// Clearing engagement cap: max radial width of cut (mm); 0 disables adaptive
-    /// clearing (pocket, profile outside-roughing).
+    /// Adaptive-clearing stepover: the radial width of cut along a *straight* wall
+    /// (mm); 0 disables adaptive clearing (pocket, profile outside-roughing). Not a
+    /// hard ceiling — see the tooltip on the geometric floor.
     Engagement,
     /// Plunge parameter A: ramp/zig-zag angle, or helix radius.
     PlungeA,
@@ -916,7 +917,8 @@ enum Field {
     ClearStepdown,
     /// Carve clearing pass: ring overlap as a percentage of the tool diameter.
     ClearOverlap,
-    /// Carve clearing pass: engagement cap (mm); 0 = plain concentric.
+    /// Carve clearing pass: adaptive stepover along a straight wall (mm); 0 = plain
+    /// concentric.
     ClearEngagement,
     /// Carve clearing pass: cutting feed (mm/min); 0 inherits the carve's.
     ClearFeed,
@@ -1000,11 +1002,11 @@ impl Field {
             Field::FaceStartOffset => "Start offset (mm)",
             Field::Overlap => "Overlap (%)",
             Field::FaceOvershoot => "Overshoot (mm)",
-            Field::Engagement => "Engagement (mm, 0=off)",
+            Field::Engagement => "Adaptive stepover (mm, 0=off)",
             Field::RingStep => "Ring step (mm, 0=auto)",
             Field::ClearStepdown => "Clear stepdown (mm, 0=full)",
             Field::ClearOverlap => "Clear overlap (%)",
-            Field::ClearEngagement => "Clear engagement (mm, 0=off)",
+            Field::ClearEngagement => "Clear adaptive stepover (0=off)",
             Field::ClearFeed => "Clear feed (mm/min, 0=same)",
             Field::ClearPlungeFeed => "Clear plunge feed (0=same)",
             Field::ClearLeadOverlap => "Clear lead overlap (mm)",
@@ -1250,9 +1252,15 @@ impl Field {
                  so the cutter fully clears the edge."
             }
             Field::Engagement => {
-                "Adaptive-clearing engagement cap: the largest radial width of cut the \
-                 tool takes at once (mm). Keeps tool load constant for high-speed \
-                 clearing. 0 = plain concentric clearing (off). Climb only."
+                "Adaptive-clearing stepover: the radial width of cut taken along a \
+                 STRAIGHT wall (mm). Keeps tool load roughly constant for high-speed \
+                 clearing. 0 = plain concentric clearing (off). Climb only.\n\n\
+                 It is not a hard maximum. Where the path curves tightly — inner \
+                 corners, the loops near a pocket's centre — the geometry forces more \
+                 than you ask for, up to roughly 1.4x this value, and no spiral clearer \
+                 can do better. What adaptive clearing removes is the full-diameter \
+                 SLOT, which is the tool-breaking hazard; the residual rise on tight \
+                 loops is a feed-rate matter, so slow the feed if the tool complains."
             }
             Field::PlungeA => {
                 "First plunge parameter: the ramp/zig-zag angle in degrees, or the helix \
@@ -1284,9 +1292,10 @@ impl Field {
                  clearing tool's diameter. Higher = smoother floor, more passes."
             }
             Field::ClearEngagement => {
-                "Adaptive-clearing engagement cap for the clearing pass: the largest \
-                 radial width of cut it takes at once (mm). 0 = plain concentric \
-                 clearing. Climb only."
+                "Adaptive-clearing stepover for the clearing pass: the radial width of \
+                 cut it takes along a STRAIGHT wall (mm). 0 = plain concentric \
+                 clearing. Climb only. As above, tight loops geometrically exceed it by \
+                 up to about 1.4x — that is a feed-rate matter, not a slot."
             }
             Field::ClearFeed => {
                 "Cutting feed for the clearing pass (mm/min). 0 uses the carve's own \
