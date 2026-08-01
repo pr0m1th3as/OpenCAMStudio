@@ -94,7 +94,7 @@ Across the top is a tabbed **icon ribbon**; below it are three docked panes —
   in and needs no button of its own. It sits beside Tooling because both are
   *installation* scope — neither a machine nor the tool library belongs to a project, and
   a machine deliberately **cannot** be set by one.
-- **View** — Show stock · Reset view · Cube on/off · Origin · Tips, then the
+- **View** — Show stock · Reset view · Cube on/off · Origin · **Envelope** · Tips, then the
   orientation-cube **size slider**, then **Panes** — the pane show/hide checkboxes
   (the Tool Library is listed as *Tools* to keep the band narrow).
 
@@ -447,6 +447,15 @@ ramp runs forward along the path and retraces it at depth instead. A closed cont
   line. **Output** shows toolpath diagnostics (e.g. a tool too large)
   *and* material-removal **collisions** from the simulation (e.g. a rapid plowing
   through remaining stock, which a green backplot would hide).
+- **View → Envelope** draws the active machine's **travel** as a dashed violet box
+  around the job, turning **red** when the job does not fit. This is the same check the
+  export makes, shown *before* the refusal instead of after.
+  **It is a size comparison, not a position.** The export checks the program's *span*
+  against travel on each axis, deliberately — your work offset puts the datum somewhere
+  inside travel, so a program in work coordinates only has to fit by size, and
+  OpenCAMStudio cannot know where G54 sits on your machine. The box is therefore centred
+  on the job rather than drawn at machine coordinates, which would be a fiction. What it
+  tells you is whether the job fits, and how much room is left.
 - **View → Show stock** overlays the *simulated* stock surface under the backplot.
   The simulation grid **refines to the narrowest cut in the program**, so a
   sub-millimetre engraved groove is actually visible rather than falling between
@@ -471,6 +480,10 @@ things worth eyeballing:
   defaults** gets you back in one click without a confirmation step you might not be
   able to reach. Check the pane rows name their axis — **Output (height)**, the rest
   **(width)**. Drag **Origin marker size** and watch the datum cross grow.
+- **Envelope:** turn it on (View → Envelope) and confirm the dashed box frames the job.
+  Switch to a machine with much smaller travel — it should turn **red** and the toolpath
+  should visibly stand outside it. Confirm the camera does **not** re-frame when you turn
+  it on: the part must not shrink because a large machine is selected.
 - **Machine and control stay yours.** Add a second machine (Machine ribbon → **Add**),
   give it a different travel and a different post, and switch between them with the
   **Active** row — the post must follow the machine. Restart and confirm you came back on

@@ -108,6 +108,8 @@ pub struct ViewPrefs {
     pub show_stock: bool,
     pub show_gizmo: bool,
     pub show_origin: bool,
+    /// Draw the active machine's travel as a box around the job.
+    pub show_envelope: bool,
     pub tooltips: bool,
     /// Orientation-cube size, logical px.
     pub gizmo_size: f32,
@@ -218,6 +220,9 @@ impl Default for ViewPrefs {
             show_stock: false,
             show_gizmo: true,
             show_origin: true,
+            // Off by default: it is a check you reach for, not something to look past
+            // on every job.
+            show_envelope: false,
             tooltips: true,
             gizmo_size: 110.0,
             origin_marker_scale: 1.0,
@@ -481,6 +486,7 @@ mod tests {
         assert!(!d.view.show_stock);
         assert!(d.view.show_gizmo);
         assert!(d.view.show_origin);
+        assert!(!d.view.show_envelope);
         assert!(d.view.tooltips);
         assert_eq!(d.view.gizmo_size, 110.0);
         assert_eq!(d.view.origin_marker_scale, 1.0, "the shipped marker size is 1x");

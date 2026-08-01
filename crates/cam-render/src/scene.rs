@@ -21,6 +21,14 @@ pub const PLUNGE: Color = [0.90, 0.35, 0.25, 1.0];
 /// cut/plunge pair.
 pub const TRAVERSE: Color = [0.30, 0.60, 0.95, 1.0];
 
+/// Machine-travel envelope. A cool violet, apart from every move colour and from the
+/// magenta datum marker, and legible under red-green deficiency.
+pub const ENVELOPE: Color = [0.62, 0.55, 0.90, 1.0];
+/// The envelope when the job does **not** fit — the same red the plunge uses, because it
+/// is the same class of message. Colour is the reinforcement, not the signal: the signal
+/// is the toolpath visibly outside the box.
+pub const ENVELOPE_OVER: Color = [0.90, 0.35, 0.25, 1.0];
+
 /// Chord tolerance (mm) used when flattening backplot arcs for display.
 const ARC_TOL: f64 = 0.02;
 
@@ -379,6 +387,51 @@ impl Scene {
         out
     }
 
+    /// Draw the machine's **travel** as a dashed wireframe box around `about`.
+    ///
+    /// **It is a size comparison, not a position.** `check_travel` compares the
+    /// program's *span* against the machine's travel per axis — deliberately, because
+    /// the operator's work offset places the datum somewhere inside travel and a program
+    /// in work coordinates therefore only has to fit by size. We do not know where G54
+    /// sits on the machine, so drawing this box at "machine coordinates" would be a
+    /// fiction. It is centred on the job instead, which is exactly the comparison the
+    /// check makes.
+    ///
+    /// Dashed, because it is a reference frame rather than geometry — the same
+    /// distinction the tool-change traverse uses.
+    pub fn add_envelope(&mut self, travel: [f32; 3], about: ([f32; 3], [f32; 3]), color: Color) {
+        let (lo, hi) = about;
+        let c = [
+            0.5 * (lo[0] + hi[0]),
+            0.5 * (lo[1] + hi[1]),
+            0.5 * (lo[2] + hi[2]),
+        ];
+        let h = [travel[0] * 0.5, travel[1] * 0.5, travel[2] * 0.5];
+        let (x0, x1) = (c[0] - h[0], c[0] + h[0]);
+        let (y0, y1) = (c[1] - h[1], c[1] + h[1]);
+        let (z0, z1) = (c[2] - h[2], c[2] + h[2]);
+
+        // Four verticals and the two rings, rather than one long strip: a wireframe box
+        // has no Eulerian path, and faking one would double back over edges and show as
+        // uneven dashes.
+        for (a, b) in [
+            ([x0, y0, z0], [x1, y0, z0]),
+            ([x1, y0, z0], [x1, y1, z0]),
+            ([x1, y1, z0], [x0, y1, z0]),
+            ([x0, y1, z0], [x0, y0, z0]),
+            ([x0, y0, z1], [x1, y0, z1]),
+            ([x1, y0, z1], [x1, y1, z1]),
+            ([x1, y1, z1], [x0, y1, z1]),
+            ([x0, y1, z1], [x0, y0, z1]),
+            ([x0, y0, z0], [x0, y0, z1]),
+            ([x1, y0, z0], [x1, y0, z1]),
+            ([x1, y1, z0], [x1, y1, z1]),
+            ([x0, y1, z0], [x0, y1, z1]),
+        ] {
+            self.add_strip_styled(vec![a, b], color, None, true);
+        }
+    }
+
     /// Axis-aligned bounds of everything in the scene, or `None` if empty.
     pub fn bounds(&self) -> Option<([f32; 3], [f32; 3])> {
         let mut min = [f32::MAX; 3];
@@ -663,6 +716,42 @@ mod tests {
                 && (s.points[0][0] - s.points[1][0]).abs() > 1e-6
         });
         assert!(!horizontal, "a reorientation's cross must stay broken: {:?}", scene.strips);
+    }
+
+    /// The envelope is a **size** comparison centred on the job, not a claim about where
+    /// the machine's travel actually sits — `check_travel` compares spans because the
+    /// work offset places the datum somewhere inside travel and we cannot know where.
+    #[test]
+    fn the_envelope_is_a_travel_sized_box_centred_on_the_job() {
+        let mut scene = Scene::new();
+        // A job spanning 20 mm in X, centred on x = 30.
+        let about = ([20.0, 0.0, -5.0], [40.0, 10.0, 0.0]);
+        scene.add_envelope([100.0, 60.0, 50.0], about, ENVELOPE);
+
+        assert_eq!(scene.strips.len(), 12, "twelve edges of a box");
+        assert!(scene.strips.iter().all(|s| s.dashed), "a reference frame, not geometry");
+        assert!(scene.strips.iter().all(|s| s.op.is_none()), "belongs to no operation");
+
+        let (lo, hi) = scene.bounds().unwrap();
+        // Travel-sized…
+        assert!((hi[0] - lo[0] - 100.0).abs() < 1e-4);
+        assert!((hi[1] - lo[1] - 60.0).abs() < 1e-4);
+        assert!((hi[2] - lo[2] - 50.0).abs() < 1e-4);
+        // …and centred on the job, so the comparison reads directly.
+        assert!((0.5 * (lo[0] + hi[0]) - 30.0).abs() < 1e-4);
+        assert!((0.5 * (lo[1] + hi[1]) - 5.0).abs() < 1e-4);
+        assert!((0.5 * (lo[2] + hi[2]) + 2.5).abs() < 1e-4);
+    }
+
+    /// A job wider than travel must visibly poke out — that *is* the signal, with colour
+    /// only reinforcing it.
+    #[test]
+    fn a_job_wider_than_travel_extends_past_the_box() {
+        let mut scene = Scene::new();
+        let about = ([0.0, 0.0, 0.0], [200.0, 10.0, 5.0]);
+        scene.add_envelope([100.0, 60.0, 50.0], about, ENVELOPE_OVER);
+        let (lo, hi) = scene.bounds().unwrap();
+        assert!(lo[0] > 0.0 && hi[0] < 200.0, "the 200 mm job outruns the 100 mm box");
     }
 
     /// The two tests above pick their periods by hand, and both happen to be periods

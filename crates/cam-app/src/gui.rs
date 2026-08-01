@@ -261,7 +261,7 @@ fn icon_svg(icon: Icon, size: f32) -> Element<'static, Message> {
         .into()
 }
 use cam_cldata::{Program, Step};
-use cam_render::{MeshVertex, OrbitCamera, Scene, Vertex, PART};
+use cam_render::{MeshVertex, OrbitCamera, Scene, Vertex, ENVELOPE, ENVELOPE_OVER, PART};
 use cam_toolpath::{CancelToken, Severity};
 
 use crate::{
@@ -1639,6 +1639,8 @@ struct App {
     origin_first: Option<[f64; 3]>,
     /// Whether the workpiece-origin datum marker is drawn (View toggle).
     show_origin: bool,
+    /// Draw the active machine's travel as a box around the job.
+    show_envelope: bool,
     status: String,
 }
 
@@ -2009,6 +2011,8 @@ enum Message {
     ToggleSetOrigin2pt,
     /// Show or hide the workpiece-origin datum marker (View tab).
     ToggleShowOrigin,
+    /// Show / hide the machine-travel envelope around the job.
+    ToggleEnvelope,
     /// A viewport click while setting the origin (either mode): world `(x,y)` +
     /// aperture, resolved to a snapped or free point.
     OriginPointPicked([f32; 2], f32),
@@ -2248,6 +2252,7 @@ impl App {
             setting_origin_2pt: false,
             origin_first: None,
             show_origin: settings.view.show_origin,
+            show_envelope: settings.view.show_envelope,
             status: "Open the sample part to begin.".to_string(),
             // Last: every field above reads from it.
             settings,
@@ -2549,6 +2554,19 @@ impl App {
             Message::ToggleShowOrigin => {
                 self.show_origin = !self.show_origin;
                 self.remember();
+            }
+            Message::ToggleEnvelope => {
+                self.show_envelope = !self.show_envelope;
+                self.remember();
+                self.status = if self.show_envelope {
+                    format!(
+                        "Showing {}'s travel around the job — a size check, not its \
+                         position on the machine.",
+                        self.controller.machine().name
+                    )
+                } else {
+                    "Hiding the machine envelope.".to_string()
+                };
             }
             Message::ToggleSetOrigin => {
                 let on = !self.setting_origin;
@@ -3624,6 +3642,7 @@ impl App {
                 show_stock: self.show_stock,
                 show_gizmo: self.show_gizmo,
                 show_origin: self.show_origin,
+                show_envelope: self.show_envelope,
                 tooltips: self.tooltips,
                 gizmo_size: self.gizmo_size,
                 // Not mirrored on `App` — the panel writes it straight into `settings`,
@@ -5323,6 +5342,12 @@ impl App {
                         Message::ToggleShowOrigin,
                     ),
                     toggle_cmd(
+                        Icon::Machine,
+                        "Envelope",
+                        self.show_envelope,
+                        Message::ToggleEnvelope,
+                    ),
+                    toggle_cmd(
                         Icon::Info,
                         "Tips",
                         self.tooltips,
@@ -5508,6 +5533,10 @@ impl App {
                         self.in_origin_pick(),
                         self.show_origin,
                         self.origin_first,
+                        self.show_envelope.then(|| {
+                            let (x, y, z) = self.controller.machine().envelope.extent();
+                            [x as f32, y as f32, z as f32]
+                        }),
                     ))
                     .width(Length::Fill)
                     .height(Length::Fill),
@@ -8093,6 +8122,8 @@ impl Viewport {
         set_origin: bool,
         show_origin: bool,
         origin_first: Option<[f64; 3]>,
+        // The active machine's travel per axis, when the envelope is shown.
+        envelope: Option<[f32; 3]>,
     ) -> Self {
         let picking = controller.pending_op().is_some();
         let pick_z = controller.document().setup.heights.top_of_stock as f32;
@@ -8169,6 +8200,22 @@ impl Viewport {
                 })
                 .unwrap_or(3.0);
             add_origin_marker(&mut scene, first, pick_z, r);
+        }
+        // The machine's travel, around the job. Added *after* `bounds` was captured, so a
+        // large machine cannot re-frame the camera and shrink the part — the box is
+        // context, not content.
+        //
+        // Red when the job does not fit: `check_travel` compares the program's span
+        // against travel per axis, so this shows the same comparison before the export
+        // refuses it rather than after.
+        if let Some(travel) = envelope {
+            if let Some((lo, hi)) = bounds {
+                let over = (hi[0] - lo[0]) > travel[0]
+                    || (hi[1] - lo[1]) > travel[1]
+                    || (hi[2] - lo[2]) > travel[2];
+                let colour = if over { ENVELOPE_OVER } else { ENVELOPE };
+                scene.add_envelope(travel, (lo, hi), colour);
+            }
         }
         // The object-snap marker under the cursor (op pick *or* set-origin).
         if let Some((hit, aperture)) = snap {
