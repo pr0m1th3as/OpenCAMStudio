@@ -2233,6 +2233,10 @@ impl App {
             // Last: every field above reads from it.
             settings,
         };
+        // The post is session state — never read from a project file — so the "default
+        // post for new projects" preference is what a session *starts* on, not only what
+        // File ▸ New produces.
+        app.controller.set_post_kind(app.settings.defaults.post);
         if let crate::LibraryLoad::Rejected(why) = &library_load {
             app.status = format!(
                 "Tool library {why}. Using the starter tools; your file is untouched \

@@ -42,6 +42,12 @@ contractually signals. So the number's only job is to encode *how much changed*.
     added the machine and post to the project wrapper and bumped even though the
     document did not change. A format change that leaves the version alone is the one
     that bites later.
+  - **A change of *meaning* need not bump.** v11 both recorded the machine/post and
+    *adopted* them on open; 2026-08-01 they became provenance only — recorded, reported,
+    never applied — because a machine is shop-local and its envelope is what gates an
+    export. The bytes on disk are unchanged, so the version is too. The rule is that the
+    version tracks what a reader must **parse**, not what it chooses to **do** with what
+    it parsed; the latter belongs in the code's own documentation and its tests.
   - Retiring old versions (raising `OLDEST_SUPPORTED`) is a **breaking change** for the
     files it drops, and belongs in a MAJOR bump with a release note naming them.
 - **The manifest bumps at release time, and git provenance covers the gap.** The

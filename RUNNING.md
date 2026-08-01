@@ -289,11 +289,26 @@ Application Support` on macOS). Seeded with a few default end mills on first run
 A project **embeds copies** of the tools it uses, so `.ocam` files stay
 self-contained; the library is the template you pick from.
 
-A saved project also records **the machine it was built for and the post it exports
-through**, so reopening a job restores both rather than leaving it pointed at whatever
-was last selected — which matters, because the machine's envelope and its feed/spindle
-ceilings are what an export is checked against. A project saved before this existed
-records neither, and opening one leaves your current machine and post alone.
+A saved project records **the machine it was built for and the post it exports
+through** — but only as *provenance*. **Opening a project never changes your machine or
+your post.**
+
+That is deliberate and it is a safety rule. A machine is local to your shop; a project
+file travels. The machine's envelope is exactly what an export is checked against, so a
+file that could set your machine could disarm that check: a job authored on a 1000 mm
+router, opened by someone with a 300 mm mill, would otherwise be verified against the
+*sender's* travel and pass. Which control you cut on is local for the same reason.
+
+What the file recorded is still worth knowing, so opening a job built for something else
+says so:
+
+> ⚠ This job was built for "Big Router" (1000×600×200 mm); yours is "Small Mill"
+> (300×200×100 mm), and built for the Okuma post; yours is grbl. Your own machine and
+> post are unchanged — check it fits before cutting.
+
+Nothing is said when they match. One consequence worth expecting rather than reporting:
+the tool-change height falls back to the machine's maximum Z, so opening a shared job on
+a different machine legitimately changes the height of its lifts.
 
 - **Tool Library pane** (replaces Project while the Tooling tab is active): every
   library tool, in two views — **Ordered** (by number, `T1: ⌀6 …`) or **Grouped**

@@ -152,8 +152,11 @@ impl From<PostError> for ExportError {
 /// The application state and operations, GUI-agnostic.
 pub struct AppController {
     machine: Machine,
-    /// The selected post/controller dialect for export.
+    /// The selected post/controller dialect for export. **Session state, never read
+    /// from a project file** — see [`open_project`](Self::open_project).
     post_kind: PostKind,
+    /// What the last opened project said it was built for. Reported, not applied.
+    provenance: Provenance,
     regions: Vec<Polygon>,
     /// Open imported chains the importer could not close — engravable strokes.
     open_paths: Vec<Polyline>,
@@ -371,6 +374,48 @@ impl From<crate::project::LoadError> for ProjectError {
 
 impl std::error::Error for ProjectError {}
 
+/// What a project recorded about the machine and post it was built for.
+///
+/// **Provenance only.** Opening a project never adopts either: a machine is shop-local,
+/// and the envelope is what gates an export, so a file that could change your machine
+/// could disarm that gate. Kept so the app can *say* what a job was authored for, which
+/// is genuinely useful when a file arrives from someone else's shop.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Provenance {
+    /// The machine the project was saved with (schema v11+), if it recorded one.
+    pub machine: Option<Machine>,
+    /// The post it was saved with, if it recorded one.
+    pub post: Option<PostKind>,
+}
+
+impl Provenance {
+    /// A one-line note for the operator when the file was built for something other
+    /// than what is selected now — `None` when it matches, or said nothing.
+    ///
+    /// The machine half names the travel, because that is the number that decides
+    /// whether the job can be cut here at all.
+    pub fn mismatch_note(&self, machine: &Machine, post: PostKind) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(m) = &self.machine {
+            if m.envelope != machine.envelope || m.name != machine.name {
+                let (bx, by, bz) = m.envelope.extent();
+                let (cx, cy, cz) = machine.envelope.extent();
+                parts.push(format!(
+                    "built for \"{}\" ({bx:.0}×{by:.0}×{bz:.0} mm); yours is \"{}\" \
+                     ({cx:.0}×{cy:.0}×{cz:.0} mm)",
+                    m.name, machine.name
+                ));
+            }
+        }
+        if let Some(p) = self.post {
+            if p != post {
+                parts.push(format!("built for the {p} post; yours is {post}"));
+            }
+        }
+        (!parts.is_empty()).then(|| format!("This job was {}.", parts.join(", and ")))
+    }
+}
+
 /// Why exporting G-code to a file failed.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ExportToError {
@@ -399,6 +444,7 @@ impl AppController {
         Self {
             machine,
             post_kind: PostKind::default(),
+            provenance: Provenance::default(),
             regions: Vec::new(),
             open_paths: Vec::new(),
             document: History::new(empty_document(&defaults)),
@@ -604,6 +650,7 @@ impl AppController {
 
     /// Reset to a fresh, empty "Untitled" project.
     pub fn new_project(&mut self) {
+        self.provenance = Provenance::default();
         self.regions.clear();
         self.open_paths.clear();
         self.document = History::new(empty_document(&self.defaults));
@@ -629,6 +676,15 @@ impl AppController {
     pub fn new_project_with_post(&mut self, post: PostKind) {
         self.new_project();
         self.set_post_kind(post);
+    }
+
+    /// What the most recently opened project recorded about the machine and post it was
+    /// built for — **provenance, never adopted**.
+    ///
+    /// Empty for a project that recorded neither (anything before schema v11) and after
+    /// a fresh project.
+    pub fn provenance(&self) -> &Provenance {
+        &self.provenance
     }
 
     /// The `.ocam` file this project was last saved to / opened from, if any.
@@ -675,16 +731,28 @@ impl AppController {
         self.open_paths = project.open_paths;
         self.defaults = project.defaults;
         self.source_name = project.source_name;
-        // Adopt what the file states and only what it states (v11). A pre-v11 project
-        // carries neither, and keeping the session's own machine and post is the right
-        // reading of that silence — the alternative would reset a configured machine to
-        // a default every time an older job was opened.
-        if let Some(machine) = project.machine {
-            self.machine = machine;
-        }
-        if let Some(post) = project.post {
-            self.post_kind = post;
-        }
+        // **Neither is adopted. Both are provenance.** (Andreas, 2026-08-01: "machine +
+        // control local, ocam file as provenance".)
+        //
+        // A machine is shop-local. A project regularly travels between users and shops,
+        // and the envelope is what *gates* an export — so taking the machine from the
+        // file disarms the one check that stops a job being cut on a machine it does not
+        // fit. Concretely: a job authored on a 1000 mm router, emailed to someone with a
+        // 300 mm mill, used to replace their machine with the sender's on open, after
+        // which `check_travel` compared the program against the *sender's* travel and
+        // passed. Silently, and it overwrote their configured machine as a side effect.
+        //
+        // The post goes the same way for the same reason: which control you are cutting
+        // on is a property of your shop, not of the file. Its failure mode is louder —
+        // foreign words, an alarming control — but the rule is easier to hold when it is
+        // one rule.
+        //
+        // What the file states is still worth *knowing*, so it is kept and offered to
+        // the caller to report; see [`provenance`](Self::provenance).
+        self.provenance = Provenance {
+            machine: project.machine,
+            post: project.post,
+        };
         self.document = History::new(project.document);
         self.excluded.clear();
         self.disabled_origins.clear();
@@ -3551,11 +3619,12 @@ mod tests {
     }
 
     #[test]
-    fn a_project_reopens_with_the_machine_and_post_it_was_saved_for() {
-        // Both were session-only until v11, so a job built for an Okuma on a big VMC
-        // reopened posting grbl for whatever machine the app last held — and the
-        // envelope and feed ceilings are exactly what gate an export, so the re-check
-        // was being made against the wrong machine.
+    fn a_project_records_the_machine_and_post_it_was_built_for_without_imposing_them() {
+        // v11 made these round-trip *and be adopted*, reasoning that the envelope and
+        // feed ceilings gate an export so the re-check must use the machine the job was
+        // built for. The premise was right and the conclusion inverted: because they
+        // gate the export, they must come from the machine that will **cut** it.
+        // Superseded 2026-08-01 — recorded, reported, never applied.
         let mut app = AppController::new(machine());
         app.open_dxf(PART_DXF, "part.dxf").unwrap();
         app.set_post_kind(PostKind::Okuma);
@@ -3575,12 +3644,18 @@ mod tests {
         // A fresh session on a different machine, posting somewhere else.
         let mut other = AppController::new(machine());
         other.set_post_kind(PostKind::Fanuc);
+        let own_machine = other.machine().clone();
         other.open_project(&path).unwrap();
 
-        assert_eq!(other.post_kind(), PostKind::Okuma);
-        assert_eq!(other.machine(), &saved_machine);
+        assert_eq!(other.post_kind(), PostKind::Fanuc, "the local control stands");
+        assert_eq!(other.machine(), &own_machine, "and the local machine");
+
+        // The file's answer survives as provenance, envelope included — it still has to
+        // round-trip through the `[x, y, z]` on-disk form to be reportable.
+        assert_eq!(other.provenance().machine.as_ref(), Some(&saved_machine));
+        assert_eq!(other.provenance().post, Some(PostKind::Okuma));
         assert_eq!(
-            other.machine().envelope.max.z,
+            other.provenance().machine.as_ref().unwrap().envelope.max.z,
             0.0,
             "the envelope round-trips through its [x, y, z] on-disk form"
         );
@@ -3589,6 +3664,8 @@ mod tests {
 
     #[test]
     fn a_pre_v11_project_leaves_the_sessions_machine_and_post_alone() {
+        // Now true of *every* project, not just those predating v11 — kept because a
+        // file that records nothing is still the case most likely to be got wrong.
         // The half that is easy to get wrong. An older file records neither, and absence
         // must not be read as "use the default" — that would quietly reset a configured
         // machine to the built-in one every time an old job was opened, and silently
@@ -3646,8 +3723,77 @@ mod tests {
         session.open_project(&path).unwrap();
         assert_eq!(
             session.post_kind(),
-            PostKind::Fanuc,
-            "opening must take the file's post, not the session's and not a preference"
+            PostKind::LinuxCnc,
+            "opening must NOT take the file's post — which control you cut on is local"
+        );
+        assert_eq!(
+            session.provenance().post,
+            Some(PostKind::Fanuc),
+            "…but what the file was built for is still worth knowing"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// **The safety property.** A machine is shop-local and its envelope is what *gates*
+    /// an export, so a file that could set your machine could disarm that gate.
+    ///
+    /// The scenario, from Andreas: a job authored on a large router is emailed to
+    /// someone with a smaller mill. Before this, opening it replaced their machine with
+    /// the sender's — after which `check_travel` compared the program against the
+    /// *sender's* travel and passed. Silently, and their configured machine was gone.
+    #[test]
+    fn opening_a_project_never_adopts_the_machine_it_was_built_for() {
+        let mut author = AppController::new(machine());
+        author.edit_machine(|m| {
+            m.name = "Big Router".into();
+            m.envelope = Envelope::new(
+                Point3::new(0.0, 0.0, -200.0),
+                Point3::new(1000.0, 600.0, 0.0),
+            );
+        });
+        author.set_post_kind(PostKind::Okuma);
+        let path = temp_path("shared_job.ocam");
+        author.save_project(&path).unwrap();
+
+        let mut small = AppController::new(machine());
+        small.edit_machine(|m| {
+            m.name = "Small Mill".into();
+            m.envelope =
+                Envelope::new(Point3::new(0.0, 0.0, -100.0), Point3::new(300.0, 200.0, 0.0));
+        });
+        small.set_post_kind(PostKind::Grbl);
+        small.open_project(&path).unwrap();
+
+        assert_eq!(small.machine().name, "Small Mill", "the local machine must survive");
+        let (x, _, _) = small.machine().envelope.extent();
+        assert_eq!(x, 300.0, "and so must its travel — this is what gates the export");
+        assert_eq!(small.post_kind(), PostKind::Grbl, "and the local control");
+
+        // The file's own answer is kept, and offered as a note rather than applied.
+        let note = small
+            .provenance()
+            .mismatch_note(small.machine(), small.post_kind())
+            .expect("a mismatch this large must be reported");
+        assert!(note.contains("Big Router") && note.contains("Small Mill"), "{note}");
+        assert!(note.contains("Okuma"), "the post mismatch belongs in the note too: {note}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// No note when the file agrees with the session — silence is the common case and
+    /// must stay silent, or the warning stops being read.
+    #[test]
+    fn a_matching_project_says_nothing() {
+        let mut app = AppController::new(machine());
+        app.set_post_kind(PostKind::Fanuc);
+        let path = temp_path("matching.ocam");
+        app.save_project(&path).unwrap();
+
+        let mut other = AppController::new(machine());
+        other.set_post_kind(PostKind::Fanuc);
+        other.open_project(&path).unwrap();
+        assert_eq!(
+            other.provenance().mismatch_note(other.machine(), other.post_kind()),
+            None
         );
         std::fs::remove_file(&path).ok();
     }
