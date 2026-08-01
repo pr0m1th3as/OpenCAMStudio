@@ -7,7 +7,7 @@ use cam_geo::{fit_arcs, PathSeg, Point};
 use cam_model::Heights;
 
 /// Tolerance for recognising arcs in flattened offset loops (mm).
-const ARCFIT_TOL: f64 = 0.01;
+pub(crate) const ARCFIT_TOL: f64 = 0.01;
 
 /// How far above a cut floor a rapid must stop, mm.
 ///

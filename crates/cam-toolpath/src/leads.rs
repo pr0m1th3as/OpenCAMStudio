@@ -45,14 +45,54 @@ pub(crate) fn lead_end_point(start: Point, tan: (f64, f64), out: (f64, f64), lea
 /// extreme; an arc is a 90° tangent arc about `on + out·radius`, sampled along its
 /// sweep so a bulge that pokes past the far wall is caught, not just the endpoints.
 pub(crate) fn lead_samples(on: Point, off: Point, out: (f64, f64), lead: Lead) -> Vec<Point> {
+    lead_samples_n(on, off, out, lead, 8)
+}
+
+/// [`lead_samples`] at a chosen density.
+///
+/// Eight points is plenty to *test* a lead against the cleared region, which is all the
+/// guard needs. It is not enough to **re-fit**: `fit_arcs` rejects a run whose chords
+/// depart from the circle by more than its tolerance, and at eight points a 3 mm lead
+/// sags 14 µm against a 10 µm tolerance — correctly refused as "a polygon whose corners
+/// merely happen to be concyclic". A ramp descends *along* the lead, so its samples do
+/// get re-fitted, and they have to be fine enough to survive it. See
+/// [`arc_lead_density`].
+pub(crate) fn lead_samples_n(
+    on: Point,
+    off: Point,
+    out: (f64, f64),
+    lead: Lead,
+    n: usize,
+) -> Vec<Point> {
     match lead {
         Lead::None => Vec::new(),
         Lead::Linear { .. } => vec![off],
         Lead::Arc { radius } => {
             let centre = Point::new(on.x + out.0 * radius, on.y + out.1 * radius);
-            arc_samples(centre, on, off, 8)
+            arc_samples(centre, on, off, n.max(2))
         }
     }
+}
+
+/// How many segments an arc lead of `radius` needs for its chords to stay within `tol`
+/// of the true circle, so a re-fit recognises it as the arc it is.
+///
+/// The sagitta of a chord subtending `θ` on radius `r` is `r(1 − cos(θ/2))`; solving for
+/// `θ` and dividing into the sweep gives the count. Halving the tolerance leaves margin,
+/// because the fitter checks the *worst* chord and the sweep is not always exactly 90°.
+pub(crate) fn arc_lead_density(radius: f64, sweep: f64, tol: f64) -> usize {
+    if radius <= 0.0 || tol <= 0.0 {
+        return 8;
+    }
+    let c = 1.0 - tol / (2.0 * radius);
+    if !(-1.0..=1.0).contains(&c) {
+        return 8;
+    }
+    let max_step = 2.0 * c.acos();
+    if max_step <= 1e-9 {
+        return 64;
+    }
+    ((sweep / max_step).ceil() as usize).clamp(8, 256)
 }
 
 /// Points evenly spaced along the short arc from `a` to `b` about `centre`

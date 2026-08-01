@@ -349,6 +349,8 @@ pub(crate) fn emit_stay_down(
         let r0 = crate::profile::rotate_to_start(&rings[0].pts, start);
         let tan = crate::profile::start_tangent(&r0);
         let out = crate::profile::outward_normal(&r0);
+        // The side the lead eases in from — into the pocket, as for a wall ring.
+        let cin = cleared_normal(tan, reversed);
         let on_ring = enter_with_plunge(
             prog,
             r0[0],
@@ -362,8 +364,20 @@ pub(crate) fn emit_stay_down(
             feed,
             id,
             &r0,
-            // No lead here: this is the interior entry, not a finished wall.
-            Vec::new(),
+            // **The lead-in applies here too.** It used to be omitted, on the reasoning
+            // that a clearing lead is the *wall-finish* lead and this is the interior
+            // entry. But the operator selected an arc lead-in *and* a ramp, and got
+            // neither an arc nor a lead — the ramp simply started on the ring. The rule
+            // is the one Andreas gave: if there is a lead-in, the ramp comes down it.
+            //
+            // Safe here despite there being nothing cleared at this level yet: the ramp
+            // flies its lead *above* the material, meeting the surface where the ring
+            // starts, so the lead cuts nothing on the way in.
+            {
+                let eff = crate::leads::guard_lead(guard, r0[0], tan, cin, lead_in, true);
+                let entry = crate::leads::lead_start_point(r0[0], tan, cin, eff);
+                crate::profile::lead_in_path(r0[0], entry, cin, eff)
+            },
         );
         // A ramped entry begins its cut where the ramp ended, and goes a full perimeter
         // from there so the sloped stretch is re-machined at depth.

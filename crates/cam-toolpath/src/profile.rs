@@ -851,7 +851,20 @@ pub(crate) fn walk_loop(pts: &[Point], from: f64, len: f64) -> Vec<Point> {
 /// point: the lead exists to keep the entry off the finished wall, so it is where a
 /// descending tool belongs.
 pub(crate) fn lead_in_path(start: Point, entry: Point, out: (f64, f64), lead: Lead) -> Vec<Point> {
-    let mut pts = crate::leads::lead_samples(start, entry, out, lead);
+    // Sampled finely enough to be re-fitted: the ramp descends along these points and
+    // they go back through `fit_arcs`, which refuses a run whose chords miss the circle
+    // by more than its tolerance. The guard's eight points are too coarse for that, so
+    // an arc lead-in came out as a fan of chords — Andreas, reading a pocket export:
+    // "it's doing ramp-along with no arcs".
+    let n = match lead {
+        Lead::Arc { radius } => crate::leads::arc_lead_density(
+            radius,
+            std::f64::consts::FRAC_PI_2,
+            crate::emit::ARCFIT_TOL,
+        ),
+        _ => 8,
+    };
+    let mut pts = crate::leads::lead_samples_n(start, entry, out, lead, n);
     pts.reverse();
     match pts.last() {
         Some(p) if (p.x - start.x).abs() < 1e-9 && (p.y - start.y).abs() < 1e-9 => {}
@@ -962,11 +975,18 @@ pub(crate) fn emit_open_ramp(
     }
 }
 
-/// Emit `path` as fed moves descending linearly **in arc length** from `from_z`,
-/// reaching exactly `to_z` at the last point. The tool must already sit at `path[0]`.
+/// Emit `path` descending linearly **in arc length** from `from_z`, reaching exactly
+/// `to_z` at its last point. The tool must already sit at `path[0]`.
+///
+/// **Arcs stay arcs.** The path is a flattened polyline, so it goes back through
+/// `fit_arcs` exactly as [`cut_polyline`](crate::emit::cut_polyline) does, and a curved
+/// run is emitted as a **helical arc** — one `G2`/`G3` with a descending `Z` — rather
+/// than as chords. Without this a ramp turned every corner it crossed into ten linear
+/// moves where the cutting pass, over the very same points, emitted one arc; and an arc
+/// lead-in could never have come out as an arc at all.
 ///
 /// Linear in arc length, not in vertex index: a loop's edges differ in length, and
-/// interpolating per vertex would tilt the ramp differently on every edge.
+/// interpolating per vertex would tilt the ramp differently on every one.
 pub(crate) fn emit_descending_path(
     prog: &mut Program,
     path: &[Point],
@@ -975,12 +995,36 @@ pub(crate) fn emit_descending_path(
     feed: f64,
     tag: Tag,
 ) {
-    let seg_len = |a: Point, b: Point| ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
-    let total: f64 = path.windows(2).map(|w| seg_len(w[0], w[1])).sum();
+    if path.len() < 2 {
+        return;
+    }
+    let segs = cam_geo::fit_arcs(path, crate::emit::ARCFIT_TOL);
+    // Each segment's length along the path — a chord for a line, r·θ for an arc, so the
+    // descent stays at the requested angle *through* a curve rather than steepening.
+    let mut from = path[0];
+    let mut lens = Vec::with_capacity(segs.len());
+    for seg in &segs {
+        let (l, end) = match seg {
+            cam_geo::PathSeg::Line { end } => ((end.x - from.x).hypot(end.y - from.y), *end),
+            cam_geo::PathSeg::Arc { end, center, ccw } => {
+                let r = (from.x - center.x).hypot(from.y - center.y);
+                let a0 = (from.y - center.y).atan2(from.x - center.x);
+                let a1 = (end.y - center.y).atan2(end.x - center.x);
+                let mut sweep = if *ccw { a1 - a0 } else { a0 - a1 };
+                while sweep <= 0.0 {
+                    sweep += std::f64::consts::TAU;
+                }
+                (r * sweep, *end)
+            }
+        };
+        lens.push(l);
+        from = end;
+    }
+    let total: f64 = lens.iter().sum();
     let last = path[path.len() - 1];
     if total.is_nan() || total <= 1e-12 {
-        // Degenerate path: there is nowhere to ramp, so drop straight to depth rather
-        // than emit a descent that never descends.
+        // Nowhere to ramp: drop straight to depth rather than emit a descent that never
+        // descends.
         prog.push(Step::Linear {
             to: Point3::new(last.x, last.y, to_z),
             feed,
@@ -988,22 +1032,34 @@ pub(crate) fn emit_descending_path(
         });
         return;
     }
+
     let mut acc = 0.0;
-    let n = path.len();
-    for (k, w) in path.windows(2).enumerate() {
-        acc += seg_len(w[0], w[1]);
-        // The final vertex takes `to_z` outright: the running sum is within a few ULP
-        // of `total`, and "reaches the exact depth" is a property worth not rounding.
-        let z = if k + 2 == n {
+    let n = segs.len();
+    for (i, seg) in segs.iter().enumerate() {
+        acc += lens[i];
+        // The last segment takes `to_z` outright: the running sum is within a few ULP of
+        // `total`, and "reaches the exact depth" is worth not rounding.
+        let z = if i + 1 == n {
             to_z
         } else {
             from_z + (to_z - from_z) * (acc / total)
         };
-        prog.push(Step::Linear {
-            to: Point3::new(w[1].x, w[1].y, z),
-            feed,
-            tag,
-        });
+        match seg {
+            cam_geo::PathSeg::Line { end } => prog.push(Step::Linear {
+                to: Point3::new(end.x, end.y, z),
+                feed,
+                tag,
+            }),
+            cam_geo::PathSeg::Arc { end, center, ccw } => prog.push(Step::Arc {
+                // A helical arc: the centre carries the *arriving* Z, which is how the
+                // dialects already write a thread mill's helix.
+                end: Point3::new(end.x, end.y, z),
+                center: Point3::new(center.x, center.y, z),
+                dir: if *ccw { ArcDir::Ccw } else { ArcDir::Cw },
+                feed,
+                tag,
+            }),
+        }
     }
 }
 
@@ -1645,7 +1701,49 @@ mod tests {
         }), "the ramp's first move should be along the lead, not the contour");
     }
 
-    /// **The lead-in flies through air and lands on the surface at the contour start.**
+    /// **A ramp keeps its arcs.** The path it descends is a flattened polyline, so it
+    /// goes back through `fit_arcs` exactly as the cutting pass does — a curved run
+    /// becomes one helical `G2`/`G3`, not a fan of chords.
+    ///
+    /// Found by Andreas reading a pocket export: ten linear moves through a corner that
+    /// the cut, over the very same points, emitted as a single arc. It also meant an arc
+    /// lead-in could never come out as an arc, whatever else was fixed.
+    #[test]
+    fn a_ramp_over_a_curve_emits_an_arc_not_chords() {
+        // A quarter circle, flattened the way an offset loop arrives.
+        let r = 10.0;
+        let pts: Vec<Point> = (0..=24)
+            .map(|i| {
+                let a = std::f64::consts::FRAC_PI_2 * (i as f64) / 24.0;
+                Point::new(r * a.cos(), r * a.sin())
+            })
+            .collect();
+        let mut prog = Program::new();
+        emit_descending_path(&mut prog, &pts, 0.0, -2.0, 300.0, Tag::new(0, MoveKind::Plunge));
+
+        let arcs = prog.steps.iter().filter(|s| matches!(s, Step::Arc { .. })).count();
+        assert!(arcs >= 1, "a flattened circle must come back as an arc:\n{:#?}", prog.steps);
+        assert!(
+            prog.steps.len() < 24,
+            "{} moves for a single quarter circle — it is still emitting chords",
+            prog.steps.len()
+        );
+
+        // Still a *helix*: monotonic descent to exactly the requested depth.
+        let zs: Vec<f64> = prog.steps.iter().map(step_end_z).collect();
+        for w in zs.windows(2) {
+            assert!(w[1] <= w[0] + 1e-9, "the ramp must descend monotonically");
+        }
+        assert!((zs.last().unwrap() + 2.0).abs() < 1e-9, "exact depth: {:?}", zs.last());
+
+        // And the descent is spread by *arc* length, so a curve does not steepen it: a
+        // quarter of r=10 is 15.708 mm, and 2 mm over that is 7.26°.
+        let total = std::f64::consts::FRAC_PI_2 * r;
+        let want = (2.0_f64 / total).atan().to_degrees();
+        assert!((want - 7.26).abs() < 0.05, "sanity: {want}");
+    }
+
+    /// **The lead-in flies through air and lands on the surface at the contour start.**    /// **The lead-in flies through air and lands on the surface at the contour start.**
     ///
     /// It starts above the material by `lead_length · tan(angle)` and reaches the
     /// material top exactly where the contour begins — then carries on into the
@@ -1665,45 +1763,55 @@ mod tests {
         let r = run_outside_rough(op);
 
         // The ramp: the run of descending Plunge moves.
+        // Arcs too: an arc lead-in is now emitted as one *helical arc*, so a filter that
+        // saw only `Linear` moves would miss the whole air portion and conclude the ramp
+        // began at depth.
         let ramp: Vec<Point3> = r
             .program
             .steps()
             .iter()
             .filter_map(|st| match st {
                 Step::Linear { to, tag, .. } if tag.kind == MoveKind::Plunge => Some(*to),
+                Step::Arc { end, tag, .. } if tag.kind == MoveKind::Plunge => Some(*end),
                 _ => None,
             })
             .collect();
         assert!(!ramp.is_empty(), "no ramp emitted");
 
         let tan = 5.0_f64.to_radians().tan();
-        let lead_len = std::f64::consts::FRAC_PI_2 * 3.0; // a quarter arc of radius 3
         let top_of_stock = 0.0;
 
-        // It starts above the stock by the lead's own rise…
-        let first = ramp[0];
+        // The rapid that precedes the ramp must leave the tool *above* the material —
+        // that is the lead's rise, and it is what lets the lead fly in air.
+        let first_plunge_at = r
+            .program
+            .steps()
+            .iter()
+            .position(|st| matches!(st,
+                Step::Linear { tag, .. } | Step::Arc { tag, .. } if tag.kind == MoveKind::Plunge))
+            .expect("a ramp");
+        let before = r.program.steps()[..first_plunge_at]
+            .iter()
+            .rev()
+            .find_map(|st| match st {
+                Step::Rapid { to, .. } | Step::Linear { to, .. } => Some(to.z),
+                _ => None,
+            })
+            .expect("something positions the tool first");
         assert!(
-            first.z > top_of_stock - lead_len * tan,
-            "the ramp began at {:.4}, not above the material",
-            first.z
+            before > top_of_stock + 1e-9,
+            "the ramp starts at {before}, not above the material — the lead would be \
+             cutting on the way in"
         );
 
-        // …and the point where it crosses the stock top is the contour start, which is
-        // where the lead ends. The chain's start corner is (20,20); with an outside
-        // profile at r=3 the contour start sits 3 mm out on -Y.
-        let crossing = ramp
-            .windows(2)
-            .find(|w| w[0].z > top_of_stock && w[1].z <= top_of_stock + 1e-9)
-            .map(|w| w[1]);
-        let crossing = crossing.expect("the ramp must cross the stock top");
+        // …and the first ramp move — the lead — lands *on* the surface, at the contour.
         assert!(
-            (crossing.z - top_of_stock).abs() < 5e-3,
-            "it crossed the surface at Z {:.4}, not at the stock top",
-            crossing.z
+            (ramp[0].z - top_of_stock).abs() < 1e-3,
+            "the lead ended at {}, not on the stock top",
+            ramp[0].z
         );
 
-        // And the whole material descent happens on the contour: from the surface to
-        // full depth is one stepdown, so the contour portion is stepdown/tan.
+        // The whole material descent therefore happens on the contour: one stepdown.
         let in_material: f64 = ramp
             .windows(2)
             .filter(|w| w[1].z < top_of_stock)

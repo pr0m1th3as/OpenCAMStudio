@@ -567,3 +567,67 @@ fn regen_goldens() {
         std::fs::write(format!("{dir}{name}.nc"), nc).unwrap();
     }
 }
+
+/// **An arc lead-in stays an arc when the ramp descends down it.**
+///
+/// Andreas, on a pocket export: *"I selected arc lead-in together with ramp-along-the-
+/// path … it's doing ramp-along with no arcs."* Two faults met here. The clearing level
+/// entry ignored the lead entirely — it was passed an empty one, on the reasoning that a
+/// clearing lead is the wall-finish lead. And the ramp emitted raw chords, because it
+/// skipped the `fit_arcs` pass the cutting emission has always run; even once the lead
+/// was wired in it would have come out as a fan of straight moves.
+#[test]
+fn a_ramped_entry_flies_its_arc_lead_in_as_one_arc() {
+    use cam_cldata::{MoveKind, Step};
+    use cam_model::{Lead, Plunge};
+
+    let mut d = pocket_doc();
+    if let cam_model::Operation::Pocket(p) = &mut d.setup.operations[0] {
+        p.clear.plunge = Plunge::Ramp { angle_deg: 5.0 };
+        p.clear.lead_in = Lead::Arc { radius: 3.0 };
+        p.clear.lead_out = Lead::Arc { radius: 3.0 };
+    }
+    let (program, _) = build_job(&d, 1000.0, SpindleDir::Cw, None, 50.0, &CancelToken::new());
+
+    // The first thing the entry does is a *descending arc* — the lead, flown in air.
+    let first_plunge = program
+        .steps()
+        .iter()
+        .find(|s| matches!(s, Step::Arc { tag, .. } | Step::Linear { tag, .. }
+                           if tag.kind == MoveKind::Plunge))
+        .expect("a ramped entry");
+    match first_plunge {
+        Step::Arc { end, center, .. } => {
+            // Descends to the material surface, not below it: the lead cuts nothing.
+            // Within a micron of the stock top — it prints as `Z0.000`.
+            //
+            // Not exactly zero, and the reason is worth knowing: the lead's *rise* is
+            // computed from the sampled polyline's chord length, while the emission now
+            // spreads the descent over true **arc** length, which is fractionally
+            // longer. So the lead ends a hair below the surface. Arc length is the right
+            // measure for the emission — it is what keeps the ramp at the requested
+            // angle *through* a curve rather than steepening — and 0.2 µm of dip is far
+            // below anything a machine or a 3-decimal G-code word can express. Trading a
+            // correct angle for an exact touch would be the wrong way round.
+            assert!(
+                end.z.abs() < 1e-3,
+                "the lead must land on the stock top, got {}",
+                end.z
+            );
+            assert!(
+                (center.z - end.z).abs() < 1e-9,
+                "a helical arc carries the arriving Z on its centre"
+            );
+        }
+        other => panic!("the ramp should open with the lead *arc*, got {other:?}"),
+    }
+
+    // And no run of chords where an arc belongs: with a 3 mm lead sampled for re-fitting,
+    // the whole lead is one move.
+    let plunge_arcs = program
+        .steps()
+        .iter()
+        .filter(|s| matches!(s, Step::Arc { tag, .. } if tag.kind == MoveKind::Plunge))
+        .count();
+    assert!(plunge_arcs >= 1, "the ramp emitted no arcs at all");
+}
