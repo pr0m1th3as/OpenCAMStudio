@@ -320,8 +320,14 @@ records neither, and opening one leaves your current machine and post alone.
 ### Run / export
 
 - **Home → Run** recomputes for the current document. The backplot is coloured by
-  move kind: green = cutting, yellow = rapid/link, red = plunge; the part outline
-  is light grey. **Output** shows toolpath diagnostics (e.g. a tool too large)
+  move kind: green = cutting, yellow = rapid/link, red = plunge, **blue dashed =
+  tool-change traverse** (the lift to tool-change height, the cross, and the descent
+  back to clearance); the part outline is light grey. The dash marks the one move the
+  *operator* never asked for — the planner inserted it — so colour says which kind of
+  move it is and the dash says who put it there. Rapids are deliberately **not**
+  dashed: a rapid is still a move the operation implies. The dash is a world-space
+  pattern sized from the scene, so zooming far in stretches it back into a solid blue
+  line. **Output** shows toolpath diagnostics (e.g. a tool too large)
   *and* material-removal **collisions** from the simulation (e.g. a rapid plowing
   through remaining stock, which a green backplot would hide).
 - **View → Show stock** overlays the *simulated* stock surface under the backplot.
@@ -340,6 +346,16 @@ records neither, and opening one leaves your current machine and post alone.
 Because the GUI is the one part that cannot be verified by automated tests, the
 things worth eyeballing:
 
+- **Dashed tool-change traverse:** build a job with **two tools** (or two origins),
+  Run, and look at the blue moves — the lift to tool-change height, the cross, the
+  descent. They must be **dashed**; everything else stays solid, rapids included.
+  Then check the pattern is legible at the scale you work at: on a small part and on
+  a large one the dashes should look about the same size, because the period comes
+  from the scene, not from a fixed millimetre count. **Zoom right in** — the dashes
+  stretch and the line goes solid blue. That is expected (the pattern is world-space,
+  not screen-space), not a bug. What would be a bug: the viewport freezing or memory
+  climbing while a backplot with traverses is on screen — that is the failure mode
+  the walk used to have, so it is worth a glance at the memory figure.
 - **Layout:** the window opens with the ribbon + Project / Viewport / Inspector /
   Output. Resizing the window changes **only** the Viewport; the side panes and
   Output keep their size. Drag a side divider, then resize the window — the pane

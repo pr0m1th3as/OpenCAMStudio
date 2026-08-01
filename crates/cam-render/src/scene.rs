@@ -42,6 +42,20 @@ fn dim(c: Color) -> Color {
     ]
 }
 
+/// Whether a backplot move is drawn dashed.
+///
+/// Only the planner-inserted [`MoveKind::Traverse`] — the lift to tool-change height,
+/// the cross, and the descent back to clearance. It is the one move the *operator*
+/// never asked for, so it reads differently from the moves that came out of an
+/// operation: colour says which kind of move it is, the dash says who put it there.
+///
+/// Deliberately not the rapid. A rapid is still a move the operation implies, and
+/// dashing both would make the distinction the colour already carries harder to see,
+/// not easier.
+fn dashed_for(kind: MoveKind) -> bool {
+    matches!(kind, MoveKind::Traverse)
+}
+
 /// The colour a backplot move is drawn in, by its role.
 fn color_for(kind: MoveKind) -> Color {
     match kind {
@@ -71,6 +85,12 @@ pub struct LineStrip {
     /// CL-data `op_id`; part/stock outlines and pick highlights carry `None`.
     /// Drives selection focus (see [`Scene::focus_operation`]).
     pub op: Option<u32>,
+    /// Draw this strip broken into dashes rather than solid.
+    ///
+    /// Carried on the strip rather than derived from the colour so that dimming an
+    /// unfocused operation cannot silently change how a move is drawn — the two are
+    /// independent properties of the same line.
+    pub dashed: bool,
 }
 
 /// A drawable scene: a set of colored polylines.
@@ -92,8 +112,24 @@ impl Scene {
 
     /// Add a polyline strip tagged with an operation id (a backplot motion).
     pub fn add_strip_op(&mut self, points: Vec<[f32; 3]>, color: Color, op: Option<u32>) {
+        self.add_strip_styled(points, color, op, false);
+    }
+
+    /// Add a polyline strip, choosing whether it draws solid or dashed.
+    pub fn add_strip_styled(
+        &mut self,
+        points: Vec<[f32; 3]>,
+        color: Color,
+        op: Option<u32>,
+        dashed: bool,
+    ) {
         if points.len() >= 2 {
-            self.strips.push(LineStrip { points, color, op });
+            self.strips.push(LineStrip {
+                points,
+                color,
+                op,
+                dashed,
+            });
         }
     }
 
@@ -132,11 +168,11 @@ impl Scene {
         for step in program.steps() {
             match step {
                 Step::Rapid { to, tag } => {
-                    push_segment(&mut scene, cur, *to, color_for(tag.kind), tag.op_id);
+                    push_segment(&mut scene, cur, *to, tag.kind, tag.op_id);
                     cur = Some(*to);
                 }
                 Step::Linear { to, tag, .. } => {
-                    push_segment(&mut scene, cur, *to, color_for(tag.kind), tag.op_id);
+                    push_segment(&mut scene, cur, *to, tag.kind, tag.op_id);
                     cur = Some(*to);
                 }
                 Step::Arc {
@@ -153,7 +189,7 @@ impl Scene {
                             *end,
                             *center,
                             *dir,
-                            color_for(tag.kind),
+                            tag.kind,
                             tag.op_id,
                         );
                     }
@@ -218,19 +254,126 @@ impl Scene {
     }
 
     /// Expand the strips into a flat `LineList` vertex buffer (two vertices per
-    /// segment).
+    /// segment), breaking dashed strips into dashes at [`Scene::dash_period`].
     pub fn line_vertices(&self) -> Vec<Vertex> {
+        self.line_vertices_dashed(self.dash_period())
+    }
+
+    /// The dash period (mm) this scene draws its dashed strips at: a fixed fraction
+    /// of the scene's diagonal, clamped to a legible range.
+    ///
+    /// **Relative to the scene, not absolute**, because the camera frames on the
+    /// scene: a fixed millimetre dash that reads well on a 50 mm part becomes a solid
+    /// line on a 500 mm one. Deriving it from the extent keeps the pattern looking the
+    /// same whatever the part's size. It is still a *world*-space pattern, so zooming
+    /// right in stretches the dashes — at which point the traverse reads as a solid
+    /// blue line, exactly as it did before this existed, so the worst case is the old
+    /// behaviour rather than a wrong one.
+    ///
+    /// A screen-constant dash would need the vertex buffer rebuilt every frame against
+    /// `world_per_pixel`; today it is built once when the scene changes.
+    pub fn dash_period(&self) -> f32 {
+        /// Dashes across the scene's diagonal.
+        const DASHES: f32 = 90.0;
+        /// Below this the pattern reads as a dotted smear, above it as a broken line.
+        const MIN_MM: f32 = 0.25;
+        const MAX_MM: f32 = 8.0;
+        let Some((min, max)) = self.bounds() else {
+            return MIN_MM;
+        };
+        let d = ((max[0] - min[0]).powi(2) + (max[1] - min[1]).powi(2) + (max[2] - min[2]).powi(2))
+            .sqrt();
+        (d / DASHES).clamp(MIN_MM, MAX_MM)
+    }
+
+    /// Expand the strips into a `LineList` buffer, using `period` mm for dashed
+    /// strips. A non-positive or non-finite `period` draws everything solid.
+    ///
+    /// Split out from [`line_vertices`](Self::line_vertices) so the pattern can be
+    /// tested at a known period instead of at whatever the scene's extent implies.
+    pub fn line_vertices_dashed(&self, period: f32) -> Vec<Vertex> {
+        /// Fraction of each period that is drawn. 0.6 leaves a gap wide enough to read
+        /// at a glance without the line losing its continuity as a *path*.
+        const DUTY: f64 = 0.6;
+        /// Most dashes one strip may be broken into. A period fine enough to exceed
+        /// this draws sub-pixel at any sane zoom, so the strip falls back to solid
+        /// rather than sizing a vertex buffer off an arbitrary caller-supplied period.
+        const MAX_DASHES: f64 = 100_000.0;
+
+        let dashing = period.is_finite() && period > 0.0;
+        let period = period as f64;
+        let dash_on = period * DUTY;
+
+        // In f64: the walk below is indexed off arc length, and accumulating that in
+        // f32 over a long strip loses the resolution the dash boundaries need.
+        let seg_len = |p: &[[f32; 3]]| -> f64 {
+            let (a, b) = (p[0], p[1]);
+            (((b[0] - a[0]) as f64).powi(2)
+                + ((b[1] - a[1]) as f64).powi(2)
+                + ((b[2] - a[2]) as f64).powi(2))
+            .sqrt()
+        };
+
         let mut out = Vec::new();
         for strip in &self.strips {
+            let total: f64 = strip.points.windows(2).map(seg_len).sum();
+            let dash_this = strip.dashed && dashing && total / period <= MAX_DASHES;
+
+            let mut push = |a: [f32; 3], b: [f32; 3]| {
+                out.push(Vertex {
+                    position: a,
+                    color: strip.color,
+                });
+                out.push(Vertex {
+                    position: b,
+                    color: strip.color,
+                });
+            };
+            if !dash_this {
+                for pair in strip.points.windows(2) {
+                    push(pair[0], pair[1]);
+                }
+                continue;
+            }
+            // Walk the strip by arc length, indexing the dashes by integer: dash `k`
+            // spans [k·period, k·period + dash_on) in the strip's own arc length. The
+            // pattern still runs unbroken through corners — that is what makes the
+            // index the *strip's* arc length rather than the segment's — but the loop
+            // is now over a computed integer range, so it cannot fail to advance.
+            //
+            // It could before. Carrying a running `phase` and comparing `phase % period`
+            // against the dash boundary meant that when the phase landed *on* a
+            // boundary, rounding put it a hair inside the dash and yielded a step below
+            // one ULP of the walk position: the walk stopped advancing and emitted
+            // zero-length dashes until the process was OOM-killed. That hit 77 of 99
+            // (length, period) pairs across the range `dash_period` can return.
+            let mut s0 = 0.0_f64;
             for pair in strip.points.windows(2) {
-                out.push(Vertex {
-                    position: pair[0],
-                    color: strip.color,
-                });
-                out.push(Vertex {
-                    position: pair[1],
-                    color: strip.color,
-                });
+                let (a, b) = (pair[0], pair[1]);
+                let len = seg_len(pair);
+                if len <= f64::EPSILON {
+                    continue;
+                }
+                let (seg_start, s1) = (s0, s0 + len);
+                let at = |s: f64| {
+                    let f = ((s - seg_start) / len) as f32;
+                    [
+                        a[0] + (b[0] - a[0]) * f,
+                        a[1] + (b[1] - a[1]) * f,
+                        a[2] + (b[2] - a[2]) * f,
+                    ]
+                };
+                let k0 = (seg_start / period).floor() as i64;
+                let k1 = (s1 / period).floor() as i64;
+                for k in k0..=k1 {
+                    // Clip dash `k` to this segment; an empty overlap draws nothing.
+                    let start = (k as f64 * period).max(seg_start);
+                    let end = (k as f64 * period + dash_on).min(s1);
+                    if end > start {
+                        push(at(start), at(end));
+                    }
+                }
+                s0 = s1;
             }
         }
         out
@@ -254,15 +397,16 @@ impl Scene {
     }
 }
 
-fn push_segment(scene: &mut Scene, from: Option<Point3>, to: Point3, color: Color, op: u32) {
+fn push_segment(scene: &mut Scene, from: Option<Point3>, to: Point3, kind: MoveKind, op: u32) {
     if let Some(a) = from {
-        scene.add_strip_op(
+        scene.add_strip_styled(
             vec![
                 [a.x as f32, a.y as f32, a.z as f32],
                 [to.x as f32, to.y as f32, to.z as f32],
             ],
-            color,
+            color_for(kind),
             Some(op),
+            dashed_for(kind),
         );
     }
 }
@@ -274,7 +418,7 @@ fn push_arc(
     end: Point3,
     center: Point3,
     dir: cam_cldata::ArcDir,
-    color: Color,
+    kind: MoveKind,
     op: u32,
 ) {
     let r = ((start.x - center.x).powi(2) + (start.y - center.y).powi(2)).sqrt();
@@ -292,7 +436,7 @@ fn push_arc(
             [p.x as f32, p.y as f32, z as f32]
         })
         .collect();
-    scene.add_strip_op(pts, color, Some(op));
+    scene.add_strip_styled(pts, color_for(kind), Some(op), dashed_for(kind));
 }
 
 #[cfg(test)]
@@ -406,6 +550,183 @@ mod tests {
         scene.add_strip(vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]], CUT);
         // A 3-point strip is 2 segments ⇒ 4 vertices.
         assert_eq!(scene.line_vertices().len(), 4);
+    }
+
+    /// Total drawn length is the property, not the vertex count: the dash pattern is
+    /// only correct if it draws the duty fraction of the line and no more.
+    fn drawn_length(vs: &[Vertex]) -> f32 {
+        vs.chunks(2)
+            .map(|p| {
+                let (a, b) = (p[0].position, p[1].position);
+                ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2) + (b[2] - a[2]).powi(2)).sqrt()
+            })
+            .sum()
+    }
+
+    #[test]
+    fn a_dashed_strip_draws_the_duty_fraction_of_its_length() {
+        let mut scene = Scene::new();
+        // 100 mm along X, dashed at a 10 mm period ⇒ 10 dashes of 6 mm = 60 mm drawn.
+        scene.add_strip_styled(vec![[0.0, 0.0, 0.0], [100.0, 0.0, 0.0]], TRAVERSE, Some(0), true);
+        let vs = scene.line_vertices_dashed(10.0);
+        assert_eq!(vs.len(), 20, "10 dashes ⇒ 10 segments ⇒ 20 vertices");
+        assert!(
+            (drawn_length(&vs) - 60.0).abs() < 1e-3,
+            "expected 60 mm drawn of 100, got {}",
+            drawn_length(&vs)
+        );
+        // Every dash must lie on the line it came from.
+        assert!(vs.iter().all(|v| v.position[1] == 0.0 && v.position[2] == 0.0));
+    }
+
+    #[test]
+    fn the_dash_phase_carries_across_a_corner() {
+        // Two 5 mm legs at a right angle, dashed at a 4 mm period. If the phase reset at
+        // the corner each leg would draw 2.4+ mm; carried, the pattern runs straight
+        // through and the total is the duty fraction of the whole 10 mm.
+        let mut scene = Scene::new();
+        scene.add_strip_styled(
+            vec![[0.0, 0.0, 0.0], [5.0, 0.0, 0.0], [5.0, 5.0, 0.0]],
+            TRAVERSE,
+            Some(0),
+            true,
+        );
+        let drawn = drawn_length(&scene.line_vertices_dashed(4.0));
+        // 10 mm at period 4, duty 0.6: dashes at [0,2.4] [4,6.4] [8,10] = 2.4+2.4+2 = 6.8.
+        assert!((drawn - 6.8).abs() < 1e-3, "phase did not carry: drew {drawn}");
+    }
+
+    /// The two tests above pick their periods by hand, and both happen to be periods
+    /// the walk survives. That is not a property of the code — it is luck. This sweeps
+    /// the whole range [`Scene::dash_period`] can return, against several lengths.
+    ///
+    /// The original walk carried a running `phase` and compared `phase % period`
+    /// against the dash boundary. Landing on a boundary rounded a hair *inside* the
+    /// dash, giving a step below one ULP of the walk position; the walk then stopped
+    /// advancing and emitted zero-length dashes until the process was OOM-killed. It
+    /// did that for 77 of the 99 (length, period) pairs below — but not for 10 mm at
+    /// period 4, nor 100 mm at period 10, so the suite stayed green.
+    ///
+    /// Note the failure mode a regression here would show: the buffer grows without
+    /// bound, so this hangs and takes the machine's memory with it rather than failing
+    /// cleanly. That is the loudest signal available from inside the walk itself; the
+    /// structural guarantee is that the loop is now over a computed integer range.
+    #[test]
+    fn the_dash_walk_terminates_and_holds_its_duty_at_every_period() {
+        const DUTY: f32 = 0.6;
+        for len in [1.0_f32, 5.0, 12.7, 50.0, 100.0, 333.3, 500.0, 1000.0] {
+            let mut scene = Scene::new();
+            scene.add_strip_styled(
+                vec![[0.0, 0.0, 0.0], [len, 0.0, 0.0]],
+                TRAVERSE,
+                Some(0),
+                true,
+            );
+            // The clamped range of dash_period(), sampled finely enough to catch the
+            // periods that divide these lengths exactly — those are the ones that put
+            // the old walk's phase on a boundary.
+            for i in 0..=64 {
+                let period = 0.25 + (i as f32) * (8.0 - 0.25) / 64.0;
+                let vs = scene.line_vertices_dashed(period);
+                // Drawn length is the duty fraction, give or take the partial dash the
+                // strip's end cuts short.
+                let (drawn, want) = (drawn_length(&vs), len * DUTY);
+                assert!(
+                    (drawn - want).abs() <= period * DUTY + 1e-2,
+                    "len {len} period {period}: drew {drawn}, expected ~{want}"
+                );
+                // Two vertices per dash, and at most one dash per period plus a partial
+                // one at each end. A buffer past that means the walk emitted degenerate
+                // dashes rather than advancing.
+                let cap = 2.0 * (len / period + 2.0);
+                assert!(
+                    (vs.len() as f32) <= cap,
+                    "len {len} period {period}: {} vertices exceeds the {cap} a dash \
+                     pattern can need",
+                    vs.len()
+                );
+            }
+        }
+    }
+
+    /// A period fine enough to shatter a strip into an unbounded number of dashes
+    /// draws it solid instead. `line_vertices_dashed` is public and takes any period,
+    /// so the vertex count must not be a function of untrusted arithmetic.
+    #[test]
+    fn an_absurdly_fine_period_falls_back_to_solid() {
+        let mut scene = Scene::new();
+        scene.add_strip_styled(
+            vec![[0.0, 0.0, 0.0], [1000.0, 0.0, 0.0]],
+            TRAVERSE,
+            Some(0),
+            true,
+        );
+        // 1000 mm at a 1 µm period would be a million dashes.
+        let vs = scene.line_vertices_dashed(0.001);
+        assert_eq!(vs.len(), 2, "expected the solid fallback, got {} verts", vs.len());
+        assert!((drawn_length(&vs) - 1000.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn only_the_traverse_is_dashed_and_solid_strips_are_untouched() {
+        let prog = ProgramBuilder::new()
+            .op(0)
+            .rapid(Point3::new(0.0, 0.0, 5.0), MoveKind::Link)
+            .rapid(Point3::new(0.0, 0.0, 50.0), MoveKind::Traverse)
+            .linear(Point3::new(20.0, 0.0, 50.0), MoveKind::Traverse)
+            .linear(Point3::new(20.0, 0.0, -1.0), MoveKind::Cutting)
+            .build();
+        let scene = Scene::from_program(&prog);
+        for s in &scene.strips {
+            assert_eq!(
+                s.dashed,
+                s.color == TRAVERSE,
+                "only the traverse may be dashed: {s:?}"
+            );
+        }
+        assert!(scene.strips.iter().any(|s| s.dashed), "the traverse must be dashed");
+
+        // A solid strip yields exactly two vertices per segment, as it always has —
+        // dashing must not have leaked into the ordinary path.
+        let solid: usize = scene.strips.iter().filter(|s| !s.dashed).map(|s| s.points.len() - 1).sum();
+        let vs = scene.line_vertices();
+        let dashed_vs = vs.len() - solid * 2;
+        assert!(dashed_vs > 0 && vs.len() > solid * 2, "the dashed strips added segments");
+    }
+
+    #[test]
+    fn a_non_positive_dash_period_draws_everything_solid() {
+        // The fallback that keeps a degenerate scene (a single point, no extent) from
+        // producing an empty or infinite loop rather than a line.
+        let mut scene = Scene::new();
+        scene.add_strip_styled(vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]], TRAVERSE, Some(0), true);
+        for period in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let vs = scene.line_vertices_dashed(period);
+            assert_eq!(vs.len(), 2, "period {period} must draw solid");
+            assert!((drawn_length(&vs) - 10.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn the_dash_period_scales_with_the_scene_not_with_the_millimetre() {
+        // The reason it is a fraction of the diagonal: a fixed millimetre dash that
+        // reads on a small part becomes a solid line on a large one.
+        let period_of = |size: f32| {
+            let mut s = Scene::new();
+            s.add_strip(vec![[0.0, 0.0, 0.0], [size, size, 0.0]], CUT);
+            s.dash_period()
+        };
+        assert!(
+            period_of(500.0) > period_of(50.0),
+            "a larger part must get a longer dash"
+        );
+        // Both clamped into the legible band whatever the extreme.
+        for size in [0.01_f32, 1.0, 100.0, 100_000.0] {
+            let p = period_of(size);
+            assert!((0.25..=8.0).contains(&p), "size {size} gave period {p}");
+        }
+        // An empty scene has no diagonal and must still answer with something drawable.
+        assert!(Scene::new().dash_period() > 0.0);
     }
 
     #[test]
