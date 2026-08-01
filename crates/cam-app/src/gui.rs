@@ -884,6 +884,9 @@ enum Field {
     ThreadDrillClearance,
     /// Thread blind-hole required allowance (mm); 0 = auto (one pitch).
     ThreadBlindAllowance,
+    /// Chamfer: absolute Z of the top edge being chamfered (mm). Seeded from the
+    /// stock top, editable because the edge is not always there.
+    ChamferTop,
     /// Chamfer width (mm).
     ChamferWidth,
     /// Chamfer tip depth below the top edge (mm); selects the flank section.
@@ -993,6 +996,7 @@ impl Field {
             Field::ThreadSpringPasses => "Spring passes",
             Field::ThreadDrillClearance => "Drill clearance (mm, 0=through)",
             Field::ThreadBlindAllowance => "Blind allowance (mm, 0=auto)",
+            Field::ChamferTop => "Top edge Z (mm)",
             Field::ChamferWidth => "Chamfer width (mm)",
             Field::ChamferDepth => "Tip depth (mm, 0=tip)",
             Field::ChamferStep => "Step (mm, 0=one pass)",
@@ -1217,6 +1221,12 @@ impl Field {
             Field::ThreadBlindAllowance => {
                 "Required clearance between the last thread and the bottom of a blind hole \
                  (mm) — the tool cannot thread flush to a blind bottom. 0 = auto (one pitch)."
+            }
+            Field::ChamferTop => {
+                "Absolute Z of the edge being chamfered (mm) — where the bevel starts, \
+                 and what Tip depth is measured down from. Seeded from the top of \
+                 stock, which is right for an edge on the raw surface; set it lower to \
+                 chamfer the rim of a pocket or a step that an earlier operation cut."
             }
             Field::ChamferWidth => {
                 "Width of the chamfer face measured along the slope (mm). With the tool \
@@ -3951,178 +3961,13 @@ impl App {
                 Field::StockTop,
                 Field::StockThickness,
             ],
-            Selection::Operation(id) => match self.controller.operation(id) {
-                Some(Operation::Profile(p)) => {
-                    let mut fields = vec![Field::Depth, Field::Stepdown];
-                    // Radial roughing (stepover) is outside-only; an inner profile is
-                    // a single-pass wall finish (rough the pocket first).
-                    if p.side == Side::Outside {
-                        fields.push(Field::Stepover);
-                        fields.push(Field::Engagement);
-                    }
-                    fields.extend([Field::ProfileOffset, Field::SpindleRpm, Field::Feed, Field::PlungeFeed]);
-                    // Lead/plunge sizes appear only when the kind uses them.
-                    if p.lead_in != Lead::None {
-                        fields.push(Field::LeadInSize);
-                    }
-                    if p.lead_out != Lead::None {
-                        fields.push(Field::LeadOutSize);
-                    }
-                    fields.push(Field::LeadOverlap);
-                    match p.plunge {
-                        Plunge::Straight => {}
-                        Plunge::Ramp { .. } => fields.push(Field::PlungeA),
-                        Plunge::Helix { .. } | Plunge::ZigZag { .. } => {
-                            fields.push(Field::PlungeA);
-                            fields.push(Field::PlungeB);
-                        }
-                    }
-                    fields
-                }
-                Some(Operation::Pocket(p)) => {
-                    let mut fields = vec![
-                        Field::Depth,
-                        Field::Stepdown,
-                        Field::Overlap,
-                        Field::Engagement,
-                        Field::ProfileOffset,
-                        Field::SpindleRpm,
-                        Field::Feed,
-                        Field::PlungeFeed,
-                        Field::LeadOverlap,
-                    ];
-                    if p.clear.lead_in != Lead::None {
-                        fields.push(Field::LeadInSize);
-                    }
-                    if p.clear.lead_out != Lead::None {
-                        fields.push(Field::LeadOutSize);
-                    }
-                    match p.clear.plunge {
-                        Plunge::Straight => {}
-                        Plunge::Ramp { .. } => fields.push(Field::PlungeA),
-                        Plunge::Helix { .. } | Plunge::ZigZag { .. } => {
-                            fields.push(Field::PlungeA);
-                            fields.push(Field::PlungeB);
-                        }
-                    }
-                    fields
-                }
-                Some(Operation::Face(_)) => vec![
-                    Field::FaceStartOffset,
-                    Field::Depth,
-                    Field::Stepdown,
-                    Field::Overlap,
-                    Field::FaceOvershoot,
-                    Field::SpindleRpm,
-                    Field::Feed,
-                    Field::PlungeFeed,
-                ],
-                Some(Operation::Drill(_)) => vec![
-                    Field::Depth,
-                    Field::DrillStartOffset,
-                    Field::Peck,
-                    Field::Dwell,
-                    Field::SpindleRpm,
-                    Field::Feed,
-                ],
-                Some(Operation::Chamfer(c)) => {
-                    let mut fields = vec![
-                        Field::ChamferWidth,
-                        Field::ChamferDepth,
-                        Field::ChamferStep,
-                        Field::SpindleRpm,
-                        Field::Feed,
-                        Field::PlungeFeed,
-                    ];
-                    if c.lead_in != Lead::None {
-                        fields.push(Field::LeadInSize);
-                    }
-                    if c.lead_out != Lead::None {
-                        fields.push(Field::LeadOutSize);
-                    }
-                    fields.push(Field::LeadOverlap);
-                    fields
-                }
-                Some(Operation::Engrave(_)) => {
-                    vec![
-                        Field::Depth,
-                        Field::Stepdown,
-                        Field::SpindleRpm,
-                        Field::Feed,
-                        Field::PlungeFeed,
-                    ]
-                }
-                // Carve has no stepdown (single-pass, deferred) and no stepover: its
-                // ring spacing plays that role, and `Depth` is a *cap* the shape may
-                // not reach.
-                Some(Operation::Carve(c)) => {
-                    let mut fields = vec![
-                        Field::Depth,
-                        Field::ProfileOffset,
-                        Field::RingStep,
-                        Field::Scallop,
-                        Field::SpindleRpm,
-                        Field::Feed,
-                        Field::PlungeFeed,
-                    ];
-                    // The clearing pass is a pocket over a derived region, so it gets a
-                    // pocket's controls -- all but two. `Depth` is not its own (the
-                    // carve's cap sets it), and a wall finishing allowance would leave a
-                    // full-depth ridge at the wall/floor junction, since the V-bit's
-                    // innermost ring runs along that boundary rather than beside it.
-                    if let Some(cl) = &c.clear {
-                        fields.extend([
-                            Field::ClearStepdown,
-                            Field::ClearOverlap,
-                            Field::ClearOffset,
-                            Field::ClearEngagement,
-                            Field::ClearFeed,
-                            Field::ClearPlungeFeed,
-                            Field::ClearLeadOverlap,
-                        ]);
-                        if cl.params.lead_in != Lead::None {
-                            fields.push(Field::ClearLeadInSize);
-                        }
-                        if cl.params.lead_out != Lead::None {
-                            fields.push(Field::ClearLeadOutSize);
-                        }
-                        match cl.params.plunge {
-                            Plunge::Straight => {}
-                            Plunge::Ramp { .. } => fields.push(Field::ClearPlungeA),
-                            Plunge::Helix { .. } | Plunge::ZigZag { .. } => {
-                                fields.push(Field::ClearPlungeA);
-                                fields.push(Field::ClearPlungeB);
-                            }
-                        }
-                    }
-                    fields
-                }
-                Some(Operation::Thread(t)) => {
-                    let mut fields = vec![
-                        Field::MajorDia,
-                        Field::Pitch,
-                        Field::ThreadTop,
-                        Field::ThreadBottom,
-                        Field::ThreadPasses,
-                        Field::ThreadSpringPasses,
-                    ];
-                    // Blind-hole fields only for internal threads (a boss has no bore).
-                    if t.internal {
-                        fields.push(Field::ThreadDrillClearance);
-                        if t.drill_clearance > 0.0 {
-                            fields.push(Field::ThreadBlindAllowance);
-                        }
-                    }
-                    fields.push(Field::SpindleRpm);
-                    fields.push(Field::Feed);
-                    fields.push(Field::PlungeFeed);
-                    fields
-                }
-                None => Vec::new(),
-            },
+            Selection::Operation(id) => self
+                .controller
+                .operation(id)
+                .map(operation_fields)
+                .unwrap_or_default(),
         }
     }
-
     /// The model value backing a field for the current selection, if any.
     fn field_value(&self, field: Field) -> Option<f64> {
         if self.library_mode() {
@@ -6371,6 +6216,186 @@ impl App {
     }
 }
 
+/// The numeric parameters the inspector shows for an operation, in display order.
+///
+/// A free function taking only the operation, so the list can be checked without
+/// standing up a GUI — `visible_fields` is a method on the iced `App` and nothing
+/// headless can reach it. The same reason `origin_move_targets` was extracted: a
+/// rule the tests cannot see is a rule that drifts, and this one silently governs
+/// whether an operation's parameter is reachable by the operator at all.
+fn operation_fields(op: &Operation) -> Vec<Field> {
+    match op {
+        Operation::Profile(p) => {
+            let mut fields = vec![Field::Depth, Field::Stepdown];
+            // Radial roughing (stepover) is outside-only; an inner profile is
+            // a single-pass wall finish (rough the pocket first).
+            if p.side == Side::Outside {
+                fields.push(Field::Stepover);
+                fields.push(Field::Engagement);
+            }
+            fields.extend([Field::ProfileOffset, Field::SpindleRpm, Field::Feed, Field::PlungeFeed]);
+            // Lead/plunge sizes appear only when the kind uses them.
+            if p.lead_in != Lead::None {
+                fields.push(Field::LeadInSize);
+            }
+            if p.lead_out != Lead::None {
+                fields.push(Field::LeadOutSize);
+            }
+            fields.push(Field::LeadOverlap);
+            match p.plunge {
+                Plunge::Straight => {}
+                Plunge::Ramp { .. } => fields.push(Field::PlungeA),
+                Plunge::Helix { .. } | Plunge::ZigZag { .. } => {
+                    fields.push(Field::PlungeA);
+                    fields.push(Field::PlungeB);
+                }
+            }
+            fields
+        }
+        Operation::Pocket(p) => {
+            let mut fields = vec![
+                Field::Depth,
+                Field::Stepdown,
+                Field::Overlap,
+                Field::Engagement,
+                Field::ProfileOffset,
+                Field::SpindleRpm,
+                Field::Feed,
+                Field::PlungeFeed,
+                Field::LeadOverlap,
+            ];
+            if p.clear.lead_in != Lead::None {
+                fields.push(Field::LeadInSize);
+            }
+            if p.clear.lead_out != Lead::None {
+                fields.push(Field::LeadOutSize);
+            }
+            match p.clear.plunge {
+                Plunge::Straight => {}
+                Plunge::Ramp { .. } => fields.push(Field::PlungeA),
+                Plunge::Helix { .. } | Plunge::ZigZag { .. } => {
+                    fields.push(Field::PlungeA);
+                    fields.push(Field::PlungeB);
+                }
+            }
+            fields
+        }
+        Operation::Face(_) => vec![
+            Field::FaceStartOffset,
+            Field::Depth,
+            Field::Stepdown,
+            Field::Overlap,
+            Field::FaceOvershoot,
+            Field::SpindleRpm,
+            Field::Feed,
+            Field::PlungeFeed,
+        ],
+        Operation::Drill(_) => vec![
+            Field::Depth,
+            Field::DrillStartOffset,
+            Field::Peck,
+            Field::Dwell,
+            Field::SpindleRpm,
+            Field::Feed,
+        ],
+        Operation::Chamfer(c) => {
+            let mut fields = vec![
+                // Heights first and top-down, as the Setup inspector reads.
+                Field::ChamferTop,
+                Field::ChamferWidth,
+                Field::ChamferDepth,
+                Field::ChamferStep,
+                Field::SpindleRpm,
+                Field::Feed,
+                Field::PlungeFeed,
+            ];
+            if c.lead_in != Lead::None {
+                fields.push(Field::LeadInSize);
+            }
+            if c.lead_out != Lead::None {
+                fields.push(Field::LeadOutSize);
+            }
+            fields.push(Field::LeadOverlap);
+            fields
+        }
+        Operation::Engrave(_) => {
+            vec![
+                Field::Depth,
+                Field::Stepdown,
+                Field::SpindleRpm,
+                Field::Feed,
+                Field::PlungeFeed,
+            ]
+        }
+        // Carve has no stepdown (single-pass, deferred) and no stepover: its
+        // ring spacing plays that role, and `Depth` is a *cap* the shape may
+        // not reach.
+        Operation::Carve(c) => {
+            let mut fields = vec![
+                Field::Depth,
+                Field::ProfileOffset,
+                Field::RingStep,
+                Field::Scallop,
+                Field::SpindleRpm,
+                Field::Feed,
+                Field::PlungeFeed,
+            ];
+            // The clearing pass is a pocket over a derived region, so it gets a
+            // pocket's controls -- all but two. `Depth` is not its own (the
+            // carve's cap sets it), and a wall finishing allowance would leave a
+            // full-depth ridge at the wall/floor junction, since the V-bit's
+            // innermost ring runs along that boundary rather than beside it.
+            if let Some(cl) = &c.clear {
+                fields.extend([
+                    Field::ClearStepdown,
+                    Field::ClearOverlap,
+                    Field::ClearOffset,
+                    Field::ClearEngagement,
+                    Field::ClearFeed,
+                    Field::ClearPlungeFeed,
+                    Field::ClearLeadOverlap,
+                ]);
+                if cl.params.lead_in != Lead::None {
+                    fields.push(Field::ClearLeadInSize);
+                }
+                if cl.params.lead_out != Lead::None {
+                    fields.push(Field::ClearLeadOutSize);
+                }
+                match cl.params.plunge {
+                    Plunge::Straight => {}
+                    Plunge::Ramp { .. } => fields.push(Field::ClearPlungeA),
+                    Plunge::Helix { .. } | Plunge::ZigZag { .. } => {
+                        fields.push(Field::ClearPlungeA);
+                        fields.push(Field::ClearPlungeB);
+                    }
+                }
+            }
+            fields
+        }
+        Operation::Thread(t) => {
+            let mut fields = vec![
+                Field::MajorDia,
+                Field::Pitch,
+                Field::ThreadTop,
+                Field::ThreadBottom,
+                Field::ThreadPasses,
+                Field::ThreadSpringPasses,
+            ];
+            // Blind-hole fields only for internal threads (a boss has no bore).
+            if t.internal {
+                fields.push(Field::ThreadDrillClearance);
+                if t.drill_clearance > 0.0 {
+                    fields.push(Field::ThreadBlindAllowance);
+                }
+            }
+            fields.push(Field::SpindleRpm);
+            fields.push(Field::Feed);
+            fields.push(Field::PlungeFeed);
+            fields
+        }
+    }
+}
+
 /// The `a` and `b` subtrees of the split with the given id, if found.
 fn find_split(
     node: &pane_grid::Node,
@@ -6853,6 +6878,7 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Engrave(o), Field::Stepdown) => Some(o.stepdown),
         (Operation::Engrave(o), Field::Feed) => Some(o.feed),
         (Operation::Engrave(o), Field::PlungeFeed) => Some(o.plunge_feed),
+        (Operation::Chamfer(o), Field::ChamferTop) => Some(o.top),
         (Operation::Chamfer(o), Field::ChamferWidth) => Some(o.width),
         (Operation::Chamfer(o), Field::ChamferDepth) => Some(o.depth),
         (Operation::Chamfer(o), Field::ChamferStep) => Some(o.step),
@@ -7000,6 +7026,11 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
             }
         }
         Operation::Chamfer(o) => {
+            // Deliberately unclamped: an edge below the part datum is an ordinary
+            // thing to chamfer, so a negative Z is a value, not a mistake.
+            if let Some(v) = get(Field::ChamferTop) {
+                o.top = v;
+            }
             if let Some(v) = get(Field::ChamferWidth) {
                 o.width = v;
             }
@@ -8533,12 +8564,111 @@ mod inspector_field_tests {
 
     #[test]
     fn drill_exposes_peck_and_dwell_fields() {
-        let fields = match drill(None, None) {
-            Operation::Drill(_) => vec![Field::Depth, Field::Peck, Field::Dwell, Field::Feed],
-            _ => unreachable!(),
-        };
+        // This used to hand-build the list it then asserted on, so it could only ever
+        // agree with itself. It now asks the inspector's own rule.
+        let fields = operation_fields(&drill(None, None));
         assert!(fields.contains(&Field::Peck));
         assert!(fields.contains(&Field::Dwell));
+    }
+
+    fn chamfer(top: f64) -> Operation {
+        Operation::Chamfer(cam_model::ChamferOp {
+            id: 1,
+            tool: 1,
+            chain: cam_geo::Contour::new(vec![
+                cam_geo::Point::new(0.0, 0.0),
+                cam_geo::Point::new(10.0, 0.0),
+                cam_geo::Point::new(10.0, 10.0),
+                cam_geo::Point::new(0.0, 10.0),
+            ]),
+            side: Side::Outside,
+            width: 1.0,
+            top,
+            depth: 0.0,
+            step: 0.0,
+            gradual: false,
+            spindle_rpm: 0.0,
+            work_offset: 1,
+            feed: 200.0,
+            plunge_feed: 100.0,
+            start: None,
+            lead_in: Lead::None,
+            lead_out: Lead::None,
+            lead_overlap: 0.0,
+        })
+    }
+
+    #[test]
+    fn a_chamfers_top_edge_is_editable_and_may_sit_below_the_datum() {
+        // `top` was seeded from the stock top and then unreachable, which is only ever
+        // right for an edge on the raw surface. The rim of a pocket, or a step an
+        // earlier operation cut, is the ordinary case that had no way to be stated.
+        let mut op = chamfer(3.0);
+        assert!(
+            operation_fields(&op).contains(&Field::ChamferTop),
+            "the inspector must show the top edge"
+        );
+        assert_eq!(op_field(&op, Field::ChamferTop), Some(3.0));
+
+        // Deliberately unclamped: an edge below the part datum is a value, not a slip.
+        let mut parsed = BTreeMap::new();
+        parsed.insert(Field::ChamferTop, -4.5);
+        apply_op_fields(&mut op, &parsed);
+        assert_eq!(op_field(&op, Field::ChamferTop), Some(-4.5));
+        let Operation::Chamfer(c) = &op else {
+            unreachable!()
+        };
+        assert_eq!(c.top, -4.5, "a negative top must survive to the model");
+    }
+
+    /// One operation of every kind, built the way the app builds them.
+    fn one_of_every_kind() -> Vec<Operation> {
+        let mut app = AppController::new(default_machine());
+        app.open_dxf(SAMPLE_DXF, "sample.dxf").expect("sample loads");
+        for kind in [
+            OpKind::Profile,
+            OpKind::Pocket,
+            OpKind::Face,
+            OpKind::Drill,
+            OpKind::Thread,
+            OpKind::Chamfer,
+            OpKind::Engrave,
+            OpKind::Carve,
+        ] {
+            app.new_operation(kind);
+        }
+        app.document().setup.operations.clone()
+    }
+
+    #[test]
+    fn every_field_the_inspector_shows_can_be_written_back() {
+        // The gap this closes: a `Field` can be declared, labelled, given a tooltip and
+        // listed by `operation_fields`, and still have no arm in `op_field` or
+        // `apply_op_fields` — in which case the box renders, accepts typing, and springs
+        // back on Apply. Nothing else in the crate calls either function, so only this
+        // catches it. Asserted per operation kind, since the arms are per kind.
+        let ops = one_of_every_kind();
+        assert!(ops.len() >= 6, "the sample part must yield operations to check");
+        for op in &ops {
+            for field in operation_fields(op) {
+                let Some(before) = op_field(op, field) else {
+                    panic!("{}: {field:?} is shown but cannot be read", op_kind(op));
+                };
+                // +1 clears every lower clamp in `apply_op_fields` (all are `max(0.0)`
+                // or `max(1)`) without reaching the one upper clamp (overlap, 99%).
+                let want = before + 1.0;
+                let mut edited = op.clone();
+                let mut parsed = BTreeMap::new();
+                parsed.insert(field, want);
+                apply_op_fields(&mut edited, &parsed);
+                assert_eq!(
+                    op_field(&edited, field),
+                    Some(want),
+                    "{}: {field:?} is shown but does not accept an edit ({before} -> {want})",
+                    op_kind(op)
+                );
+            }
+        }
     }
 
     #[test]

@@ -368,6 +368,10 @@ things worth eyeballing:
   whole block should vanish. The Project row should read `Carve  T… + T…` in cutting
   order. In the backplot the V-bit should link its rings without lifting, but **lift**
   rather than skim across floor the end mill has already finished.
+- **Chamfer:** the Inspector's first field is **Top edge Z**, seeded from the top of
+  stock. Lower it and the whole bevel should move down with it in the backplot —
+  that is the case of chamfering a pocket rim or a step, which had no way to be
+  stated before. A negative value must be accepted, not clamped.
 - **Guards:** point an operation at a tool that cannot do the job — face with a
   chamfer mill, profile with a V-bit, thread with an end mill — and confirm the
   Output pane explains why and the operation is marked ⚠ in the tree, while merely
