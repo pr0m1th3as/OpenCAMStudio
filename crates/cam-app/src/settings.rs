@@ -29,7 +29,6 @@
 
 use std::path::{Path, PathBuf};
 
-use cam_post::PostKind;
 use serde::{Deserialize, Serialize};
 
 use crate::SnapKind;
@@ -47,8 +46,14 @@ use crate::SnapKind;
 /// **v2:** `defaults: NewProjectPrefs` became `session: SessionState`. The post stopped
 /// being a *preference* ("which post do new projects get") and became *last-used
 /// session state* ("which control were you on"), once machine and control became
-/// shop-local and the machine library took over nominating a default.
-pub const SETTINGS_VERSION: u32 = 2;
+/// shop-local.
+///
+/// **v3:** `session.post` retired in favour of `session.machine`. A machine now carries
+/// its control (`MachineEntry::post`), so the active machine *implies* the post and
+/// keeping both would be two sources of truth for one question — which is the objection
+/// that retired the preference in the first place, one level down. Predicted in v2's own
+/// documentation; it took two days.
+pub const SETTINGS_VERSION: u32 = 3;
 
 /// What happened when the settings file was read — the public face of
 /// [`crate::config::ConfigLoad`].
@@ -187,18 +192,18 @@ pub struct PanePrefs {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SessionState {
-    /// The post/control last selected.
+    /// The machine last selected, by name — and with it the control, since a machine
+    /// carries its post.
     ///
-    /// Session state, never read from a project file — a `.ocam` records the post it was
-    /// built for as provenance only, because which control you cut on is a property of
-    /// your shop (Andreas, 2026-08-01). It has its own control in the Machine ribbon
-    /// group, which is why it is **not** in the preferences panel: that panel holds
-    /// settings with no other home.
+    /// **Active, not preferred.** This is where you left off, not a default nominated in
+    /// a panel: two settings answering "which machine do I start on" is one too many,
+    /// and when they disagree someone authors against the wrong travel. The safety comes
+    /// from the active machine being *visible*.
     ///
-    /// Retires when the machine library lands — a machine will carry its post, so the
-    /// active *machine* will imply this, and keeping both would be two sources of truth
-    /// for one question. See `MACHINE_PLAN.md`.
-    pub post: PostKind,
+    /// A name that no longer resolves — the machine was deleted, or this file was copied
+    /// to another installation — falls back to the first in the library, and the app
+    /// says so rather than landing somewhere silently.
+    pub machine: Option<String>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -379,23 +384,24 @@ impl Settings {
     /// for once, at document schema v10.
     fn migrate(&mut self, from: u32) {
         for step in from..SETTINGS_VERSION {
-            // v1→v2: `defaults.post` became `session.post`. The old key lands in `extra`
-            // (everything unknown does), so the value is still here to move — which is
-            // the whole reason unknown keys are preserved rather than dropped.
+            // Both steps so far *retire* a key rather than reshape one, so both simply
+            // remove it. A key nothing reads is a key that misleads the next reader, and
+            // `extra` would otherwise carry it back out to disk forever.
             //
-            // One arm today; the shape stays a loop over steps because the *next* change
-            // must not have to invent it (`schema_version` went nine versions unread for
-            // want of exactly this).
+            // v1→v2: `defaults.post` (a nominated default for new projects).
+            // v2→v3: `session.post` (last-used control) — a machine carries its control
+            // now, so the active machine implies it.
+            //
+            // Neither value is carried forward, because the concept it named no longer
+            // exists: a post is a property of a machine. The cost is one re-pick on the
+            // machine, once.
             if step == 1 {
-                if let Some(post) = self
-                    .extra
-                    .get("defaults")
-                    .and_then(|d| d.get("post"))
-                    .and_then(|p| serde_json::from_value::<PostKind>(p.clone()).ok())
-                {
-                    self.session.post = post;
-                }
                 self.extra.remove("defaults");
+            }
+            if step == 2 {
+                if let Some(obj) = self.extra.get_mut("session").and_then(|v| v.as_object_mut()) {
+                    obj.remove("post");
+                }
             }
         }
         self.settings_version = SETTINGS_VERSION;
@@ -470,7 +476,7 @@ mod tests {
     #[test]
     fn the_defaults_are_exactly_todays_hard_coded_values() {
         let d = Settings::default();
-        assert_eq!(d.settings_version, 2);
+        assert_eq!(d.settings_version, 3);
 
         assert!(!d.view.show_stock);
         assert!(d.view.show_gizmo);
@@ -498,7 +504,7 @@ mod tests {
         assert_eq!(d.panes.min_inspector_px, 240.0);
         assert_eq!(d.panes.min_output_px, 60.0);
 
-        assert_eq!(d.session.post, PostKind::default());
+        assert_eq!(d.session.machine, None, "nothing selected until there is a library");
     }
 
     #[test]
@@ -627,7 +633,7 @@ mod tests {
             },
             vec![SnapKind::End],
             SessionState {
-                post: PostKind::Okuma,
+                machine: Some("Mill".into()),
                 extra: Default::default(),
             },
             PanePrefs {
@@ -644,7 +650,7 @@ mod tests {
             s.panes.min_inspector_px, 180.0,
             "remembering the session must not reset the user's pane minimums"
         );
-        assert_eq!(s.session.post, PostKind::Okuma, "the control is remembered");
+        assert_eq!(s.session.machine.as_deref(), Some("Mill"), "the machine is remembered");
         assert!(
             s.view.extra.contains_key("future_toggle")
                 && s.panes.extra.contains_key("future_pane")
@@ -728,7 +734,7 @@ mod tests {
     /// preserved rather than dropped — which is exactly what makes the value still
     /// available to move.
     #[test]
-    fn a_v1_file_carries_its_post_across_the_rename() {
+    fn a_v1_file_migrates_through_every_step_without_error() {
         let s = Scratch::new("settings");
         std::fs::write(
             s.file("settings.json"),
@@ -739,17 +745,17 @@ mod tests {
 
         let (got, outcome) = load_from(&s.file("settings.json"));
         assert_eq!(outcome, LoadOutcome::Loaded);
-        assert_eq!(
-            got.session.post,
-            PostKind::Okuma,
-            "the operator's control must survive the rename, not silently reset"
-        );
         assert_eq!(got.settings_version, SETTINGS_VERSION);
-        assert!(!got.view.tooltips, "and everything else still loads");
+        assert!(!got.view.tooltips, "everything else still loads");
         assert!(
             !got.extra.contains_key("defaults"),
-            "the migrated key must not linger and be written back out"
+            "a migrated key must not linger and be written back out"
         );
+        // v1's post went to v2's `session.post`, which v3 then retired — the machine
+        // carries the control now. What matters is that a two-step migration runs
+        // cleanly and leaves nothing stale behind, not that the value survived a
+        // concept that no longer exists.
+        assert_eq!(got.session.machine, None);
     }
 
     #[test]
@@ -762,7 +768,7 @@ mod tests {
         written.snapping.default_snaps = vec![SnapKind::End, SnapKind::Nearest];
         written.panes.project_px = 310.0;
         written.panes.min_inspector_px = 180.0;
-        written.session.post = PostKind::Okuma;
+        written.session.machine = Some("Router".into());
         written.save_to(&s.file("settings.json")).unwrap();
 
         let (got, outcome) = load_from(&s.file("settings.json"));

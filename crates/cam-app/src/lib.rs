@@ -31,7 +31,7 @@ pub use controller::{
     Selection, SnapHit, SnapKind,
 };
 pub use machines::{default_machine, load as load_machines, load_from as load_machines_from,
-    MachineLibrary, MachineLoad, MACHINES_VERSION};
+    MachineEntry, MachineLibrary, MachineLoad, MACHINES_VERSION};
 pub use project::{OcamFile, Project};
 pub use settings::{
     load as load_settings, load_from as load_settings_from, settings_path, LoadOutcome,

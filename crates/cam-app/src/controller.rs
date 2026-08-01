@@ -500,6 +500,16 @@ impl AppController {
     /// Edit the machine (envelope/name/limits). No re-run needed: the backplot is
     /// independent of the machine, and `export_nc` always re-posts against the
     /// current machine, so limit changes are re-checked at the next export.
+    /// Make `machine` the active one — what an export is gated against.
+    ///
+    /// Session state: never read from a project file, because the envelope is what gates
+    /// an export and a file that could set it could disarm that gate. Clears any cached
+    /// `.nc`, since the ceilings it was checked against have changed.
+    pub fn set_machine(&mut self, machine: Machine) {
+        self.machine = machine;
+        self.nc = None;
+    }
+
     pub fn edit_machine(&mut self, f: impl FnOnce(&mut Machine)) {
         f(&mut self.machine);
     }

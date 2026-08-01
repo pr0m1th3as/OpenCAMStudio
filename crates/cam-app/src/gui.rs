@@ -1440,6 +1440,11 @@ mod help {
     pub const THREAD_CUT: &str =
         "Climb vs conventional milling for the threading orbit — climb usually finishes \
          cleaner.";
+    pub const ACTIVE_MACHINE: &str =
+        "Which machine you are working on. The fields below edit it, and an export is \
+         checked against its travel — so this is the one thing that decides whether a \
+         job can be cut here. Machines are local to this installation: opening a project \
+         built elsewhere never changes it.";
     pub const POST: &str =
         "The machine controller/dialect the exported G-code is written for (grbl, Fanuc, \
          …). Pick the one your control speaks.";
@@ -1533,6 +1538,11 @@ struct App {
     output_px: f32,
     /// The preferences panel is open.
     show_prefs: bool,
+    /// Every machine this installation knows about. The **active** one is mirrored into
+    /// the controller (which gates exports against it); this is the set to pick from.
+    machines: crate::MachineLibrary,
+    /// The active machine's name — the key the selection is remembered by.
+    active_machine: String,
     /// The user's preferences, as loaded at startup and written back on change.
     ///
     /// The view/snap/pane fields below stay the live state — the settings copy is
@@ -2027,6 +2037,12 @@ enum Message {
     /// A continuous control has settled (slider released) — write preferences now
     /// rather than on every intermediate value.
     SettingsSettled,
+    /// Make this machine the active one — and adopt its control with it.
+    ActiveMachineChanged(String),
+    /// Add a machine to the library: a copy of the active one, ready to edit.
+    NewMachine,
+    /// Remove the active machine (never the last).
+    DeleteMachine,
     /// Open / close the preferences panel.
     ShowPrefs,
     ClosePrefs,
@@ -2171,8 +2187,20 @@ impl App {
         // reported the way a rejected *library* is: defaults here cost the user a
         // layout, not their tools.
         let (settings, _) = crate::load_settings();
+        let (machines, machine_load) = crate::load_machines();
+        // Resolve where you left off. A name that no longer resolves lands on the first
+        // machine — never on nothing — and is *reported*, because silently authoring
+        // against a different machine's travel is the failure this whole area exists to
+        // prevent.
+        let remembered = settings.session.machine.clone();
+        let stale = remembered.is_some() && !machines.resolves(remembered.as_deref());
+        let active = machines
+            .resolve(remembered.as_deref())
+            .cloned()
+            .unwrap_or_else(|| crate::MachineEntry::new(crate::default_machine()));
+        let active_machine = active.name().to_string();
         let mut app = Self {
-            controller: AppController::new(crate::default_machine()),
+            controller: AppController::new(active.machine.clone()),
             panes: initial_panes(),
             show_license: false,
             show_prefs: false,
@@ -2190,6 +2218,8 @@ impl App {
             view: ViewControls::default(),
             cursor: None,
             library,
+            machines,
+            active_machine,
             lib_sel: 0,
             tool_edit: None,
             library_view: LibraryView::Ordered,
@@ -2215,9 +2245,21 @@ impl App {
             // Last: every field above reads from it.
             settings,
         };
-        // Where you left off. The post is session state — never read from a project
-        // file — so it is restored, not nominated: last-used wins, like the armed snaps.
-        app.controller.set_post_kind(app.settings.session.post);
+        // The active machine carries its control, so resolving the machine above chose
+        // the post too — one source of truth, which is why `session.post` was retired.
+        app.controller.set_post_kind(active.post);
+        if stale {
+            app.status = format!(
+                "The machine you last used is no longer in the library; using \"{}\" \
+                 instead. Check it before cutting.",
+                app.active_machine
+            );
+        } else if let crate::MachineLoad::Rejected(why) = &machine_load {
+            app.status = format!(
+                "Machine library {why}. Using the default machine; your file is untouched \
+                 (a copy is beside it as machines.json.bak)."
+            );
+        }
         if let crate::LibraryLoad::Rejected(why) = &library_load {
             app.status = format!(
                 "Tool library {why}. Using the starter tools; your file is untouched \
@@ -2299,12 +2341,14 @@ impl App {
             }
             Message::MachineNameChanged(name) => {
                 self.controller.edit_machine(|m| m.name = name);
+                self.sync_active_machine();
             }
             Message::PostKindChanged(kind) => {
                 self.controller.set_post_kind(kind);
-                // Remembered for next launch — it is where you left off, not a default
-                // someone nominated in a panel.
-                self.remember();
+                // The picker sits in the Machine inspector, so it edits *this machine's*
+                // control — that is what the field means there. Remembered with the
+                // machine, not separately.
+                self.sync_active_machine();
                 self.status = format!("Post: {kind}.");
             }
             Message::Apply => {
@@ -2850,6 +2894,46 @@ impl App {
                 self.gizmo_size = v.clamp(GIZMO_SIZE_MIN, GIZMO_SIZE_MAX)
             }
             Message::SettingsSettled => self.remember(),
+            Message::ActiveMachineChanged(name) => {
+                if let Some(entry) = self.machines.by_name(&name).cloned() {
+                    self.active_machine = name;
+                    self.controller.set_machine(entry.machine);
+                    // The machine carries its control: picking the machine picks the
+                    // post. This is the error the library itself would otherwise create
+                    // — right machine, wrong control, because the last job used another.
+                    self.controller.set_post_kind(entry.post);
+                    self.remember();
+                    self.rerun();
+                    self.status = format!("Machine: {} ({}).", self.active_machine, entry.post);
+                }
+            }
+            Message::NewMachine => {
+                // A copy of the active one: machines in a shop differ from each other in
+                // one or two numbers, so duplicating beats starting from nothing.
+                let mut entry = self
+                    .machines
+                    .by_name(&self.active_machine)
+                    .cloned()
+                    .unwrap_or_else(|| crate::MachineEntry::new(crate::default_machine()));
+                entry.machine.name = format!("{} copy", entry.name());
+                self.active_machine = self.machines.add(entry);
+                self.machines.save();
+                self.sync_active_machine();
+                self.status = format!("Added machine \"{}\".", self.active_machine);
+            }
+            Message::DeleteMachine => {
+                if self.machines.remove(&self.active_machine) {
+                    self.machines.save();
+                    // `remove` refuses the last one, so there is always something here.
+                    let entry = self.machines.machines[0].clone();
+                    self.active_machine = entry.name().to_string();
+                    self.controller.set_machine(entry.machine);
+                    self.controller.set_post_kind(entry.post);
+                    self.remember();
+                    self.rerun();
+                    self.status = format!("Machine: {}.", self.active_machine);
+                }
+            }
             Message::ShowPrefs => self.show_prefs = true,
             Message::ClosePrefs => {
                 self.show_prefs = false;
@@ -3492,6 +3576,22 @@ impl App {
         self.panes.resize(split, ratio);
     }
 
+    /// Write the controller's machine and post back into the library entry, following a
+    /// rename, and persist.
+    ///
+    /// The Machine inspector edits the *active* machine in place, and the name is the
+    /// handle the selection is remembered by — so a rename has to move the entry and the
+    /// remembered selection together, or the next launch resolves nothing.
+    fn sync_active_machine(&mut self) {
+        let entry = crate::MachineEntry {
+            machine: self.controller.machine().clone(),
+            post: self.controller.post_kind(),
+        };
+        self.active_machine = self.machines.replace(&self.active_machine, entry);
+        self.machines.save();
+        self.remember();
+    }
+
     /// Copy the live view/snap/pane state into the preferences and write them out.
     ///
     /// Called from every handler that changes one of them. The mapping itself lives in
@@ -3512,7 +3612,7 @@ impl App {
             },
             self.snaps.clone(),
             crate::SessionState {
-                post: self.controller.post_kind(),
+                machine: Some(self.active_machine.clone()),
                 extra: Default::default(),
             },
             crate::PanePrefs {
@@ -5133,11 +5233,21 @@ impl App {
                 },
                 GroupSpec {
                     title: "Machine",
-                    commands: vec![cmd(
-                        Icon::Machine,
-                        "Machine",
-                        Some(Message::Select(Selection::Machine)),
-                    )],
+                    commands: vec![
+                        cmd(
+                            Icon::Machine,
+                            "Machine",
+                            Some(Message::Select(Selection::Machine)),
+                        ),
+                        cmd(Icon::NewTool, "Add", Some(Message::NewMachine)),
+                        cmd(
+                            Icon::Delete,
+                            "Delete",
+                            // Never the last: an empty library has nothing to gate an
+                            // export against.
+                            (self.machines.machines.len() > 1).then_some(Message::DeleteMachine),
+                        ),
+                    ],
                 },
             ],
             RibbonTab::Tooling => vec![GroupSpec {
@@ -6123,6 +6233,26 @@ impl App {
         }
 
         if let Selection::Machine = self.controller.selection() {
+            // Which machine is active — above its own fields, because everything below
+            // edits *this* one. The library is local: a machine is a property of your
+            // shop, and a project file records the one it was built for as provenance
+            // only (it can never set yours, or it could disarm the travel check).
+            if self.machines.machines.len() > 1 {
+                list = list.push(
+                    row![
+                        label_help("Active", help::ACTIVE_MACHINE, self.tooltips),
+                        pick_list(
+                            self.machines.names(),
+                            Some(self.active_machine.clone()),
+                            Message::ActiveMachineChanged,
+                        )
+                        .text_size(12)
+                        .width(INSPECTOR_PICKER_W),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                );
+            }
             // Machine name (a free-text tag), above the travel fields. Committed on
             // change so multiple machines can be told apart later.
             list = list.push(

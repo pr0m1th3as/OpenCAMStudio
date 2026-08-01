@@ -48,6 +48,46 @@ pub fn default_machine() -> Machine {
 /// The machine library file's format version.
 pub const MACHINES_VERSION: u32 = 1;
 
+/// One machine, and the control it is wired to.
+///
+/// **The post lives here, not on [`Machine`]**, for two reasons. Layering: `cam-model`
+/// knows nothing of `cam-post`, and should not learn. And meaning: which control a
+/// machine has is a fact about *this shop's* installation of it, which is exactly what
+/// this library is for.
+///
+/// The machine's own fields are flattened, so a v1 `machines.json` — written before the
+/// post existed — loads unchanged with the post defaulting. Additive, no version step.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MachineEntry {
+    /// Travel, feeds, spindle ceiling, safe Z.
+    #[serde(flatten)]
+    pub machine: Machine,
+    /// The control this machine has, and therefore the post its programs are written
+    /// for.
+    ///
+    /// **Selecting a machine selects this.** The library exists because a shop has more
+    /// than one machine, and more than one machine almost always means more than one
+    /// control — so "pick the small mill, get Okuma G-code because that is what the last
+    /// job used" is a mistake the library itself creates. Tying the two removes it.
+    #[serde(default)]
+    pub post: cam_post::PostKind,
+}
+
+impl MachineEntry {
+    /// A machine with the default control.
+    pub fn new(machine: Machine) -> Self {
+        Self {
+            machine,
+            post: cam_post::PostKind::default(),
+        }
+    }
+
+    /// This machine's name — the handle the selection is remembered by.
+    pub fn name(&self) -> &str {
+        &self.machine.name
+    }
+}
+
 /// The machines this installation knows about.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -55,7 +95,7 @@ pub struct MachineLibrary {
     /// Format version — see [`MACHINES_VERSION`].
     pub machines_version: u32,
     /// Every machine, in the order they are shown.
-    pub machines: Vec<Machine>,
+    pub machines: Vec<MachineEntry>,
     /// Keys this build does not know about, carried through a save untouched.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -80,14 +120,24 @@ impl MachineLibrary {
     pub fn seeded() -> Self {
         Self {
             machines_version: MACHINES_VERSION,
-            machines: vec![default_machine()],
+            machines: vec![MachineEntry::new(default_machine())],
             extra: Default::default(),
         }
     }
 
-    /// The machine with this name.
-    pub fn by_name(&self, name: &str) -> Option<&Machine> {
-        self.machines.iter().find(|m| m.name == name)
+    /// The entry with this name.
+    pub fn by_name(&self, name: &str) -> Option<&MachineEntry> {
+        self.machines.iter().find(|m| m.name() == name)
+    }
+
+    /// The entry with this name, mutably.
+    pub fn by_name_mut(&mut self, name: &str) -> Option<&mut MachineEntry> {
+        self.machines.iter_mut().find(|m| m.name() == name)
+    }
+
+    /// Every machine's name, in order — what the picker shows.
+    pub fn names(&self) -> Vec<String> {
+        self.machines.iter().map(|m| m.name().to_string()).collect()
     }
 
     /// Resolve a remembered selection to an actual machine.
@@ -97,7 +147,7 @@ impl MachineLibrary {
     /// rather than to nothing. The caller is expected to say so: silently landing on a
     /// different machine than the one you left on is precisely the failure this whole
     /// area exists to prevent.
-    pub fn resolve(&self, name: Option<&str>) -> Option<&Machine> {
+    pub fn resolve(&self, name: Option<&str>) -> Option<&MachineEntry> {
         name.and_then(|n| self.by_name(n)).or_else(|| self.machines.first())
     }
 
@@ -111,17 +161,41 @@ impl MachineLibrary {
     /// Names are the handle everywhere else — the selection is remembered by name, and
     /// the provenance note quotes it — so a duplicate would make "which machine"
     /// ambiguous in the one place it must not be.
-    pub fn add(&mut self, mut machine: Machine) -> String {
-        if self.by_name(&machine.name).is_some() {
-            let base = machine.name.clone();
+    pub fn add(&mut self, mut entry: MachineEntry) -> String {
+        if self.by_name(entry.name()).is_some() {
+            let base = entry.name().to_string();
             let mut n = 2;
             while self.by_name(&format!("{base} ({n})")).is_some() {
                 n += 1;
             }
-            machine.name = format!("{base} ({n})");
+            entry.machine.name = format!("{base} ({n})");
         }
-        let name = machine.name.clone();
-        self.machines.push(machine);
+        let name = entry.name().to_string();
+        self.machines.push(entry);
+        name
+    }
+
+    /// Replace the entry called `was` — used when the active machine is edited, since
+    /// editing may change the very name it is keyed by. Returns the (possibly
+    /// disambiguated) new name.
+    pub fn replace(&mut self, was: &str, entry: MachineEntry) -> String {
+        let renamed = entry.name() != was;
+        let clashes = renamed && self.by_name(entry.name()).is_some();
+        let Some(slot) = self.machines.iter().position(|m| m.name() == was) else {
+            return self.add(entry);
+        };
+        let mut entry = entry;
+        if clashes {
+            // Same rule as `add`: names are the handle, so they stay unique.
+            let base = entry.name().to_string();
+            let mut n = 2;
+            while self.by_name(&format!("{base} ({n})")).is_some() {
+                n += 1;
+            }
+            entry.machine.name = format!("{base} ({n})");
+        }
+        let name = entry.name().to_string();
+        self.machines[slot] = entry;
         name
     }
 
@@ -134,7 +208,7 @@ impl MachineLibrary {
             return false;
         }
         let before = self.machines.len();
-        self.machines.retain(|m| m.name != name);
+        self.machines.retain(|m| m.name() != name);
         self.machines.len() != before
     }
 }
@@ -223,11 +297,11 @@ mod tests {
     use super::*;
     use crate::config::tests::Scratch;
 
-    fn named(name: &str) -> Machine {
-        Machine {
+    fn named(name: &str) -> MachineEntry {
+        MachineEntry::new(Machine {
             name: name.into(),
             ..default_machine()
-        }
+        })
     }
 
     /// **The inertness test.** Introducing the library must change nothing until a user
@@ -238,7 +312,7 @@ mod tests {
         let s = Scratch::new("machines");
         let (lib, outcome) = load_from(&s.file("machines.json"));
         assert_eq!(outcome, MachineLoad::Seeded);
-        assert_eq!(lib.machines, vec![default_machine()]);
+        assert_eq!(lib.machines, vec![MachineEntry::new(default_machine())]);
         assert!(s.file("machines.json").exists());
 
         let (again, outcome) = load_from(&s.file("machines.json"));
@@ -303,16 +377,16 @@ mod tests {
         lib.add(named("Router"));
         lib.add(named("Mill"));
 
-        assert_eq!(lib.resolve(Some("Mill")).unwrap().name, "Mill");
+        assert_eq!(lib.resolve(Some("Mill")).unwrap().name(), "Mill");
         assert!(lib.resolves(Some("Mill")));
 
         assert_eq!(
-            lib.resolve(Some("Deleted")).unwrap().name,
+            lib.resolve(Some("Deleted")).unwrap().name(),
             "Router",
             "a stale name lands on the first machine, not on nothing"
         );
         assert!(!lib.resolves(Some("Deleted")), "…and the caller can tell");
-        assert_eq!(lib.resolve(None).unwrap().name, "Router");
+        assert_eq!(lib.resolve(None).unwrap().name(), "Router");
     }
 
     /// The last machine cannot be removed: an empty library has nothing to gate an
@@ -326,6 +400,47 @@ mod tests {
         assert!(!lib.remove("Router"), "the last one stays");
         assert_eq!(lib.machines.len(), 1);
         assert!(!lib.remove("Never existed"));
+    }
+
+    /// A `machines.json` written before machines had a control loads unchanged, with the
+    /// post defaulting — additive, so no version step. The machine's own fields are
+    /// flattened precisely so this holds.
+    #[test]
+    fn a_library_written_before_the_post_existed_still_loads() {
+        let s = Scratch::new("machines");
+        std::fs::write(
+            s.file("machines.json"),
+            r#"{"machines_version": 1, "machines": [
+                 {"name": "Router", "rapid_rate": 2000.0, "max_spindle_rpm": 10000.0,
+                  "max_feed": 800.0, "safe_z": 5.0, "tool_change_pos": null,
+                  "envelope": {"min": [0.0,0.0,-50.0], "max": [300.0,180.0,50.0]}}]}"#,
+        )
+        .unwrap();
+        let (lib, outcome) = load_from(&s.file("machines.json"));
+        assert_eq!(outcome, MachineLoad::Loaded);
+        assert_eq!(lib.machines.len(), 1);
+        assert_eq!(lib.machines[0].name(), "Router");
+        assert_eq!(lib.machines[0].post, cam_post::PostKind::default());
+        assert_eq!(lib.machines[0].machine.max_feed, 800.0);
+    }
+
+    /// Editing the active machine can rename it — and the name is the handle the
+    /// selection is remembered by, so the replacement has to keep names unique too.
+    #[test]
+    fn replacing_an_entry_follows_a_rename_and_still_disambiguates() {
+        let mut lib = MachineLibrary::default();
+        lib.add(named("Router"));
+        lib.add(named("Mill"));
+
+        let renamed = lib.replace("Router", named("Big Router"));
+        assert_eq!(renamed, "Big Router");
+        assert!(lib.by_name("Router").is_none());
+        assert_eq!(lib.machines.len(), 2);
+
+        // Renaming onto a name already taken must not create a second "Mill".
+        let clashed = lib.replace("Big Router", named("Mill"));
+        assert_eq!(clashed, "Mill (2)");
+        assert_eq!(lib.machines.len(), 2);
     }
 
     #[test]

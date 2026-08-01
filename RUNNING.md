@@ -368,6 +368,19 @@ that have no other control:
   which. These are **logical** pixels, so a high-DPI screen with display scaling is
   already handled; raise them on a large screen, lower them on a small or unscaled one
   where the shipped values can leave the viewport too narrow to work in.
+The **machine** is not here either, and for a stronger reason. Your machines live in a
+**local library** (`machines.json`), picked from the *Active* row at the top of the
+Machine inspector, with **Add** / **Delete** in the Machine ribbon group. Everything
+below that row edits the machine you have selected. **Each machine carries its own
+control**, so picking a machine picks its post — a shop with a Haas and a grbl router
+should not have to remember to switch the post as well, and "right machine, wrong
+control" is a mistake a machine library would otherwise create.
+
+An export is checked against the **active** machine's travel, which is what decides
+whether a job can be cut here at all. Which machine you last used is remembered; if it
+has since been deleted the app falls back to the first in the library and says so rather
+than landing somewhere quietly.
+
 The **post** is deliberately *not* here. It has its own control in the Machine ribbon
 group, and it is remembered between runs as where you left off — not nominated as a
 default. Neither creating a project nor opening someone else's changes it: which control
@@ -453,9 +466,13 @@ things worth eyeballing:
   defaults** gets you back in one click without a confirmation step you might not be
   able to reach. Check the pane rows name their axis — **Output (height)**, the rest
   **(width)**. Drag **Origin marker size** and watch the datum cross grow.
-- **Machine and control stay yours.** Change the post in the Machine ribbon, restart, and
-  confirm it came back. Then open a `.ocam` saved with a *different* machine and post —
-  yours must be untouched, and the status line must say what the job was built for.
+- **Machine and control stay yours.** Add a second machine (Machine ribbon → **Add**),
+  give it a different travel and a different post, and switch between them with the
+  **Active** row — the post must follow the machine. Restart and confirm you came back on
+  the one you left. Then open a `.ocam` saved with a *different* machine and post: yours
+  must be untouched, and the status line must say what the job was built for. Finally,
+  make a job too big for the small machine and confirm the export is **refused** on it
+  and accepted on the large one — that check is the whole reason the library is local.
 - **Preferences that stick:** change the View-tab toggles (Stock / Cube / Origin /
   Tips), drag the cube-size slider, arm or disarm a couple of object snaps, and drag
   the pane dividers. **Restart.** All of it should come back as you left it — they are
