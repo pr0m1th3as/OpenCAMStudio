@@ -1530,6 +1530,8 @@ struct App {
     project_px: f32,
     inspector_px: f32,
     output_px: f32,
+    /// The preferences panel is open.
+    show_prefs: bool,
     /// The user's preferences, as loaded at startup and written back on change.
     ///
     /// The view/snap/pane fields below stay the live state — the settings copy is
@@ -2024,6 +2026,17 @@ enum Message {
     /// A continuous control has settled (slider released) — write preferences now
     /// rather than on every intermediate value.
     SettingsSettled,
+    /// Open / close the preferences panel.
+    ShowPrefs,
+    ClosePrefs,
+    /// Pickbox aperture, logical px. The object-snap catch distance follows it.
+    SetPickbox(f32),
+    /// Snap marker size, as a multiple of the catch aperture.
+    SetMarkerScale(f32),
+    /// The smallest `pane` may be dragged to, logical px.
+    SetPaneMin(Pane, f32),
+    /// Put every preference back to its shipped value.
+    RestoreDefaults,
     PaneResized(pane_grid::ResizeEvent),
     PaneDragged(pane_grid::DragEvent),
     /// The window was resized (tracked for pixel-accurate pane minimums).
@@ -2174,6 +2187,7 @@ impl App {
             controller: AppController::new(default_machine()),
             panes: initial_panes(),
             show_license: false,
+            show_prefs: false,
             window: iced::Size::new(1280.0, 800.0),
             project_px: settings.panes.project_px,
             inspector_px: settings.panes.inspector_px,
@@ -2840,6 +2854,53 @@ impl App {
                 self.gizmo_size = v.clamp(GIZMO_SIZE_MIN, GIZMO_SIZE_MAX)
             }
             Message::SettingsSettled => self.remember(),
+            Message::ShowPrefs => self.show_prefs = true,
+            Message::ClosePrefs => {
+                self.show_prefs = false;
+                self.remember();
+            }
+            Message::SetPickbox(v) => {
+                let (lo, hi) = crate::PICKBOX_RANGE;
+                self.settings.snapping.pickbox_px = v.clamp(lo, hi);
+            }
+            Message::SetMarkerScale(v) => {
+                let (lo, hi) = crate::MARKER_SCALE_RANGE;
+                self.settings.snapping.marker_scale = v.clamp(lo, hi);
+            }
+            Message::SetPaneMin(pane, v) => {
+                let (lo, hi) = crate::PANE_MIN_RANGE;
+                let v = v.clamp(lo, hi);
+                let p = &mut self.settings.panes;
+                match pane {
+                    Pane::Project => p.min_project_px = v,
+                    Pane::Library => p.min_library_px = v,
+                    Pane::Viewport => p.min_viewport_px = v,
+                    Pane::Inspector => p.min_inspector_px = v,
+                    Pane::Output => p.min_output_px = v,
+                }
+                // Live-apply: a minimum only means something once the layout obeys it,
+                // and the point of the control is to *see* the pane stop shrinking.
+                self.apply_fixed_layout();
+            }
+            Message::RestoreDefaults => {
+                // The only escape from a layout the user cannot otherwise undo, so it
+                // resets *everything* — pane sizes and minimums included — and applies
+                // at once rather than behind a confirm they might not be able to reach.
+                self.settings = crate::Settings::default();
+                let s = &self.settings;
+                self.show_stock = s.view.show_stock;
+                self.show_gizmo = s.view.show_gizmo;
+                self.show_origin = s.view.show_origin;
+                self.tooltips = s.view.tooltips;
+                self.gizmo_size = s.view.gizmo_size;
+                self.snaps = s.snapping.default_snaps.clone();
+                self.project_px = s.panes.project_px;
+                self.inspector_px = s.panes.inspector_px;
+                self.output_px = s.panes.output_px;
+                self.apply_fixed_layout();
+                self.settings.save();
+                self.status = "Preferences restored to defaults.".to_string();
+            }
             Message::PaneResized(pane_grid::ResizeEvent { split, ratio }) => {
                 let ratio = self.clamp_resize(split, ratio);
                 self.panes.resize(split, ratio);
@@ -4344,6 +4405,11 @@ impl App {
         if let Some(pickbox) = self.pickbox_overlay() {
             layers = layers.push(pickbox);
         }
+        if let Some(card) = self.prefs_overlay() {
+            let catcher = mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
+                .on_press(Message::ClosePrefs);
+            layers = layers.push(catcher).push(card);
+        }
         if let Some(card) = self.license_overlay() {
             // Same catcher pattern as the menus: a click anywhere off the card closes.
             let catcher = mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
@@ -4351,6 +4417,164 @@ impl App {
             layers = layers.push(catcher).push(card);
         }
         layers.into()
+    }
+
+    /// The preferences panel. `None` unless open.
+    ///
+    /// **Only settings with no other control appear here.** The View ribbon already
+    /// toggles stock/cube/origin/tips and sizes the cube, and the snap buttons arm the
+    /// object snaps — duplicating those would create two places to change one thing and
+    /// the inevitable question of which is authoritative. What has no home anywhere
+    /// else is the picking tolerances and the pane minimums, so that is what this is.
+    ///
+    /// **Live-apply, not Apply-on-dirty.** The two-commit-class convention governs edits
+    /// to the *model* — the thing that becomes G-code. These are not that, and a
+    /// tolerance you cannot see change while dragging is a tolerance you cannot set.
+    fn prefs_overlay(&self) -> Option<Element<'_, Message>> {
+        if !self.show_prefs {
+            return None;
+        }
+        let heading = |t: &'static str| text(t).size(14);
+        let note = |t: String| text(t).size(11);
+
+        // A labelled slider with its value shown, the shape every row here takes.
+        let row_for = |label: &'static str,
+                       range: (f32, f32),
+                       value: f32,
+                       step: f32,
+                       shown: String,
+                       msg: fn(f32) -> Message|
+         -> Element<'_, Message> {
+            row![
+                text(label).size(12).width(Length::Fixed(150.0)),
+                slider(range.0..=range.1, value, msg)
+                    .step(step)
+                    .on_release(Message::SettingsSettled)
+                    .width(Length::Fixed(190.0)),
+                text(shown).size(12).width(Length::Fixed(64.0)),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center)
+            .into()
+        };
+
+        let snapping = column![
+            heading("Picking and snapping"),
+            row_for(
+                "Pickbox size",
+                crate::PICKBOX_RANGE,
+                self.settings.snapping.pickbox_px,
+                1.0,
+                format!("{:.0} px", self.settings.snapping.pickbox_px),
+                Message::SetPickbox,
+            ),
+            // Shown, not settable. The catch distance is a fixed multiple of the
+            // pickbox on purpose: two absolute knobs would let it be set *smaller*
+            // than the box that feeds it. Showing the derived number keeps the
+            // relationship visible instead of merely documented.
+            note(format!(
+                "Object snaps catch within {:.0} px — {:.1}× the pickbox.",
+                self.settings.snap_catch_px(),
+                crate::SNAP_CATCH_MULTIPLE,
+            )),
+            row_for(
+                "Snap marker size",
+                crate::MARKER_SCALE_RANGE,
+                self.settings.snapping.marker_scale,
+                0.1,
+                format!("{:.1}×", self.settings.snapping.marker_scale),
+                Message::SetMarkerScale,
+            ),
+        ]
+        .spacing(6);
+
+        let p = &self.settings.panes;
+        let pane_row = |pane: Pane, value: f32| -> Element<'_, Message> {
+            row![
+                text(pane.name()).size(12).width(Length::Fixed(150.0)),
+                slider(crate::PANE_MIN_RANGE.0..=crate::PANE_MIN_RANGE.1, value, move |v| {
+                    Message::SetPaneMin(pane, v)
+                })
+                .step(5.0_f32)
+                .on_release(Message::SettingsSettled)
+                .width(Length::Fixed(190.0)),
+                text(format!("{value:.0} px")).size(12).width(Length::Fixed(64.0)),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center)
+            .into()
+        };
+
+        let panes = column![
+            heading("Smallest a pane may be"),
+            note(
+                "These are logical pixels, so a high-DPI screen with display scaling is \
+                 already handled. Raise them on a large screen; lower them on a small or \
+                 unscaled one, where the shipped values can leave the viewport too narrow \
+                 to work in."
+                    .to_string()
+            ),
+            pane_row(Pane::Project, p.min_project_px),
+            pane_row(Pane::Library, p.min_library_px),
+            pane_row(Pane::Viewport, p.min_viewport_px),
+            pane_row(Pane::Inspector, p.min_inspector_px),
+            pane_row(Pane::Output, p.min_output_px),
+        ]
+        .spacing(6);
+
+        let btn = |label: &'static str, msg: Message| {
+            button(
+                text(label)
+                    .size(13)
+                    .line_height(iced::widget::text::LineHeight::Relative(1.0))
+                    .align_y(Alignment::Center),
+            )
+            .padding(Padding::from([5.0, 14.0]))
+            .on_press(msg)
+        };
+
+        let card = container(
+            column![
+                text("Preferences").size(20),
+                note(
+                    "Saved to settings.json in your configuration folder, and applied as \
+                     you change them."
+                        .to_string()
+                ),
+                snapping,
+                panes,
+                row![
+                    // Left, away from Close: it is destructive, and the two should not
+                    // be adjacent when one of them is the escape from an unusable layout.
+                    btn("Restore defaults", Message::RestoreDefaults),
+                    Space::new().width(Length::Fill),
+                    btn("Close", Message::ClosePrefs),
+                ]
+                .align_y(Alignment::Center),
+            ]
+            .spacing(12)
+            .padding(4),
+        )
+        .width(520)
+        .padding(16)
+        .style(|theme: &iced::Theme| container::Style {
+            background: Some(Background::Color(theme.extended_palette().background.weak.color)),
+            border: Border {
+                color: theme.extended_palette().background.strong.color,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..Default::default()
+        });
+
+        Some(
+            container(card)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(Alignment::Center)
+                .align_y(Alignment::Center)
+                .into(),
+        )
     }
 
     /// The licence-and-credits overlay (View tab -> About -> Licence). `None` unless
@@ -4732,6 +4956,12 @@ impl App {
                     }),
                 )
                 .padding(Padding::from([0.0, 7.0])),
+            )
+            .push(
+                button(text("Preferences").size(12))
+                    .padding(Padding::from([5.0, 14.0]))
+                    .on_press(Message::ShowPrefs)
+                    .style(|_theme, status| tab_button_style(false, status)),
             )
             .push(
                 button(text("About").size(12))

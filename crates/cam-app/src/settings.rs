@@ -628,6 +628,71 @@ mod tests {
         );
     }
 
+    /// Every extreme a preferences slider can reach must survive a save and reload
+    /// unchanged.
+    ///
+    /// The panel's sliders are bounded by these same range constants, so this ties the
+    /// two together: if a control's range were ever widened past what `clamp_all`
+    /// accepts, the user would set a value, restart, and find it silently moved — with
+    /// nothing to tell them the app had overruled them.
+    #[test]
+    fn every_value_a_control_can_reach_survives_a_reload() {
+        for pick in [PICKBOX_RANGE.0, PICKBOX_RANGE.1] {
+            for scale in [MARKER_SCALE_RANGE.0, MARKER_SCALE_RANGE.1] {
+                for pane_min in [PANE_MIN_RANGE.0, PANE_MIN_RANGE.1] {
+                    for gizmo in [GIZMO_SIZE_RANGE.0, GIZMO_SIZE_RANGE.1] {
+                        let mut s = Settings::default();
+                        s.snapping.pickbox_px = pick;
+                        s.snapping.marker_scale = scale;
+                        s.view.gizmo_size = gizmo;
+                        s.panes.min_project_px = pane_min;
+                        s.panes.min_library_px = pane_min;
+                        s.panes.min_viewport_px = pane_min;
+                        s.panes.min_inspector_px = pane_min;
+                        s.panes.min_output_px = pane_min;
+                        let before = s.clone();
+                        s.clamp_all();
+                        assert_eq!(
+                            s, before,
+                            "a value the panel allows was changed on load: \
+                             pickbox {pick}, scale {scale}, pane min {pane_min}, gizmo {gizmo}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Restore-to-defaults is the only escape from a layout the user cannot otherwise
+    /// undo — five maxed-out pane minimums leave no room for the viewport. So it has
+    /// to reset *everything*, not just the section in front of them.
+    #[test]
+    fn restoring_defaults_recovers_from_an_unusable_layout() {
+        let mut wrecked = Settings::default();
+        for m in [
+            &mut wrecked.panes.min_project_px,
+            &mut wrecked.panes.min_library_px,
+            &mut wrecked.panes.min_viewport_px,
+            &mut wrecked.panes.min_inspector_px,
+            &mut wrecked.panes.min_output_px,
+        ] {
+            *m = PANE_MIN_RANGE.1;
+        }
+        wrecked.panes.project_px = PANE_SIZE_RANGE.1;
+        wrecked.snapping.pickbox_px = PICKBOX_RANGE.1;
+        assert_ne!(wrecked, Settings::default());
+
+        // What the panel's button does.
+        let restored = Settings::default();
+        assert_eq!(restored.panes, PanePrefs::default(), "pane sizes AND minimums");
+        assert_eq!(restored.snapping, SnapPrefs::default());
+        assert_eq!(restored.view, ViewPrefs::default());
+        let side = restored.panes.min_project_px
+            + restored.panes.min_inspector_px
+            + restored.panes.min_viewport_px;
+        assert!(side <= 1366.0, "the recovered layout must fit a modest screen");
+    }
+
     #[test]
     fn a_saved_file_reloads_identically() {
         let s = Scratch::new();

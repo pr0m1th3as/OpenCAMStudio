@@ -333,11 +333,32 @@ records neither, and opening one leaves your current machine and post alone.
 
 ### Preferences
 
-The View toggles, the orientation-cube size, the armed object snaps and the pane
-sizes you drag to are **remembered between runs**, in
-`<config-dir>/OpenCAMStudio/settings.json` (beside `tools.json`). Nothing else is a
-preference yet — the panel that will expose pickbox size, pane minimums and a default
-post for new projects is still to come.
+**Preferences** sits beside **About**, right of the ribbon tabs. It holds the settings
+that have no other control:
+
+- **Pickbox size** — the aperture of the square that follows the cursor during a pick.
+  Its half-size is also the vertex-snap tolerance. The object-snap catch distance is
+  shown beneath it but is **not separately settable**: it stays a fixed 1.5× the
+  pickbox, because two independent numbers would let you set a catch distance smaller
+  than the box feeding it.
+- **Snap marker size** — how large the engaged snap glyph draws. Unlike the catch
+  distance this *is* its own control: it is a visual size, not a tolerance, so a large
+  marker with a tight aperture is a reasonable thing to want.
+- **Smallest a pane may be** — the five per-pane minimums. These are **logical**
+  pixels, so a high-DPI screen with display scaling is already handled; raise them on a
+  large screen, lower them on a small or unscaled one where the shipped values can
+  leave the viewport too narrow to work in.
+
+Changes apply as you drag, and are written when you let go. **Restore defaults** puts
+everything back — including the pane sizes and minimums, since it is the way out of a
+layout that has left no room for the viewport.
+
+Everything else that is remembered has its control where you already use it: the View
+toggles, the cube-size slider, the armed object snaps and the pane sizes you drag to
+are all **remembered between runs** without appearing here. Duplicating them in a panel
+would create two places to change one thing.
+
+All of it lives in `<config-dir>/OpenCAMStudio/settings.json`, beside `tools.json`.
 
 The file is versioned, and a file it cannot read is **never overwritten**: an
 unparseable one, or one written by a newer build, leaves you on the defaults with your
@@ -400,6 +421,13 @@ ramp runs forward along the path and retraces it at depth instead. A closed cont
 Because the GUI is the one part that cannot be verified by automated tests, the
 things worth eyeballing:
 
+- **The Preferences panel:** open it (beside About). Drag **Pickbox size** and watch
+  the pick square change *while you drag* — then check the catch-distance line beneath
+  it tracks the pickbox rather than standing still. Drag a **pane minimum** up and
+  confirm that divider now refuses to go past it. Then the escape hatch: push every
+  pane minimum to maximum until the viewport is unusable, and confirm **Restore
+  defaults** gets you back in one click without a confirmation step you might not be
+  able to reach.
 - **Preferences that stick:** change the View-tab toggles (Stock / Cube / Origin /
   Tips), drag the cube-size slider, arm or disarm a couple of object snaps, and drag
   the pane dividers. **Restart.** All of it should come back as you left it — they are
