@@ -5,9 +5,11 @@
 //! ## Depth and passes
 //!
 //! The full radial depth of a 60° form (0.5413·pitch internal, 0.6134·pitch external)
-//! is reached in `passes` equal radial steps, each a full helix, stepping the tool-
-//! centre orbit outward (internal) or inward (external) so the crest lands from the
-//! grazing surface to the root, deepest last; `spring_passes` add full-depth repeats.
+//! is reached in `passes` steps, each a full helix, stepping the tool-centre orbit
+//! outward (internal) or inward (external) so the crest lands from the grazing surface
+//! to the root, deepest last; `spring_passes` add full-depth repeats. The steps are
+//! equal in *radius* by default, or equal in *material* when `gradual` is set — see
+//! [`infeed_fractions`], which is where the difference and its reason live.
 //! The tool geometry is enforced up front by three hard gates (min cutting ⌀ vs. the
 //! pre-drilled minor bore, max thread depth from the reduced neck, reach vs. length of
 //! cut) plus a blind-hole allowance that validates the drilled depth.
@@ -212,15 +214,13 @@ impl Strategy for ThreadStrategy {
             )));
             bail!();
         }
-        // Radial infeed passes (equal steps to full depth), then any spring passes at
-        // full depth. Each entry is a tool-centre orbit radius; the emitter cuts a full
-        // helix at each, deepest last.
+        // Radial infeed passes to full depth, then any spring passes at full depth. Each
+        // entry is a tool-centre orbit radius; the emitter cuts a full helix at each,
+        // deepest last.
         let npass = op.passes.max(1);
-        let mut orbits: Vec<f64> = (1..=npass)
-            .map(|i| {
-                let f = i as f64 / npass as f64;
-                orbit_of(cut_start + f * (cut_final - cut_start))
-            })
+        let mut orbits: Vec<f64> = infeed_fractions(npass, op.gradual)
+            .into_iter()
+            .map(|f| orbit_of(cut_start + f * (cut_final - cut_start)))
             .collect();
         for _ in 0..op.spring_passes {
             orbits.push(orbit_of(cut_final));
@@ -323,6 +323,37 @@ impl Strategy for ThreadStrategy {
             cancelled: false,
         }
     }
+}
+
+/// The fraction of the full radial depth reached by each infeed pass, in cutting order,
+/// always ending exactly at `1.0`.
+///
+/// - **uniform** (`!gradual`): equal radial steps, `i/n`. The simplest reading of "cut it
+///   in `n` passes", and what every thread cut before this existed.
+/// - **gradual**: equal *material* per pass, `√(i/n)`.
+///
+/// The square root is the whole content, and it is the same one [`pass_widths`] uses for
+/// a chamfer. A thread form is a V, so the groove it cuts widens axially in proportion to
+/// how deep it has gone: at radial penetration `x` the section removed is a triangle of
+/// height `x` and base `2·x·tan(α/2)`, hence area `∝ x²`. Equal radial steps therefore
+/// take a *rising* bite — with 4 passes the last removes 7/16 of the metal and the first
+/// only 1/16. That is backwards: the last pass is the one cutting the finished flank, so
+/// it is the one that should be light. Inverting `area ∝ x²` gives `x ∝ √(area)`, so
+/// equal areas mean penetrations at `√(i/n)`.
+///
+/// [`pass_widths`]: crate::chamfer
+fn infeed_fractions(npass: u32, gradual: bool) -> Vec<f64> {
+    let n = npass.max(1);
+    (1..=n)
+        .map(|i| {
+            let f = i as f64 / n as f64;
+            if gradual {
+                f.sqrt()
+            } else {
+                f
+            }
+        })
+        .collect()
 }
 
 /// Everything shared across the holes of one thread operation.
@@ -501,6 +532,7 @@ mod tests {
             climb,
             passes: 1,
             spring_passes: 0,
+            gradual: false,
             drill_clearance: 0.0,
             blind_allowance: 0.0,
             feed: 200.0,
@@ -845,6 +877,92 @@ mod tests {
             "passes deepen: {radii:?}"
         );
         assert!((radii.last().unwrap() - (5.0 - 2.5)).abs() < 1e-9);
+    }
+
+    /// Gradual sizing must equalise the **material** each pass removes, not the radii.
+    ///
+    /// Measured as the area actually taken, not as "the radii follow a square root" —
+    /// the square root is the implementation, the equal bite is the property. A thread
+    /// form is a V, so the section cut to radial penetration `x` is a triangle whose
+    /// base grows with `x`; area therefore goes as `x²`, and the per-pass bite is the
+    /// difference of consecutive squares.
+    #[test]
+    fn gradual_passes_remove_equal_material_where_uniform_ones_do_not() {
+        let bites = |gradual: bool| -> Vec<f64> {
+            let mut o = op(true, Hand::Right, true);
+            o.passes = 4;
+            o.gradual = gradual;
+            let r = run(o, tool(5.0));
+            assert!(!r.has_errors(), "{:?}", r.diagnostics);
+            let radii = pass_radii(&r.program);
+            assert_eq!(radii.len(), 4, "{radii:?}");
+            // Radial penetration of each pass, from the grazing radius outward, then the
+            // area removed by each (∝ x², so the bite is the difference of squares).
+            let full = *radii.last().unwrap();
+            let start = full - 0.541_265 * 1.5; // grazing orbit radius, M10x1.5 internal
+            let areas: Vec<f64> = radii.iter().map(|r| (r - start).powi(2)).collect();
+            let mut out = vec![areas[0]];
+            out.extend(areas.windows(2).map(|w| w[1] - w[0]));
+            out
+        };
+
+        // Uniform: the bite rises steeply — with 4 passes the last takes 7x the first
+        // (7/16 of the metal against 1/16), which is the wrong way round, since the last
+        // pass is the one cutting the finished flank.
+        let uniform = bites(false);
+        let ratio = uniform.last().unwrap() / uniform[0];
+        assert!(
+            (ratio - 7.0).abs() < 1e-6,
+            "uniform steps must load the last pass 7x the first, got {ratio:.3}: {uniform:?}"
+        );
+
+        // Gradual: every pass takes the same area.
+        let grad = bites(true);
+        let first = grad[0];
+        for (i, a) in grad.iter().enumerate() {
+            assert!(
+                (a - first).abs() < 1e-9 * first.max(1.0),
+                "pass {i} removed {a:.6}, not the {first:.6} every pass should: {grad:?}"
+            );
+        }
+
+        // Both must still finish at exactly full depth — gradual changes the route, not
+        // the destination.
+        let total = |v: &[f64]| v.iter().sum::<f64>();
+        assert!((total(&uniform) - total(&grad)).abs() < 1e-9);
+    }
+
+    /// The default is unchanged, which is what keeps every saved thread cutting as it did.
+    #[test]
+    fn a_thread_is_uniform_unless_asked_otherwise() {
+        let mut o = op(true, Hand::Right, true);
+        o.passes = 3;
+        assert!(!o.gradual, "gradual must default to off");
+        let uniform = run(o.clone(), tool(5.0));
+        o.gradual = true;
+        let gradual = run(o, tool(5.0));
+        assert_ne!(
+            uniform.program.steps, gradual.program.steps,
+            "the flag must actually change the path"
+        );
+    }
+
+    #[test]
+    fn one_pass_and_a_zero_pass_count_are_the_same_either_way() {
+        // The edge the fractions must not fumble: a single pass goes straight to full
+        // depth, and `passes = 0` is read as 1 — with or without gradual.
+        for gradual in [false, true] {
+            for passes in [0, 1] {
+                let mut o = op(true, Hand::Right, true);
+                o.passes = passes;
+                o.gradual = gradual;
+                let r = run(o, tool(5.0));
+                assert!(!r.has_errors(), "{:?}", r.diagnostics);
+                let radii = pass_radii(&r.program);
+                assert_eq!(radii.len(), 1, "gradual={gradual} passes={passes}: {radii:?}");
+                assert!((radii[0] - (5.0 - 2.5)).abs() < 1e-9, "must reach full depth");
+            }
+        }
     }
 
     /// A spring pass adds one extra full-depth helix (8 half-turns here) at the final

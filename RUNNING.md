@@ -372,6 +372,9 @@ things worth eyeballing:
   stock. Lower it and the whole bevel should move down with it in the backplot —
   that is the case of chamfering a pocket rim or a step, which had no way to be
   stated before. A negative value must be accepted, not clamped.
+- **Thread:** with **Passes** above 1, the **Gradual** checkbox should visibly change the
+  infeed radii in the backplot — the early passes step further, the last one least. Both
+  settings must still finish at exactly full depth.
 - **Guards:** point an operation at a tool that cannot do the job — face with a
   chamfer mill, profile with a V-bit, thread with an end mill — and confirm the
   Output pane explains why and the operation is marked ⚠ in the tree, while merely

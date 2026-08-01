@@ -1338,6 +1338,7 @@ impl AppController {
                     climb: true,
                     passes: 1,
                     spring_passes: 0,
+                    gradual: false,
                     drill_clearance: 0.0,
                     blind_allowance: 0.0,
                     spindle_rpm,

@@ -191,6 +191,10 @@ fn step(from: u32, doc: &mut Value) -> Result<(), MigrationError> {
         // because it numbers the save-file as a whole, and a format change that leaves
         // the version alone is the one that bites later.
         10 => Ok(()),
+        // v11→v12 added `ThreadOp::gradual`, a `#[serde(default)]` bool that is `false`
+        // in every file that predates it — and `false` is exactly the equal-radial-step
+        // sizing those files were cut with. Additive; the identity is the whole step.
+        11 => Ok(()),
         _ => Err(MigrationError::MissingStep { from }),
     }
 }

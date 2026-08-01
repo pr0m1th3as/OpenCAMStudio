@@ -1417,6 +1417,12 @@ mod help {
     pub const CHAMFER_GRADUAL: &str =
         "Spread the chamfer over its passes so each removes an equal amount of material, \
          rather than full-width passes stepping down. Only matters for a multi-pass chamfer.";
+    pub const THREAD_GRADUAL: &str =
+        "Size the radial infeed passes so each removes an equal amount of material, \
+         instead of stepping out by an equal radius each time. A thread form is a V, so \
+         the groove widens as it deepens and equal radial steps make the LAST pass the \
+         heaviest — the pass that cuts the finished flank. Gradual reverses that, \
+         leaving the finishing pass the lightest. Only matters with more than one pass.";
     pub const BORE: &str =
         "Whether the thread is cut into a hole (Internal) or onto a boss/stud (External). \
          Sets which side of the pitch line the tool orbits.";
@@ -2029,6 +2035,8 @@ enum Message {
     ClearingClimbToggled(bool),
     /// Toggle the selected chamfer's gradual (equal-material) stepping.
     ChamferGradualToggled(bool),
+    /// Toggle the selected thread's gradual (equal-material) radial infeed.
+    ThreadGradualToggled(bool),
     /// Create a new default tool and select it.
     NewTool,
     /// Delete the selected tool.
@@ -2924,6 +2932,15 @@ impl App {
                 self.controller.edit_selected_operation(|op| {
                     if let Operation::Chamfer(c) = op {
                         c.gradual = on;
+                    }
+                });
+                self.refresh_fields();
+                self.rerun();
+            }
+            Message::ThreadGradualToggled(on) => {
+                self.controller.edit_selected_operation(|op| {
+                    if let Operation::Thread(t) = op {
+                        t.gradual = on;
                     }
                 });
                 self.refresh_fields();
@@ -5974,6 +5991,17 @@ impl App {
                         |c| Message::ThreadClimbChanged(c == CutStyle::Climb),
                         INSPECTOR_PICKER_W,
                     ));
+                    // Equal material per infeed pass — only meaningful with more than one.
+                    list = list.push(
+                        row![
+                            label_help("Gradual", help::THREAD_GRADUAL, self.tooltips),
+                            checkbox(t.gradual)
+                                .size(15)
+                                .on_toggle(Message::ThreadGradualToggled),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                    );
                 }
                 Some(Operation::Carve(c)) => {
                     list = list.push(

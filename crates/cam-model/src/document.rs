@@ -59,7 +59,11 @@ use crate::Tool;
 ///     change, since the version numbers the save-file as a whole and not the
 ///     [`Document`] alone. [`Machine`](crate::Machine) and `PostKind` became
 ///     serializable to carry it.
-pub const SCHEMA_VERSION: u32 = 11;
+/// v12: [`ThreadOp`] gained `gradual` — infeed passes sized for equal *material* rather
+///     than equal radial steps, the control [`ChamferOp`] already had. Additive and
+///     `false` by default, which is the behaviour every existing file already has, so
+///     the step is an identity and no saved thread changes.
+pub const SCHEMA_VERSION: u32 = 12;
 
 /// The safety planes for a setup, all **absolute Z in millimetres**. By
 /// convention WCS Z0 is the top of stock, so `top_of_stock` is usually `0.0`.
@@ -667,11 +671,23 @@ pub struct ThreadOp {
     /// and `internal` this fixes the helix direction and travel sense.
     pub climb: bool,
     /// Number of **radial infeed passes**: the thread is cut to full depth in this
-    /// many equal radial steps (each a full helix, stepping the orbit outward for an
+    /// many radial steps (each a full helix, stepping the orbit outward for an
     /// internal thread / inward for an external one). `1` (the default) cuts the whole
-    /// depth in a single pass; more passes lighten the cut for hard material.
+    /// depth in a single pass; more passes lighten the cut for hard material. How the
+    /// steps are *sized* is [`gradual`](Self::gradual).
     #[serde(default)]
     pub passes: u32,
+    /// When `true`, size the infeed passes for **equal material per pass** instead of
+    /// equal radial steps.
+    ///
+    /// A thread form is a V, so the groove widens axially as it deepens and the section
+    /// removed grows as the square of the radial penetration. Equal radial steps
+    /// therefore load the *last* pass hardest — the opposite of what multiple passes are
+    /// for, since that is the pass cutting the finished flank. Gradual makes each pass
+    /// remove the same area (penetration `∝ √(i/n)`), so the finishing pass is the
+    /// lightest. The same reasoning, and the same `√k`, as [`ChamferOp::gradual`].
+    #[serde(default)]
+    pub gradual: bool,
     /// Extra **spring passes** at the final (full) depth, to clean up elastic spring-back
     /// after the last cutting pass. `0` (the default) adds none.
     #[serde(default)]
