@@ -96,11 +96,16 @@ fn cut_ring(prog: &mut Program, pts: &[Point], feed: f64, tag: Tag, lead_overlap
 /// under the tool, not by whether it is the first entry of the level; that is what this
 /// now does. `tan`/`out` orient the helix or ramp, as at a level entry.
 ///
-/// `ring` is the closed loop about to be cut, beginning at the point the cut begins
-/// at. A contour ramp travels along it and therefore comes down at its *far* end
-/// rather than at `p`; it arrives at `ring[0]`, which is where the cut starts, so the
-/// entry contract every other strategy keeps still holds. Returns whether it ramped —
-/// the caller's lead-in has nothing left to ease if it did.
+/// `ring` is the closed loop about to be cut, beginning where the cut begins;
+/// `lead_path` is the lead-in from its own start point to that ring point (empty when
+/// there is no lead).
+///
+/// A contour ramp descends along the lead **through air** and then along the ring, in
+/// one unbroken slope — the same shape a profile pass uses, via the shared
+/// [`crate::profile::contour_ramp`]. Returns the arc length of ring the ramp consumed:
+/// the caller must begin its cut there and travel a full perimeter, so the stretch the
+/// ramp sloped is re-machined at depth. `None` means it did not ramp, and the caller's
+/// lead-in still has its usual job.
 #[allow(clippy::too_many_arguments)]
 fn enter_with_plunge(
     prog: &mut Program,
@@ -115,30 +120,36 @@ fn enter_with_plunge(
     feed: f64,
     id: u32,
     ring: &[Point],
-) -> bool {
-    let ramp = crate::profile::contour_ramp_len(plunge, from_z - z)
-        .map(|len| crate::profile::approach_along_loop(ring, len))
-        .filter(|path| path.len() > 1);
-    // Where the tool comes down: the ramp's far end, or the entry footprint itself.
-    let down_at = ramp.as_ref().map_or(p, |path| path[0]);
+    lead_path: Vec<Point>,
+) -> Option<f64> {
+    // The ramp never travels through air to reach the material: its height is measured
+    // from the top of stock, or from the floor the previous level left.
+    let ramp_top = from_z.min(h.top_of_stock);
+    let ramp = crate::profile::contour_ramp(ring, lead_path, plunge, ramp_top, z);
+    // Where the tool comes down: the ramp's own start (above the material when there is
+    // a lead to fly in), or the entry footprint.
+    let (down_at, arrive_at) = match &ramp {
+        Some((path, _, top)) => (path[0], top.max(z)),
+        None => (p, from_z),
+    };
     prog.push(Step::Rapid {
         to: Point3::new(down_at.x, down_at.y, h.clearance),
         tag: Tag::new(id, MoveKind::Link),
     });
-    // The rapid stops short of `from_z` when that is a cut floor: what is under the
+    // The rapid stops short of `arrive_at` when that is a cut floor: what is under the
     // tool decides the *strategy* (above), and the same question decides how the tool
     // may arrive at all.
-    crate::emit::descend_to(prog, down_at, from_z, h, feed, id);
-    if let Some(path) = &ramp {
+    crate::emit::descend_to(prog, down_at, arrive_at, h, feed, id);
+    if let Some((path, on_ring, top)) = &ramp {
         crate::profile::emit_descending_path(
             prog,
             path,
-            from_z,
+            *top,
             z,
             feed,
             Tag::new(id, MoveKind::Plunge),
         );
-        return true;
+        return Some(*on_ring);
     }
     crate::profile::emit_plunge(
         prog,
@@ -152,7 +163,7 @@ fn enter_with_plunge(
         feed,
         Tag::new(id, MoveKind::Plunge),
     );
-    false
+    None
 }
 
 /// The normal toward the **cleared** side of a wall loop — where the tool has been,
@@ -189,7 +200,8 @@ fn approach(
     id: u32,
     link_threshold: f64,
     ring: &[Point],
-) -> bool {
+    lead_path: Vec<Point>,
+) -> Option<f64> {
     let hop = (p.x - prev_end.x).hypot(p.y - prev_end.y);
     if hop <= link_threshold {
         prog.push(Step::Linear {
@@ -197,14 +209,14 @@ fn approach(
             feed,
             tag: Tag::new(id, MoveKind::Cutting),
         });
-        return false;
+        return None;
     }
     prog.push(Step::Rapid {
         to: Point3::new(prev_end.x, prev_end.y, h.clearance),
         tag: Tag::new(id, MoveKind::Link),
     });
     enter_with_plunge(
-        prog, p, tan, out, from_z, z, h, plunge, plunge_feed, feed, id, ring,
+        prog, p, tan, out, from_z, z, h, plunge, plunge_feed, feed, id, ring, lead_path,
     )
 }
 
@@ -251,18 +263,39 @@ fn emit_wall_ring(
 
     let lead = Tag::new(id, MoveKind::LeadIn);
     let cut = Tag::new(id, MoveKind::Cutting);
+    // The ramp descends *along the lead* — through air, meeting the wall at `start` —
+    // and then along the ring. So the lead is handed to the entry rather than emitted
+    // after it.
     let ramped = approach(
         prog, prev_end, entry, tan_in, cin, from_z, z, h, plunge, feed, plunge_feed, id,
         link_threshold, &ri,
+        crate::profile::lead_in_path(start, entry, cin, eff_in),
     );
-    // A contour ramp arrives on the wall at `start`, at depth and already tangent, so
-    // the lead-in has nothing left to ease.
-    if !ramped {
-        crate::leads::emit_lead(prog, entry, start, start, cin, eff_in, z, feed, lead);
+    match ramped {
+        // It ramped: the lead was flown on the way down, and the cut must begin where
+        // the ramp ended and travel a full perimeter, so the sloped stretch is
+        // re-machined at depth.
+        Some(on_ring) => {
+            let perim = crate::profile::loop_perimeter(&ri);
+            let walked = crate::profile::walk_loop(&ri, on_ring, perim + lead_overlap);
+            let last = walked[walked.len() - 1];
+            let prev = walked[walked.len().saturating_sub(2)];
+            let tan_out = crate::profile::unit(last.x - prev.x, last.y - prev.y);
+            let cout = cleared_normal(tan_out, reversed);
+            let eff_out = crate::leads::guard_lead(guard, last, tan_out, cout, lead_out, false);
+            let exit = crate::leads::lead_end_point(last, tan_out, cout, eff_out);
+            crate::emit::cut_polyline(prog, &walked, feed, cut, z);
+            // The lead-**out** stays flat at depth; only the lead-in descends.
+            crate::leads::emit_lead(prog, last, exit, last, cout, eff_out, z, feed, lead);
+            exit
+        }
+        None => {
+            crate::leads::emit_lead(prog, entry, start, start, cin, eff_in, z, feed, lead);
+            crate::emit::cut_polyline(prog, &loop_pts, feed, cut, z);
+            crate::leads::emit_lead(prog, exit_on, exit, exit_on, cout, eff_out, z, feed, lead);
+            exit
+        }
     }
-    crate::emit::cut_polyline(prog, &loop_pts, feed, cut, z);
-    crate::leads::emit_lead(prog, exit_on, exit, exit_on, cout, eff_out, z, feed, lead);
-    exit
 }
 
 /// Emit a **stay-down, inside-out** pocket path. Per depth level: enter once at the
@@ -316,7 +349,7 @@ pub(crate) fn emit_stay_down(
         let r0 = crate::profile::rotate_to_start(&rings[0].pts, start);
         let tan = crate::profile::start_tangent(&r0);
         let out = crate::profile::outward_normal(&r0);
-        enter_with_plunge(
+        let on_ring = enter_with_plunge(
             prog,
             r0[0],
             tan,
@@ -329,8 +362,20 @@ pub(crate) fn emit_stay_down(
             feed,
             id,
             &r0,
+            // No lead here: this is the interior entry, not a finished wall.
+            Vec::new(),
         );
-        let mut prev_end = cut_ring(prog, &r0, feed, cut, lead_overlap, z);
+        // A ramped entry begins its cut where the ramp ended, and goes a full perimeter
+        // from there so the sloped stretch is re-machined at depth.
+        let mut prev_end = match on_ring {
+            Some(from) => {
+                let perim = crate::profile::loop_perimeter(&r0);
+                let walked = crate::profile::walk_loop(&r0, from, perim + lead_overlap);
+                crate::emit::cut_polyline(prog, &walked, feed, cut, z);
+                walked[walked.len() - 1]
+            }
+            None => cut_ring(prog, &r0, feed, cut, lead_overlap, z),
+        };
 
         for ring in &rings[1..] {
             if ring.is_wall && leaded {
@@ -364,7 +409,7 @@ pub(crate) fn emit_stay_down(
             // [`cleared_normal`] is the function that already knows this, and it handles
             // conventional milling's flipped windings too.
             let rtan = crate::profile::start_tangent(&ri);
-            approach(
+            let on_ring = approach(
                 prog,
                 prev_end,
                 ri[0],
@@ -379,8 +424,21 @@ pub(crate) fn emit_stay_down(
                 id,
                 link_threshold,
                 &ri,
+                // An interior clearing ring has no lead of its own.
+                Vec::new(),
             );
-            prev_end = cut_ring(prog, &ri, feed, cut, lead_overlap, z);
+            // As at the level entry: a ramped approach starts its cut where the ramp
+            // ended and travels a full perimeter, so it re-machines what it sloped. A
+            // short hop cuts across at depth and needs none of that.
+            prev_end = match on_ring {
+                Some(from) => {
+                    let perim = crate::profile::loop_perimeter(&ri);
+                    let walked = crate::profile::walk_loop(&ri, from, perim + lead_overlap);
+                    crate::emit::cut_polyline(prog, &walked, feed, cut, z);
+                    walked[walked.len() - 1]
+                }
+                None => cut_ring(prog, &ri, feed, cut, lead_overlap, z),
+            };
         }
         // Retract; the next level re-enters at the interior start.
         prog.push(Step::Rapid {

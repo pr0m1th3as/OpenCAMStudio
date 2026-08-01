@@ -477,37 +477,19 @@ fn emit_loop_rich(
         // thirds of the first pass's ramp a slow feed through nothing, and dragged the
         // tool around the contour's corners to spend the length.
         let ramp_top = prev_z.min(h.top_of_stock);
-        let ramp_len = contour_ramp_len(op.plunge, ramp_top - z);
 
         // The ramp descends along the lead-in first, and only then along the contour:
         // the lead exists to keep the entry off the finished wall, so it is exactly
         // where a descending tool belongs. A lead long enough (or an angle steep
         // enough) to absorb the whole stepdown keeps the wall untouched entirely —
         // which is how the operator controls this.
-        let ramp = ramp_len.map(|in_material| {
-            let lead_path = lead_in_path(start, entry, out, lead_in);
-            let lead_len = path_length(&lead_path);
-            let mut path = lead_path;
-            // `walk_loop` starts at the contour point the lead already reached. The
-            // contour carries the **whole** material descent: the lead is flown in air.
-            path.extend(walk_loop(pts, 0.0, in_material).into_iter().skip(1));
-            // **The lead-in never cuts.** It starts above the material by exactly what
-            // the same angle covers over its own length, so the tool descends the lead
-            // through air and meets the surface *at* the contour start — then carries
-            // on into the material at the same angle, one unbroken descent with the
-            // air/material transition landing precisely where the cut begins. Before
-            // this the lead started *on* the surface and was already cutting as it
-            // swung in, which is the opposite of what a lead-in is for.
-            //
-            // The rise is `lead_len · tan(angle)`, and `tan(angle) = dz / in_material`
-            // by construction — so no second look at the angle is needed here.
-            let rise = if in_material > 1e-12 {
-                lead_len * (ramp_top - z) / in_material
-            } else {
-                0.0
-            };
-            (path, in_material, ramp_top + rise)
-        });
+        let ramp = contour_ramp(
+            pts,
+            lead_in_path(start, entry, out, lead_in),
+            op.plunge,
+            ramp_top,
+            z,
+        );
 
         // Where the pass begins cutting at depth: the arc position the ramp ended at.
         let cut_from = ramp.as_ref().map_or(0.0, |(_, on_contour, _)| *on_contour);
@@ -881,52 +863,46 @@ pub(crate) fn lead_in_path(start: Point, entry: Point, out: (f64, f64), lead: Le
     pts
 }
 
-/// The stretch of the closed loop `pts` that **arrives at `pts[0]`** after `len` mm
-/// of travel, found by walking backwards from the start and wrapping as often as
-/// needed. Returned in travel order, so the last point is always `pts[0]`.
+/// The entry ramp for a closed loop, or `None` when the plunge is not a contour ramp.
 ///
-/// Backwards, so that the ramp ends where the pass begins. The stretch it leaves
-/// sloped is then the loop's own final stretch, which the pass re-machines at full
-/// depth as it closes — no extra motion, and nothing stranded. A ramp running
-/// *forward* from the start would leave that wedge uncut, and would move the point
-/// the cut begins at, which is the operator's (possibly snapped) choice.
-pub(crate) fn approach_along_loop(pts: &[Point], len: f64) -> Vec<Point> {
-    let n = pts.len();
-    if n < 2 || len.is_nan() || len <= 0.0 {
-        return vec![pts[0]];
+/// Returns the path to descend along, how much of it lies **on the loop**, and the Z
+/// the descent starts from.
+///
+/// The shape of it, in one place because profile passes and carve wall rings must not
+/// drift apart:
+/// - `lead_path` (from the lead's start to the loop, empty for no lead) is flown in
+///   **air**: the descent begins `lead_len · tan(angle)` above the material, so the tool
+///   meets the surface *at* the loop's start and never cuts on the way in.
+/// - the loop then carries the **whole** material descent, `(ramp_top − z) / tan(angle)`.
+/// - the caller must begin its cut at the returned arc offset and travel a full
+///   perimeter from there, so the stretch the ramp sloped is re-machined at depth.
+pub(crate) fn contour_ramp(
+    pts: &[Point],
+    lead_path: Vec<Point>,
+    plunge: Plunge,
+    ramp_top: f64,
+    z: f64,
+) -> Option<(Vec<Point>, f64, f64)> {
+    let in_material = contour_ramp_len(plunge, ramp_top - z)?;
+    let lead_len = path_length(&lead_path);
+    let mut path = lead_path;
+    if path.is_empty() {
+        path.push(pts[0]);
     }
-    // Collected against the direction of travel, then reversed.
-    let mut back = vec![pts[0]];
-    let mut remaining = len;
-    let mut from = pts[0];
-    let mut i = 0usize;
-    // Bounded by construction rather than by the arithmetic working out: see
-    // MAX_RAMP_LAPS. One step per edge, so `n` steps is one lap.
-    for _ in 0..n.saturating_mul(MAX_RAMP_LAPS) {
-        if remaining <= 0.0 {
-            break;
-        }
-        let prev = (i + n - 1) % n;
-        let to = pts[prev];
-        let (dx, dy) = (to.x - from.x, to.y - from.y);
-        let seg = (dx * dx + dy * dy).sqrt();
-        if seg <= 1e-12 {
-            i = prev; // coincident vertices contribute no length
-            continue;
-        }
-        if seg >= remaining {
-            let t = remaining / seg;
-            back.push(Point::new(from.x + dx * t, from.y + dy * t));
-            break;
-        }
-        remaining -= seg;
-        back.push(to);
-        from = to;
-        i = prev;
+    path.extend(walk_loop(pts, 0.0, in_material).into_iter().skip(1));
+    if path.len() < 2 {
+        return None;
     }
-    back.reverse();
-    back
+    // `tan(angle) = (ramp_top − z) / in_material` by construction, so the lead's rise
+    // needs no second look at the angle.
+    let rise = if in_material > 1e-12 {
+        lead_len * (ramp_top - z) / in_material
+    } else {
+        0.0
+    };
+    Some((path, in_material, ramp_top + rise))
 }
+
 
 /// The first `len` mm of an **open** path, from `path[0]` forward, truncated at the
 /// path's end. Unlike [`approach_along_loop`] there is nothing to wrap around, so a
@@ -1211,59 +1187,58 @@ mod tests {
         assert!(contour_ramp_len(Plunge::Ramp { angle_deg: 20.0 }, 0.0).is_none());
     }
 
-    /// The ramp must arrive **at** the pass's start point, entering the loop behind it.
-    /// That direction is the whole reason no extra motion is needed to clean the slope:
-    /// the wedge it leaves is the loop's final stretch, which the pass then re-cuts.
+    /// Wrapping and the lap cap now belong to [`walk_loop`], the single walker for both
+    /// halves of a ramped entry. `approach_along_loop` — which walked *backwards* from
+    /// the start — is gone: the ramp runs forward from the lead-in now, so nothing
+    /// needed it.
     #[test]
-    fn the_contour_ramp_arrives_at_the_start_from_behind_it() {
+    fn walking_the_loop_covers_the_length_asked_for_and_wraps() {
         let pts = square();
-        let path = approach_along_loop(&pts, 30.0);
-        let last = path[path.len() - 1];
+        let quarter = walk_loop(&pts, 0.0, 30.0);
+        assert!((path_len(&quarter) - 30.0).abs() < 1e-9);
         assert!(
-            (last.x - pts[0].x).abs() < 1e-9 && (last.y - pts[0].y).abs() < 1e-9,
-            "the ramp must end where the pass begins, got {last:?}"
+            (quarter[0].x - pts[0].x).abs() < 1e-9 && (quarter[0].y - pts[0].y).abs() < 1e-9,
+            "a walk from arc 0 starts at the loop's start"
         );
-        assert!((path_len(&path) - 30.0).abs() < 1e-9, "got {}", path_len(&path));
-        // Backwards from (0,0) is along the *last* edge, (0,100) → (0,0): so the ramp
-        // starts 30 mm up the left-hand side, not 30 mm along the bottom.
-        assert!(
-            (path[0].x).abs() < 1e-9 && (path[0].y - 30.0).abs() < 1e-9,
-            "ramp entered forward, not behind the start: {:?}",
-            path[0]
-        );
-    }
-
-    #[test]
-    fn a_contour_ramp_longer_than_the_loop_wraps_instead_of_giving_up() {
-        let pts = square();
         // 950 mm on a 400 mm perimeter: two full laps and 150 mm.
-        let path = approach_along_loop(&pts, 950.0);
-        assert!((path_len(&path) - 950.0).abs() < 1e-6, "got {}", path_len(&path));
-        let last = path[path.len() - 1];
-        assert!((last.x - pts[0].x).abs() < 1e-9 && (last.y - pts[0].y).abs() < 1e-9);
+        let long = walk_loop(&pts, 0.0, 950.0);
+        assert!((path_len(&long) - 950.0).abs() < 1e-6, "got {}", path_len(&long));
+        // And a walk starting part-way round begins where it was told to.
+        let offset = walk_loop(&pts, 150.0, 10.0);
+        assert!(
+            (offset[0].x - 100.0).abs() < 1e-9 && (offset[0].y - 50.0).abs() < 1e-9,
+            "150 mm round a 100 mm square is halfway up the right-hand side: {:?}",
+            offset[0]
+        );
     }
 
-    /// A shallow enough angle asks for unbounded travel. The cap steepens the ramp
-    /// rather than sizing a buffer off the arithmetic — the same lesson as the dashed
-    /// backplot's walk: bound the output, do not trust the numbers to stay sane.
+    /// A shallow enough angle asks for unbounded travel. The cap bounds the buffer
+    /// rather than trusting the arithmetic to stay sane — the same lesson as the dashed
+    /// backplot's walk.
     #[test]
-    fn an_absurdly_shallow_ramp_is_bounded_by_the_lap_cap() {
+    fn an_absurdly_long_walk_is_bounded_by_the_lap_cap() {
         let pts = square();
-        let path = approach_along_loop(&pts, 1.0e9);
+        let path = walk_loop(&pts, 0.0, 1.0e9);
+        // The guarantee is on **edges walked**, not on whole laps: the cap allows one
+        // edge per lap per vertex, plus two for the partial edges at each end. On a
+        // 4-edge square that is 32 laps and a bit, which is the point — a bound, not a
+        // round number.
         assert!(
-            path_len(&path) <= 400.0 * MAX_RAMP_LAPS as f64 + 1e-6,
-            "ramp ran {} mm, past the {MAX_RAMP_LAPS}-lap cap",
+            path.len() <= 4 * MAX_RAMP_LAPS + 3,
+            "{} vertices is past the bound",
+            path.len()
+        );
+        assert!(
+            path_len(&path) <= 400.0 * (MAX_RAMP_LAPS as f64 + 1.0),
+            "walked {} mm, past the {MAX_RAMP_LAPS}-lap cap",
             path_len(&path)
         );
-        assert!(path.len() <= 4 * MAX_RAMP_LAPS + 2, "{} vertices", path.len());
-        let last = path[path.len() - 1];
-        assert!((last.x - pts[0].x).abs() < 1e-9 && (last.y - pts[0].y).abs() < 1e-9);
     }
 
     #[test]
     fn a_descending_path_falls_monotonically_and_reaches_the_exact_depth() {
         let pts = square();
-        let path = approach_along_loop(&pts, 30.0);
+        let path = walk_loop(&pts, 0.0, 30.0);
         let mut prog = Program::new();
         emit_descending_path(
             &mut prog,

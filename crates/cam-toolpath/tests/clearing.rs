@@ -277,6 +277,76 @@ fn carve_doc() -> Document {
     setup(vec![Operation::Carve(op)], vec![vbit, end_mill(2, 6.0)])
 }
 
+/// A carve/pocket wall ring ramps the same way a profile pass does — via the shared
+/// `profile::contour_ramp` — so the two cannot drift apart. What is ring-specific is the
+/// *wiring*: the cut has to begin where the ramp ended and go a full perimeter from
+/// there, or the stretch the ramp sloped is left standing.
+#[test]
+fn a_ramped_clearing_entry_never_drops_vertically_and_re_machines_its_ramp() {
+    use cam_cldata::{MoveKind, Point3, Step};
+    use cam_model::Plunge;
+
+    let mut d = pocket_doc();
+    if let cam_model::Operation::Pocket(p) = &mut d.setup.operations[0] {
+        p.clear.plunge = Plunge::Ramp { angle_deg: 5.0 };
+    }
+    let (program, diags) = build_job(&d, 1000.0, SpindleDir::Cw, None, 50.0, &CancelToken::new());
+    assert!(
+        diags.iter().all(|x| x.severity != cam_toolpath::Severity::Error),
+        "{diags:?}"
+    );
+
+    // No `Plunge` move may drop straight down while it is descending: that is the entry
+    // a ramp exists to avoid, and it is what a silent fallback would produce.
+    let mut pos = Point3::new(0.0, 0.0, 0.0);
+    let (mut vertical, mut ramped) = (0, 0);
+    for st in program.steps() {
+        let (to, kind) = match st {
+            Step::Linear { to, tag, .. } => (*to, Some(tag.kind)),
+            Step::Rapid { to, .. } => (*to, None),
+            Step::Arc { end, .. } => (*end, None),
+            _ => continue,
+        };
+        if kind == Some(MoveKind::Plunge) && to.z < pos.z - 1e-9 {
+            if (to.x - pos.x).hypot(to.y - pos.y) <= 1e-9 {
+                vertical += 1;
+            } else {
+                ramped += 1;
+            }
+        }
+        pos = to;
+    }
+    assert_eq!(vertical, 0, "a ramped clearing entry dropped vertically {vertical} times");
+    assert!(ramped > 0, "no ramp was emitted at all");
+
+    // And the cutting that follows each ramp must be at least a full ring — the ramp
+    // consumed part of one, and only a full perimeter from there re-machines it.
+    let cutting: f64 = {
+        let mut pos = Point3::new(0.0, 0.0, 0.0);
+        let mut total = 0.0;
+        for st in program.steps() {
+            let to = match st {
+                Step::Linear { to, tag, .. } => {
+                    if tag.kind == MoveKind::Cutting {
+                        total += (to.x - pos.x).hypot(to.y - pos.y);
+                    }
+                    *to
+                }
+                Step::Rapid { to, .. } => *to,
+                Step::Arc { end, .. } => *end,
+                _ => continue,
+            };
+            pos = to;
+        }
+        total
+    };
+    // The boundary ring alone is ~200 mm per level, three levels, plus island rings.
+    assert!(
+        cutting > 400.0,
+        "only {cutting:.0} mm of cutting — the rings are not being closed"
+    );
+}
+
 // --- goldens ---
 
 #[test]
