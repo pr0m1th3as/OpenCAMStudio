@@ -284,6 +284,31 @@ impl Settings {
         p.min_output_px = clamp(p.min_output_px, PANE_MIN_RANGE, d.panes.min_output_px);
     }
 
+    /// Replace the remembered session state — the values the GUI keeps live and the
+    /// user changes by using the app, rather than by opening a preferences panel.
+    ///
+    /// Here rather than in `gui.rs` so the mapping is testable without standing up a
+    /// GUI, and so there is exactly **one** place that knows it: per-field syncing
+    /// scattered through the message handlers would drift the moment a field was
+    /// added, and the symptom — one preference quietly not persisting — is close to
+    /// invisible.
+    ///
+    /// `extra` is carried across rather than replaced: unknown keys written by a newer
+    /// build must survive a session with an older one (see [`load_from`]).
+    pub fn remember_session(&mut self, view: ViewPrefs, snaps: Vec<SnapKind>, panes: PanePrefs) {
+        let view_extra = std::mem::take(&mut self.view.extra);
+        let pane_extra = std::mem::take(&mut self.panes.extra);
+        self.view = ViewPrefs {
+            extra: view_extra,
+            ..view
+        };
+        self.panes = PanePrefs {
+            extra: pane_extra,
+            ..panes
+        };
+        self.snapping.default_snaps = snaps;
+    }
+
     /// The object-snap catch aperture (logical px) implied by the pickbox.
     pub fn snap_catch_px(&self) -> f32 {
         self.snapping.pickbox_px * SNAP_CATCH_MULTIPLE
@@ -567,6 +592,40 @@ mod tests {
         // And the clamped result must itself be usable: no minimum may exceed the
         // upper bound that keeps a window habitable.
         assert!(got.panes.min_project_px <= PANE_MIN_RANGE.1);
+    }
+
+    #[test]
+    fn remembering_a_session_keeps_unknown_keys_and_the_pane_minimums() {
+        let mut s = Settings::default();
+        s.view.extra.insert("future_toggle".into(), serde_json::json!(true));
+        s.panes.extra.insert("future_pane".into(), serde_json::json!(7));
+        s.panes.min_inspector_px = 180.0; // a value the user had set
+
+        s.remember_session(
+            ViewPrefs {
+                tooltips: false,
+                gizmo_size: 175.0,
+                ..Default::default()
+            },
+            vec![SnapKind::End],
+            PanePrefs {
+                project_px: 310.0,
+                ..s.panes.clone()
+            },
+        );
+
+        assert!(!s.view.tooltips);
+        assert_eq!(s.view.gizmo_size, 175.0);
+        assert_eq!(s.snapping.default_snaps, vec![SnapKind::End]);
+        assert_eq!(s.panes.project_px, 310.0);
+        assert_eq!(
+            s.panes.min_inspector_px, 180.0,
+            "remembering the session must not reset the user's pane minimums"
+        );
+        assert!(
+            s.view.extra.contains_key("future_toggle") && s.panes.extra.contains_key("future_pane"),
+            "a newer build's keys must survive an older build's session"
+        );
     }
 
     #[test]

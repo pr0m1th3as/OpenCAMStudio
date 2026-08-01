@@ -331,6 +331,23 @@ records neither, and opening one leaves your current machine and post alone.
     and a length of cut, drawn as one 60° tooth on a long reduced neck. Full-form
     has a cutting ⌀, thread length, and pitch, drawn as a stack of 60° threads.
 
+### Preferences
+
+The View toggles, the orientation-cube size, the armed object snaps and the pane
+sizes you drag to are **remembered between runs**, in
+`<config-dir>/OpenCAMStudio/settings.json` (beside `tools.json`). Nothing else is a
+preference yet — the panel that will expose pickbox size, pane minimums and a default
+post for new projects is still to come.
+
+The file is versioned, and a file it cannot read is **never overwritten**: an
+unparseable one, or one written by a newer build, leaves you on the defaults with your
+file intact. Delete it to return to the shipped defaults.
+
+The same protection now covers the **tool library**. `tools.json` previously fell back
+to the starter 36 tools *and saved them* if it failed to parse — silently replacing a
+hand-built library. It now leaves the file alone, keeps a `tools.json.bak` copy beside
+it, and says so in the status bar at startup.
+
 ### Plunge styles — how the tool gets down
 
 Set per operation in the Inspector. All four reach exactly the requested depth; they
@@ -383,6 +400,14 @@ ramp runs forward along the path and retraces it at depth instead. A closed cont
 Because the GUI is the one part that cannot be verified by automated tests, the
 things worth eyeballing:
 
+- **Preferences that stick:** change the View-tab toggles (Stock / Cube / Origin /
+  Tips), drag the cube-size slider, arm or disarm a couple of object snaps, and drag
+  the pane dividers. **Restart.** All of it should come back as you left it — they are
+  written to `<config-dir>/OpenCAMStudio/settings.json`. Then the case that matters:
+  drag the dividers wide, restart with the **window made much narrower**, and confirm
+  the layout degrades to fit rather than squeezing the Viewport to nothing. Deleting
+  `settings.json` must bring back the shipped defaults; a *corrupt* one must leave you
+  with defaults and the file untouched (nothing should overwrite it).
 - **Dashed tool-change traverse:** build a job with **two tools** (or two origins),
   Run, and look at the blue moves — the lift to tool-change height, the cross, the
   descent. They must be **dashed**; everything else stays solid, rapids included.

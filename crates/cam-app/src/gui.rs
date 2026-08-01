@@ -1524,6 +1524,11 @@ struct App {
     project_px: f32,
     inspector_px: f32,
     output_px: f32,
+    /// The user's preferences, as loaded at startup and written back on change.
+    ///
+    /// The view/snap/pane fields below stay the live state — the settings copy is
+    /// refreshed through `remember`, which is the single place that knows the mapping.
+    settings: crate::Settings,
     /// The active ribbon tab.
     active_tab: RibbonTab,
     /// The index (within the active tab's groups) of the open collapse-popup, if any.
@@ -1622,13 +1627,6 @@ const PICKBOX_PX: f32 = 12.0;
 /// let a user set a catch distance *smaller* than the pickbox feeding it. Do not
 /// "finish the job" by adding a second knob; see `Settings::snap_catch_px`.
 const SNAP_PICK_PX: f32 = crate::SNAP_CATCH_MULTIPLE * PICKBOX_PX;
-/// The object snaps armed in a fresh session: End + Mid + Quadrant, with Nearest
-/// opt-in (AutoCAD-style). A function rather than an inline literal so the settings
-/// default can be asserted against it — see `settings_agree_with_constants`.
-fn initial_snaps() -> Vec<SnapKind> {
-    vec![SnapKind::End, SnapKind::Mid, SnapKind::Quadrant]
-}
-
 /// Snap marker size as a multiple of the snap aperture.
 /// TODO(prefs): expose this (snap-shape size) in user preferences.
 const SNAP_MARK_SCALE: f32 = 1.2;
@@ -1691,8 +1689,9 @@ fn is_clear_field(field: Field) -> bool {
     )
 }
 
-/// Orientation-cube on-screen size (logical px): default and the slider's range.
-const GIZMO_SIZE_DEFAULT: f32 = 110.0;
+/// Orientation-cube on-screen size (logical px): the slider's range. The *default*
+/// now lives in `Settings` alone — the session reads it from there, so a constant
+/// here would be a second copy to keep in step.
 const GIZMO_SIZE_MIN: f32 = 60.0;
 const GIZMO_SIZE_MAX: f32 = 220.0;
 /// Inset of the cube from the viewport's top-right corner (logical px).
@@ -2025,6 +2024,9 @@ enum Message {
     CloseLicense,
     /// Set the orientation cube's on-screen size (logical px).
     SetGizmoSize(f32),
+    /// A continuous control has settled (slider released) — write preferences now
+    /// rather than on every intermediate value.
+    SettingsSettled,
     PaneResized(pane_grid::ResizeEvent),
     PaneDragged(pane_grid::DragEvent),
     /// The window was resized (tracked for pixel-accurate pane minimums).
@@ -2167,21 +2169,25 @@ impl App {
         // tools and assume theirs were lost. They are not — the file is untouched, with
         // a `.bak` beside it — but only if nobody edits a tool first.
         let (library, library_load) = ToolLibrary::load();
+        // Preferences seed the session. A rejected settings file is deliberately not
+        // reported the way a rejected *library* is: defaults here cost the user a
+        // layout, not their tools.
+        let (settings, _) = crate::load_settings();
         let mut app = Self {
             controller: AppController::new(default_machine()),
             panes: initial_panes(),
             show_license: false,
             window: iced::Size::new(1280.0, 800.0),
-            project_px: 220.0,
-            inspector_px: 250.0,
-            output_px: 140.0,
+            project_px: settings.panes.project_px,
+            inspector_px: settings.panes.inspector_px,
+            output_px: settings.panes.output_px,
             active_tab: RibbonTab::Home,
             open_group: None,
             fields: BTreeMap::new(),
-            show_stock: false,
-            show_gizmo: true,
-            tooltips: true,
-            gizmo_size: GIZMO_SIZE_DEFAULT,
+            show_stock: settings.view.show_stock,
+            show_gizmo: settings.view.show_gizmo,
+            tooltips: settings.view.tooltips,
+            gizmo_size: settings.view.gizmo_size,
             view: ViewControls::default(),
             cursor: None,
             library,
@@ -2198,15 +2204,17 @@ impl App {
             window_cursor: iced::Point::ORIGIN,
             focus_ops: BTreeSet::new(),
             modifiers: iced::keyboard::Modifiers::default(),
-            snaps: initial_snaps(),
+            snaps: settings.snapping.default_snaps.clone(),
             snap_hover: None,
             snap_aperture: 1.0,
             hover_loop: None,
             setting_origin: false,
             setting_origin_2pt: false,
             origin_first: None,
-            show_origin: true,
+            show_origin: settings.view.show_origin,
             status: "Open the sample part to begin.".to_string(),
+            // Last: every field above reads from it.
+            settings,
         };
         if let crate::LibraryLoad::Rejected(why) = &library_load {
             app.status = format!(
@@ -2480,7 +2488,10 @@ impl App {
                 self.controller.set_origin_disabled(index, disabled);
                 self.rerun();
             }
-            Message::ToggleShowOrigin => self.show_origin = !self.show_origin,
+            Message::ToggleShowOrigin => {
+                self.show_origin = !self.show_origin;
+                self.remember();
+            }
             Message::ToggleSetOrigin => {
                 let on = !self.setting_origin;
                 self.setting_origin = on;
@@ -2712,6 +2723,7 @@ impl App {
                 } else {
                     self.snaps.push(kind);
                 }
+                self.remember();
             }
             Message::ReinitOp => {
                 let id = self.open_op_menu.take();
@@ -2784,6 +2796,7 @@ impl App {
                 } else {
                     "Hiding simulated stock.".to_string()
                 };
+                self.remember();
             }
             Message::OrbitBy(dyaw, dpitch) => {
                 // Turntable: horizontal drag spins about world up, vertical tilts.
@@ -2808,7 +2821,10 @@ impl App {
                 };
             }
             Message::ResetView => self.view = ViewControls::default(),
-            Message::ToggleGizmo => self.show_gizmo = !self.show_gizmo,
+            Message::ToggleGizmo => {
+                self.show_gizmo = !self.show_gizmo;
+                self.remember();
+            }
             Message::ShowLicense => self.show_license = true,
             Message::CloseLicense => self.show_license = false,
             Message::ToggleTooltips => {
@@ -2818,15 +2834,22 @@ impl App {
                 } else {
                     "Tooltips off.".to_string()
                 };
+                self.remember();
             }
             Message::SetGizmoSize(v) => {
+                // Not persisted here: the slider emits continuously while dragged, and
+                // writing the file on every tick would be a hundred writes for one
+                // decision. `SettingsSettled` fires on release.
                 self.gizmo_size = v.clamp(GIZMO_SIZE_MIN, GIZMO_SIZE_MAX)
             }
+            Message::SettingsSettled => self.remember(),
             Message::PaneResized(pane_grid::ResizeEvent { split, ratio }) => {
                 let ratio = self.clamp_resize(split, ratio);
                 self.panes.resize(split, ratio);
-                // Persist the dragged size so a later window resize keeps it.
+                // Persist the dragged size so a later window resize keeps it —
+                // and, now, so the next run opens with the layout the user chose.
                 self.capture_side_px(split, ratio);
+                self.remember();
             }
             Message::PaneDragged(pane_grid::DragEvent::Dropped { pane, target }) => {
                 self.panes.drop(pane, target);
@@ -3406,6 +3429,34 @@ impl App {
         let ratio = if in_a { frac } else { 1.0 - frac };
         let ratio = self.clamp_resize(split, ratio);
         self.panes.resize(split, ratio);
+    }
+
+    /// Copy the live view/snap/pane state into the preferences and write them out.
+    ///
+    /// Called from every handler that changes one of them. The mapping itself lives in
+    /// `Settings::remember_session` so it can be tested headlessly; this is only the
+    /// gathering.
+    fn remember(&mut self) {
+        self.settings.remember_session(
+            crate::ViewPrefs {
+                show_stock: self.show_stock,
+                show_gizmo: self.show_gizmo,
+                show_origin: self.show_origin,
+                tooltips: self.tooltips,
+                gizmo_size: self.gizmo_size,
+                extra: Default::default(),
+            },
+            self.snaps.clone(),
+            crate::PanePrefs {
+                project_px: self.project_px,
+                inspector_px: self.inspector_px,
+                output_px: self.output_px,
+                // The minimums are not session state — they are set in preferences,
+                // and remembering a layout must not reset them.
+                ..self.settings.panes.clone()
+            },
+        );
+        self.settings.save();
     }
 
     /// Hold the non-Viewport panes at their fixed pixel sizes, letting the Viewport
@@ -4884,6 +4935,7 @@ impl App {
                 Message::SetGizmoSize,
             )
             .step(1.0_f32)
+            .on_release(Message::SettingsSettled)
             .width(Length::Fixed(140.0))
             .into()
         } else {
@@ -8495,13 +8547,16 @@ mod settings_agree_with_constants {
         // The catch aperture is derived from the pickbox rather than stored, so this
         // is the assertion that the derivation reproduces the old constant exactly.
         assert_eq!(d.snap_catch_px(), SNAP_PICK_PX);
-        assert_eq!(d.snapping.default_snaps, initial_snaps());
+        // The armed-snap set has no counterpart here any more: the session reads it
+        // from `Settings`, so `settings.rs` is the only place it is written. That is
+        // the duplication this module exists to catch, removed rather than checked.
     }
 
+    /// The cube's *default* size is no longer duplicated here — the session reads it
+    /// from `Settings`. Its **range** still is, because the slider needs literal
+    /// bounds, so that is what this checks.
     #[test]
-    fn the_view_defaults_match() {
-        let d = Settings::default();
-        assert_eq!(d.view.gizmo_size, GIZMO_SIZE_DEFAULT);
+    fn the_gizmo_slider_range_is_the_preferences_range() {
         assert_eq!(
             crate::GIZMO_SIZE_RANGE,
             (GIZMO_SIZE_MIN, GIZMO_SIZE_MAX),
