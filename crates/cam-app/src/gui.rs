@@ -2162,6 +2162,11 @@ fn initial_panes() -> pane_grid::State<Pane> {
 
 impl App {
     fn new() -> (Self, iced::Task<Message>) {
+        // Destructured rather than discarded: a library that failed to load is the one
+        // thing at startup the operator must be *told* about, or they meet the stock
+        // tools and assume theirs were lost. They are not — the file is untouched, with
+        // a `.bak` beside it — but only if nobody edits a tool first.
+        let (library, library_load) = ToolLibrary::load();
         let mut app = Self {
             controller: AppController::new(default_machine()),
             panes: initial_panes(),
@@ -2179,7 +2184,7 @@ impl App {
             gizmo_size: GIZMO_SIZE_DEFAULT,
             view: ViewControls::default(),
             cursor: None,
-            library: ToolLibrary::load(),
+            library,
             lib_sel: 0,
             tool_edit: None,
             library_view: LibraryView::Ordered,
@@ -2203,6 +2208,12 @@ impl App {
             show_origin: true,
             status: "Open the sample part to begin.".to_string(),
         };
+        if let crate::LibraryLoad::Rejected(why) = &library_load {
+            app.status = format!(
+                "Tool library {why}. Using the starter tools; your file is untouched \
+                 (a copy is beside it as tools.json.bak)."
+            );
+        }
         app.refresh_fields();
         // Seed the fixed layout against the assumed window size; the first real
         // resize event re-applies it against the true size.

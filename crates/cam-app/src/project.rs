@@ -26,6 +26,10 @@ pub enum LoadError {
     Json(String),
     /// The file parsed, but its document could not be brought to the current schema.
     Migration(migrate::MigrationError),
+    /// A tool library written by a newer build. Refused rather than read leniently:
+    /// Import Library *replaces* the working set, so misreading one costs the user
+    /// their tools.
+    LibraryVersion { found: u32, supported: u32 },
 }
 
 impl std::fmt::Display for LoadError {
@@ -33,6 +37,11 @@ impl std::fmt::Display for LoadError {
         match self {
             LoadError::Json(e) => write!(f, "{e}"),
             LoadError::Migration(e) => write!(f, "{e}"),
+            LoadError::LibraryVersion { found, supported } => write!(
+                f,
+                "this tool library is format {found}; this build understands \
+                 {supported}. Update OpenCAMStudio to open it."
+            ),
         }
     }
 }
@@ -99,9 +108,11 @@ impl OcamFile {
     /// Parse a `.ocam` file, accepting a **legacy untagged project** (a bare [`Project`]
     /// object written before the `"ocam"` tag existed) as `Project`.
     ///
-    /// A project is migrated to the current schema on the way through; a library is not,
-    /// because [`ToolLibrary`] carries no schema version and has only ever grown fields
-    /// with serde defaults.
+    /// A project is migrated to the current schema on the way through. A library carries
+    /// its own [`LIBRARY_VERSION`](crate::LIBRARY_VERSION) and needs no migration yet —
+    /// it has only ever grown fields with serde defaults — but a library from a *newer*
+    /// build is refused rather than read leniently, because importing one replaces the
+    /// working tool set.
     pub fn from_json(text: &str) -> Result<Self, LoadError> {
         let mut value: serde_json::Value = serde_json::from_str(text)?;
 
@@ -112,7 +123,16 @@ impl OcamFile {
         // try-then-fall-back arrangement would do to a genuinely too-new file.
         let tag = value.get("ocam").and_then(serde_json::Value::as_str);
         match tag {
-            Some("library") => Ok(serde_json::from_value(value)?),
+            Some("library") => {
+                let lib: crate::ToolLibrary = serde_json::from_value(value)?;
+                if lib.library_version > crate::LIBRARY_VERSION {
+                    return Err(LoadError::LibraryVersion {
+                        found: lib.library_version,
+                        supported: crate::LIBRARY_VERSION,
+                    });
+                }
+                Ok(OcamFile::Library(lib))
+            }
             Some("project") => {
                 migrate_project(&mut value)?;
                 Ok(serde_json::from_value(value)?)

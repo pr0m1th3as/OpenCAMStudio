@@ -359,6 +359,12 @@ impl From<crate::project::LoadError> for ProjectError {
         match e {
             crate::project::LoadError::Json(e) => ProjectError::Json(e),
             crate::project::LoadError::Migration(e) => ProjectError::Schema(e),
+            // A too-new *library* reaching the project path means the user opened one
+            // as a project. Report the version, not "not a project": the version is
+            // the actionable half, and it is why the file could not be read at all.
+            e @ crate::project::LoadError::LibraryVersion { .. } => {
+                ProjectError::Json(e.to_string())
+            }
         }
     }
 }

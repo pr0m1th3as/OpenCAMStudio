@@ -35,7 +35,7 @@ pub use settings::{
     MARKER_SCALE_RANGE, PANE_MIN_RANGE, PANE_SIZE_RANGE, PICKBOX_RANGE, SETTINGS_VERSION,
     SNAP_CATCH_MULTIPLE,
 };
-pub use tool_library::{families_for, ToolKindPick, ToolLibrary};
+pub use tool_library::{families_for, LibraryLoad, ToolKindPick, ToolLibrary, LIBRARY_VERSION};
 
 /// The human-facing version string, including git provenance on a dev build.
 ///

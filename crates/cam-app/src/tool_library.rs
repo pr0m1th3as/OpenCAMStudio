@@ -8,7 +8,7 @@
 //! presentation is GUI. Keeping them here is what lets the headless tests assert
 //! that a fresh install can actually start all eight operations.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use cam_model::{Tool, ToolKind};
 
@@ -64,10 +64,55 @@ pub fn default_tool(number: u32, kind: ToolKind) -> Tool {
     }
 }
 
+/// The tool library file's format version.
+///
+/// Its own counter, like the settings file's — `cam_model::SCHEMA_VERSION` describes
+/// the *document*, and a library is not a document. v1 is the shape every library
+/// ever written already has, which is why an unversioned file reads as v1 rather
+/// than being refused.
+pub const LIBRARY_VERSION: u32 = 1;
+
+/// A library file with no `library_version` predates the field. Every such file is
+/// the v1 shape — the field was added *because* the format needed a version, not
+/// because the format changed — so reading it as v1 is the truth, not a guess.
+fn unversioned_is_v1() -> u32 {
+    1
+}
+
+/// What happened when the library file was read. Returned rather than swallowed so
+/// the app can *say* the library did not load, instead of the user meeting an
+/// unexpected set of stock tools and wondering where theirs went.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LibraryLoad {
+    /// No file yet: the starter library is in force, and was written if there was
+    /// anywhere to write it.
+    Seeded,
+    /// Read and adopted.
+    Loaded,
+    /// A file exists but could not be used. The starter library is in force, **the
+    /// file was left exactly as it was**, and a copy was put beside it as `.bak`.
+    Rejected(String),
+}
+
 /// A reusable set of tool definitions, persisted to the config directory.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolLibrary {
+    /// Format version — see [`LIBRARY_VERSION`].
+    #[serde(default = "unversioned_is_v1")]
+    pub library_version: u32,
     pub tools: Vec<Tool>,
+}
+
+impl Default for ToolLibrary {
+    /// An **empty** library at the current version — not the starter set. Use
+    /// [`ToolLibrary::defaults`] for that; the two are different things and conflating
+    /// them is how a test ends up asserting against the shipped catalogue by accident.
+    fn default() -> Self {
+        Self {
+            library_version: LIBRARY_VERSION,
+            tools: Vec::new(),
+        }
+    }
 }
 
 impl ToolLibrary {
@@ -253,36 +298,87 @@ impl ToolLibrary {
             kind: ToolKind::ThreadMill { pitch: None },
             ..Default::default()
         });
-        Self { tools }
+        Self {
+            library_version: LIBRARY_VERSION,
+            tools,
+        }
     }
 
-    /// Load the library from disk, falling back to (and persisting) the defaults if
-    /// the file is missing or unreadable.
-    pub fn load() -> Self {
-        if let Some(path) = library_path() {
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                if let Ok(lib) = serde_json::from_str::<ToolLibrary>(&text) {
-                    return lib;
-                }
-            }
+    /// Load the library from the config directory.
+    ///
+    /// See [`load_from`](Self::load_from) — the failure contract is the point.
+    pub fn load() -> (Self, LibraryLoad) {
+        match library_path() {
+            Some(path) => Self::load_from(&path),
+            // Nowhere to persist on this machine: the starter set, and no file.
+            None => (Self::defaults(), LibraryLoad::Seeded),
         }
-        let lib = Self::defaults();
-        lib.save();
-        lib
+    }
+
+    /// Load the library from `path`.
+    ///
+    /// **A file we could not read is never overwritten.** This function used to fall
+    /// back to the starter set *and immediately save it*, so a parse failure — a
+    /// future format change, a truncated write, a bad hand-edit — silently replaced a
+    /// real tool library with the stock 36, with no error and no way back. A tool
+    /// library is hand-built over time; it is some of the most expensive data the app
+    /// holds.
+    ///
+    /// So now: missing seeds and saves (that is first-run, and correct), but
+    /// unreadable, unparseable or newer-than-us leaves the file **exactly** as it is
+    /// and puts a copy beside it as `.bak`. The user meets the starter set with an
+    /// explanation, and their own file is still on disk.
+    ///
+    /// The residual case, which no load contract can prevent: once the user
+    /// *deliberately* edits a tool, saving writes over that file. Hence the `.bak`
+    /// copy and the message — the recovery has to exist before they touch anything.
+    pub fn load_from(path: &Path) -> (Self, LibraryLoad) {
+        let reject = |why: String| {
+            // Preserve what we could not read, before anything can overwrite it.
+            let bak = path.with_extension("json.bak");
+            let _ = std::fs::copy(path, &bak);
+            (Self::defaults(), LibraryLoad::Rejected(why))
+        };
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            // Missing is first run, not a failure: seed and persist.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let lib = Self::defaults();
+                let _ = lib.save_to(path);
+                return (lib, LibraryLoad::Seeded);
+            }
+            Err(e) => return reject(format!("could not be read ({e})")),
+        };
+        let lib: ToolLibrary = match serde_json::from_str(&text) {
+            Ok(l) => l,
+            Err(e) => return reject(format!("is not a valid tool library ({e})")),
+        };
+        if lib.library_version > LIBRARY_VERSION {
+            return reject(format!(
+                "was written by a newer version (format {}, this build understands \
+                 {LIBRARY_VERSION})",
+                lib.library_version
+            ));
+        }
+        (lib, LibraryLoad::Loaded)
     }
 
     /// Persist the library to the config directory (best-effort; errors are ignored
     /// — a read-only config dir simply means changes don't persist across runs).
     pub fn save(&self) {
-        let Some(path) = library_path() else {
-            return;
-        };
+        if let Some(path) = library_path() {
+            let _ = self.save_to(&path);
+        }
+    }
+
+    /// Persist to `path`, creating the directory if needed.
+    pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)?;
         }
-        if let Ok(text) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(&path, text);
-        }
+        let text = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(path, text)
     }
 
     /// The library tool to seed a newly-created operation of `kind` with — a
@@ -560,6 +656,134 @@ impl std::fmt::Display for ToolKindPick {
 }
 
 #[cfg(test)]
+mod library_file_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            static N: AtomicU32 = AtomicU32::new(0);
+            let d = std::env::temp_dir().join(format!(
+                "ocam-library-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&d).expect("scratch dir");
+            Self(d)
+        }
+        fn file(&self) -> PathBuf {
+            self.0.join("tools.json")
+        }
+        fn bak(&self) -> PathBuf {
+            self.0.join("tools.json.bak")
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// **The hazard this fix exists for.** The old `load()` fell back to the starter
+    /// set *and immediately saved it*, so a library that failed to parse was replaced
+    /// on disk — silently, with no error and no copy. A hand-built tool library is
+    /// among the most expensive data the app holds.
+    #[test]
+    fn an_unreadable_library_is_never_overwritten_and_is_backed_up() {
+        let s = Scratch::new();
+        let precious = r#"{"tools": [ this is corrupt but it is THEIRS"#;
+        std::fs::write(s.file(), precious).unwrap();
+
+        let (lib, outcome) = ToolLibrary::load_from(&s.file());
+        assert!(matches!(outcome, LibraryLoad::Rejected(_)), "{outcome:?}");
+        assert_eq!(lib, ToolLibrary::defaults(), "the starter set is in force");
+        assert_eq!(
+            std::fs::read_to_string(s.file()).unwrap(),
+            precious,
+            "the user's library must survive a failed load"
+        );
+        assert_eq!(
+            std::fs::read_to_string(s.bak()).unwrap(),
+            precious,
+            "and a copy must exist before anything can overwrite it"
+        );
+    }
+
+    #[test]
+    fn a_library_from_a_newer_build_is_refused_not_read_leniently() {
+        let s = Scratch::new();
+        let newer = format!(r#"{{"library_version": {}, "tools": []}}"#, LIBRARY_VERSION + 3);
+        std::fs::write(s.file(), &newer).unwrap();
+
+        let (lib, outcome) = ToolLibrary::load_from(&s.file());
+        assert!(matches!(outcome, LibraryLoad::Rejected(_)), "{outcome:?}");
+        assert_eq!(lib, ToolLibrary::defaults());
+        assert_eq!(std::fs::read_to_string(s.file()).unwrap(), newer);
+        // An empty `tools` list read leniently would have looked like "you have no
+        // tools" — indistinguishable from a real empty library.
+    }
+
+    #[test]
+    fn a_missing_library_seeds_the_starter_set_and_persists_it() {
+        let s = Scratch::new();
+        let (lib, outcome) = ToolLibrary::load_from(&s.file());
+        assert_eq!(outcome, LibraryLoad::Seeded);
+        assert_eq!(lib, ToolLibrary::defaults());
+        assert!(s.file().exists(), "first run must seed the library");
+        assert!(!s.bak().exists(), "a first run has nothing to back up");
+
+        // And it reloads as itself.
+        let (again, outcome) = ToolLibrary::load_from(&s.file());
+        assert_eq!(outcome, LibraryLoad::Loaded);
+        assert_eq!(again, lib);
+    }
+
+    /// Every library ever written predates the version field, and every one of them is
+    /// the v1 shape. Reading them as v1 is the truth; refusing them would be a
+    /// self-inflicted data loss on upgrade.
+    #[test]
+    fn a_library_written_before_the_version_field_loads_as_v1() {
+        let s = Scratch::new();
+        let old = ToolLibrary::defaults();
+        let mut value = serde_json::to_value(&old).unwrap();
+        value.as_object_mut().unwrap().remove("library_version");
+        assert!(value.get("library_version").is_none());
+        std::fs::write(s.file(), serde_json::to_string_pretty(&value).unwrap()).unwrap();
+
+        let (lib, outcome) = ToolLibrary::load_from(&s.file());
+        assert_eq!(outcome, LibraryLoad::Loaded);
+        assert_eq!(lib.library_version, 1);
+        assert_eq!(lib.tools, old.tools, "the tools must survive untouched");
+        assert!(!s.bak().exists(), "an unversioned file is valid, not rejected");
+    }
+
+    #[test]
+    fn a_saved_library_round_trips_with_its_version() {
+        let s = Scratch::new();
+        let lib = ToolLibrary::defaults();
+        lib.save_to(&s.file()).unwrap();
+        let text = std::fs::read_to_string(s.file()).unwrap();
+        assert!(text.contains("library_version"), "the version must be written");
+        let (back, outcome) = ToolLibrary::load_from(&s.file());
+        assert_eq!(outcome, LibraryLoad::Loaded);
+        assert_eq!(back, lib);
+    }
+
+    /// `Default` is an *empty* library, not the starter set. They are different things
+    /// and the distinction is load-bearing: a test that took `Default` for the starter
+    /// set would assert against whatever the catalogue happens to contain.
+    #[test]
+    fn default_is_empty_and_defaults_is_the_catalogue() {
+        assert!(ToolLibrary::default().tools.is_empty());
+        assert!(!ToolLibrary::defaults().tools.is_empty());
+        assert_eq!(ToolLibrary::default().library_version, LIBRARY_VERSION);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -682,7 +906,8 @@ mod tests {
                 mk(2, 12.0, ToolKind::EndMill),
                 mk(3, 8.0, ToolKind::EndMill),
             ],
-        };
+                      ..Default::default()
+                  };
         let t = lib.default_tool_for(OpKind::Face).unwrap();
         assert_eq!(t.diameter, 12.0);
         assert!(matches!(t.kind, ToolKind::EndMill));
@@ -703,7 +928,8 @@ mod tests {
                 mk(2, 8.0, ToolKind::EndMill),
                 mk(3, 16.0, ToolKind::FaceMill),
             ],
-        };
+                      ..Default::default()
+                  };
         let t = lib.default_tool_for(OpKind::Face).unwrap();
         assert_eq!(t.number, 3, "the ⌀16 face mill is the largest flat tool");
 
@@ -714,7 +940,8 @@ mod tests {
                 included_angle_deg: 90.0,
                 tip_diameter: 0.5,
             })],
-        };
+                               ..Default::default()
+                           };
         assert_eq!(only_chamfer.default_tool_for(OpKind::Face).unwrap().number, 1);
     }
 
@@ -733,7 +960,8 @@ mod tests {
                 }),
                 mk(5, 12.0, ToolKind::ThreadMill { pitch: None }),
             ],
-        };
+                      ..Default::default()
+                  };
         assert_eq!(lib.default_tool_for(OpKind::Drill).unwrap().number, 2, "first Drill");
         assert_eq!(lib.default_tool_for(OpKind::Chamfer).unwrap().number, 4, "first ChamferMill");
         assert_eq!(lib.default_tool_for(OpKind::Thread).unwrap().number, 5, "first ThreadMill");
@@ -752,7 +980,8 @@ mod tests {
                 mk(2, 8.0, ToolKind::EndMill),
                 mk(3, 4.0, ToolKind::EndMill),
             ],
-        };
+                      ..Default::default()
+                  };
         for op in [OpKind::Profile, OpKind::Pocket] {
             let t = lib.default_tool_for(op).unwrap();
             assert!(matches!(t.kind, ToolKind::EndMill), "{op:?} took the drill");
@@ -805,31 +1034,32 @@ mod tests {
                 tip_radius: 0.1,
             })
         };
-        let below = ToolLibrary { tools: vec![bit(1, 6.0, 30.0), bit(2, 6.0, 50.0)] };
+        let below = ToolLibrary { tools: vec![bit(1, 6.0, 30.0), bit(2, 6.0, 50.0)], ..Default::default() };
         assert_eq!(below.default_tool_for(OpKind::Engrave).unwrap().number, 2, "50° is nearer 60");
-        let above = ToolLibrary { tools: vec![bit(1, 6.0, 90.0), bit(2, 6.0, 70.0)] };
+        let above = ToolLibrary { tools: vec![bit(1, 6.0, 90.0), bit(2, 6.0, 70.0)], ..Default::default() };
         assert_eq!(above.default_tool_for(OpKind::Engrave).unwrap().number, 2, "70° is nearer 60");
 
         // Equidistant (45 and 75): the sharper bit wins. A narrow groove can be cut
         // deeper to widen it; a blunt bit can never cut a narrow one.
-        let tie = ToolLibrary { tools: vec![bit(1, 6.0, 75.0), bit(2, 6.0, 45.0)] };
+        let tie = ToolLibrary { tools: vec![bit(1, 6.0, 75.0), bit(2, 6.0, 45.0)], ..Default::default() };
         let t = tie.default_tool_for(OpKind::Engrave).unwrap();
         assert_eq!(t.number, 2, "a tie must break to the sharper bit");
 
         // A library with no V-bit at all still yields something rather than nothing --
         // the operator can change it, an empty wizard cannot be worked around.
-        let none = ToolLibrary { tools: vec![mk(1, 6.0, ToolKind::EndMill)] };
+        let none = ToolLibrary { tools: vec![mk(1, 6.0, ToolKind::EndMill)], ..Default::default() };
         assert_eq!(none.default_tool_for(OpKind::Engrave).unwrap().number, 1);
     }
 
     #[test]
     fn a_single_tool_of_a_kind_is_still_chosen() {
         // The median must not misbehave at the edges: one tool, or two.
-        let one = ToolLibrary { tools: vec![mk(1, 6.0, ToolKind::EndMill)] };
+        let one = ToolLibrary { tools: vec![mk(1, 6.0, ToolKind::EndMill)], ..Default::default() };
         assert_eq!(one.default_tool_for(OpKind::Profile).unwrap().diameter, 6.0);
         let two = ToolLibrary {
             tools: vec![mk(1, 10.0, ToolKind::EndMill), mk(2, 4.0, ToolKind::EndMill)],
-        };
+                      ..Default::default()
+                  };
         assert_eq!(
             two.default_tool_for(OpKind::Profile).unwrap().diameter,
             4.0,
@@ -844,7 +1074,8 @@ mod tests {
         // be exercised on a library that deliberately lacks them.
         let lib = ToolLibrary {
             tools: vec![mk(1, 6.0, ToolKind::EndMill), mk(2, 10.0, ToolKind::EndMill)],
-        };
+                      ..Default::default()
+                  };
         for kind in [OpKind::Drill, OpKind::Thread, OpKind::Chamfer] {
             assert_eq!(
                 lib.default_tool_for(kind).unwrap().number,
@@ -873,7 +1104,8 @@ mod tests {
                 mk(2, 6.0, ToolKind::EndMill),
                 mk(3, 10.0, ToolKind::EndMill),
             ],
-        };
+                          ..Default::default()
+                      };
         lib.tools.retain(|t| t.number != 2);
         let idx = lib.add_default();
         assert_eq!(lib.tools[idx].number, 2, "the freed #2 is reused, not #4");
@@ -890,7 +1122,8 @@ mod tests {
                 mk(2, 6.0, ToolKind::EndMill),
                 mk(3, 10.0, ToolKind::EndMill),
             ],
-        };
+                          ..Default::default()
+                      };
         // Move #3 (index 2) onto #1 → the two swap.
         lib.set_number(2, 1);
         assert_eq!(lib.tools[2].number, 1, "target adopted");
@@ -911,7 +1144,8 @@ mod tests {
                 mk(2, 6.0, ToolKind::EndMill),
                 mk(3, 10.0, ToolKind::EndMill),
             ],
-        };
+                          ..Default::default()
+                      };
         let before = lib.tools.len();
 
         // A genuinely new tool gets the next free number and is inserted.
@@ -948,7 +1182,8 @@ mod tests {
                     tip_radius: 0.2,
                 }),
             ],
-        };
+                      ..Default::default()
+                  };
         assert_eq!(
             lib.default_tool_for(OpKind::Engrave).unwrap().number,
             2,
