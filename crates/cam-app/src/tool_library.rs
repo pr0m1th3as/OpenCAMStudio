@@ -288,12 +288,13 @@ impl ToolLibrary {
     /// The library tool to seed a newly-created operation of `kind` with — a
     /// sensible starting default the user can still override in the wizard picker.
     ///
-    /// Every op has a **natural tool kind** and defaults to the first tool of that
-    /// kind: Profile/Pocket → `EndMill`, Drill → `Drill`, Thread → `ThreadMill`,
-    /// Chamfer → `ChamferMill`. **Face** is the one that also sorts by size: it
-    /// wants a flat-bottomed tool (a chamfer or ball tool would leave a scalloped
-    /// floor), and the *largest* such tool means the fewest passes, so facing
-    /// prefers the biggest `EndMill`/`FaceMill`.
+    /// Every op has a **natural tool kind** and defaults to the median tool of that
+    /// kind by diameter: Profile/Pocket → `EndMill`, Drill → `Drill`, Thread →
+    /// `ThreadMill`, Chamfer → `ChamferMill`. **Face** is the one that instead takes
+    /// the largest: it wants a flat-bottomed tool (a chamfer or ball tool would leave
+    /// a scalloped floor), and the *largest* such tool means the fewest passes.
+    /// **Engrave/Carve** are the ones that do not sort by size at all — a V-bit is
+    /// chosen by its included angle (see below).
     ///
     /// In every case this is only a **default** — we never *reject* a tool the user
     /// picks; and if no tool of the preferred kind exists we fall back to the first
@@ -320,6 +321,41 @@ impl ToolLibrary {
             of_kind.sort_by(|a, b| a.diameter.total_cmp(&b.diameter));
             Some(of_kind[(of_kind.len() - 1) / 2])
         };
+        // V-bits are chosen by **included angle**, never by diameter. A V-bit's body
+        // diameter says where its cone flares out — a reach limit — while the angle is
+        // what shapes every cut it makes, so sorting by size ranks them on the wrong
+        // property. On the starter set (30/45/60/90) the median-by-diameter landed on
+        // the 45°, an engraving bit; the Amana catalogue calls the **60°** "the general
+        // go-to bit", and it is the one both engraving and carving want to start from.
+        //
+        // A target angle here, deliberately unlike the median used for diameters above,
+        // because the two quantities behave differently. Diameters span whatever the
+        // shop happens to own, so a median degrades gracefully and a magic number does
+        // not. Angles do the opposite: they cluster on a small standard set with a
+        // conventional default, so "nearest 60°" holds against a library of three bits
+        // or three hundred, while a median would just track whichever half of the set
+        // is better stocked.
+        //
+        // Ties break to the **sharper** bit — the cheaper mistake, matching the lower
+        // middle taken above. A narrow groove can always be cut deeper to widen it; a
+        // blunt bit can never be made to cut a narrow one.
+        const GO_TO_VBIT_ANGLE_DEG: f64 = 60.0;
+        let nearest_vbit = || -> Option<&Tool> {
+            self.tools
+                .iter()
+                .filter_map(|t| match t.kind {
+                    ToolKind::VBit {
+                        included_angle_deg, ..
+                    } => Some((t, included_angle_deg)),
+                    _ => None,
+                })
+                .min_by(|(_, a), (_, b)| {
+                    let da = (a - GO_TO_VBIT_ANGLE_DEG).abs();
+                    let db = (b - GO_TO_VBIT_ANGLE_DEG).abs();
+                    da.total_cmp(&db).then(a.total_cmp(b))
+                })
+                .map(|(t, _)| t)
+        };
         let preferred = match kind {
             // Facing is the exception, and deliberately so: it wants the *largest* flat
             // tool (fewest passes), which is scallop-safe and what a facing pass is for.
@@ -335,8 +371,9 @@ impl ToolLibrary {
             // Engraving *requires* a V-bit (a chamfer mill's tip does not cut), so
             // this is the one default that matches the strategy's hard gate.
             // Carving *requires* a V-bit too — it is the same gate, for the same
-            // reason: the tool's own cone is what shapes the cut.
-            OpKind::Engrave | OpKind::Carve => middle(|k| matches!(k, ToolKind::VBit { .. })),
+            // reason: the tool's own cone is what shapes the cut. And for the same
+            // reason it is chosen by angle, not by size.
+            OpKind::Engrave | OpKind::Carve => nearest_vbit(),
         };
         preferred.or_else(|| self.tools.first()).copied()
     }
@@ -757,16 +794,53 @@ mod tests {
         assert_eq!(dia(OpKind::Chamfer), 6.35, "of 6.35/12.7 the lower middle");
         // Facing keeps its own rule -- widest flat tool, which is the face mill.
         assert_eq!(dia(OpKind::Face), 50.0);
-        // A V-bit's size is really its angle; the middle by diameter lands on a
-        // general-purpose one rather than the finest.
-        let v = lib.default_tool_for(OpKind::Engrave).unwrap();
-        let ToolKind::VBit { included_angle_deg, .. } = v.kind else {
-            panic!("engrave must seed a V-bit")
+        // V-bits are the exception to the size rule entirely -- see
+        // `v_bits_are_seeded_by_angle_not_by_size`.
+    }
+
+    #[test]
+    fn v_bits_are_seeded_by_angle_not_by_size() {
+        // A V-bit's diameter is where its cone flares out -- a reach limit -- while the
+        // angle is what shapes the cut, so ranking them by size ranks the wrong
+        // property. On the starter set the median-by-diameter landed on the 45°
+        // engraving bit; the catalogue go-to is the 60°.
+        let lib = ToolLibrary::defaults();
+        for op in [OpKind::Engrave, OpKind::Carve] {
+            let v = lib.default_tool_for(op).unwrap();
+            let ToolKind::VBit { included_angle_deg, .. } = v.kind else {
+                panic!("{op:?} must seed a V-bit")
+            };
+            assert_eq!(included_angle_deg, 60.0, "{op:?} seeded the wrong V-bit");
+            // And it is emphatically not the median by diameter, which is the point:
+            // of {6.35, 6.35, 12.7, 12.7} the lower middle is 6.35, the 45° bit.
+            assert_eq!(v.diameter, 12.7);
+        }
+    }
+
+    #[test]
+    fn the_nearest_v_bit_angle_wins_and_ties_go_to_the_sharper() {
+        // No 60° in the library: the nearest angle wins from either side.
+        let bit = |n, d, a| {
+            mk(n, d, ToolKind::VBit {
+                included_angle_deg: a,
+                tip_radius: 0.1,
+            })
         };
-        assert!(
-            included_angle_deg >= 45.0,
-            "seeded the {included_angle_deg}° V-bit, the finest and slowest"
-        );
+        let below = ToolLibrary { tools: vec![bit(1, 6.0, 30.0), bit(2, 6.0, 50.0)] };
+        assert_eq!(below.default_tool_for(OpKind::Engrave).unwrap().number, 2, "50° is nearer 60");
+        let above = ToolLibrary { tools: vec![bit(1, 6.0, 90.0), bit(2, 6.0, 70.0)] };
+        assert_eq!(above.default_tool_for(OpKind::Engrave).unwrap().number, 2, "70° is nearer 60");
+
+        // Equidistant (45 and 75): the sharper bit wins. A narrow groove can be cut
+        // deeper to widen it; a blunt bit can never cut a narrow one.
+        let tie = ToolLibrary { tools: vec![bit(1, 6.0, 75.0), bit(2, 6.0, 45.0)] };
+        let t = tie.default_tool_for(OpKind::Engrave).unwrap();
+        assert_eq!(t.number, 2, "a tie must break to the sharper bit");
+
+        // A library with no V-bit at all still yields something rather than nothing --
+        // the operator can change it, an empty wizard cannot be worked around.
+        let none = ToolLibrary { tools: vec![mk(1, 6.0, ToolKind::EndMill)] };
+        assert_eq!(none.default_tool_for(OpKind::Engrave).unwrap().number, 1);
     }
 
     #[test]
