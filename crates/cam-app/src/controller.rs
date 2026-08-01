@@ -143,6 +143,34 @@ pub enum ExportError {
     Post(PostError),
 }
 
+impl std::fmt::Display for ExportError {
+    /// Words an operator can act on.
+    ///
+    /// There was no `Display` at all, so `ExportToError` fell back to `{e:?}` and a
+    /// blocked export reported itself as `Post(TravelExceeded { axis: 'X', span: 400.0,
+    /// … })`. That is a developer's view of the problem shown to someone standing at a
+    /// machine. `PostError` already words itself properly; this stops swallowing it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExportError::NothingToExport => {
+                write!(f, "there is no toolpath yet — run the job first (Home ▸ Run).")
+            }
+            ExportError::HasErrors => write!(
+                f,
+                "the last run reported errors. Fix the operations marked ⚠ in the project                  tree, then run again."
+            ),
+            ExportError::RapidThroughStock(n) => write!(
+                f,
+                "{n} rapid move{} would plow through material that has not been cut yet —                  a crash hazard, so the export is blocked.",
+                if *n == 1 { "" } else { "s" }
+            ),
+            ExportError::Post(e) => write!(f, "{e}."),
+        }
+    }
+}
+
+impl std::error::Error for ExportError {}
+
 impl From<PostError> for ExportError {
     fn from(e: PostError) -> Self {
         ExportError::Post(e)
@@ -428,7 +456,7 @@ pub enum ExportToError {
 impl std::fmt::Display for ExportToError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ExportToError::Export(e) => write!(f, "{e:?}"),
+            ExportToError::Export(e) => write!(f, "{e}"),
             ExportToError::Io(e) => write!(f, "file error: {e}"),
         }
     }
@@ -3728,6 +3756,42 @@ mod tests {
             "and opening a job built elsewhere keeps yours"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    /// A blocked export must say something an operator can act on. There was no
+    /// `Display` for `ExportError`, so the message fell back to `{e:?}` — a developer's
+    /// view of the problem, shown to someone standing at a machine.
+    #[test]
+    fn a_blocked_export_explains_itself_in_words() {
+        use cam_post::PostError;
+        let cases = [
+            (ExportError::NothingToExport, "run the job"),
+            (ExportError::HasErrors, "⚠"),
+            (ExportError::RapidThroughStock(3), "crash hazard"),
+            (
+                ExportError::Post(PostError::TravelExceeded {
+                    axis: 'X',
+                    span: 400.0,
+                    travel: 300.0,
+                }),
+                "travel",
+            ),
+        ];
+        for (e, expect) in cases {
+            let said = e.to_string();
+            assert!(
+                said.contains(expect),
+                "{e:?} reads {said:?}, which does not mention {expect:?}"
+            );
+            assert!(
+                !said.contains('{') && !said.contains("Post("),
+                "{said:?} is still a Debug rendering"
+            );
+        }
+        // Plurality, because "1 rapid moves" is the kind of thing that makes a warning
+        // look unconsidered.
+        assert!(ExportError::RapidThroughStock(1).to_string().contains("1 rapid move would"));
+        assert!(ExportError::RapidThroughStock(2).to_string().contains("2 rapid moves would"));
     }
 
     #[test]

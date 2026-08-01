@@ -375,7 +375,12 @@ that have no other control:
   where the shipped values can leave the viewport too narrow to work in.
 The **machine** is not here either, and for a stronger reason. Your machines live in a
 **local library** (`machines.json`), picked from the *Active* row at the top of the
-Machine inspector, with **New** / **Delete** on the **Machinery** ribbon tab. Everything
+Machine inspector, with **New** / **Delete** on the **Machinery** ribbon tab.
+
+Switching machines with the *Active* picker is immediate — it is navigation, not an
+edit. Everything below it, **including the name and the post**, waits for **Apply**, the
+same as the travel figures: Apply lights up while something is pending and greys again
+once it is committed, so you can always tell whether what you typed has taken. Everything
 below that row edits the machine you have selected. **Each machine carries its own
 control**, so picking a machine picks its post — a shop with a Haas and a grbl router
 should not have to remember to switch the post as well, and "right machine, wrong
@@ -436,6 +441,14 @@ ramp runs forward along the path and retraces it at depth instead. A closed cont
 
 ### Run / export
 
+**A blocked export never opens a file dialog.** The G-code is posted the moment you
+click Export, so if the job cannot be exported — a toolpath larger than the machine's
+travel, operations still marked ⚠, a rapid that would plow through uncut stock — you get
+an error dialog *then*, and no file chooser appears. Picking a folder and a filename only
+to be refused afterwards reads as "saved", and sends you looking for a file that was
+never written. The dialog is used rather than the status line because the **Output** pane
+can be hidden, and a refusal is the one message that must not be missable.
+
 - **Home → Run** recomputes for the current document. The backplot is coloured by
   move kind: green = cutting, yellow = rapid/link, red = plunge, **blue dashed =
   tool-change traverse** (the lift to tool-change height, the cross, and the descent
@@ -480,6 +493,13 @@ things worth eyeballing:
   defaults** gets you back in one click without a confirmation step you might not be
   able to reach. Check the pane rows name their axis — **Output (height)**, the rest
   **(width)**. Drag **Origin marker size** and watch the datum cross grow.
+- **Apply means Apply:** on the Machinery tab, type a new machine name — **Apply** must
+  light up, and the name must *not* change until you click it. Same for the post. Then
+  switch machines with *Active* mid-edit: the pending edit should be dropped, not carried
+  onto the machine you switched to.
+- **A blocked export shows no file dialog:** make a job too big for the active machine and
+  click Export. You should get an error dialog immediately and never see a file chooser.
+  Hide the Output pane first — the message must still reach you.
 - **Envelope:** turn it on (View → Envelope) and confirm the dashed box frames the job.
   Switch to a machine with much smaller travel — it should turn **red** and the toolpath
   should visibly stand outside it. Confirm the camera does **not** re-frame when you turn

@@ -352,6 +352,21 @@ async fn confirm_export_duplicates(detail: String) -> bool {
         == rfd::MessageDialogResult::Yes
 }
 
+/// Native error dialog for an export that cannot happen.
+///
+/// A dialog rather than the status line, because the status line lives in the **Output**
+/// pane and the operator can hide it — at which point a refusal would be entirely
+/// silent. A blocked export is exactly the case that must not be.
+async fn report_export_blocked(detail: String) {
+    rfd::AsyncMessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("Cannot export")
+        .set_description(detail)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show()
+        .await;
+}
+
 /// Native Yes/No warning gating the **bulk renumber** (it rewrites every tool's number).
 async fn confirm_renumber(detail: String) -> bool {
     rfd::AsyncMessageDialog::new()
@@ -1550,6 +1565,13 @@ struct App {
     machines: crate::MachineLibrary,
     /// The active machine's name — the key the selection is remembered by.
     active_machine: String,
+    /// Uncommitted machine edits, awaiting **Apply** — the same promise the numeric
+    /// fields make. A rename that took effect per keystroke had no way to be abandoned,
+    /// wrote both config files on every letter, and gave the operator no signal that
+    /// anything was pending (Andreas, 2026-08-01). Only the *Active* picker stays
+    /// instant: switching machines is a navigation, not an edit.
+    machine_name_edit: Option<String>,
+    machine_post_edit: Option<PostKind>,
     /// The user's preferences, as loaded at startup and written back on change.
     ///
     /// The view/snap/pane fields below stay the live state — the settings copy is
@@ -2231,6 +2253,8 @@ impl App {
             library,
             machines,
             active_machine,
+            machine_name_edit: None,
+            machine_post_edit: None,
             lib_sel: 0,
             tool_edit: None,
             library_view: LibraryView::Ordered,
@@ -2352,16 +2376,14 @@ impl App {
                 }
             }
             Message::MachineNameChanged(name) => {
-                self.controller.edit_machine(|m| m.name = name);
-                self.sync_active_machine();
+                // Buffered, not committed: Apply lights up, exactly as it does for the
+                // travel fields beside it.
+                self.machine_name_edit = Some(name);
             }
             Message::PostKindChanged(kind) => {
-                self.controller.set_post_kind(kind);
-                // The picker sits in the Machine inspector, so it edits *this machine's*
-                // control — that is what the field means there. Remembered with the
-                // machine, not separately.
-                self.sync_active_machine();
-                self.status = format!("Post: {kind}.");
+                // Also buffered. The picker sits in the Machine inspector, so it edits
+                // *this machine's* control — and an edit waits for Apply.
+                self.machine_post_edit = Some(kind);
             }
             Message::Apply => {
                 // Blocked while any field is invalid or there is nothing to commit (also
@@ -2476,6 +2498,18 @@ impl App {
                 };
             }
             Message::ExportNc => {
+                // **Post before opening the dialog.** The refusal used to come *after*
+                // the operator had picked a folder and a filename, which reads as "saved"
+                // — they close the dialog believing the job exported and go looking for a
+                // file that was never written. Doing the work first means the only dialog
+                // they ever see is one that will produce a file.
+                if let Err(e) = self.controller.export_nc() {
+                    self.status = format!("Export blocked: {e}");
+                    return iced::Task::perform(
+                        report_export_blocked(format!("{e}")),
+                        |()| Message::CloseRibbonPopup,
+                    );
+                }
                 // Guardrail: if any included operations are exact duplicates, they
                 // would post the same toolpath twice. Confirm before the machine
                 // sees it — but don't block (a spring/finishing pass is legitimate).
@@ -2504,10 +2538,24 @@ impl App {
                     "Export cancelled — exclude or edit the duplicate operation(s).".to_string();
             }
             Message::NcToExport(Some(path)) => {
-                self.status = match self.controller.export_nc_to(&path) {
-                    Ok(()) => format!("Exported G-code to {}.", path.display()),
-                    Err(e) => format!("Export blocked: {e}"),
-                };
+                // The post already succeeded (checked before the dialog opened), so a
+                // failure here is the *write* — a read-only folder, a full disk. Still
+                // worth a dialog: the operator has just been told a file was coming.
+                match self.controller.export_nc_to(&path) {
+                    Ok(()) => {
+                        self.status = format!("Exported G-code to {}.", path.display());
+                    }
+                    Err(e) => {
+                        self.status = format!("Export failed: {e}");
+                        return iced::Task::perform(
+                            report_export_blocked(format!(
+                                "Could not write {}.\n\n{e}",
+                                path.display()
+                            )),
+                            |()| Message::CloseRibbonPopup,
+                        );
+                    }
+                }
             }
             // Cancelled dialogs — nothing to do.
             Message::ProjectToOpen(None)
@@ -2921,6 +2969,10 @@ impl App {
             Message::SettingsSettled => self.remember(),
             Message::ActiveMachineChanged(name) => {
                 if let Some(entry) = self.machines.by_name(&name).cloned() {
+                    // A pending edit belongs to the machine it was typed on; carrying it
+                    // across would apply it to the wrong one.
+                    self.machine_name_edit = None;
+                    self.machine_post_edit = None;
                     self.active_machine = name;
                     self.controller.set_machine(entry.machine);
                     // The machine carries its control: picking the machine picks the
@@ -4140,6 +4192,9 @@ impl App {
     /// from the committed library entry. Outside Tooling mode there is no working copy,
     /// so the Apply button keeps its usual (validity-only) gating.
     fn inspector_dirty(&self) -> bool {
+        if self.machine_edit_dirty() {
+            return true;
+        }
         if !self.library_mode() {
             // Same promise the Tooling editor makes, everywhere else: Apply is live only
             // when something is actually pending. The buffers are seeded from the model
@@ -4423,7 +4478,40 @@ impl App {
 
     /// Parse the inspector buffers and commit them to the selected node as one
     /// undoable change, then recompute.
+    /// Whether a machine name or post is typed but not yet applied.
+    fn machine_edit_dirty(&self) -> bool {
+        let name = self
+            .machine_name_edit
+            .as_ref()
+            .is_some_and(|n| n != &self.controller.machine().name);
+        let post = self
+            .machine_post_edit
+            .is_some_and(|p| p != self.controller.post_kind());
+        name || post
+    }
+
+    /// Commit any pending machine name / post, writing them into the library.
+    fn apply_machine_edit(&mut self) {
+        if !self.machine_edit_dirty() {
+            return;
+        }
+        if let Some(name) = self.machine_name_edit.clone() {
+            self.controller.edit_machine(|m| m.name = name);
+        }
+        if let Some(post) = self.machine_post_edit {
+            self.controller.set_post_kind(post);
+        }
+        self.sync_active_machine();
+        // Re-seed from what was actually stored — `sync_active_machine` may have
+        // disambiguated a rename onto a name already taken, and the box must show what
+        // the library holds, not what was typed.
+        self.machine_name_edit = None;
+        self.machine_post_edit = None;
+        self.status = format!("Machine: {} ({}).", self.active_machine, self.controller.post_kind());
+    }
+
     fn apply_inspector(&mut self) {
+        self.apply_machine_edit();
         let mut parsed: BTreeMap<Field, f64> = BTreeMap::new();
         for (&field, text) in &self.fields {
             match text.trim().parse::<f64>() {
@@ -6312,7 +6400,12 @@ impl App {
             list = list.push(
                 row![
                     label_help("Name", help::MACHINE_NAME, self.tooltips),
-                    text_input("machine", &self.controller.machine().name)
+                    text_input(
+                        "machine",
+                        self.machine_name_edit
+                            .as_deref()
+                            .unwrap_or(&self.controller.machine().name),
+                    )
                         .on_input(Message::MachineNameChanged)
                         .width(Length::Fixed(120.0)),
                 ]
@@ -6324,7 +6417,7 @@ impl App {
                 "Post",
                 help::POST,
                 self.tooltips,
-                self.controller.post_kind(),
+                self.machine_post_edit.unwrap_or(self.controller.post_kind()),
                 &PostKind::ALL[..],
                 Message::PostKindChanged,
                 INSPECTOR_PICKER_W,
