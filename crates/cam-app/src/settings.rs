@@ -42,8 +42,13 @@ use crate::SnapKind;
 ///
 /// Purely additive changes — a new field with `#[serde(default)]` — need no bump: an
 /// older file simply loads with the default. Bump when an existing field changes
-/// meaning or shape, and add a step to [`migrate`].
-pub const SETTINGS_VERSION: u32 = 1;
+/// meaning or shape, and add a step to [`Settings::migrate`].
+///
+/// **v2:** `defaults: NewProjectPrefs` became `session: SessionState`. The post stopped
+/// being a *preference* ("which post do new projects get") and became *last-used
+/// session state* ("which control were you on"), once machine and control became
+/// shop-local and the machine library took over nominating a default.
+pub const SETTINGS_VERSION: u32 = 2;
 
 /// What happened when the settings file was read. Returned rather than swallowed so
 /// the caller can say something in the Output pane instead of the user wondering why
@@ -70,7 +75,7 @@ pub struct Settings {
     pub view: ViewPrefs,
     pub snapping: SnapPrefs,
     pub panes: PanePrefs,
-    pub defaults: NewProjectPrefs,
+    pub session: SessionState,
     /// Keys this build does not know about, carried through a save untouched.
     ///
     /// So that running an older build after a newer one does not quietly delete the
@@ -156,18 +161,31 @@ pub struct PanePrefs {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-/// Seeds for a **newly created** project — and nothing else.
+/// Where you left off — restored on launch, **not** nominated in a panel.
+///
+/// The distinction matters and it is easy to blur (it was blurred once, in
+/// `MACHINE_PLAN` §6, until Andreas pulled on it): an **active** selection is session
+/// state that changes as you work; a **preferred** one is a default you nominate. Two
+/// settings answering "which one do I start on" is one too many — when they disagree
+/// the user has to know which wins, and for a machine that ambiguity ends with someone
+/// authoring against the wrong travel limits.
+///
+/// So: last-used wins, for the same reason the armed snaps and the pane sizes do. The
+/// safety comes from the active selection being *visible*, not from how it was chosen.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct NewProjectPrefs {
-    /// The post a fresh project targets.
+pub struct SessionState {
+    /// The post/control last selected.
     ///
-    /// **Applies at new-project creation only.** An opened `.ocam` keeps its own post
-    /// (schema v11), and a file predating v11 says nothing and leaves the session's
-    /// choice alone — reading absence as "use the preference" would retarget an old
-    /// job on open, which is exactly what v11 exists to prevent. Andreas, 2026-08-01:
-    /// *"Existing projects opened respect `.ocam`, we never retarget unless the user
-    /// explicitly does so."*
+    /// Session state, never read from a project file — a `.ocam` records the post it was
+    /// built for as provenance only, because which control you cut on is a property of
+    /// your shop (Andreas, 2026-08-01). It has its own control in the Machine ribbon
+    /// group, which is why it is **not** in the preferences panel: that panel holds
+    /// settings with no other home.
+    ///
+    /// Retires when the machine library lands — a machine will carry its post, so the
+    /// active *machine* will imply this, and keeping both would be two sources of truth
+    /// for one question. See `MACHINE_PLAN.md`.
     pub post: PostKind,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -231,7 +249,7 @@ impl Default for Settings {
             view: ViewPrefs::default(),
             snapping: SnapPrefs::default(),
             panes: PanePrefs::default(),
-            defaults: NewProjectPrefs::default(),
+            session: SessionState::default(),
             extra: Default::default(),
         }
     }
@@ -310,9 +328,20 @@ impl Settings {
     ///
     /// `extra` is carried across rather than replaced: unknown keys written by a newer
     /// build must survive a session with an older one (see [`load_from`]).
-    pub fn remember_session(&mut self, view: ViewPrefs, snaps: Vec<SnapKind>, panes: PanePrefs) {
+    pub fn remember_session(
+        &mut self,
+        view: ViewPrefs,
+        snaps: Vec<SnapKind>,
+        session: SessionState,
+        panes: PanePrefs,
+    ) {
         let view_extra = std::mem::take(&mut self.view.extra);
         let pane_extra = std::mem::take(&mut self.panes.extra);
+        let session_extra = std::mem::take(&mut self.session.extra);
+        self.session = SessionState {
+            extra: session_extra,
+            ..session
+        };
         self.view = ViewPrefs {
             extra: view_extra,
             ..view
@@ -337,8 +366,25 @@ impl Settings {
     /// number that gets written and never read. That mistake has already been paid
     /// for once, at document schema v10.
     fn migrate(&mut self, from: u32) {
-        for _step in from..SETTINGS_VERSION {
-            // match _step { 1 => …, _ => {} }
+        for step in from..SETTINGS_VERSION {
+            // v1→v2: `defaults.post` became `session.post`. The old key lands in `extra`
+            // (everything unknown does), so the value is still here to move — which is
+            // the whole reason unknown keys are preserved rather than dropped.
+            //
+            // One arm today; the shape stays a loop over steps because the *next* change
+            // must not have to invent it (`schema_version` went nine versions unread for
+            // want of exactly this).
+            if step == 1 {
+                if let Some(post) = self
+                    .extra
+                    .get("defaults")
+                    .and_then(|d| d.get("post"))
+                    .and_then(|p| serde_json::from_value::<PostKind>(p.clone()).ok())
+                {
+                    self.session.post = post;
+                }
+                self.extra.remove("defaults");
+            }
         }
         self.settings_version = SETTINGS_VERSION;
     }
@@ -469,7 +515,7 @@ mod tests {
     #[test]
     fn the_defaults_are_exactly_todays_hard_coded_values() {
         let d = Settings::default();
-        assert_eq!(d.settings_version, 1);
+        assert_eq!(d.settings_version, 2);
 
         assert!(!d.view.show_stock);
         assert!(d.view.show_gizmo);
@@ -497,7 +543,7 @@ mod tests {
         assert_eq!(d.panes.min_inspector_px, 240.0);
         assert_eq!(d.panes.min_output_px, 60.0);
 
-        assert_eq!(d.defaults.post, PostKind::default());
+        assert_eq!(d.session.post, PostKind::default());
     }
 
     #[test]
@@ -617,6 +663,7 @@ mod tests {
         s.panes.extra.insert("future_pane".into(), serde_json::json!(7));
         s.panes.min_inspector_px = 180.0; // a value the user had set
 
+        s.session.extra.insert("future_session".into(), serde_json::json!("x"));
         s.remember_session(
             ViewPrefs {
                 tooltips: false,
@@ -624,6 +671,10 @@ mod tests {
                 ..Default::default()
             },
             vec![SnapKind::End],
+            SessionState {
+                post: PostKind::Okuma,
+                extra: Default::default(),
+            },
             PanePrefs {
                 project_px: 310.0,
                 ..s.panes.clone()
@@ -638,8 +689,11 @@ mod tests {
             s.panes.min_inspector_px, 180.0,
             "remembering the session must not reset the user's pane minimums"
         );
+        assert_eq!(s.session.post, PostKind::Okuma, "the control is remembered");
         assert!(
-            s.view.extra.contains_key("future_toggle") && s.panes.extra.contains_key("future_pane"),
+            s.view.extra.contains_key("future_toggle")
+                && s.panes.extra.contains_key("future_pane")
+                && s.session.extra.contains_key("future_session"),
             "a newer build's keys must survive an older build's session"
         );
     }
@@ -710,6 +764,39 @@ mod tests {
         assert!(side <= 1366.0, "the recovered layout must fit a modest screen");
     }
 
+    /// **The migrate hook's first real use.** `schema_version` was written into every
+    /// project save for nine versions and read by nothing; the settings counter was
+    /// built to be read from day one, and this is the step that proves it is.
+    ///
+    /// A v1 file nominated a post under `defaults`; v2 keeps it as last-used session
+    /// state under `session`. The old key survives the rename because unknown keys are
+    /// preserved rather than dropped — which is exactly what makes the value still
+    /// available to move.
+    #[test]
+    fn a_v1_file_carries_its_post_across_the_rename() {
+        let s = Scratch::new();
+        std::fs::write(
+            s.file(),
+            r#"{"settings_version": 1, "defaults": {"post": "Okuma"},
+                "view": {"tooltips": false}}"#,
+        )
+        .unwrap();
+
+        let (got, outcome) = load_from(&s.file());
+        assert_eq!(outcome, LoadOutcome::Loaded);
+        assert_eq!(
+            got.session.post,
+            PostKind::Okuma,
+            "the operator's control must survive the rename, not silently reset"
+        );
+        assert_eq!(got.settings_version, SETTINGS_VERSION);
+        assert!(!got.view.tooltips, "and everything else still loads");
+        assert!(
+            !got.extra.contains_key("defaults"),
+            "the migrated key must not linger and be written back out"
+        );
+    }
+
     #[test]
     fn a_saved_file_reloads_identically() {
         let s = Scratch::new();
@@ -720,7 +807,7 @@ mod tests {
         written.snapping.default_snaps = vec![SnapKind::End, SnapKind::Nearest];
         written.panes.project_px = 310.0;
         written.panes.min_inspector_px = 180.0;
-        written.defaults.post = PostKind::Okuma;
+        written.session.post = PostKind::Okuma;
         written.save_to(&s.file()).unwrap();
 
         let (got, outcome) = load_from(&s.file());

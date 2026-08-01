@@ -2039,8 +2039,6 @@ enum Message {
     SetPaneMin(Pane, f32),
     /// Workpiece-origin marker size, as a multiple of the shipped size.
     SetOriginMarker(f32),
-    /// The post a *newly created* project targets. Never applied to an opened one.
-    SetDefaultPost(PostKind),
     /// Put every preference back to its shipped value.
     RestoreDefaults,
     PaneResized(pane_grid::ResizeEvent),
@@ -2233,10 +2231,9 @@ impl App {
             // Last: every field above reads from it.
             settings,
         };
-        // The post is session state — never read from a project file — so the "default
-        // post for new projects" preference is what a session *starts* on, not only what
-        // File ▸ New produces.
-        app.controller.set_post_kind(app.settings.defaults.post);
+        // Where you left off. The post is session state — never read from a project
+        // file — so it is restored, not nominated: last-used wins, like the armed snaps.
+        app.controller.set_post_kind(app.settings.session.post);
         if let crate::LibraryLoad::Rejected(why) = &library_load {
             app.status = format!(
                 "Tool library {why}. Using the starter tools; your file is untouched \
@@ -2321,6 +2318,9 @@ impl App {
             }
             Message::PostKindChanged(kind) => {
                 self.controller.set_post_kind(kind);
+                // Remembered for next launch — it is where you left off, not a default
+                // someone nominated in a panel.
+                self.remember();
                 self.status = format!("Post: {kind}.");
             }
             Message::Apply => {
@@ -2331,10 +2331,9 @@ impl App {
                 }
             }
             Message::NewProject => {
-                // The one project-affecting preference, and it applies *here* only —
-                // the rule lives in the controller so it can be tested without an app.
-                self.controller
-                    .new_project_with_post(self.settings.defaults.post);
+                // The post is *not* touched: a new project does not move you to a
+                // different machine or control, so there is nothing to re-target.
+                self.controller.new_project();
                 self.focus_ops.clear();
                 self.refresh_fields();
                 self.status = "New project.".to_string();
@@ -2883,14 +2882,6 @@ impl App {
             Message::SetOriginMarker(v) => {
                 let (lo, hi) = crate::ORIGIN_MARKER_RANGE;
                 self.settings.view.origin_marker_scale = v.clamp(lo, hi);
-            }
-            Message::SetDefaultPost(kind) => {
-                // A preference for the *next* new project. Deliberately does not touch
-                // the open one: changing what new jobs target must not retarget the job
-                // in front of you.
-                self.settings.defaults.post = kind;
-                self.settings.save();
-                self.status = format!("New projects will target {kind}.");
             }
             Message::SetPaneMin(pane, v) => {
                 let (lo, hi) = crate::PANE_MIN_RANGE;
@@ -3536,6 +3527,10 @@ impl App {
                 extra: Default::default(),
             },
             self.snaps.clone(),
+            crate::SessionState {
+                post: self.controller.post_kind(),
+                extra: Default::default(),
+            },
             crate::PanePrefs {
                 project_px: self.project_px,
                 inspector_px: self.inspector_px,
@@ -4633,29 +4628,6 @@ impl App {
                 ),
                 snapping,
                 panes,
-                column![
-                    heading("New projects"),
-                    row![
-                        text("Post / controller").size(12).width(Length::Fixed(150.0)),
-                        pick_list(
-                            &PostKind::ALL[..],
-                            Some(self.settings.defaults.post),
-                            Message::SetDefaultPost,
-                        )
-                        .text_size(12)
-                        .width(Length::Fixed(190.0)),
-                    ]
-                    .spacing(10)
-                    .align_y(Alignment::Center),
-                    note(
-                        "Applies to projects you create from now on. Opening a project \
-                         always uses the post saved in the file, and a file saved before \
-                         posts were recorded leaves your current choice alone — an \
-                         existing job is never retargeted behind your back."
-                            .to_string()
-                    ),
-                ]
-                .spacing(6),
                 row![
                     // Left, away from Close: it is destructive, and the two should not
                     // be adjacent when one of them is the escape from an unusable layout.

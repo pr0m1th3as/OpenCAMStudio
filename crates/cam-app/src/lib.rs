@@ -31,7 +31,7 @@ pub use controller::{
 pub use project::{OcamFile, Project};
 pub use settings::{
     load as load_settings, load_from as load_settings_from, settings_path, LoadOutcome,
-    NewProjectPrefs, PanePrefs, Settings, SnapPrefs, ViewPrefs, GIZMO_SIZE_RANGE,
+    PanePrefs, SessionState, Settings, SnapPrefs, ViewPrefs, GIZMO_SIZE_RANGE,
     MARKER_SCALE_RANGE, ORIGIN_MARKER_RANGE, PANE_MIN_RANGE, PANE_SIZE_RANGE, PICKBOX_RANGE,
     SETTINGS_VERSION,
     SNAP_CATCH_MULTIPLE,

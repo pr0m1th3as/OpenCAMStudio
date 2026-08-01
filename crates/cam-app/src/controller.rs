@@ -664,20 +664,6 @@ impl AppController {
         self.invalidate();
     }
 
-    /// Reset to a fresh, empty project targeting `post`.
-    ///
-    /// The post here is a **preference for new work**, and this is the only path it
-    /// travels. [`open_project`](Self::open_project) always takes the post from the
-    /// file, and a file predating schema v11 records none and leaves the session's
-    /// choice alone — reading absence as "use the preference" would retarget an old job
-    /// on open, which is exactly what v11 exists to prevent. Keeping the two paths
-    /// separate is the whole point; a single "apply the default" helper shared between
-    /// them would erase the distinction.
-    pub fn new_project_with_post(&mut self, post: PostKind) {
-        self.new_project();
-        self.set_post_kind(post);
-    }
-
     /// What the most recently opened project recorded about the machine and post it was
     /// built for — **provenance, never adopted**.
     ///
@@ -3706,16 +3692,21 @@ mod tests {
     /// Andreas's rule: "existing projects opened respect `.ocam`, we never retarget
     /// unless the user explicitly does so".
     #[test]
-    fn a_new_project_adopts_the_preferred_post_but_an_opened_one_never_does() {
+    fn neither_a_new_project_nor_an_opened_one_changes_the_control() {
+        // The post is session state: which control you are cutting on is a property of
+        // your shop, not of the job in front of you. So neither File ▸ New nor opening
+        // someone's `.ocam` moves it. There was briefly a "default post for new
+        // projects" preference; it was retired once machine and control went local,
+        // because the machine library will carry the post and two sources of truth for
+        // one question is one too many.
         let mut app = AppController::new(machine());
-        app.set_post_kind(PostKind::Grbl);
+        app.set_post_kind(PostKind::Okuma);
 
-        app.new_project_with_post(PostKind::Okuma);
-        assert_eq!(app.post_kind(), PostKind::Okuma, "a new project takes the preference");
+        app.new_project();
+        assert_eq!(app.post_kind(), PostKind::Okuma, "a new project keeps your control");
 
-        // Save it as a v11 file that records Fanuc, then reopen: the *file* wins.
+        let path = temp_path("keeps_post.ocam");
         app.set_post_kind(PostKind::Fanuc);
-        let path = temp_path("prefers_post.ocam");
         app.save_project(&path).unwrap();
 
         let mut session = AppController::new(machine());
@@ -3724,76 +3715,7 @@ mod tests {
         assert_eq!(
             session.post_kind(),
             PostKind::LinuxCnc,
-            "opening must NOT take the file's post — which control you cut on is local"
-        );
-        assert_eq!(
-            session.provenance().post,
-            Some(PostKind::Fanuc),
-            "…but what the file was built for is still worth knowing"
-        );
-        std::fs::remove_file(&path).ok();
-    }
-
-    /// **The safety property.** A machine is shop-local and its envelope is what *gates*
-    /// an export, so a file that could set your machine could disarm that gate.
-    ///
-    /// The scenario, from Andreas: a job authored on a large router is emailed to
-    /// someone with a smaller mill. Before this, opening it replaced their machine with
-    /// the sender's — after which `check_travel` compared the program against the
-    /// *sender's* travel and passed. Silently, and their configured machine was gone.
-    #[test]
-    fn opening_a_project_never_adopts_the_machine_it_was_built_for() {
-        let mut author = AppController::new(machine());
-        author.edit_machine(|m| {
-            m.name = "Big Router".into();
-            m.envelope = Envelope::new(
-                Point3::new(0.0, 0.0, -200.0),
-                Point3::new(1000.0, 600.0, 0.0),
-            );
-        });
-        author.set_post_kind(PostKind::Okuma);
-        let path = temp_path("shared_job.ocam");
-        author.save_project(&path).unwrap();
-
-        let mut small = AppController::new(machine());
-        small.edit_machine(|m| {
-            m.name = "Small Mill".into();
-            m.envelope =
-                Envelope::new(Point3::new(0.0, 0.0, -100.0), Point3::new(300.0, 200.0, 0.0));
-        });
-        small.set_post_kind(PostKind::Grbl);
-        small.open_project(&path).unwrap();
-
-        assert_eq!(small.machine().name, "Small Mill", "the local machine must survive");
-        let (x, _, _) = small.machine().envelope.extent();
-        assert_eq!(x, 300.0, "and so must its travel — this is what gates the export");
-        assert_eq!(small.post_kind(), PostKind::Grbl, "and the local control");
-
-        // The file's own answer is kept, and offered as a note rather than applied.
-        let note = small
-            .provenance()
-            .mismatch_note(small.machine(), small.post_kind())
-            .expect("a mismatch this large must be reported");
-        assert!(note.contains("Big Router") && note.contains("Small Mill"), "{note}");
-        assert!(note.contains("Okuma"), "the post mismatch belongs in the note too: {note}");
-        std::fs::remove_file(&path).ok();
-    }
-
-    /// No note when the file agrees with the session — silence is the common case and
-    /// must stay silent, or the warning stops being read.
-    #[test]
-    fn a_matching_project_says_nothing() {
-        let mut app = AppController::new(machine());
-        app.set_post_kind(PostKind::Fanuc);
-        let path = temp_path("matching.ocam");
-        app.save_project(&path).unwrap();
-
-        let mut other = AppController::new(machine());
-        other.set_post_kind(PostKind::Fanuc);
-        other.open_project(&path).unwrap();
-        assert_eq!(
-            other.provenance().mismatch_note(other.machine(), other.post_kind()),
-            None
+            "and opening a job built elsewhere keeps yours"
         );
         std::fs::remove_file(&path).ok();
     }
