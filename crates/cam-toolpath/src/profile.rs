@@ -484,18 +484,33 @@ fn emit_loop_rich(
         // where a descending tool belongs. A lead long enough (or an angle steep
         // enough) to absorb the whole stepdown keeps the wall untouched entirely —
         // which is how the operator controls this.
-        let ramp = ramp_len.map(|len| {
+        let ramp = ramp_len.map(|in_material| {
             let lead_path = lead_in_path(start, entry, out, lead_in);
             let lead_len = path_length(&lead_path);
-            let on_contour = (len - lead_len).max(0.0);
             let mut path = lead_path;
-            // `walk_loop` starts at the contour point the lead already reached.
-            path.extend(walk_loop(pts, 0.0, on_contour).into_iter().skip(1));
-            (path, on_contour)
+            // `walk_loop` starts at the contour point the lead already reached. The
+            // contour carries the **whole** material descent: the lead is flown in air.
+            path.extend(walk_loop(pts, 0.0, in_material).into_iter().skip(1));
+            // **The lead-in never cuts.** It starts above the material by exactly what
+            // the same angle covers over its own length, so the tool descends the lead
+            // through air and meets the surface *at* the contour start — then carries
+            // on into the material at the same angle, one unbroken descent with the
+            // air/material transition landing precisely where the cut begins. Before
+            // this the lead started *on* the surface and was already cutting as it
+            // swung in, which is the opposite of what a lead-in is for.
+            //
+            // The rise is `lead_len · tan(angle)`, and `tan(angle) = dz / in_material`
+            // by construction — so no second look at the angle is needed here.
+            let rise = if in_material > 1e-12 {
+                lead_len * (ramp_top - z) / in_material
+            } else {
+                0.0
+            };
+            (path, in_material, ramp_top + rise)
         });
 
         // Where the pass begins cutting at depth: the arc position the ramp ended at.
-        let cut_from = ramp.as_ref().map_or(0.0, |(_, on_contour)| *on_contour);
+        let cut_from = ramp.as_ref().map_or(0.0, |(_, on_contour, _)| *on_contour);
         // A full perimeter from there, so the ramped stretch is re-machined, plus the
         // operator's overlap.
         let (loop_pts, exit_on, tan_out) = if ramps {
@@ -519,10 +534,10 @@ fn emit_loop_rich(
         //
         // A ramp stops at the top of material and feeds from there; every other plunge
         // style still comes down to `prev_z` and descends from it, unchanged.
-        let arrive_at = if ramp.is_some() {
-            ramp_top.max(z)
-        } else {
-            prev_z
+        let arrive_at = match &ramp {
+            // The top of the ramp, which for a lead-in sits *above* the material.
+            Some((_, _, top)) => top.max(z),
+            None => prev_z,
         };
         if i == 0 || repositions {
             prog.push(Step::Rapid {
@@ -532,8 +547,8 @@ fn emit_loop_rich(
             crate::emit::descend_to(prog, entry, arrive_at, h, op.feed, op.id);
         }
 
-        if let Some((path, _)) = &ramp {
-            emit_descending_path(prog, path, ramp_top, z, op.feed, plunge_tag);
+        if let Some((path, _, top)) = &ramp {
+            emit_descending_path(prog, path, *top, z, op.feed, plunge_tag);
         } else {
             emit_plunge(
                 prog,
@@ -1653,6 +1668,78 @@ mod tests {
             Step::Linear { to, .. } => *to,
             _ => unreachable!(),
         }), "the ramp's first move should be along the lead, not the contour");
+    }
+
+    /// **The lead-in flies through air and lands on the surface at the contour start.**
+    ///
+    /// It starts above the material by `lead_length · tan(angle)` and reaches the
+    /// material top exactly where the contour begins — then carries on into the
+    /// material at the same angle. One unbroken descent, with the air/material
+    /// transition landing precisely where the cut starts. Before this the lead began
+    /// *on* the surface and was already cutting as it swung in, which is the opposite
+    /// of what a lead-in is for (Andreas, 2026-08-01).
+    #[test]
+    fn the_lead_in_descends_through_air_and_meets_the_surface_at_the_contour() {
+        let mut op = outside_rough_op(0.0);
+        op.stepover = 0.0;
+        op.depth = 1.0;
+        op.stepdown = 1.0;
+        op.plunge = Plunge::Ramp { angle_deg: 5.0 };
+        op.lead_in = Lead::Arc { radius: 3.0 };
+        op.lead_out = Lead::None;
+        let r = run_outside_rough(op);
+
+        // The ramp: the run of descending Plunge moves.
+        let ramp: Vec<Point3> = r
+            .program
+            .steps()
+            .iter()
+            .filter_map(|st| match st {
+                Step::Linear { to, tag, .. } if tag.kind == MoveKind::Plunge => Some(*to),
+                _ => None,
+            })
+            .collect();
+        assert!(!ramp.is_empty(), "no ramp emitted");
+
+        let tan = 5.0_f64.to_radians().tan();
+        let lead_len = std::f64::consts::FRAC_PI_2 * 3.0; // a quarter arc of radius 3
+        let top_of_stock = 0.0;
+
+        // It starts above the stock by the lead's own rise…
+        let first = ramp[0];
+        assert!(
+            first.z > top_of_stock - lead_len * tan,
+            "the ramp began at {:.4}, not above the material",
+            first.z
+        );
+
+        // …and the point where it crosses the stock top is the contour start, which is
+        // where the lead ends. The chain's start corner is (20,20); with an outside
+        // profile at r=3 the contour start sits 3 mm out on -Y.
+        let crossing = ramp
+            .windows(2)
+            .find(|w| w[0].z > top_of_stock && w[1].z <= top_of_stock + 1e-9)
+            .map(|w| w[1]);
+        let crossing = crossing.expect("the ramp must cross the stock top");
+        assert!(
+            (crossing.z - top_of_stock).abs() < 5e-3,
+            "it crossed the surface at Z {:.4}, not at the stock top",
+            crossing.z
+        );
+
+        // And the whole material descent happens on the contour: from the surface to
+        // full depth is one stepdown, so the contour portion is stepdown/tan.
+        let in_material: f64 = ramp
+            .windows(2)
+            .filter(|w| w[1].z < top_of_stock)
+            .map(|w| (w[1].x - w[0].x).hypot(w[1].y - w[0].y))
+            .sum();
+        let want = 1.0 / tan;
+        assert!(
+            (in_material - want).abs() < 0.6,
+            "the in-material ramp ran {in_material:.2} mm; one stepdown at 5° is \
+             {want:.2} mm. If it is short, the lead is wrongly absorbing part of the cut."
+        );
     }
 
     /// Only the lead-**in** descends. The lead-out stays at the cutting plane.
