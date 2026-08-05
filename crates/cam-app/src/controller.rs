@@ -1488,6 +1488,10 @@ impl AppController {
                     work_offset: 1,
                     feed,
                     plunge_feed,
+                    // Straight by default, as every carve was before the style existed: a
+                    // V-bit has a cutting tip, so it is the one entry that is always
+                    // legal. Ramping is the operator's choice, not ours to assume.
+                    plunge: Plunge::Straight,
                     // On by default: a carve is hundreds of rings, and every link is
                     // verified before it is taken (the ones that would gouge still lift).
                     stay_down: true,

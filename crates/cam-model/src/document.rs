@@ -63,7 +63,12 @@ use crate::Tool;
 ///     than equal radial steps, the control [`ChamferOp`] already had. Additive and
 ///     `false` by default, which is the behaviour every existing file already has, so
 ///     the step is an identity and no saved thread changes.
-pub const SCHEMA_VERSION: u32 = 12;
+/// v13: [`CarveOp`] gained `plunge` — the V-bit's own Z-entry style, which it never had
+///     (its clearing pass did, via [`ClearParams`], and the asymmetry was invisible until
+///     an export showed seventeen straight plunges up to 3 mm deep). Additive and
+///     [`Plunge::Straight`] by default, which is precisely what every existing carve
+///     already does, so the step is an identity and no saved carve changes.
+pub const SCHEMA_VERSION: u32 = 13;
 
 /// The safety planes for a setup, all **absolute Z in millimetres**. By
 /// convention WCS Z0 is the top of stock, so `top_of_stock` is usually `0.0`.
@@ -934,6 +939,22 @@ pub struct CarveOp {
     pub feed: f64,
     /// Plunge feed for the approach in Z, mm/min.
     pub plunge_feed: f64,
+    /// How the V-bit enters the material at each ring.
+    ///
+    /// A carve can run to hundreds of rings, and until v13 every one of them dropped
+    /// **straight** in — one real export showed seventeen vertical plunges up to 3 mm
+    /// deep. That is *safe* (a V-bit has a cutting tip, so [`crate::Plunge::Straight`]
+    /// passes the plunge guard where a non-centre-cutting end mill would not), but it is
+    /// a question of finish and tool life, and the operator had no say in it.
+    ///
+    /// Applies to the **V-bit's** own rings only. The clearing pass has its own style, in
+    /// [`CarveClearing::params`] — they are different tools cutting different things, and
+    /// the end mill is the one that cannot plunge at all.
+    ///
+    /// `#[serde(default)]` is [`crate::Plunge::Straight`], which is exactly what every
+    /// pre-v13 carve did, so an older file keeps the path it was cut with.
+    #[serde(default)]
+    pub plunge: Plunge,
     /// Link the rings **without lifting** where it is safe to do so, instead of
     /// retracting to clearance and plunging afresh for every ring.
     ///
@@ -1316,6 +1337,7 @@ mod tests {
             scallop: 0.0,
             feed: 300.0,
             plunge_feed: 100.0,
+            plunge: Plunge::Straight,
             stay_down: false,
             start: None,
         })

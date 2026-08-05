@@ -827,6 +827,33 @@ fn emit_loop(
     };
     let start = pts[0];
 
+    // Where the descent into this loop begins: the depth the tool already sits at when
+    // it links in, otherwise the carved surface. Never the retract plane — a ramp that
+    // measured its height from there would spend most of its travel in air, which is the
+    // mistake the profile ramp made and had corrected (`profile::pass`, "the ramp never
+    // travels through air").
+    let ramp_top = match (linked, st.at) {
+        (true, Some((_, zq))) => zq.min(op.top),
+        _ => op.top,
+    };
+    // A contour ramp has to be planned before the tool commits to anything: it descends
+    // *along this loop*, arriving at depth an arc length further round, and the cut then
+    // travels a full perimeter from there so the sloped stretch is re-machined at depth.
+    // Safe on a wall ring for the reason the shape itself gives — while the ramp is
+    // shallower than the ring's own depth it cuts a *narrower* V, entirely inside the
+    // surface the finished ring leaves, so it can only leave material, never remove too
+    // much. A carve has no lead-in of its own, so the ramp is all loop and its top is the
+    // material surface exactly.
+    let ramp = crate::profile::contour_ramp(&pts, Vec::new(), op.plunge, ramp_top, z);
+    // For a helix or a zig-zag: the tangent at the entry, and the side the tool may swing
+    // out to. **Left of travel** — the offsets are wound so the region being consumed lies
+    // there, for a boundary loop and an island loop alike (see `rings::cleared_normal`),
+    // so a helix opens into the carve rather than across its boundary. The V-groove itself
+    // is symmetric about the path, so this choice is about what is *outside* the ring, not
+    // about the cut.
+    let tan = crate::profile::start_tangent(&pts);
+    let inward = (-tan.1, tan.0);
+
     match (linked, st.at) {
         (true, Some((_, zq))) => {
             // Traverse at the *previous* loop's depth, where the region just verified
@@ -837,12 +864,33 @@ fn emit_loop(
                 feed: op.feed,
                 tag: tags.cut,
             });
-            if (z - zq).abs() > 1e-12 {
-                body.push(Step::Linear {
-                    to: Point3::new(start.x, start.y, z),
-                    feed: op.plunge_feed,
-                    tag: tags.plunge,
-                });
+            match &ramp {
+                Some((path, _, top)) => crate::profile::emit_descending_path(
+                    body,
+                    path,
+                    *top,
+                    z,
+                    op.feed,
+                    tags.plunge,
+                ),
+                // Only when there is a descent at all. `emit_plunge` emits a move for a
+                // zero drop rather than nothing (its `dz <= 0` fallback is the *straight*
+                // plunge, not a no-op), and every floor loop after the first sits at the
+                // depth the tool is already at — one redundant `G1` per loop, over
+                // hundreds of loops.
+                None if (z - zq).abs() > 1e-12 => crate::profile::emit_plunge(
+                    body,
+                    start,
+                    tan,
+                    inward,
+                    zq,
+                    z,
+                    op.plunge,
+                    op.plunge_feed,
+                    op.feed,
+                    tags.plunge,
+                ),
+                None => {}
             }
         }
         _ => {
@@ -858,23 +906,55 @@ fn emit_loop(
                 to: Point3::new(start.x, start.y, heights.clearance),
                 tag: tags.link,
             });
-            body.push(Step::Rapid {
-                to: Point3::new(start.x, start.y, heights.retract.max(op.top)),
-                tag: tags.link,
-            });
-            body.push(Step::Linear {
-                to: Point3::new(start.x, start.y, z),
-                feed: op.plunge_feed,
-                tag: tags.plunge,
-            });
+            match &ramp {
+                Some((path, _, top)) => {
+                    // Down to the top of the ramp under the rule every descent obeys —
+                    // rapid only as far as `rapid_floor` allows, feed the remainder — and
+                    // then along the loop. Not the plain rapid to `retract.max(op.top)`
+                    // below: that lands above the surface and the plunge feeds from there,
+                    // whereas a ramp starts *at* the material and must be brought to it.
+                    crate::emit::descend_to(body, start, top.max(z), heights, op.feed, op.id);
+                    crate::profile::emit_descending_path(body, path, *top, z, op.feed, tags.plunge);
+                }
+                None => {
+                    let from_z = heights.retract.max(op.top);
+                    body.push(Step::Rapid {
+                        to: Point3::new(start.x, start.y, from_z),
+                        tag: tags.link,
+                    });
+                    crate::profile::emit_plunge(
+                        body,
+                        start,
+                        tan,
+                        inward,
+                        from_z,
+                        z,
+                        op.plunge,
+                        op.plunge_feed,
+                        op.feed,
+                        tags.plunge,
+                    );
+                }
+            }
             st.lifts += 1;
         }
     }
 
-    crate::emit::cut_loop(body, &pts, op.feed, tags.cut, z);
     st.rings_cut += 1;
-    // `cut_loop` closes back to the start, so that is where the tool is.
-    st.at = Some((start, z));
+    match &ramp {
+        // The cut begins where the ramp ended and runs a full perimeter from there.
+        Some((_, on_loop, _)) => {
+            let perim = crate::profile::loop_perimeter(&pts);
+            let walked = crate::profile::walk_loop(&pts, *on_loop, perim);
+            crate::emit::cut_polyline(body, &walked, op.feed, tags.cut, z);
+            st.at = Some((walked[walked.len() - 1], z));
+        }
+        None => {
+            crate::emit::cut_loop(body, &pts, op.feed, tags.cut, z);
+            // `cut_loop` closes back to the start, so that is where the tool is.
+            st.at = Some((start, z));
+        }
+    }
     st.guard = guard_next.to_vec();
 }
 
@@ -1320,6 +1400,7 @@ mod tests {
             scallop: 0.0,
             feed: 200.0,
             plunge_feed: 100.0,
+            plunge: Plunge::Straight,
             stay_down: false,
             start: None,
         }
@@ -2139,6 +2220,151 @@ mod tests {
                 .any(|s| matches!(s, Step::Arc { tag, .. } if tag.kind == MoveKind::Plunge)),
             "no helical plunge was emitted"
         );
+    }
+
+    // --- the V-bit's own entry (schema v13) ---
+
+    /// Every `Plunge`-tagged descent in `steps`, split into (vertical, travelled).
+    ///
+    /// The distinction is the whole point of a plunge style: a descent that moves in XY
+    /// while it drops is being eased in, one that does not is a bare drill-in. Counting
+    /// rather than asserting on the first, because a carve entered *hundreds* of times
+    /// and it is the total that was the complaint.
+    fn descents(steps: &[Step]) -> (usize, usize) {
+        let mut pos = Point3::new(0.0, 0.0, 0.0);
+        let (mut vertical, mut travelled) = (0, 0);
+        for st in steps {
+            let (to, kind) = match st {
+                Step::Linear { to, tag, .. } => (*to, Some(tag.kind)),
+                Step::Arc { end, tag, .. } => (*end, Some(tag.kind)),
+                Step::Rapid { to, .. } => (*to, None),
+                _ => continue,
+            };
+            if kind == Some(MoveKind::Plunge) && to.z < pos.z - 1e-9 {
+                if (to.x - pos.x).hypot(to.y - pos.y) <= 1e-9 {
+                    vertical += 1;
+                } else {
+                    travelled += 1;
+                }
+            }
+            pos = to;
+        }
+        (vertical, travelled)
+    }
+
+    #[test]
+    fn a_straight_carve_is_what_it_always_was() {
+        // The default, and every file written before `CarveOp::plunge` existed: each
+        // ring is entered by a bare vertical drop. Pinned so the new control cannot
+        // change the path of a project nobody has touched.
+        let mut o = op(1.0);
+        o.ring_step = 0.25;
+        let r = run(o, vbit(90.0, 0.0));
+        let (vertical, travelled) = descents(r.program.steps());
+        assert!(vertical > 0, "the default entry stopped being a straight drop");
+        assert_eq!(travelled, 0, "the default entry travelled while descending");
+    }
+
+    #[test]
+    fn a_ramped_carve_never_drops_vertically_into_material() {
+        // One real export showed seventeen straight plunges up to 3 mm deep, which is
+        // what this answers (Andreas, 2026-08-05). A V-bit *may* drop straight in — it
+        // has a cutting tip, so `check_plunge` allows it — but finish and tool life are
+        // the operator's call, and until v13 there was no way to make it.
+        let mut o = op(1.0);
+        o.ring_step = 0.25;
+        o.plunge = Plunge::Ramp { angle_deg: 5.0 };
+        let r = run(o, vbit(90.0, 0.0));
+        assert!(errors(&r).is_empty(), "{:?}", errors(&r));
+        let (vertical, travelled) = descents(r.program.steps());
+        assert_eq!(vertical, 0, "a ramped carve dropped vertically {vertical} times");
+        assert!(travelled > 0, "no ramp was emitted at all");
+    }
+
+    #[test]
+    fn a_ramped_carve_still_cuts_every_ring_end_to_end() {
+        // The ramp consumes part of the ring on the way down, so the cut has to begin
+        // where the ramp ended and travel a **full perimeter** from there. Cut a
+        // perimeter from the ring's *start* instead and the sloped stretch is simply
+        // left standing on the finished wall — the failure the profile ramp had, caught
+        // by reading G-code rather than by a test.
+        let cut_length = |o: CarveOp| {
+            let r = run(o, vbit(90.0, 0.0));
+            assert!(errors(&r).is_empty(), "{:?}", errors(&r));
+            let mut pos = Point3::new(0.0, 0.0, 0.0);
+            let mut total = 0.0;
+            for st in r.program.steps() {
+                let (to, cutting) = match st {
+                    Step::Linear { to, tag, .. } => (*to, tag.kind == MoveKind::Cutting),
+                    Step::Arc { end, tag, .. } => (*end, tag.kind == MoveKind::Cutting),
+                    Step::Rapid { to, .. } => (*to, false),
+                    _ => continue,
+                };
+                if cutting {
+                    total += (to.x - pos.x).hypot(to.y - pos.y);
+                }
+                pos = to;
+            }
+            total
+        };
+        let mut straight = op(1.0);
+        straight.ring_step = 0.25;
+        let mut ramped = straight.clone();
+        ramped.plunge = Plunge::Ramp { angle_deg: 5.0 };
+        let (flat, sloped) = (cut_length(straight), cut_length(ramped));
+        assert!(flat > 0.0);
+        assert!(
+            sloped >= flat - 1e-6,
+            "the ramped carve cut {sloped:.1} mm against the straight entry's {flat:.1} mm — \
+             a ring is being closed short of its own ramp"
+        );
+    }
+
+    #[test]
+    fn the_carve_plunge_style_is_the_operators_choice() {
+        // Not only the ramp: a helix must reach the emitter too, and it arrives as arcs.
+        let mut o = op(1.0);
+        o.ring_step = 0.25;
+        o.plunge = Plunge::Helix {
+            radius: 0.5,
+            pitch: 0.25,
+        };
+        let r = run(o, vbit(90.0, 0.0));
+        assert!(errors(&r).is_empty(), "{:?}", errors(&r));
+        assert!(
+            r.program
+                .steps()
+                .iter()
+                .any(|s| matches!(s, Step::Arc { tag, .. } if tag.kind == MoveKind::Plunge)),
+            "no helical plunge was emitted"
+        );
+    }
+
+    #[test]
+    fn the_carve_and_its_clearing_pass_plunge_independently() {
+        // Two tools in one operation, two entries. The V-bit's style must not reach the
+        // end mill's pass or the other way about: they cut different things, and the end
+        // mill is the one that may not be able to plunge at all. The clearing pass runs
+        // first and hands the spindle back with a `ToolChange`, which is the seam.
+        let mut o = op(1.0);
+        o.ring_step = 0.25;
+        o.plunge = Plunge::Ramp { angle_deg: 5.0 };
+        o.clear = Some(clearing(2));
+        let r = run_with(o, &[vbit(90.0, 0.0), endmill(2, 4.0)]);
+        assert!(errors(&r).is_empty(), "{:?}", errors(&r));
+        let steps = r.program.steps();
+        let change = steps
+            .iter()
+            .position(|s| matches!(s, Step::ToolChange { .. }))
+            .expect("the change back to the V-bit");
+        let (clear_vertical, _) = descents(&steps[..change]);
+        let (carve_vertical, carve_travelled) = descents(&steps[change..]);
+        assert!(
+            clear_vertical > 0,
+            "the clearing pass's own straight entry was overridden by the carve's ramp"
+        );
+        assert_eq!(carve_vertical, 0, "the V-bit still dropped straight in");
+        assert!(carve_travelled > 0, "the V-bit's ramp never reached the emitter");
     }
 
     #[test]

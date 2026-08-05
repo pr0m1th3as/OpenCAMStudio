@@ -439,6 +439,14 @@ to where it entered — so a one-way ramp there would strand the wedge it leaves
 ramp runs forward along the path and retraces it at depth instead. A closed contour
 (profile, carve wall rings) needs no such return.
 
+A **carve has two plunge pickers**, and they are separate on purpose. **Plunge**, near
+the top of the Inspector, is the **V-bit's** own entry into each ring; **Clearing
+plunge**, in the second block under the clearing tool, is the **end mill's**. They are
+different cutters entering different material, and only one of them is guaranteed able
+to drop straight in — a V-bit always has a cutting tip, an end mill may not. Before
+this the V-bit had no say at all and always drilled straight down, once per ring, which
+on a carve means hundreds of times.
+
 ### Run / export
 
 **A blocked export never opens a file dialog.** The G-code is posted the moment you
@@ -557,6 +565,13 @@ things worth eyeballing:
   whole block should vanish. The Project row should read `Carve  T… + T…` in cutting
   order. In the backplot the V-bit should link its rings without lifting, but **lift**
   rather than skim across floor the end mill has already finished.
+- **Carve plunge (v13):** the Inspector's **Plunge** picker near the top is the
+  V-bit's, and it is *not* the **Clearing plunge** picker further down — set them to
+  different styles and check each moves only its own tool's entry. Set the V-bit's to
+  *Ramp along path*: a **Plunge angle** field appears, and in the backplot the red
+  entry moves should slope along each ring rather than dropping vertically. Exported
+  G-code is where this is really checked — no `G1 Z-…` on its own for the V-bit's
+  passes, and the ring should still close a full lap past where the ramp ended.
 - **Chamfer:** the Inspector's first field is **Top edge Z**, seeded from the top of
   stock. Lower it and the whole bevel should move down with it in the backplot —
   that is the case of chamfering a pocket rim or a step, which had no way to be

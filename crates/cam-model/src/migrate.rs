@@ -195,6 +195,11 @@ fn step(from: u32, doc: &mut Value) -> Result<(), MigrationError> {
         // in every file that predates it — and `false` is exactly the equal-radial-step
         // sizing those files were cut with. Additive; the identity is the whole step.
         11 => Ok(()),
+        // v12→v13 added `CarveOp::plunge`, a `#[serde(default)]` `Plunge` that is
+        // `Straight` in every file that predates it — and a straight drop is exactly what
+        // those carves were cut with, since the V-bit had no entry style at all. Additive;
+        // the identity is the whole step.
+        12 => Ok(()),
         _ => Err(MigrationError::MissingStep { from }),
     }
 }

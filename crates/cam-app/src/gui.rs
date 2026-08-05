@@ -1432,6 +1432,11 @@ mod help {
          before the V-bit runs. A cone cannot leave a flat floor, so without this those \
          areas come out ridged. The end mill also takes the bulk material, sparing the \
          carving tip.";
+    pub const CARVE_PLUNGE: &str =
+        "How the V-bit enters downward at each ring. A V-bit always has a cutting tip, so \
+         a straight drop is safe -- but a carve enters hundreds of times, and ramping \
+         along the ring is kinder to the tip and to the finish. This is the V-bit's own \
+         entry; the clearing tool has its own picker below.";
     pub const CARVE_CLEAR_PLUNGE: &str =
         "How the clearing tool enters downward. The flat area is entered in solid stock, \
          so a tool that is not centre-cutting -- or a deep carve in hard material -- \
@@ -3181,6 +3186,9 @@ impl App {
                 self.controller.edit_selected_operation(|op| match op {
                     Operation::Profile(p) => p.plunge = kind.to_plunge(),
                     Operation::Pocket(p) => p.clear.plunge = kind.to_plunge(),
+                    // The V-bit's own entry — `CarveClearPlungeChanged` is the clearing
+                    // pass's, and the two must not be crossed.
+                    Operation::Carve(c) => c.plunge = kind.to_plunge(),
                     _ => {}
                 });
                 self.refresh_fields();
@@ -3874,7 +3882,7 @@ impl App {
         match op {
             Operation::Profile(p) => (Some(p.plunge), None),
             Operation::Pocket(p) => (Some(p.clear.plunge), None),
-            Operation::Carve(c) => (None, c.clear.as_ref().map(|cl| cl.params.plunge)),
+            Operation::Carve(c) => (Some(c.plunge), c.clear.as_ref().map(|cl| cl.params.plunge)),
             _ => (None, None),
         }
     }
@@ -6655,6 +6663,17 @@ impl App {
                     );
                 }
                 Some(Operation::Carve(c)) => {
+                    // The V-bit's own entry. The clearing pass has its own picker far
+                    // below, under the tool it belongs to — they are different tools
+                    // cutting different things, and only one of them can plunge freely.
+                    list = list.push(profile_picker(
+                        "Plunge",
+                        help::CARVE_PLUNGE,
+                        self.tooltips,
+                        PlungeKind::of(c.plunge),
+                        &PlungeKind::ALL[..],
+                        Message::PlungeKindChanged,
+                    ));
                     list = list.push(
                         row![
                             label_help("Stay down", help::CARVE_STAY_DOWN, self.tooltips),
@@ -7019,6 +7038,15 @@ fn operation_fields(op: &Operation) -> Vec<Field> {
                 Field::Feed,
                 Field::PlungeFeed,
             ];
+            // The V-bit's own entry parameters, exactly as a profile's.
+            match c.plunge {
+                Plunge::Straight => {}
+                Plunge::Ramp { .. } => fields.push(Field::PlungeA),
+                Plunge::Helix { .. } | Plunge::ZigZag { .. } => {
+                    fields.push(Field::PlungeA);
+                    fields.push(Field::PlungeB);
+                }
+            }
             // The clearing pass is a pocket over a derived region, so it gets a
             // pocket's controls -- all but two. `Depth` is not its own (the
             // carve's cap sets it), and a wall finishing allowance would leave a
@@ -7541,6 +7569,8 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Carve(o), Field::Scallop) => Some(o.scallop),
         (Operation::Carve(o), Field::Feed) => Some(o.feed),
         (Operation::Carve(o), Field::PlungeFeed) => Some(o.plunge_feed),
+        (Operation::Carve(o), Field::PlungeA) => Some(plunge_params(o.plunge).0),
+        (Operation::Carve(o), Field::PlungeB) => Some(plunge_params(o.plunge).1),
         (Operation::Carve(o), Field::ClearStepdown) => Some(o.clear?.params.stepdown),
         (Operation::Carve(o), Field::ClearOverlap) => Some(o.clear?.params.overlap * 100.0),
         (Operation::Carve(o), Field::ClearOffset) => Some(o.clear?.params.offset),
@@ -7860,6 +7890,10 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
             if let Some(v) = get(Field::PlungeFeed) {
                 o.plunge_feed = v;
             }
+            let (a, b) = plunge_params(o.plunge);
+            let a = get(Field::PlungeA).unwrap_or(a);
+            let b = get(Field::PlungeB).unwrap_or(b);
+            o.plunge = set_plunge_params(o.plunge, a, b);
         }
     }
 }
@@ -9459,6 +9493,67 @@ mod inspector_field_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_carves_two_plunges_are_edited_separately() {
+        // A carve is the only operation with **two** plunge styles — the V-bit's own
+        // (v13) and the clearing end mill's — and they share one pair of parameter slots
+        // split by prefix (`PlungeA` vs `ClearPlungeA`). Crossing them is a one-word
+        // mistake, both sides are a `Plunge`, so nothing else would notice: the field
+        // would read, write and round-trip perfectly, on the wrong tool.
+        //
+        // Not covered by `every_field_the_inspector_shows_can_be_written_back` either,
+        // which only sees fields a *default* operation shows — and the default is
+        // `Straight`, whose parameter boxes do not appear at all.
+        let mut op = one_of_every_kind()
+            .into_iter()
+            .find(|o| matches!(o, Operation::Carve(_)))
+            .expect("the sample part yields a carve");
+        let Operation::Carve(c) = &mut op else {
+            unreachable!()
+        };
+        c.plunge = Plunge::Ramp { angle_deg: 5.0 };
+        c.clear = Some(CarveClearing {
+            tool: 2,
+            params: ClearParams {
+                plunge: Plunge::Helix {
+                    radius: 1.0,
+                    pitch: 0.5,
+                },
+                ..Default::default()
+            },
+        });
+
+        let fields = operation_fields(&op);
+        assert!(fields.contains(&Field::PlungeA), "the V-bit's ramp angle is not shown");
+        assert!(
+            fields.contains(&Field::ClearPlungeA),
+            "the clearing helix radius is not shown"
+        );
+        assert_eq!(op_field(&op, Field::PlungeA), Some(5.0), "the V-bit's own angle");
+        assert_eq!(
+            op_field(&op, Field::ClearPlungeA),
+            Some(1.0),
+            "the clearing pass's own radius"
+        );
+
+        // Editing one must leave the other exactly as it was.
+        let mut parsed = BTreeMap::new();
+        parsed.insert(Field::PlungeA, 12.0);
+        apply_op_fields(&mut op, &parsed);
+        let Operation::Carve(c) = &op else {
+            unreachable!()
+        };
+        assert_eq!(c.plunge, Plunge::Ramp { angle_deg: 12.0 });
+        assert_eq!(
+            c.clear.expect("the clearing pass").params.plunge,
+            Plunge::Helix {
+                radius: 1.0,
+                pitch: 0.5
+            },
+            "editing the V-bit's plunge moved the clearing pass's"
+        );
     }
 
     #[test]

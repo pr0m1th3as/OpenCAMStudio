@@ -820,6 +820,7 @@ fn carve_document(clear_tool: Option<u32>, trailing_tool: Option<u32>) -> Docume
         scallop: 0.0,
         feed: 300.0,
         plunge_feed: 100.0,
+        plunge: cam_model::Plunge::Straight,
         stay_down: true,
         start: None,
     };
