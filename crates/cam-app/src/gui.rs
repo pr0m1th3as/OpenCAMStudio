@@ -1301,13 +1301,13 @@ impl Field {
                  SLOT, which is the tool-breaking hazard; the residual rise on tight \
                  loops is a feed-rate matter, so slow the feed if the tool complains."
             }
-            Field::PlungeA => {
-                "First plunge parameter: the ramp/zig-zag angle in degrees, or the helix \
-                 radius in mm — depending on the plunge type chosen below."
-            }
-            Field::PlungeB => {
-                "Second plunge parameter: the zig-zag length, or the helix pitch (mm) — \
-                 depending on the plunge type. Unused for a straight plunge."
+            // Reached only with no operation selected — with one, `plunge_help` names the
+            // quantity the chosen style actually uses. Deliberately does not enumerate
+            // "angle or radius": that positional wording is what the kind-aware labels and
+            // tooltips exist to replace.
+            Field::PlungeA | Field::PlungeB => {
+                "A parameter of the plunge style chosen below. Pick a style and this box \
+                 is labelled with the quantity it takes."
             }
             Field::RingStep => {
                 "How far apart the WALL rings step inward (mm) -- a roughing control, not \
@@ -1352,13 +1352,11 @@ impl Field {
                  radius for an arc lead, ramp length for a linear one (mm)."
             }
             Field::ClearLeadOutSize => "Size of the clearing pass's lead-out (see lead-in).",
-            Field::ClearPlungeA => {
-                "First clearing-plunge parameter: the ramp/zig-zag angle in degrees, or \
-                 the helix radius in mm, depending on the plunge type."
-            }
-            Field::ClearPlungeB => {
-                "Second clearing-plunge parameter: the zig-zag length, or the helix pitch \
-                 (mm). Unused for a straight plunge."
+            // As for `PlungeA`/`PlungeB`: with a clearing pass selected, `plunge_help`
+            // names the quantity the chosen style takes.
+            Field::ClearPlungeA | Field::ClearPlungeB => {
+                "A parameter of the clearing pass's plunge style. Pick a style and this \
+                 box is labelled with the quantity it takes."
             }
             Field::ClearOffset => {
                 "How far the end mill stays off the carved surface (mm), leaving that skin \
@@ -1527,6 +1525,78 @@ fn set_plunge_params(plunge: Plunge, a: f64, b: f64) -> Plunge {
             length: b,
         },
     }
+}
+
+/// The inspector **label** for a plunge parameter — `first` selects the A/B slot,
+/// `clearing` the carve clearing pass's copy of the pair.
+///
+/// These were positional — "Plunge angle/radius", "Plunge length/pitch" — one slot
+/// standing for two physically distinct quantities depending on the style, and the label
+/// had to say so because it could not name them. **An angle and a radius are not the same
+/// kind of thing** (Andreas, 2026-08-01): a ramp is always an angle in degrees, never a
+/// radius; a helix is always a radius and a pitch, both in millimetres.
+///
+/// A free function, and paired with [`plunge_param_help`], so the two can be checked
+/// against each other headlessly — the methods on the app need a selection, which is what
+/// let the help stay positional for four days after the labels stopped being so.
+fn plunge_param_label(plunge: Plunge, first: bool, clearing: bool) -> Option<&'static str> {
+    Some(match (plunge, first, clearing) {
+        (Plunge::Ramp { .. }, true, false) => "Ramp angle (°)",
+        (Plunge::Ramp { .. }, true, true) => "Clearing ramp angle (°)",
+        (Plunge::Helix { .. }, true, false) => "Helix radius (mm)",
+        (Plunge::Helix { .. }, false, false) => "Helix pitch (mm)",
+        (Plunge::Helix { .. }, true, true) => "Clearing helix radius (mm)",
+        (Plunge::Helix { .. }, false, true) => "Clearing helix pitch (mm)",
+        (Plunge::ZigZag { .. }, true, false) => "Zig-zag angle (°)",
+        (Plunge::ZigZag { .. }, false, false) => "Zig-zag length (mm)",
+        (Plunge::ZigZag { .. }, true, true) => "Clearing zig-zag angle (°)",
+        (Plunge::ZigZag { .. }, false, true) => "Clearing zig-zag length (mm)",
+        // `Straight` takes no parameters, and `Ramp`'s second slot is unused: neither has
+        // a box to label. Pinned by `every_labelled_plunge_parameter_explains_itself`.
+        _ => return None,
+    })
+}
+
+/// The inspector **tooltip** for a plunge parameter, describing the quantity that style
+/// actually takes. Pairs with [`plunge_param_label`], whose `None` cases it mirrors.
+///
+/// **Deliberately says nothing about which tool.** A helix radius is a helix radius
+/// whether the V-bit or a carve's clearing end mill is descending on it; the label already
+/// carries the "Clearing" prefix, and the style *picker's* tooltip is where the
+/// tool-specific warning belongs (an end mill may not be centre-cutting, a V-bit always
+/// is). Hence no `clearing` parameter here — the physics does not have one.
+fn plunge_param_help(plunge: Plunge, first: bool) -> Option<&'static str> {
+    Some(match (plunge, first) {
+        (Plunge::Ramp { .. }, true) => {
+            "Angle from horizontal the tool descends at while travelling ALONG the \
+             toolpath, arriving at full depth where the pass begins. Shallower is gentler \
+             and travels further -- 0.5° needs 115 mm of travel per millimetre of descent \
+             -- so on a small loop the ramp wraps around it repeatedly. Past 32 laps it \
+             steepens to fit rather than growing without bound."
+        }
+        (Plunge::Helix { .. }, true) => {
+            "Radius of the helix the tool spirals down on, measured from the entry point. \
+             The circle it travels is twice this across, plus the tool's own diameter, and \
+             all of it has to fit inside the material being entered."
+        }
+        (Plunge::Helix { .. }, false) => {
+            "How far the helix descends per full turn (mm). Together with the radius this \
+             already fixes the helix angle, which is why there is no separate angle \
+             control -- a third knob would overconstrain it."
+        }
+        (Plunge::ZigZag { .. }, true) => {
+            "Angle from horizontal for the back-and-forth ramp. Use this style only where \
+             there is no room to ramp along the path -- a slot no wider than the tool -- \
+             since the oscillation re-cuts the same ground on every stroke."
+        }
+        (Plunge::ZigZag { .. }, false) => {
+            "How far the oscillation reaches along the toolpath before reversing (mm). The \
+             number of out-and-back strokes is chosen so each stays within this reach and \
+             the angle still holds, so a shorter reach means MORE strokes, not a steeper \
+             descent."
+        }
+        _ => return None,
+    })
 }
 
 /// A library tool as offered in the wizard's tool picker (carries its library index
@@ -3887,17 +3957,21 @@ impl App {
         }
     }
 
-    /// The label for a plunge parameter, named for what it actually **is** under the
-    /// selected style. `None` when the field is not a plunge parameter.
-    ///
-    /// These were positional — "Plunge angle/radius" and "Plunge length/pitch" — one
-    /// slot standing for two physically distinct quantities depending on the style, and
-    /// the label had to say so because it could not name them. An angle and a radius
-    /// are not the same kind of thing (Andreas, 2026-08-01): **a ramp is always an
-    /// angle in degrees, never a radius; a helix is always a radius and a pitch, both
-    /// in millimetres.** The tool inspector has been kind-aware for a long time; this
-    /// is the same treatment for the entry styles.
+    /// The label for a plunge parameter under the current selection's style — see
+    /// [`plunge_param_label`], which holds the wording.
     fn plunge_label(&self, field: Field) -> Option<&'static str> {
+        let (plunge, first, clearing) = self.plunge_param(field)?;
+        plunge_param_label(plunge, first, clearing)
+    }
+
+    /// Which plunge parameter `field` is, for the current selection: the style it belongs
+    /// to, whether it is the **first** of the pair, and whether it is the **clearing**
+    /// pass's rather than the operation's own. `None` when it is not a plunge parameter,
+    /// or when nothing that has one is selected.
+    ///
+    /// The one place the `Field` → (style, slot) mapping lives, so the label and the help
+    /// cannot disagree about which parameter they are describing.
+    fn plunge_param(&self, field: Field) -> Option<(Plunge, bool, bool)> {
         let op = self.controller.selected_operation()?;
         let (own, clear) = Self::op_plunge_styles(op);
         let (plunge, clearing) = match field {
@@ -3905,20 +3979,23 @@ impl App {
             Field::ClearPlungeA | Field::ClearPlungeB => (clear?, true),
             _ => return None,
         };
-        let first = matches!(field, Field::PlungeA | Field::ClearPlungeA);
-        Some(match (plunge, first, clearing) {
-            (Plunge::Ramp { .. }, true, false) => "Ramp angle (°)",
-            (Plunge::Ramp { .. }, true, true) => "Clearing ramp angle (°)",
-            (Plunge::Helix { .. }, true, false) => "Helix radius (mm)",
-            (Plunge::Helix { .. }, false, false) => "Helix pitch (mm)",
-            (Plunge::Helix { .. }, true, true) => "Clearing helix radius (mm)",
-            (Plunge::Helix { .. }, false, true) => "Clearing helix pitch (mm)",
-            (Plunge::ZigZag { .. }, true, false) => "Zig-zag angle (°)",
-            (Plunge::ZigZag { .. }, false, false) => "Zig-zag length (mm)",
-            (Plunge::ZigZag { .. }, true, true) => "Clearing zig-zag angle (°)",
-            (Plunge::ZigZag { .. }, false, true) => "Clearing zig-zag length (mm)",
-            _ => return None,
-        })
+        Some((
+            plunge,
+            matches!(field, Field::PlungeA | Field::ClearPlungeA),
+            clearing,
+        ))
+    }
+
+    /// The tooltip for a plunge parameter under the current selection's style — see
+    /// [`plunge_param_help`]. `None` falls through to the generic wording, which is only
+    /// reachable with nothing selected.
+    ///
+    /// The labels became kind-aware on 2026-08-01 and these did not, so a box labelled
+    /// "Ramp angle (°)" still explained itself as "the ramp/zig-zag angle in degrees, or
+    /// the helix radius in mm" — the very positional wording the labels exist to replace.
+    fn plunge_help(&self, field: Field) -> Option<&'static str> {
+        let (plunge, first, _) = self.plunge_param(field)?;
+        plunge_param_help(plunge, first)
     }
 
     /// The kind of the tool the inspector is editing (library entry or project tool).
@@ -4037,7 +4114,9 @@ impl App {
                 "Included angle of the V-bit's cone (e.g. 60° or 90°) — the point angle \
                  that sets how cut depth maps to cut width."
             }
-            _ => field.help(),
+            // Same fallback shape as `field_label`: a plunge parameter's help follows the
+            // selected entry style, exactly as its label does.
+            _ => self.plunge_help(field).unwrap_or_else(|| field.help()),
         }
     }
 
@@ -9493,6 +9572,48 @@ mod inspector_field_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn every_labelled_plunge_parameter_explains_itself() {
+        // The defect this exists to prevent, which really happened: the labels were made
+        // kind-aware and the tooltips were not, so a box reading "Ramp angle (°)" still
+        // explained itself as "the ramp/zig-zag angle in degrees, or the helix radius in
+        // mm" — offering the reader two physically different quantities for the one number
+        // in front of them, which is exactly what naming the label was meant to end.
+        //
+        // The property is the pairing, not the wording: a slot has a label if and only if
+        // it has help. That is what drifted, and it can only be checked because both are
+        // free functions — the methods that wrap them need a live selection.
+        for plunge in PlungeKind::ALL.map(PlungeKind::to_plunge) {
+            for first in [true, false] {
+                let help = plunge_param_help(plunge, first);
+                for clearing in [true, false] {
+                    let label = plunge_param_label(plunge, first, clearing);
+                    assert_eq!(
+                        label.is_some(),
+                        help.is_some(),
+                        "{plunge:?} slot {} (clearing={clearing}): label {:?} but help {:?}",
+                        if first { "A" } else { "B" },
+                        label.map(|_| "some"),
+                        help.map(|_| "some"),
+                    );
+                }
+                // And where there is help, it must not fall back to the positional
+                // phrasing the labels replaced.
+                if let Some(h) = help {
+                    assert!(
+                        !h.contains(" or the helix") && !h.contains("plunge parameter"),
+                        "{plunge:?} slot {} still explains itself positionally: {h}",
+                        if first { "A" } else { "B" }
+                    );
+                }
+            }
+        }
+        // Straight takes no parameters at all, and a ramp's second slot is unused — both
+        // must stay unlabelled, or the inspector would show a box with nothing behind it.
+        assert!(plunge_param_label(Plunge::Straight, true, false).is_none());
+        assert!(plunge_param_label(Plunge::Ramp { angle_deg: 5.0 }, false, false).is_none());
     }
 
     #[test]

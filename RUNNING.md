@@ -565,6 +565,12 @@ things worth eyeballing:
   whole block should vanish. The Project row should read `Carve  T… + T…` in cutting
   order. In the backplot the V-bit should link its rings without lifting, but **lift**
   rather than skim across floor the end mill has already finished.
+- **Plunge parameter tooltips:** with a plunge style other than *Straight* selected,
+  hover the parameter box. The tooltip must describe **the quantity in front of you** —
+  "Angle from horizontal the tool descends at…" for a ramp, "Radius of the helix…" for a
+  helix — never the old "the ramp/zig-zag angle in degrees, or the helix radius in mm".
+  Check the clearing pass's boxes too; they take the same wording, since a helix radius is
+  a helix radius whichever tool is descending on it.
 - **Carve plunge (v13):** the Inspector's **Plunge** picker near the top is the
   V-bit's, and it is *not* the **Clearing plunge** picker further down — set them to
   different styles and check each moves only its own tool's entry. Set the V-bit's to
