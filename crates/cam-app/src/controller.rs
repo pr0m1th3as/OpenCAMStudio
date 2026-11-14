@@ -1245,31 +1245,49 @@ impl AppController {
         id: u64,
         placement: cam_model::RigidTransform,
     ) -> Result<(), String> {
-        if !placement.is_rigid() {
-            return Err("Placement must be a finite rigid transform".into());
+        self.place_cad_instances(vec![(id, placement)])
+    }
+
+    /// Apply placements as one undoable edit, validating the entire selection first.
+    pub fn place_cad_instances(
+        &mut self,
+        placements: Vec<(u64, cam_model::RigidTransform)>,
+    ) -> Result<(), String> {
+        let mut ids = std::collections::BTreeSet::new();
+        for (id, placement) in &placements {
+            if !placement.is_rigid() {
+                return Err("Placement must be a finite rigid transform".into());
+            }
+            if !ids.insert(*id) || self.geometry_state().instance(*id).is_none() {
+                return Err("Missing or duplicate CAD instance".into());
+            }
         }
-        if self.geometry_state().instance(id).is_none() {
-            return Err("Missing CAD instance".into());
+        if placements.is_empty() {
+            return Err("No CAD bodies selected".into());
         }
         self.edit_document(move |doc| {
-            if let Some(instance) = doc.geometry.instances.iter_mut().find(|i| i.id == id) {
-                instance.placement = placement;
+            for (id, placement) in &placements {
+                if let Some(instance) = doc.geometry.instances.iter_mut().find(|i| i.id == *id) {
+                    instance.placement = *placement;
+                }
             }
             let geometry = doc.geometry.clone();
             for setup in &mut doc.setups {
                 let refs = &setup.frame.references;
-                if refs.model_instance == Some(id)
-                    && refs.x.is_none()
-                    && refs.y.is_none()
-                    && refs.z.is_none()
+                if let Some((id, placement)) = placements
+                    .iter()
+                    .find(|(id, _)| refs.model_instance == Some(*id))
                 {
-                    if let Ok(mut frame) = cam_model::SetupFrame::from_model_instance(&geometry, id)
-                    {
-                        frame.references.origin = refs.origin.clone();
-                        if matches!(refs.origin, cam_model::FrameOrigin::ModelOrigin) {
-                            setup.origin = frame.to_setup_vector(placement.translation);
+                    if refs.x.is_none() && refs.y.is_none() && refs.z.is_none() {
+                        if let Ok(mut frame) =
+                            cam_model::SetupFrame::from_model_instance(&geometry, *id)
+                        {
+                            frame.references.origin = refs.origin.clone();
+                            if matches!(refs.origin, cam_model::FrameOrigin::ModelOrigin) {
+                                setup.origin = frame.to_setup_vector(placement.translation);
+                            }
+                            setup.frame = frame;
                         }
-                        setup.frame = frame;
                     }
                 }
             }

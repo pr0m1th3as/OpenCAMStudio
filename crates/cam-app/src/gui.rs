@@ -80,6 +80,8 @@ mod setup_editor_view;
 #[path = "gui_thread_parameters.rs"]
 mod thread_parameters;
 use operation_tabs::OperationTab;
+#[path = "gui_move.rs"]
+mod move_view;
 #[path = "gui_project_tree.rs"]
 mod project_tree_view;
 use project_tree_view::{TreeDrag, TreeMessage, TreeNode};
@@ -2199,6 +2201,7 @@ struct App {
     /// Shared transactional editor for setup, stock and postprocess settings. The
     /// draft survives tab changes; only the footer can commit or discard it.
     setup_draft: Option<cam_model::Setup>,
+    move_draft: Option<move_view::MoveDraft>,
     pattern_draft: Option<PatternDraft>,
     pattern_tab: pattern_editor_view::PatternTab,
     setup_model_selection: Option<InstanceId>,
@@ -2285,6 +2288,8 @@ struct App {
     output_px: f32,
     /// The preferences panel is open.
     show_prefs: bool,
+    shortcut_capture: Option<&'static str>,
+    shortcut_feedback: String,
     show_stock_palette: bool,
     /// Every machine this installation knows about. The **active** one is mirrored into
     /// the controller (which gates exports against it); this is the set to pick from.
@@ -2746,6 +2751,13 @@ enum BoreOption {
 
 #[derive(Debug, Clone)]
 enum Message {
+    MoveOpen(TreeNode),
+    MoveValue(usize, String),
+    MoveHandleStart(usize, [f64; 9], [f64; 3]),
+    MoveHandleDelta(f64),
+    MoveHandleInput(String),
+    MoveCancel,
+    MoveApply,
     Rotary(rotary_view::Action),
     PollMcp,
     TraverseFocus(bool),
@@ -3083,6 +3095,9 @@ enum Message {
     /// Open / close the preferences panel.
     ShowPrefs,
     ClosePrefs,
+    CaptureShortcut(&'static str),
+    ClearShortcut(&'static str),
+    ShortcutKey(Option<char>, iced::keyboard::Modifiers),
     /// Pickbox aperture, logical px. The object-snap catch distance follows it.
     SetPickbox(f32),
     /// Snap marker size, as a multiple of the catch aperture.
@@ -3864,6 +3879,7 @@ impl App {
             notice_queue: VecDeque::new(),
             notice_filters: [true; 3],
             status_messages: StatusMessages::default(),
+            move_draft: None,
             setup_draft: None,
             pattern_draft: None,
             pattern_tab: pattern_editor_view::PatternTab::Placement,
@@ -3938,6 +3954,8 @@ impl App {
             inspector_enabled: true,
             show_license: false,
             show_prefs: false,
+            shortcut_capture: None,
+            shortcut_feedback: String::new(),
             show_stock_palette: false,
             window: iced::Size::new(1280.0, 800.0),
             project_px: settings.panes.project_px,
@@ -4095,6 +4113,11 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> iced::Task<Message> {
+        if matches!(message, Message::CadEscape) && self.shortcut_capture.is_some() {
+            self.shortcut_capture = None;
+            self.shortcut_feedback = "Shortcut change cancelled.".into();
+            return iced::Task::none();
+        }
         if matches!(message, Message::CadEscape) && self.operation_rename.is_some() {
             self.operation_rename = None;
             return iced::Task::none();
@@ -4132,6 +4155,14 @@ impl App {
         }
         if matches!(message, Message::PollMcp) {
             return self.poll_mcp();
+        }
+        if self.move_draft.is_some() && matches!(&message,
+            Message::Select(_) | Message::SelectSetup(_) | Message::EditSetup(_) | Message::ClickOp(_)
+            | Message::BeginOp(_) | Message::Undo | Message::Redo | Message::RunJob | Message::ExportNc
+            | Message::ImportCad | Message::ReplaceCadAsset(_) | Message::RemoveCadAsset(_)
+            | Message::MoveOpen(_)) {
+            self.status = "Apply or cancel the move first.".into();
+            return iced::Task::none();
         }
         if self.pattern_draft.is_some()
             && matches!(
@@ -4256,6 +4287,10 @@ impl App {
         }
         if self.tool_info.is_some() && matches!(message, Message::CadEscape) {
             self.tool_info = None;
+            return iced::Task::none();
+        }
+        if self.move_draft.is_some() && matches!(message, Message::CadEscape) {
+            self.cancel_move();
             return iced::Task::none();
         }
         if self.tool_info.is_some()
@@ -5068,6 +5103,23 @@ impl App {
                 self.drawing_editing_op = None;
                 self.status = "Geometry selection cancelled; other draft edits retained.".into();
             }
+            Message::MoveOpen(node) => self.open_move(node),
+            Message::MoveValue(index, value) => {
+                if let Some(draft) = &mut self.move_draft {
+                    draft.values[index] = value;
+                    draft.clear_handle();
+                }
+            }
+            Message::MoveHandleStart(index, base, direction) => self.start_move_handle(index, base, direction),
+            Message::MoveHandleDelta(value) => self.set_move_handle(value, format!("{value:.2}")),
+            Message::MoveHandleInput(value) => {
+                if let Ok(number) = value.trim().parse::<f64>() {
+                    if number.is_finite() { self.set_move_handle(number, value.clone()); }
+                }
+                self.set_move_handle_text(value);
+            }
+            Message::MoveCancel => self.cancel_move(),
+            Message::MoveApply => self.apply_move(),
             Message::Tree(message) => return self.update_tree(message),
             Message::ShowStatus(target) => {
                 let fingerprints = self.controller.current_toolpath_fingerprints();
@@ -8074,9 +8126,60 @@ impl App {
             }
             Message::ShowPrefs => self.show_prefs = true,
             Message::ClosePrefs => {
+                self.shortcut_capture = None;
                 self.show_prefs = false;
                 self.show_stock_palette = false;
                 self.remember();
+            }
+            Message::CaptureShortcut(id) => {
+                self.shortcut_capture = Some(id);
+                self.shortcut_feedback = "Press a shortcut, or Escape to cancel.".into();
+            }
+            Message::ClearShortcut(id) => {
+                self.settings.shortcuts.insert(id.into(), String::new());
+                self.shortcut_capture = None;
+                self.shortcut_feedback = "Shortcut cleared.".into();
+                self.settings.save();
+            }
+            Message::ShortcutKey(key, modifiers) => {
+                if let Some(id) = self.shortcut_capture {
+                    if let Some(binding) = shortcut_binding(key, modifiers) {
+                        if ["Cmd+A", "Cmd+C", "Cmd+V", "Cmd+X"].contains(&binding.as_str()) {
+                            self.shortcut_feedback =
+                                "That shortcut is reserved for text editing.".into();
+                        } else if let Some((_, label, _)) =
+                            SHORTCUTS.iter().find(|(other, _, _)| {
+                                *other != id && shortcut_value(&self.settings, other) == binding
+                            })
+                        {
+                            self.shortcut_feedback =
+                                format!("Already assigned to {label}. Choose another shortcut.");
+                        } else {
+                            self.settings.shortcuts.insert(id.into(), binding);
+                            self.shortcut_capture = None;
+                            self.shortcut_feedback = "Shortcut saved.".into();
+                            self.settings.save();
+                        }
+                    } else {
+                        self.shortcut_feedback =
+                            "Use Command/Ctrl with a letter or number, optionally with Shift."
+                                .into();
+                    }
+                } else if !self.show_prefs {
+                    if let Some(binding) = shortcut_binding(key, modifiers) {
+                        if let Some(id) = shortcut_for_binding(&self.settings, &binding) {
+                            if let Some(action) = shortcut_action(id) {
+                                if !matches!(action, Message::BeginOp(_))
+                                    || (self.controller.has_geometry()
+                                        && !self.controller.setups().is_empty()
+                                        && !self.library.tools.is_empty())
+                                {
+                                    return self.update(action);
+                                }
+                            }
+                        }
+                    }
+                }
             }
             Message::SetPickbox(v) => {
                 let (lo, hi) = crate::PICKBOX_RANGE;
@@ -8113,6 +8216,8 @@ impl App {
                 // The only escape from a layout the user cannot otherwise undo, so it
                 // resets *everything* — pane sizes and minimums included — and applies
                 // at once rather than behind a confirm they might not be able to reach.
+                self.shortcut_capture = None;
+                self.shortcut_feedback.clear();
                 self.settings = crate::Settings::default();
                 self.restore_tool_table_preferences();
                 self.edited_preset_input = None;
@@ -9150,6 +9255,21 @@ impl App {
                 )) => Some(Message::ToolColumnRelease),
                 _ => None,
             }),
+            if self.shortcut_capture.is_some() {
+                iced::event::listen_with(|event, status, _| match event {
+                    iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                        key: iced::keyboard::Key::Character(key),
+                        modifiers,
+                        repeat: false,
+                        ..
+                    }) if status == iced::event::Status::Captured => {
+                        Some(Message::ShortcutKey(key.chars().next(), modifiers))
+                    }
+                    _ => None,
+                })
+            } else {
+                iced::Subscription::none()
+            },
             // Track the window-absolute cursor so overlays (the op context menu)
             // anchor exactly under the pointer — widget-local positions are offset
             // by the pane's origin, which is what caused the menu to appear astray.
@@ -9159,6 +9279,14 @@ impl App {
                 )) => Some(Message::Tree(TreeMessage::Release)),
                 iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
                     Some(Message::WindowCursor(position))
+                }
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Character(key),
+                    modifiers,
+                    repeat: false,
+                    ..
+                }) if status == iced::event::Status::Ignored => {
+                    Some(Message::ShortcutKey(key.chars().next(), modifiers))
                 }
                 iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
                     key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
@@ -9229,7 +9357,8 @@ impl App {
     /// Close the pane itself so an idle inspector gives its space to the viewport.
     /// Creation and geometry picking belong to the active operation editor.
     fn sync_inspector_visibility(&mut self) {
-        let editing = self.simulation.is_some()
+        let editing = self.move_draft.is_some()
+            || self.simulation.is_some()
             || self.pattern_draft.is_some()
             || self.library_mode()
             || (self.active_tab == RibbonTab::Machinery
@@ -11327,6 +11456,26 @@ impl App {
             .on_press(msg)
         };
 
+        let mut shortcuts = column![heading("Keyboard shortcuts"), note("Select Change, then press Command/Ctrl and a letter or number (Shift is optional). Escape cancels.".into())].spacing(5);
+        for &(id, label, _) in SHORTCUTS {
+            let shown = if self.shortcut_capture == Some(id) {
+                "Press shortcut…".to_string()
+            } else {
+                display_shortcut(shortcut_value(&self.settings, id))
+            };
+            shortcuts = shortcuts.push(
+                row![
+                    text(label).size(12).width(160),
+                    text(shown).size(12).width(150),
+                    button(text("Change").size(12)).on_press(Message::CaptureShortcut(id)),
+                    button(text("Clear").size(12)).on_press(Message::ClearShortcut(id)),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
+        }
+        shortcuts = shortcuts.push(text(&self.shortcut_feedback).size(11));
+
         let card = container(
             column![
                 text("Preferences").size(20),
@@ -11357,7 +11506,8 @@ impl App {
                         .spacing(6),
                         snapping,
                         stock,
-                        simulation
+                        simulation,
+                        shortcuts
                     ]
                     .spacing(12)
                 )
@@ -11821,10 +11971,45 @@ impl App {
                 GroupSpec {
                     title: "Project",
                     commands: vec![
-                        cmd(Icon::New, "New", Some(Message::NewProject)),
-                        cmd(Icon::Open, "Open", Some(Message::OpenProject)),
-                        cmd(Icon::Save, "Save", Some(Message::SaveProject)),
-                        cmd(Icon::Save, "Save As", Some(Message::SaveProjectAs)),
+                        cmd_help(
+                            Icon::New,
+                            "New",
+                            Some(Message::NewProject),
+                            format!(
+                                "{} ({})",
+                                Icon::New.help(),
+                                display_shortcut(shortcut_value(&self.settings, "new"))
+                            ),
+                        ),
+                        cmd_help(
+                            Icon::Open,
+                            "Open",
+                            Some(Message::OpenProject),
+                            format!(
+                                "{} ({})",
+                                Icon::Open.help(),
+                                display_shortcut(shortcut_value(&self.settings, "open"))
+                            ),
+                        ),
+                        cmd_help(
+                            Icon::Save,
+                            "Save",
+                            Some(Message::SaveProject),
+                            format!(
+                                "{} ({})",
+                                Icon::Save.help(),
+                                display_shortcut(shortcut_value(&self.settings, "save"))
+                            ),
+                        ),
+                        cmd_help(
+                            Icon::Save,
+                            "Save As",
+                            Some(Message::SaveProjectAs),
+                            format!(
+                                "Save the project under a new name. ({})",
+                                display_shortcut(shortcut_value(&self.settings, "save_as"))
+                            ),
+                        ),
                     ],
                 },
                 GroupSpec {
@@ -11838,8 +12023,26 @@ impl App {
                 GroupSpec {
                     title: "Edit",
                     commands: vec![
-                        cmd(Icon::Undo, "Undo", Some(Message::Undo)),
-                        cmd(Icon::Redo, "Redo", Some(Message::Redo)),
+                        cmd_help(
+                            Icon::Undo,
+                            "Undo",
+                            Some(Message::Undo),
+                            format!(
+                                "{} ({})",
+                                Icon::Undo.help(),
+                                display_shortcut(shortcut_value(&self.settings, "undo"))
+                            ),
+                        ),
+                        cmd_help(
+                            Icon::Redo,
+                            "Redo",
+                            Some(Message::Redo),
+                            format!(
+                                "{} ({})",
+                                Icon::Redo.help(),
+                                display_shortcut(shortcut_value(&self.settings, "redo"))
+                            ),
+                        ),
                         if self.controller.run_pending() {
                             cmd(Icon::Run, "Cancel run", Some(Message::CancelRun))
                         } else {
@@ -11853,24 +12056,115 @@ impl App {
                 // Roughly the order a part is actually made: skim the blank flat,
                 // then cut its shape, then the features, then the decoration.
                 commands: vec![
-                    cmd(Icon::Face, "Face", begin(OpKind::Face)),
-                    cmd(Icon::Profile, "Profile", begin(OpKind::Profile)),
-                    cmd(Icon::Pocket, "Pocket", begin(OpKind::Pocket)),
-                    cmd(Icon::Drill, "Drill", begin(OpKind::Drill)),
-                    cmd(Icon::Thread, "Thread", begin(OpKind::Thread)),
-                    cmd(Icon::Bore, "Bore", begin(OpKind::Bore)),
-                    cmd(Icon::Chamfer, "Chamfer", begin(OpKind::Chamfer)),
-                    cmd(Icon::Engrave, "Engrave", begin(OpKind::Engrave)),
-                    cmd(Icon::Carve, "Carve", begin(OpKind::Carve)),
-                    cmd(
+                    cmd_help(
+                        Icon::Face,
+                        "Face",
+                        begin(OpKind::Face),
+                        format!(
+                            "{} ({})",
+                            Icon::Face.help(),
+                            display_shortcut(shortcut_value(&self.settings, "face"))
+                        ),
+                    ),
+                    cmd_help(
+                        Icon::Profile,
+                        "Profile",
+                        begin(OpKind::Profile),
+                        format!(
+                            "{} ({})",
+                            Icon::Profile.help(),
+                            display_shortcut(shortcut_value(&self.settings, "profile"))
+                        ),
+                    ),
+                    cmd_help(
+                        Icon::Pocket,
+                        "Pocket",
+                        begin(OpKind::Pocket),
+                        format!(
+                            "{} ({})",
+                            Icon::Pocket.help(),
+                            display_shortcut(shortcut_value(&self.settings, "pocket"))
+                        ),
+                    ),
+                    cmd_help(
+                        Icon::Drill,
+                        "Drill",
+                        begin(OpKind::Drill),
+                        format!(
+                            "{} ({})",
+                            Icon::Drill.help(),
+                            display_shortcut(shortcut_value(&self.settings, "drill"))
+                        ),
+                    ),
+                    cmd_help(
+                        Icon::Thread,
+                        "Thread",
+                        begin(OpKind::Thread),
+                        format!(
+                            "{} ({})",
+                            Icon::Thread.help(),
+                            display_shortcut(shortcut_value(&self.settings, "thread"))
+                        ),
+                    ),
+                    cmd_help(
+                        Icon::Bore,
+                        "Bore",
+                        begin(OpKind::Bore),
+                        format!(
+                            "{} ({})",
+                            Icon::Bore.help(),
+                            display_shortcut(shortcut_value(&self.settings, "bore"))
+                        ),
+                    ),
+                    cmd_help(
+                        Icon::Chamfer,
+                        "Chamfer",
+                        begin(OpKind::Chamfer),
+                        format!(
+                            "{} ({})",
+                            Icon::Chamfer.help(),
+                            display_shortcut(shortcut_value(&self.settings, "chamfer"))
+                        ),
+                    ),
+                    cmd_help(
+                        Icon::Engrave,
+                        "Engrave",
+                        begin(OpKind::Engrave),
+                        format!(
+                            "{} ({})",
+                            Icon::Engrave.help(),
+                            display_shortcut(shortcut_value(&self.settings, "engrave"))
+                        ),
+                    ),
+                    cmd_help(
+                        Icon::Carve,
+                        "Carve",
+                        begin(OpKind::Carve),
+                        format!(
+                            "{} ({})",
+                            Icon::Carve.help(),
+                            display_shortcut(shortcut_value(&self.settings, "carve"))
+                        ),
+                    ),
+                    cmd_help(
                         Icon::Adaptive,
                         "3D Adaptive Clearing",
                         begin(OpKind::Adaptive),
+                        format!(
+                            "{} ({})",
+                            Icon::Adaptive.help(),
+                            display_shortcut(shortcut_value(&self.settings, "adaptive"))
+                        ),
                     ),
-                    cmd(
+                    cmd_help(
                         Icon::Parallel,
                         "3D Parallel / Scallop",
                         begin(OpKind::Parallel),
+                        format!(
+                            "{} ({})",
+                            Icon::Parallel.help(),
+                            display_shortcut(shortcut_value(&self.settings, "parallel"))
+                        ),
                     ),
                 ],
             }],
@@ -13226,6 +13520,105 @@ fn solve_densities(counts: &[usize], available: f32) -> Vec<Density> {
     densities
 }
 
+// Stored as portable Cmd combinations: Cmd means ⌘ on macOS and Ctrl elsewhere.
+const SHORTCUTS: &[(&str, &str, &str)] = &[
+    ("new", "New project", "Cmd+N"),
+    ("open", "Open project", "Cmd+O"),
+    ("save", "Save project", "Cmd+S"),
+    ("save_as", "Save as", "Cmd+Shift+S"),
+    ("undo", "Undo", "Cmd+Z"),
+    ("redo", "Redo", "Cmd+Shift+Z"),
+    ("face", "Face", "Cmd+Shift+F"),
+    ("profile", "Profile", "Cmd+Shift+P"),
+    ("pocket", "Pocket", "Cmd+Shift+K"),
+    ("drill", "Drill", "Cmd+Shift+D"),
+    ("thread", "Thread", "Cmd+Shift+T"),
+    ("bore", "Bore", "Cmd+Shift+B"),
+    ("chamfer", "Chamfer", "Cmd+Shift+C"),
+    ("engrave", "Engrave", "Cmd+Shift+E"),
+    ("carve", "Carve", "Cmd+Shift+V"),
+    ("adaptive", "3D Adaptive Clearing", "Cmd+Shift+A"),
+    ("parallel", "Parallel", "Cmd+Shift+L"),
+];
+
+fn shortcut_value<'a>(settings: &'a crate::Settings, id: &str) -> &'a str {
+    settings
+        .shortcuts
+        .get(id)
+        .map(String::as_str)
+        .unwrap_or_else(|| {
+            SHORTCUTS
+                .iter()
+                .find(|(name, _, _)| *name == id)
+                .map_or("", |(_, _, default)| *default)
+        })
+}
+
+fn shortcut_binding(key: Option<char>, modifiers: iced::keyboard::Modifiers) -> Option<String> {
+    use iced::keyboard::Modifiers;
+    if modifiers != Modifiers::COMMAND && modifiers != (Modifiers::COMMAND | Modifiers::SHIFT) {
+        return None;
+    }
+    let key = key?.to_ascii_uppercase();
+    if !key.is_ascii_alphanumeric() {
+        return None;
+    }
+    Some(format!(
+        "Cmd+{}{key}",
+        if modifiers.shift() { "Shift+" } else { "" }
+    ))
+}
+
+fn shortcut_for_binding<'a>(settings: &'a crate::Settings, binding: &str) -> Option<&'static str> {
+    SHORTCUTS
+        .iter()
+        .find(|(id, _, _)| shortcut_value(settings, id) == binding)
+        .map(|(id, _, _)| *id)
+        .or_else(|| {
+            (!cfg!(target_os = "macos")
+                && binding == "Cmd+Y"
+                && !settings.shortcuts.contains_key("redo"))
+            .then_some("redo")
+        })
+}
+
+fn shortcut_action(id: &str) -> Option<Message> {
+    Some(match id {
+        "new" => Message::NewProject,
+        "open" => Message::OpenProject,
+        "save" => Message::SaveProject,
+        "save_as" => Message::SaveProjectAs,
+        "undo" => Message::Undo,
+        "redo" => Message::Redo,
+        "face" => Message::BeginOp(OpKind::Face),
+        "profile" => Message::BeginOp(OpKind::Profile),
+        "pocket" => Message::BeginOp(OpKind::Pocket),
+        "drill" => Message::BeginOp(OpKind::Drill),
+        "thread" => Message::BeginOp(OpKind::Thread),
+        "bore" => Message::BeginOp(OpKind::Bore),
+        "chamfer" => Message::BeginOp(OpKind::Chamfer),
+        "engrave" => Message::BeginOp(OpKind::Engrave),
+        "carve" => Message::BeginOp(OpKind::Carve),
+        "adaptive" => Message::BeginOp(OpKind::Adaptive),
+        "parallel" => Message::BeginOp(OpKind::Parallel),
+        _ => return None,
+    })
+}
+
+fn display_shortcut(binding: &str) -> String {
+    if binding.is_empty() {
+        return "Unassigned".into();
+    }
+    binding.replace(
+        "Cmd",
+        if cfg!(target_os = "macos") {
+            "⌘"
+        } else {
+            "Ctrl"
+        },
+    )
+}
+
 /// One ribbon command in a group's data model — enough to render it at any
 /// density (icon+label, icon-only, or inside a popup).
 struct Command {
@@ -13240,7 +13633,7 @@ struct Command {
     /// Help used to be keyed by icon alone, which is right while an icon means one
     /// thing. The moment one is reused — the tool icon standing in for "add a machine" —
     /// it silently describes the wrong action, which is worse than no tooltip.
-    help: Option<&'static str>,
+    help: Option<String>,
 }
 
 /// A ribbon group's data model.
@@ -13275,10 +13668,10 @@ fn cmd_help(
     icon: Icon,
     label: &'static str,
     action: Option<Message>,
-    help: &'static str,
+    help: impl Into<String>,
 ) -> Command {
     Command {
-        help: Some(help),
+        help: Some(help.into()),
         ..cmd(icon, label, action)
     }
 }
@@ -13331,10 +13724,18 @@ fn render_command(command: &Command, compact: bool, show: bool) -> Element<'stat
     }
     delayed_tooltip(
         btn,
-        container(text(command.help.unwrap_or_else(|| command.icon.help())).size(12))
-            .padding(8)
-            .max_width(300.0)
-            .style(container::rounded_box),
+        container(
+            text(
+                command
+                    .help
+                    .clone()
+                    .unwrap_or_else(|| command.icon.help().to_string()),
+            )
+            .size(12),
+        )
+        .padding(8)
+        .max_width(300.0)
+        .style(container::rounded_box),
         tooltip::Position::Bottom,
     )
     .into()
@@ -14477,6 +14878,7 @@ struct Viewport {
     frame_bounds: Option<([f32; 3], [f32; 3])>,
     controls: ViewControls,
     grid_size: [f32; 3],
+    grid_frame: cam_model::RigidTransform,
     show_gizmo: bool,
     /// On-screen cube size, logical px (fixed; independent of window size).
     gizmo_size: f32,
@@ -14529,6 +14931,7 @@ impl Viewport {
         silhouette_bottom: Option<f64>,
         cached_cad_scene: Option<Arc<CadScene>>,
         stock_draft: Option<&cam_model::Setup>,
+        tree_body: Option<InstanceId>,
     ) -> Self {
         let cad_hover = cad_hover.filter(|reference| {
             preview.is_none()
@@ -14632,6 +15035,18 @@ impl Viewport {
             selected.to_vec()
         } else {
             let mut selected = controller.cad_selection().to_vec();
+            if let Some(instance) = tree_body.and_then(|id| controller.geometry_state().instance(id)) {
+                if let Some(asset) = controller.geometry_state().asset(instance.asset_id) {
+                    selected.push(EntityRef {
+                        asset_id: asset.id,
+                        revision: asset.revision,
+                        instance_id: instance.id,
+                        body_id: instance.body_id,
+                        kind: EntityKind::Body,
+                        id: instance.body_id,
+                    });
+                }
+            }
             for id in focus_ops {
                 if let Some(binding) = controller.geometry_state().bindings.get(id) {
                     selected.extend(binding.selected.iter().cloned());
@@ -14958,6 +15373,7 @@ impl Viewport {
                 let (x, y, z) = controller.machine().envelope.extent();
                 [x as f32, y as f32, z as f32]
             },
+            grid_frame: Default::default(),
             show_gizmo,
             gizmo_size,
             snap_catch_px: prefs.snapping.pickbox_px * crate::SNAP_CATCH_MULTIPLE,
@@ -15673,7 +16089,7 @@ impl shader::Program<Message> for Viewport {
             cone_vertices: Arc::new(cone_vertices),
             cone_indices: Arc::new(cone_indices),
             grid_vertices: Arc::new(
-                grid_view::GridLayout::new(self.camera(), bounds.size(), self.grid_size).vertices(),
+                grid_view::GridLayout::new(self.camera(), bounds.size(), self.grid_size, self.grid_frame).vertices(),
             ),
             vertices: self.vertices.clone(),
             overlay_vertices: Arc::new(overlays),
@@ -16036,6 +16452,43 @@ impl shader::Primitive for ScenePrimitive {
         gizmo_pass.set_viewport(gx as f32, gy as f32, size as f32, size as f32, 0.0, 1.0);
         gizmo_pass.set_scissor_rect(gx, gy, size, size);
         pipeline.gizmo.draw(&mut gizmo_pass);
+    }
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    use super::*;
+    use iced::keyboard::Modifiers;
+
+    #[test]
+    fn defaults_are_unique_and_cover_all_actions() {
+        let settings = crate::Settings::default();
+        let mut bindings = BTreeSet::new();
+        for &(id, _, binding) in SHORTCUTS {
+            assert!(bindings.insert(binding), "duplicate binding: {binding}");
+            assert!(shortcut_action(id).is_some(), "missing action: {id}");
+            assert_eq!(shortcut_for_binding(&settings, binding), Some(id));
+        }
+        assert_eq!(
+            shortcut_binding(Some('p'), Modifiers::COMMAND | Modifiers::SHIFT).as_deref(),
+            Some("Cmd+Shift+P")
+        );
+        assert!(shortcut_binding(Some('p'), Modifiers::COMMAND | Modifiers::ALT).is_none());
+        assert!(shortcut_binding(Some('p'), Modifiers::NONE).is_none());
+    }
+
+    #[test]
+    fn overrides_and_unassigned_bindings_survive_settings_round_trip() {
+        let mut settings = crate::Settings::default();
+        settings.shortcuts.insert("profile".into(), "Cmd+9".into());
+        settings.shortcuts.insert("save".into(), String::new());
+        let loaded: crate::Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(shortcut_for_binding(&loaded, "Cmd+9"), Some("profile"));
+        assert_eq!(shortcut_for_binding(&loaded, "Cmd+Shift+P"), None);
+        assert_eq!(shortcut_value(&loaded, "save"), "");
+        assert_eq!(shortcut_for_binding(&loaded, "Cmd+S"), None);
+        assert_eq!(shortcut_value(&loaded, "open"), "Cmd+O");
     }
 }
 

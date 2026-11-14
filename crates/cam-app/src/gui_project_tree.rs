@@ -213,7 +213,8 @@ impl App {
     }
 
     fn tree_edit_blocked(&mut self) -> bool {
-        if self.controller.pending_op().is_some()
+        if self.move_draft.is_some()
+            || self.controller.pending_op().is_some()
             || self.pattern_draft.is_some()
             || self.cad_pending_kind.is_some()
             || self.cad_editing_op.is_some()
@@ -1243,6 +1244,10 @@ impl App {
                         if hidden { "Show model" } else { "Hide model" }.into(),
                         Message::SetAssetVisible(*id, hidden),
                     ))
+                    .push(item(
+                        "Move model…".into(),
+                        Message::MoveOpen(TreeNode::Asset(*id)),
+                    ))
                     .push(item("Replace model…".into(), Message::ReplaceCadAsset(*id)))
                     .push(item("Remove model".into(), Message::RemoveCadAsset(*id)));
             }
@@ -1262,7 +1267,11 @@ impl App {
                         "Isolate body".into(),
                         Message::CadIsolateInstance(*id),
                     ))
-                    .push(item("Show all geometry".into(), Message::CadShowAll));
+                    .push(item("Show all geometry".into(), Message::CadShowAll))
+                    .push(item(
+                        "Move body…".into(),
+                        Message::MoveOpen(TreeNode::Model(*id)),
+                    ));
             }
         }
         let menu = container(scrollable(items.padding(4)).height(Length::Shrink))
@@ -1479,6 +1488,77 @@ mod tests {
                     .any(|candidate| candidate.entity.instance_id == *id)
             })
             .collect()
+    }
+
+    #[test]
+    fn moving_model_previews_in_inspector_and_cancel_discards() {
+        let (mut app, _) = tree_app();
+        add_browser_models(&mut app);
+        let before = app.controller.geometry_state().instance(1).unwrap().placement;
+        let _ = app.update(Message::MoveOpen(TreeNode::Asset(1)));
+        assert!(app.pane_handle(Pane::Inspector).is_some());
+        let _ = app.update(Message::MoveValue(0, "10".into()));
+        assert_eq!(app.controller.geometry_state().instance(1).unwrap().placement, before);
+        let scene = app.machining_viewport().cad_scene;
+        assert!(scene.pick_candidates(cam_render::Ray { origin: [12., 2., 10.], direction: [0.,0.,-1.] }, EntityKind::Body, 0.1, false).iter().any(|c| c.entity.instance_id == 1));
+        let _ = app.update(Message::MoveCancel);
+        assert_eq!(app.controller.geometry_state().instance(1).unwrap().placement, before);
+        let _ = app.update(Message::MoveOpen(TreeNode::Asset(1)));
+        let _ = app.update(Message::MoveValue(0, "10".into()));
+        let _ = app.update(Message::MoveApply);
+        assert_eq!(app.controller.geometry_state().instance(1).unwrap().placement.translation[0], 10.);
+        assert_eq!(app.controller.geometry_state().instance(2).unwrap().placement.translation[0], 30.);
+        assert!(app.controller.undo());
+        assert_eq!(app.controller.geometry_state().instance(1).unwrap().placement, before);
+    }
+
+    #[test]
+    fn move_gizmo_tracks_rotation_and_drags_in_local_axes() {
+        let (mut app, _) = tree_app();
+        add_browser_models(&mut app);
+        let _ = app.update(Message::MoveOpen(TreeNode::Model(1)));
+        let _ = app.update(Message::MoveValue(5, "90".into()));
+        for index in 6..9 { let _ = app.update(Message::MoveValue(index, "0".into())); }
+        let camera = app.machining_viewport().camera();
+        let axes = app.move_handles(camera).unwrap().axes;
+        assert!(axes[0][0].abs() < 1e-9 && (axes[0][1] - 1.).abs() < 1e-9);
+        let base = [0., 0., 0., 0., 0., 90., 0., 0., 0.];
+        let _ = app.update(Message::MoveHandleStart(0, base, axes[0]));
+        let _ = app.update(Message::MoveHandleInput("5".into()));
+        let base = [0., 5., 0., 0., 0., 90., 0., 0., 0.];
+        let _ = app.update(Message::MoveHandleStart(3, base, axes[0]));
+        let _ = app.update(Message::MoveHandleInput("90".into()));
+        let _ = app.update(Message::MoveApply);
+        let placement = app.controller.geometry_state().instance(1).unwrap().placement;
+        assert!(placement.translation[0].abs() < 1e-8 && (placement.translation[1] - 5.).abs() < 1e-8);
+        let rotated_z = placement.transform_vector([0., 0., 1.]);
+        assert!((rotated_z[0] - 1.).abs() < 1e-8 && rotated_z[1].abs() < 1e-8 && rotated_z[2].abs() < 1e-8);
+    }
+
+    #[test]
+    fn move_rotation_remains_correct_through_all_quadrants() {
+        let (mut app, _) = tree_app();
+        add_browser_models(&mut app);
+        let _ = app.update(Message::MoveOpen(TreeNode::Model(1)));
+        for index in 6..9 { let _ = app.update(Message::MoveValue(index, "0".into())); }
+        let _ = app.update(Message::MoveHandleStart(4, [0.; 9], [0., 1., 0.]));
+        for angle in [-360_f64, -270., -180., -90., 0., 90., 180., 270., 360., 450.] {
+            let _ = app.update(Message::MoveHandleDelta(angle));
+            let axes = app.move_handles(app.machining_viewport().camera()).unwrap().axes;
+            let (sin, cos) = angle.to_radians().sin_cos();
+            assert!((axes[0][0] - cos).abs() < 1e-8 && (axes[0][2] + sin).abs() < 1e-8, "angle {angle}: {:?}", axes[0]);
+        }
+    }
+
+    #[test]
+    fn moving_body_only_changes_selected_instance() {
+        let (mut app, _) = tree_app();
+        add_browser_models(&mut app);
+        let _ = app.update(Message::MoveOpen(TreeNode::Model(1)));
+        let _ = app.update(Message::MoveValue(1, "5".into()));
+        let _ = app.update(Message::MoveApply);
+        assert_eq!(app.controller.geometry_state().instance(1).unwrap().placement.translation, [0., 5., 0.]);
+        assert_eq!(app.controller.geometry_state().instance(2).unwrap().placement.translation, [20., 0., 0.]);
     }
 
     #[test]
@@ -2307,6 +2387,30 @@ mod tests {
     }
 
     #[test]
+    fn tree_body_selection_highlights_with_siblings_visible() {
+        let (mut app, _) = tree_app();
+        add_browser_models(&mut app);
+        let before = app.controller.document().clone();
+        let _ = app.select_tree_node(&TreeNode::Model(1));
+        assert_eq!(visible_bodies(&app), [1, 2]);
+        assert!(app.controller.cad_selection().is_empty(), "tree highlighting must not change machining selection");
+        let view = app.machining_viewport();
+        let selected = [0.20, 0.60, 0.98, 1.];
+        let neutral = [0.55, 0.58, 0.63, 1.];
+        assert!(view.mesh_vertices.iter().any(|v| v.position[0] < 15. && v.color == selected));
+        assert!(view.mesh_vertices.iter().any(|v| v.position[0] > 15. && v.color == neutral));
+        let _ = app.select_tree_node(&TreeNode::Model(2));
+        let view = app.machining_viewport();
+        assert!(view.mesh_vertices.iter().any(|v| v.position[0] < 15. && v.color == neutral));
+        assert!(view.mesh_vertices.iter().any(|v| v.position[0] > 15. && v.color == selected));
+        send(&mut app, Message::CadIsolateInstance(2));
+        assert_eq!(visible_bodies(&app), [2]);
+        send(&mut app, Message::CadShowAll);
+        assert_eq!(visible_bodies(&app), [1, 2]);
+        assert_eq!(app.controller.document(), &before);
+    }
+
+    #[test]
     fn tree_selection_scopes_models_setups_operations_and_member_picking() {
         let (mut app, ids) = tree_app();
         add_browser_models(&mut app);
@@ -2329,7 +2433,7 @@ mod tests {
             .stock_bounds()
             .is_none());
         let _ = app.select_tree_node(&TreeNode::Model(2));
-        assert_eq!(visible_bodies(&app), [2]);
+        assert_eq!(visible_bodies(&app), [1, 2]);
         let _ = app.select_tree_node(&TreeNode::Models);
         assert_eq!(visible_bodies(&app), [1, 2, 3, 4]);
         send(&mut app, Message::EditSetup(first_setup));

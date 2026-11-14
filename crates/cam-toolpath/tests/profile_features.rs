@@ -527,6 +527,18 @@ fn open_profiles_require_computed_compensation() {
 }
 
 #[test]
+fn open_profile_ignores_retained_closure_overlap() {
+    let mut op = profile();
+    op.closed = false;
+    op.chain = Contour::new(vec![Point::new(0., 0.), Point::new(20., 0.)]);
+    let without_overlap = run(op.clone());
+    op.lead_overlap = 0.6;
+    let with_overlap = run(op);
+    assert!(!with_overlap.has_errors(), "{:?}", with_overlap.diagnostics);
+    assert_eq!(with_overlap.program, without_overlap.program);
+}
+
+#[test]
 fn open_leads_extensions_ramp_and_alternating_levels_preserve_endpoints() {
     let mut op = profile();
     op.closed = false;

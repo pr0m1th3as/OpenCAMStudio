@@ -241,6 +241,7 @@ pub(super) struct ViewportKey {
     focus: BTreeSet<u32>,
     hidden: Vec<u32>,
     model_view: bool,
+    tree_body: Option<InstanceId>,
     show_stock: bool,
     show_origin: bool,
     envelope: Option<[f32; 3]>,
@@ -396,7 +397,11 @@ impl App {
             } else {
                 match &self.model_view {
                     Some(TreeNode::Asset(id)) => instance.asset_id == *id,
-                    Some(TreeNode::Model(id)) => instance.id == *id,
+                    Some(TreeNode::Model(id)) => self
+                        .controller
+                        .geometry_state()
+                        .instance(*id)
+                        .is_some_and(|selected| selected.asset_id == instance.asset_id),
                     Some(_) => true,
                     None => {
                         setup.model_instances.contains(&instance.id)
@@ -483,6 +488,7 @@ impl App {
         let labels = grid_view::GridLabels {
             camera: viewport.camera(),
             grid_size: viewport.grid_size,
+            frame: viewport.grid_frame,
             measurement: grid_view::selection_measurement(
                 self.controller.geometry_state(),
                 self.controller.cad_selection(),
@@ -539,6 +545,9 @@ impl App {
                     .height(Length::Fill),
             );
         }
+        if let Some(handles) = self.move_handles(viewport_camera) {
+            overlays = overlays.push(canvas::Canvas::new(handles).width(Length::Fill).height(Length::Fill));
+        }
         if let Some(legend) = self.simulation.as_ref().and_then(|player| {
             player.force_viewport_legend(
                 viewport_browser_width,
@@ -548,6 +557,10 @@ impl App {
             overlays = overlays.push(legend);
         }
         layers = layers.push(overlays.width(Length::Fill).height(Length::Fill));
+        if let Some(input) = self.move_handle_input() {
+            layers = layers.push(container(input).width(Length::Fill).height(Length::Fill)
+                .align_x(iced::alignment::Horizontal::Right).align_y(iced::alignment::Vertical::Bottom).padding(18));
+        }
         if self.show_project_browser {
             let browser = container(
                 column![text(self.project_title()).size(13), self.project_tree()].spacing(6),
@@ -630,12 +643,20 @@ impl App {
             })
             .collect();
         let editing = self.operation_preview_active() || self.pattern_draft.is_some();
+        let tree_body = match self.model_view {
+            Some(TreeNode::Model(id))
+                if !editing && self.move_draft.is_none() && self.controller.cad_selection().is_empty() =>
+            {
+                Some(id)
+            }
+            _ => None,
+        };
         let selected_geometry = self.editor_selected_geometry();
         // Playback geometry changes only when a new display frame is published.
         // Reuse its geometry during intervening ticks and camera/menu events.
         // Drafts have their own small semantic key as well.
         // Unstamped synchronous/headless results have no publication identity.
-        let cacheable = self.controller.outcome().is_none_or(|o| o.stamp.is_some());
+        let cacheable = self.move_draft.is_none() && self.controller.outcome().is_none_or(|o| o.stamp.is_some());
         let key = cacheable.then(|| ViewportKey {
             revision: self.controller.revision(),
             setup: self.controller.active_setup_id(),
@@ -665,6 +686,7 @@ impl App {
             focus: self.focus_ops.clone(),
             hidden: hidden.clone(),
             model_view,
+            tree_body,
             show_stock: self.show_stock,
             show_origin: self.show_origin,
             envelope: self.show_envelope.then(|| {
@@ -776,8 +798,9 @@ impl App {
                 }),
                 editing.then_some(selected_geometry.as_slice()),
                 silhouette_bottom,
-                Some(self.cached_cad_scene(&cad_hidden)),
+                Some(self.move_preview_scene(&cad_hidden).unwrap_or_else(|| self.cached_cad_scene(&cad_hidden))),
                 self.setup_draft.as_ref(),
+                tree_body,
             );
             if let Some(player) = self.simulation.as_ref().filter(|_| !model_view && !editing) {
                 if player.options.rotary_view
@@ -913,6 +936,22 @@ impl App {
         viewport.cad_select_through = self.cad_select_through;
         let (grid_x, grid_y, grid_z) = self.controller.machine().envelope.extent();
         viewport.grid_size = [grid_x as f32, grid_y as f32, grid_z as f32];
+        viewport.grid_frame = if model_view {
+            Default::default()
+        } else if let Some(setup) = self
+            .setup_draft
+            .as_ref()
+            .or_else(|| self.controller.document().active_setup())
+        {
+            cam_model::RigidTransform {
+                rotation: setup.frame.world_from_setup.rotation,
+                translation: setup
+                    .frame
+                    .to_world_vector(setup.origin_position(self.controller.active_origin())),
+            }
+        } else {
+            Default::default()
+        };
         viewport.controls = self.view;
         viewport.show_gizmo = self.show_gizmo;
         viewport.gizmo_size = self.gizmo_size;
@@ -948,6 +987,9 @@ impl App {
             },
             viewport.cad_scene.bounds(),
         );
+        if self.move_draft.is_some() {
+            viewport.frame_bounds = self.cached_cad_scene(&cad_hidden).bounds();
+        }
         if self.pattern_draft.is_some() {
             viewport.frame_bounds = union_bounds(viewport.frame_bounds, viewport.bounds);
         }
@@ -2051,6 +2093,29 @@ mod tests {
         assert!((0..3).all(|i| (a[i] - b[i]).abs() < 1e-5), "{a:?} != {b:?}");
     }
     #[test]
+    fn grid_uses_active_work_origin_and_setup_draft() {
+        let mut app = picking_app();
+        let setup = app.setup_draft.as_mut().unwrap();
+        setup.frame = cam_model::SetupFrame::from_xy([0., 1., 0.], [-1., 0., 0.]).unwrap();
+        setup.origin = [4., 5., 6.];
+        let expected = setup.frame.to_world_vector(setup.origin);
+        let viewport = app.machining_viewport();
+        assert_eq!(viewport.grid_frame.translation, expected);
+        assert_eq!(viewport.grid_frame.rotation, setup_rotation(&app));
+        app.setup_draft = None;
+        app.controller.add_origin();
+        app.controller.edit_active_origin(|origin| *origin = [12., 13., 14.]);
+        let viewport = app.machining_viewport();
+        assert_eq!(viewport.grid_frame.translation, [12., 13., 14.]);
+        app.model_view = Some(TreeNode::Models);
+        assert_eq!(app.machining_viewport().grid_frame, Default::default());
+    }
+
+    fn setup_rotation(app: &App) -> [[f64; 3]; 3] {
+        app.setup_draft.as_ref().unwrap().frame.world_from_setup.rotation
+    }
+
+    #[test]
     fn box_origin_modes_pick_only_their_bounds_without_snap_preferences_or_fallback() {
         let mut app = picking_app();
         app.settings.snapping.enabled = false;
@@ -2413,6 +2478,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         viewport.browser_overlay_width = 250.;
         let bounds = iced::Rectangle {
@@ -2523,6 +2589,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let bounds = iced::Rectangle {
             x: 0.,
@@ -2597,6 +2664,7 @@ mod tests {
             None,
             false,
             true,
+            None,
             None,
             None,
             None,
@@ -2978,6 +3046,7 @@ mod performance_tests {
                 None,
                 false,
                 false,
+                None,
                 None,
                 None,
                 None,

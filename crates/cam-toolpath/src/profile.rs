@@ -154,6 +154,14 @@ impl Strategy for ProfileStrategy {
 }
 impl ProfileStrategy {
     fn compute_resolved(&self, env: &JobEnv, cancel: &CancelToken) -> StrategyResult {
+        // Preserve a closed profile's stored overlap when its selection changes
+        // to open paths, but never apply it to those paths. Mixed selections
+        // remain subject to validation because closed paths could use overlap.
+        if self.op.lead_overlap != 0. && self.op.contours().all(|contour| !contour.closed) {
+            let mut op = self.op.clone();
+            op.lead_overlap = 0.;
+            return Self::new(op).compute_resolved(env, cancel);
+        }
         if !self.op.passes.multiple_depths {
             let mut op = self.op.clone();
             op.passes.multiple_depths = true;

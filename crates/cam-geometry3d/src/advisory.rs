@@ -20,7 +20,9 @@ pub fn verify_profile_entry(state: &GeometryState, entry: &ProfileGeometryEntry)
             resolve_selection(state, &[body], ExtractionRecipe::ProfileSilhouette, 0.).map(|_| ())
         })
     } else {
-        profile_contours::extract(state, selected).map(|_| ())
+        profile_entries::body_groups(selected)
+            .iter()
+            .try_for_each(|group| profile_contours::extract(state, group).map(|_| ()))
     };
     result.err()
 }

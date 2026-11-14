@@ -1717,10 +1717,7 @@ fn pocket_and_drill_report_obstructed_approaches_as_advisory_findings() {
         app.create_cad_operation_with_tool(kind, vec![selected.clone()], tool)
             .unwrap();
         let outcome = app.run(&CancelToken::new());
-        assert_eq!(
-            outcome.completion,
-            JobCompletion::Complete
-        );
+        assert_eq!(outcome.completion, JobCompletion::Complete);
         let result = app.export_nc();
         assert!(result.is_ok(), "{result:?}");
 
@@ -2609,4 +2606,24 @@ fn multiple_pockets_track_each_instances_placement_and_reject_incomplete_chains(
         0.
     )
     .is_err());
+}
+
+#[test]
+fn multi_body_placement_is_atomic_and_undoable() {
+    let (mut state, _) = pocket();
+    let mut second = state.instances[0].clone();
+    second.id = 2;
+    second.placement.translation = [10., 0., 0.];
+    state.instances.push(second);
+    let mut app = controller();
+    app.add_cad_asset(state.assets[0].clone(), state.instances).unwrap();
+    let first = RigidTransform { translation: [3., 4., 0.], ..Default::default() };
+    let second = RigidTransform { translation: [13., 4., 0.], ..Default::default() };
+    assert!(app.place_cad_instances(vec![(1, first), (99, second)]).is_err());
+    assert_eq!(app.geometry_state().instance(1).unwrap().placement.translation, [0.; 3]);
+    app.place_cad_instances(vec![(1, first), (2, second)]).unwrap();
+    assert_eq!(app.geometry_state().instance(2).unwrap().placement, second);
+    assert!(app.undo());
+    assert_eq!(app.geometry_state().instance(1).unwrap().placement.translation, [0.; 3]);
+    assert_eq!(app.geometry_state().instance(2).unwrap().placement.translation, [10., 0., 0.]);
 }

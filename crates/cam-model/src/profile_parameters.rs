@@ -528,11 +528,11 @@ impl ProfileOp {
             );
         }
         if self.contours().any(|c| !c.closed)
-            && (self.tabs.enabled || self.comp != Comp::Computed || self.lead_overlap != 0.)
+            && (self.tabs.enabled
+                || self.comp != Comp::Computed
+                || (self.lead_overlap != 0. && self.contours().any(|c| c.closed)))
         {
-            return Err(
-                "Open profiles require computed compensation and no tabs or closure overlap".into(),
-            );
+            return Err("Open profiles require computed compensation and no tabs; mixed open and closed profiles cannot use closure overlap".into());
         }
         if self.comp != Comp::Computed
             && (!caps.control

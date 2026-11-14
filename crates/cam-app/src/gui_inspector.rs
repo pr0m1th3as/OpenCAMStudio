@@ -11,6 +11,9 @@ const ESTLCAM_OUTPUT_CHOICES: &[&str] = &[
 
 impl App {
     pub(super) fn inspector(&self) -> Element<'_, Message> {
+        if self.move_draft.is_some() {
+            return self.move_inspector();
+        }
         if self.pattern_draft.is_some() {
             return self.pattern_editor();
         }

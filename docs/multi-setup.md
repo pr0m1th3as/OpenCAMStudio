@@ -53,7 +53,9 @@ view. Box points remain selectable with drawing snapping disabled. Box and picke
 points capture an explicit datum; they do not follow later stock/model resizing.
 Changing orientation preserves an explicit datum's world position. Model origin
 uses the selected model instance's origin. All WCS edits preview in the same setup
-draft and commit with OK or revert with Cancel.
+draft and commit with OK or revert with Cancel. In a setup view, the viewport grid
+uses the active work origin and the setup axes; it updates with the WCS preview.
+The model browser view uses the world grid.
 
 Stock supports a fixed-size box, positioned against the model along each axis,
 or a box with independent allowances on all six sides. Material is separate from

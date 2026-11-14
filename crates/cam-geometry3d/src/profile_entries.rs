@@ -1,5 +1,21 @@
 use super::*;
 
+pub(super) fn body_groups(selected: &[EntityRef]) -> Vec<Vec<EntityRef>> {
+    let mut groups: Vec<Vec<EntityRef>> = Vec::new();
+    for reference in selected {
+        if let Some(group) = groups.iter_mut().find(|group| {
+            let first = &group[0];
+            (first.asset_id, first.instance_id, first.body_id)
+                == (reference.asset_id, reference.instance_id, reference.body_id)
+        }) {
+            group.push(reference.clone());
+        } else {
+            groups.push(vec![reference.clone()]);
+        }
+    }
+    groups
+}
+
 /// Resolve named entries independently, allowing faces, chains and silhouettes
 /// in one operation with advisory feature verification.
 pub fn profile_entry_contours(
@@ -9,6 +25,26 @@ pub fn profile_entry_contours(
     let mut heights = None;
     let mut contours = match &entry.source {
         ProfileGeometrySource::Contours(contours) => contours.clone(),
+        ProfileGeometrySource::Cad(selected)
+            if entry.kind == ProfileGeometryKind::Chain && body_groups(selected).len() > 1 =>
+        {
+            let mut all = Vec::new();
+            for group in body_groups(selected) {
+                let mut body_entry = entry.clone();
+                body_entry.source = ProfileGeometrySource::Cad(group);
+                // Apply presentation settings once, after combining the bodies,
+                // so per-contour overrides keep their global indices.
+                body_entry.reversed = false;
+                body_entry.side_rule = ProfileSideRule::StartOutside;
+                body_entry.side_overrides.clear();
+                let (contours, interval) = profile_entry_contours(state, &body_entry)?;
+                if let Some(interval) = interval {
+                    merge_heights(&mut heights, interval)?;
+                }
+                all.extend(contours);
+            }
+            all
+        }
         ProfileGeometrySource::Cad(selected)
             if entry.kind == ProfileGeometryKind::Chain
                 && entry.chain_mode == ProfileChainMode::Closed =>

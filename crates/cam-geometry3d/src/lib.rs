@@ -2486,6 +2486,57 @@ mod tests {
     }
 
     #[test]
+    fn profile_chain_resolves_edges_from_multiple_body_instances() {
+        let (mut state, face) = plate_with_hole();
+        let mut second = state.instances[0].clone();
+        second.id = 2;
+        second.placement.translation = [30., 0., 0.];
+        state.instances.push(second);
+        let wire = state.assets[0]
+            .topology
+            .loops
+            .iter()
+            .find(|wire| wire.face_id == face.id && wire.is_outer)
+            .unwrap();
+        let edges: Vec<_> = wire
+            .edge_uses
+            .iter()
+            .map(|usage| reference(usage.edge_id, EntityKind::Edge))
+            .collect();
+        for mode in [
+            ProfileChainMode::Auto,
+            ProfileChainMode::Closed,
+            ProfileChainMode::Open,
+        ] {
+            let selected: Vec<_> = edges
+                .iter()
+                .cloned()
+                .chain(edges.iter().cloned().map(|mut edge| {
+                    edge.instance_id = 2;
+                    edge
+                }))
+                .collect();
+            let mut entry = ProfileGeometryEntry::new(ProfileGeometryKind::Chain, "Chains".into());
+            entry.source = ProfileGeometrySource::Cad(selected.clone());
+            entry.chain_mode = mode;
+            entry.side_overrides.insert(1, Side::On);
+            let recipe = ExtractionRecipe::ProfileEntries {
+                entries: vec![entry.clone()],
+            };
+            let binding = resolve_selection_advisory(&state, &selected, recipe, 0.).unwrap();
+            let input = resolve_binding_advisory(&state, &binding).unwrap();
+            assert_eq!(input.profiles.len(), 2);
+            assert_eq!(input.profiles[1].side, Side::On);
+            assert!(input
+                .profiles
+                .iter()
+                .all(|p| p.closed == (mode != ProfileChainMode::Open)));
+            assert!(input.profiles[1].chain.points().iter().all(|p| p.x >= 30.));
+            assert!(verify_profile_entry(&state, &entry).is_none());
+        }
+    }
+
+    #[test]
     fn open_chain_uses_local_wall_normals_despite_unsupported_face_trims() {
         let (mut state, face) = plate_with_hole();
         let wire = state.assets[0]

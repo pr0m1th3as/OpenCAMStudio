@@ -97,6 +97,8 @@ pub struct Settings {
     pub simulation: SimulationPrefs,
     pub session: SessionState,
     pub tool_table: ToolTablePrefs,
+    /// Shortcut overrides; an empty value disables a command.
+    pub shortcuts: std::collections::BTreeMap<String, String>,
     /// Keys this build does not know about, carried through a save untouched.
     ///
     /// So that running an older build after a newer one does not quietly delete the
@@ -453,6 +455,7 @@ impl Default for Settings {
             simulation: SimulationPrefs::default(),
             session: SessionState::default(),
             tool_table: ToolTablePrefs::default(),
+            shortcuts: Default::default(),
             extra: Default::default(),
         }
     }
