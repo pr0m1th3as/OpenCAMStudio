@@ -112,8 +112,17 @@ impl App {
     }
 
     fn browser_disclosure(&self, expanded: bool, message: Message) -> Element<'_, Message> {
+        let arrow: &'static [u8] = if expanded {
+            br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><path d="M0 2.5h10L5 7.5z" fill="#dce2ea"/></svg>"##
+        } else {
+            br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><path d="M2.5 0v10L7.5 5z" fill="#dce2ea"/></svg>"##
+        };
         button(
-            container(text(if expanded { "▾" } else { "▸" }).size(13))
+            container(
+                iced::widget::svg(iced::widget::svg::Handle::from_memory(arrow))
+                    .width(10)
+                    .height(10),
+            )
                 .width(18)
                 .height(20)
                 .center_x(18)
