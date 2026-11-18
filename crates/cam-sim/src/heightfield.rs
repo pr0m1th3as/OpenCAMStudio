@@ -326,6 +326,13 @@ impl Heightfield {
         sweep.source = self.cut_source;
         let id = self.cuts.len() as u32;
         self.cuts.push(sweep);
+        // Even when no column height changes, this sweep can extend the
+        // reconstructed wall between samples. Cached tiles must see it.
+        let (mesh_x0, mesh_x1) =
+            self.index_range(a[0].min(b[0]) - radius, a[0].max(b[0]) + radius, 0);
+        let (mesh_y0, mesh_y1) =
+            self.index_range(a[1].min(b[1]) - radius, a[1].max(b[1]) + radius, 1);
+        self.invalidate_mesh_region([mesh_x0, mesh_y0], [mesh_x1, mesh_y1]);
         let (iy0, iy1) = self.index_range(a[1].min(b[1]) - radius, a[1].max(b[1]) + radius, 1);
         let r2 = radius * radius;
         for iy in iy0..=iy1 {
@@ -372,6 +379,11 @@ impl Heightfield {
                         );
                         self.z[index] = bottom;
                         self.winners[index] = id;
+                    } else if bottom == self.z[index] && self.better_wall_sweep(ix, iy, &sweep) {
+                        // A later pass can extend the wall without lowering a
+                        // sampled cell. Keep its sweep for contour reconstruction.
+                        self.winners[index] = id;
+                        changed = true;
                     }
                 }
             }
@@ -379,6 +391,40 @@ impl Heightfield {
                 self.invalidate_mesh_region([ix0, iy], [ix1, iy]);
             }
         }
+    }
+
+    // Prefer a same-depth sweep only when it improves the existing cutter at
+    // every adjacent higher column. This avoids replacing a useful corner
+    // sweep with one that moves some other wall inward.
+    fn better_wall_sweep(&self, x: usize, y: usize, candidate: &Sweep) -> bool {
+        let index = y * self.nx + x;
+        let Some(previous) = self.cuts.get(self.winners[index] as usize) else {
+            return false;
+        };
+        if previous.operation != candidate.operation || self.surface_tracking {
+            return false;
+        }
+        let mut improved = false;
+        for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+            let nx = x as isize + dx;
+            let ny = y as isize + dy;
+            if nx < 0 || ny < 0 || nx >= self.nx as isize || ny >= self.ny as isize {
+                continue;
+            }
+            let height = self.z[ny as usize * self.nx + nx as usize];
+            if height <= self.z[index] {
+                continue;
+            }
+            let (px, py) = self.center(nx as usize, ny as usize);
+            let level = (f64::from(height) + f64::from(self.z[index])) * 0.5;
+            let old = previous.implicit(px, py, level);
+            let new = candidate.implicit(px, py, level);
+            if new > old + 1e-9 {
+                return false;
+            }
+            improved |= new < old - 1e-9;
+        }
+        improved
     }
 
     fn operation_at(&self, x: usize, y: usize) -> Option<u32> {
@@ -921,6 +967,37 @@ mod tests {
             "deep {} vs shallow {}: a deep pocket walls its edge; a shallow one ramps",
             wall_faces(&deep),
             wall_faces(&shallow)
+        );
+    }
+
+    #[test]
+    fn finishing_sweep_updates_wall_when_no_column_height_changes() {
+        let mut field = Heightfield::new([-5., -2.5], [15., 8.], 1.1555555556, 0.);
+        let tool = ToolProfile::flat(3.);
+        field.cut_segment_profile([-10., -4.8, -18.], [20., -4.8, -18.], &tool);
+        let before = field.z.clone();
+        let mut cache = StockMeshCache::default();
+        let rough = cache.mesh_controlled(&field, -18., &|| false).unwrap();
+        field.cut_segment_profile([-10., -3.8, -18.], [20., -3.8, -18.], &tool);
+        assert_eq!(field.z, before, "both passes hit the same column centers");
+        let finished = cache.mesh_controlled(&field, -18., &|| false).unwrap();
+        let wall_y = |mesh: &SurfaceMesh| {
+            mesh.positions
+                .iter()
+                .zip(&mesh.normals)
+                .filter(|(p, n)| p[0] > 2. && p[0] < 8. && n[1] < -0.5 && n[2].abs() < 0.1)
+                .map(|(p, _)| p[1])
+                .fold(f32::INFINITY, f32::min)
+        };
+        assert!(
+            (wall_y(&rough) + 1.8).abs() < 0.02,
+            "rough wall: {}",
+            wall_y(&rough)
+        );
+        assert!(
+            (wall_y(&finished) + 0.8).abs() < 0.02,
+            "finished wall: {}",
+            wall_y(&finished)
         );
     }
 
