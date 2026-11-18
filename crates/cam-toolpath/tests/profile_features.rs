@@ -183,7 +183,7 @@ fn leads_that_cannot_fit_warn_once_and_preserve_selected_positions() {
 
 #[test]
 fn saved_profiles_with_outdated_finish_revisions_are_recomputed() {
-    for revision in [None, Some(1)] {
+    for revision in [None, Some(1), Some(2)] {
         let op = Operation::Profile(profile());
         let env = JobEnv {
             heights: Heights::new(8., 3., 0.),
