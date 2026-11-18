@@ -13586,7 +13586,7 @@ fn shortcut_binding(key: Option<char>, modifiers: iced::keyboard::Modifiers) -> 
     ))
 }
 
-fn shortcut_for_binding<'a>(settings: &'a crate::Settings, binding: &str) -> Option<&'static str> {
+fn shortcut_for_binding(settings: &crate::Settings, binding: &str) -> Option<&'static str> {
     SHORTCUTS
         .iter()
         .find(|(id, _, _)| shortcut_value(settings, id) == binding)

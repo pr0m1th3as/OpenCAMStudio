@@ -2,6 +2,14 @@
 use super::*;
 use iced::widget::column;
 
+type ProjectedHandles = (
+    iced::Point,
+    [iced::Point; 3],
+    [iced::Point; 3],
+    [iced::Vector; 3],
+    f64,
+);
+
 #[derive(Clone, Debug)]
 pub(super) struct MoveDraft {
     ids: Vec<u64>,
@@ -187,8 +195,8 @@ impl App {
         };
         let mut values = edit.base;
         if edit.index < 3 {
-            for i in 0..3 {
-                values[i] += edit.direction[i] * delta;
+            for (value, direction) in values.iter_mut().zip(edit.direction) {
+                *value += direction * delta;
             }
         } else {
             let [x, y, z] = edit.direction;
@@ -218,8 +226,8 @@ impl App {
                 z_angle.to_degrees(),
             ]);
         }
-        for i in 0..6 {
-            draft.values[i] = format!("{:.10}", values[i]);
+        for (output, value) in draft.values.iter_mut().zip(values).take(6) {
+            *output = format!("{value:.10}");
         }
         edit.text = text;
     }
@@ -413,17 +421,17 @@ impl MoveHandles {
         let project = |point| picking_view::project(self.camera, bounds, point).map(|v| v.0);
         let center = project(self.origin)?;
         let mut tips = [center; 3];
-        for axis in 0..3 {
-            tips[axis] = project(std::array::from_fn(|j| {
+        for (axis, tip) in tips.iter_mut().enumerate() {
+            *tip = project(std::array::from_fn(|j| {
                 self.origin[j] + length * self.axes[axis][j]
             }))?;
         }
         let mut dots = Vec::new();
         let mut radii = [length * 1.8; 3];
-        for axis in 0..3 {
+        for (axis, radius_out) in radii.iter_mut().enumerate() {
             let a = (axis + 1) % 3;
             let b = (axis + 2) % 3;
-            let mut best = (0., radii[axis], center);
+            let mut best = (0., *radius_out, center);
             for step in 0..=16 {
                 let radius = length * (1.8 + 0.2 * step as f64);
                 let point = project(std::array::from_fn(|j| {
@@ -444,7 +452,7 @@ impl MoveHandles {
                     break;
                 }
             }
-            radii[axis] = best.1;
+            *radius_out = best.1;
             dots.push(best.2);
         }
         Some(radii)
@@ -466,26 +474,14 @@ impl MoveHandles {
     fn projected(
         &self,
         size: iced::Size,
-    ) -> Option<(
-        iced::Point,
-        [iced::Point; 3],
-        [iced::Point; 3],
-        [iced::Vector; 3],
-        f64,
-    )> {
+    ) -> Option<ProjectedHandles> {
         self.projected_with_radii(size, None)
     }
     fn projected_with_radii(
         &self,
         size: iced::Size,
         locked_radii: Option<[f64; 3]>,
-    ) -> Option<(
-        iced::Point,
-        [iced::Point; 3],
-        [iced::Point; 3],
-        [iced::Vector; 3],
-        f64,
-    )> {
+    ) -> Option<ProjectedHandles> {
         if size.width <= 0. || size.height <= 0. {
             return None;
         }
@@ -508,13 +504,13 @@ impl MoveHandles {
             let radius = radii[axis];
             let angle = std::f64::consts::FRAC_PI_4;
             let mut p = self.origin;
-            for i in 0..3 {
-                p[i] += radius * (self.axes[a][i] * angle.cos() + self.axes[b][i] * angle.sin());
+            for (i, coord) in p.iter_mut().enumerate() {
+                *coord += radius * (self.axes[a][i] * angle.cos() + self.axes[b][i] * angle.sin());
             }
             dots[axis] = project(p)?;
             let mut q = p;
-            for i in 0..3 {
-                q[i] += radius
+            for (i, coord) in q.iter_mut().enumerate() {
+                *coord += radius
                     * (-self.axes[a][i] * angle.sin() + self.axes[b][i] * angle.cos())
                     * 0.01;
             }
@@ -711,8 +707,8 @@ impl canvas::Program<Message> for MoveHandles {
                     let angle = std::f64::consts::FRAC_PI_4
                         + (i as f64 / 32. - 0.5) * std::f64::consts::FRAC_PI_4;
                     let mut p = self.origin;
-                    for j in 0..3 {
-                        p[j] += radius
+                    for (j, coord) in p.iter_mut().enumerate() {
+                        *coord += radius
                             * (self.axes[a][j] * angle.cos() + self.axes[b][j] * angle.sin());
                     }
                     picking_view::project(self.camera, rect, p).map(|v| v.0)
