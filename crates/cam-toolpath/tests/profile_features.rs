@@ -539,6 +539,39 @@ fn open_profile_ignores_retained_closure_overlap() {
 }
 
 #[test]
+fn tangential_extension_applies_to_each_open_pass_and_ignores_closed_contours() {
+    let mut op = profile();
+    op.closed = false;
+    op.side = Side::On;
+    op.chain = Contour::new(vec![Point::new(0., 0.), Point::new(20., 0.)]);
+    op.passes.tangential_extension_distance = 5.;
+    op.passes.finishing = true;
+    op.passes.finish_count = 2;
+    let result = run(op.clone());
+    assert!(!result.has_errors(), "{:?}", result.diagnostics);
+    let starts = plunges(&result);
+    let ends = cuts(&result);
+    assert!(starts.len() >= 4, "{starts:?}");
+    assert!(starts
+        .iter()
+        .all(|p| (p.x + 5.).abs() < 1e-6 || (p.x - 25.).abs() < 1e-6));
+    assert!(
+        ends.iter()
+            .filter(|p| (p.x + 5.).abs() < 1e-6 || (p.x - 25.).abs() < 1e-6)
+            .count()
+            >= 4
+    );
+
+    let mut closed = profile();
+    let baseline = run(closed.clone());
+    closed.passes.tangential_extension_distance = 5.;
+    assert_eq!(run(closed).program, baseline.program);
+
+    op.passes.tangential_extension_distance = -1.;
+    assert!(run(op).has_errors());
+}
+
+#[test]
 fn open_leads_extensions_ramp_and_alternating_levels_preserve_endpoints() {
     let mut op = profile();
     op.closed = false;

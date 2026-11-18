@@ -180,6 +180,8 @@ pub enum OperationParameter {
     ProfileFinishDepths,
     #[serde(rename = "profileFinishDepthStep")]
     ProfileFinishDepthStep,
+    #[serde(rename = "profileTangentialExtensionDistance")]
+    ProfileTangentialExtensionDistance,
     #[serde(rename = "profileStartExtension")]
     ProfileStartExtension,
     #[serde(rename = "profileEndExtension")]
@@ -212,7 +214,7 @@ pub enum OperationParameter {
     StartY,
 }
 impl OperationParameter {
-    pub const ALL: [Self; 102] = [
+    pub const ALL: [Self; 103] = [
         Self::CuttingSpeed,
         Self::FeedPerTooth,
         Self::LiftHeight,
@@ -300,6 +302,7 @@ impl OperationParameter {
         Self::ProfileFloorLeave,
         Self::ProfileFinishDepths,
         Self::ProfileFinishDepthStep,
+        Self::ProfileTangentialExtensionDistance,
         Self::ProfileStartExtension,
         Self::ProfileEndExtension,
         Self::ProfileTolerance,
@@ -405,6 +408,7 @@ impl OperationParameter {
             Self::ProfileFloorLeave => "floorAllowance",
             Self::ProfileFinishDepths => "profileFinishDepths",
             Self::ProfileFinishDepthStep => "profileFinishDepthStep",
+            Self::ProfileTangentialExtensionDistance => "profileTangentialExtensionDistance",
             Self::ProfileStartExtension => "profileStartExtension",
             Self::ProfileEndExtension => "profileEndExtension",
             Self::ProfileTolerance => "arcTolerance",
@@ -601,6 +605,9 @@ impl OperationParameter {
             }
             (Operation::Profile(o), Self::ProfileFinishDepthStep) => {
                 Some(o.passes.finishing_stepdown)
+            }
+            (Operation::Profile(o), Self::ProfileTangentialExtensionDistance) => {
+                Some(o.passes.tangential_extension_distance)
             }
             (Operation::Profile(o), Self::ProfileStartExtension) => Some(o.passes.start_extension),
             (Operation::Profile(o), Self::ProfileEndExtension) => Some(o.passes.end_extension),
@@ -1143,6 +1150,9 @@ impl OperationParameter {
             }
             (Operation::Profile(o), Self::ProfileFinishDepthStep) => {
                 o.passes.finishing_stepdown = value;
+            }
+            (Operation::Profile(o), Self::ProfileTangentialExtensionDistance) => {
+                o.passes.tangential_extension_distance = value;
             }
             (Operation::Profile(o), Self::ProfileStartExtension) => {
                 o.passes.start_extension = value;

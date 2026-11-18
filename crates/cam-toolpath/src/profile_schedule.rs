@@ -333,6 +333,7 @@ fn scheduled(op: &ProfileOp, env: &JobEnv, cancel: &CancelToken) -> StrategyResu
         pass.passes = ProfilePasses {
             outer_corner: p.outer_corner,
             tolerance: p.tolerance,
+            tangential_extension_distance: p.tangential_extension_distance,
             start_extension: p.start_extension,
             end_extension: p.end_extension,
             lead_end_distance: p.lead_end_distance,

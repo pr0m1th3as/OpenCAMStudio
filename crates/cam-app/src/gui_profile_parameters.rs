@@ -336,6 +336,7 @@ pub(super) enum Number {
     FloorLeave,
     FinishDepths,
     FinishDepthStep,
+    TangentialExtensionDistance,
     StartExtension,
     EndExtension,
     Tolerance,
@@ -356,6 +357,7 @@ impl Number {
             Self::FloorLeave => "Floor allowance (mm)",
             Self::FinishDepths => "Finishing depths",
             Self::FinishDepthStep => "Finishing step (mm)",
+            Self::TangentialExtensionDistance => "Tangential extension distance (mm)",
             Self::StartExtension => "Start extension (mm)",
             Self::EndExtension => "End extension (mm)",
             Self::Tolerance => "Arc-fit tolerance (mm)",
@@ -376,6 +378,7 @@ impl Number {
         Self::FloorLeave => "Signed axial allowance above the selected bottom. Positive leaves material; negative cuts below the nominal bottom. Linked CAD requires a nonnegative value.",
         Self::FinishDepths => "Number of fixed-size depth increments reserved at the bottom of the cut. Zero uses the regular stepdown throughout. This is independent of radial finishing passes.",
         Self::FinishDepthStep => "Height of each reserved bottom depth increment. Their combined height must be smaller than the total cut. This is independent of radial finish spacing.",
+        Self::TangentialExtensionDistance => "Extend both ends of each open toolpath in a straight line along its endpoint tangents. Overlapping extensions are not trimmed. Zero disables the extension.",
         Self::StartExtension => "Extend the selected open chain backward along its first tangent before offsetting. This does not add a closing edge.",
         Self::EndExtension => "Extend the selected open chain forward along its last tangent before offsetting. Independent of the start extension.",
         Self::Tolerance => "Maximum error used when fitting arcs to the cutting polyline. This does not improve the accuracy of a coarse imported curve.",
@@ -396,6 +399,7 @@ impl Number {
             Self::FloorLeave => p.floor_allowance,
             Self::FinishDepths => p.finishing_depths as f64,
             Self::FinishDepthStep => p.finishing_stepdown,
+            Self::TangentialExtensionDistance => p.tangential_extension_distance,
             Self::StartExtension => p.start_extension,
             Self::EndExtension => p.end_extension,
             Self::Tolerance => p.tolerance,
@@ -429,6 +433,7 @@ impl Number {
             Self::FloorLeave => p.floor_allowance = value,
             Self::FinishDepths => p.finishing_depths = value as u32,
             Self::FinishDepthStep => p.finishing_stepdown = value,
+            Self::TangentialExtensionDistance => p.tangential_extension_distance = value,
             Self::StartExtension => p.start_extension = value,
             Self::EndExtension => p.end_extension = value,
             Self::Tolerance => p.tolerance = value,
@@ -668,7 +673,11 @@ pub(super) fn numeric_fields(p: &ProfileOp) -> Vec<Field> {
         ]);
     }
     if p.contours().any(|c| !c.closed) {
-        values.extend([Number::StartExtension, Number::EndExtension]);
+        values.extend([
+            Number::TangentialExtensionDistance,
+            Number::StartExtension,
+            Number::EndExtension,
+        ]);
     }
     if p.tabs.enabled && !p.tabs.manual && p.tabs.count.is_some() {
         values.push(Number::TabCount);
@@ -835,6 +844,7 @@ impl App {
             list = list.push(toggle(Toggle::Preserve));
             if p.contours().any(|c| !c.closed) {
                 list = list.push(toggle(Toggle::BothWays));
+                list = list.push(number(Number::TangentialExtensionDistance));
             }
             list = list.optional_section(
                 "Finishing passes",

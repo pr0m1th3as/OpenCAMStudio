@@ -115,6 +115,9 @@ pub(super) fn parameter(field: Field) -> Option<OperationParameter> {
         Field::Profile(profile_parameters::Number::FinishDepthStep) => {
             Some(OperationParameter::ProfileFinishDepthStep)
         }
+        Field::Profile(profile_parameters::Number::TangentialExtensionDistance) => {
+            Some(OperationParameter::ProfileTangentialExtensionDistance)
+        }
         Field::Profile(profile_parameters::Number::StartExtension) => {
             Some(OperationParameter::ProfileStartExtension)
         }

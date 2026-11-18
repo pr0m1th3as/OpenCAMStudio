@@ -795,6 +795,22 @@ fn open_profile(op: &ProfileOp, radius: f64, env: &JobEnv, cancel: &CancelToken)
         Ok(p) => p,
         Err(e) => return fail(&e),
     };
+    let distance = op.passes.tangential_extension_distance;
+    if distance > 0. {
+        let n = points.len();
+        let a = unit(points[1].x - points[0].x, points[1].y - points[0].y);
+        let b = unit(
+            points[n - 1].x - points[n - 2].x,
+            points[n - 1].y - points[n - 2].y,
+        );
+        let start = Point::new(points[0].x - a.0 * distance, points[0].y - a.1 * distance);
+        let end = Point::new(
+            points[n - 1].x + b.0 * distance,
+            points[n - 1].y + b.1 * distance,
+        );
+        points.insert(0, start);
+        points.push(end);
+    }
     let material_right = op.clearing.climb == (env.spindle == SpindleDir::Cw);
     let reverse = match op.side {
         Side::Outside | Side::On => !material_right,
