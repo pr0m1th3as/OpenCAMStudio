@@ -2616,14 +2616,45 @@ fn multi_body_placement_is_atomic_and_undoable() {
     second.placement.translation = [10., 0., 0.];
     state.instances.push(second);
     let mut app = controller();
-    app.add_cad_asset(state.assets[0].clone(), state.instances).unwrap();
-    let first = RigidTransform { translation: [3., 4., 0.], ..Default::default() };
-    let second = RigidTransform { translation: [13., 4., 0.], ..Default::default() };
-    assert!(app.place_cad_instances(vec![(1, first), (99, second)]).is_err());
-    assert_eq!(app.geometry_state().instance(1).unwrap().placement.translation, [0.; 3]);
-    app.place_cad_instances(vec![(1, first), (2, second)]).unwrap();
+    app.add_cad_asset(state.assets[0].clone(), state.instances)
+        .unwrap();
+    let first = RigidTransform {
+        translation: [3., 4., 0.],
+        ..Default::default()
+    };
+    let second = RigidTransform {
+        translation: [13., 4., 0.],
+        ..Default::default()
+    };
+    assert!(app
+        .place_cad_instances(vec![(1, first), (99, second)])
+        .is_err());
+    assert_eq!(
+        app.geometry_state()
+            .instance(1)
+            .unwrap()
+            .placement
+            .translation,
+        [0.; 3]
+    );
+    app.place_cad_instances(vec![(1, first), (2, second)])
+        .unwrap();
     assert_eq!(app.geometry_state().instance(2).unwrap().placement, second);
     assert!(app.undo());
-    assert_eq!(app.geometry_state().instance(1).unwrap().placement.translation, [0.; 3]);
-    assert_eq!(app.geometry_state().instance(2).unwrap().placement.translation, [10., 0., 0.]);
+    assert_eq!(
+        app.geometry_state()
+            .instance(1)
+            .unwrap()
+            .placement
+            .translation,
+        [0.; 3]
+    );
+    assert_eq!(
+        app.geometry_state()
+            .instance(2)
+            .unwrap()
+            .placement
+            .translation,
+        [10., 0., 0.]
+    );
 }

@@ -546,7 +546,11 @@ impl App {
             );
         }
         if let Some(handles) = self.move_handles(viewport_camera) {
-            overlays = overlays.push(canvas::Canvas::new(handles).width(Length::Fill).height(Length::Fill));
+            overlays = overlays.push(
+                canvas::Canvas::new(handles)
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            );
         }
         if let Some(legend) = self.simulation.as_ref().and_then(|player| {
             player.force_viewport_legend(
@@ -558,8 +562,14 @@ impl App {
         }
         layers = layers.push(overlays.width(Length::Fill).height(Length::Fill));
         if let Some(input) = self.move_handle_input() {
-            layers = layers.push(container(input).width(Length::Fill).height(Length::Fill)
-                .align_x(iced::alignment::Horizontal::Right).align_y(iced::alignment::Vertical::Bottom).padding(18));
+            layers = layers.push(
+                container(input)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_x(iced::alignment::Horizontal::Right)
+                    .align_y(iced::alignment::Vertical::Bottom)
+                    .padding(18),
+            );
         }
         if self.show_project_browser {
             let browser = container(
@@ -645,7 +655,9 @@ impl App {
         let editing = self.operation_preview_active() || self.pattern_draft.is_some();
         let tree_body = match self.model_view {
             Some(TreeNode::Model(id))
-                if !editing && self.move_draft.is_none() && self.controller.cad_selection().is_empty() =>
+                if !editing
+                    && self.move_draft.is_none()
+                    && self.controller.cad_selection().is_empty() =>
             {
                 Some(id)
             }
@@ -656,7 +668,8 @@ impl App {
         // Reuse its geometry during intervening ticks and camera/menu events.
         // Drafts have their own small semantic key as well.
         // Unstamped synchronous/headless results have no publication identity.
-        let cacheable = self.move_draft.is_none() && self.controller.outcome().is_none_or(|o| o.stamp.is_some());
+        let cacheable = self.move_draft.is_none()
+            && self.controller.outcome().is_none_or(|o| o.stamp.is_some());
         let key = cacheable.then(|| ViewportKey {
             revision: self.controller.revision(),
             setup: self.controller.active_setup_id(),
@@ -798,7 +811,10 @@ impl App {
                 }),
                 editing.then_some(selected_geometry.as_slice()),
                 silhouette_bottom,
-                Some(self.move_preview_scene(&cad_hidden).unwrap_or_else(|| self.cached_cad_scene(&cad_hidden))),
+                Some(
+                    self.move_preview_scene(&cad_hidden)
+                        .unwrap_or_else(|| self.cached_cad_scene(&cad_hidden)),
+                ),
                 self.setup_draft.as_ref(),
                 tree_body,
             );
@@ -2104,7 +2120,8 @@ mod tests {
         assert_eq!(viewport.grid_frame.rotation, setup_rotation(&app));
         app.setup_draft = None;
         app.controller.add_origin();
-        app.controller.edit_active_origin(|origin| *origin = [12., 13., 14.]);
+        app.controller
+            .edit_active_origin(|origin| *origin = [12., 13., 14.]);
         let viewport = app.machining_viewport();
         assert_eq!(viewport.grid_frame.translation, [12., 13., 14.]);
         app.model_view = Some(TreeNode::Models);
@@ -2112,7 +2129,12 @@ mod tests {
     }
 
     fn setup_rotation(app: &App) -> [[f64; 3]; 3] {
-        app.setup_draft.as_ref().unwrap().frame.world_from_setup.rotation
+        app.setup_draft
+            .as_ref()
+            .unwrap()
+            .frame
+            .world_from_setup
+            .rotation
     }
 
     #[test]

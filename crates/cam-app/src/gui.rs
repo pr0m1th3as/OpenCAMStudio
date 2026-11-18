@@ -4156,11 +4156,24 @@ impl App {
         if matches!(message, Message::PollMcp) {
             return self.poll_mcp();
         }
-        if self.move_draft.is_some() && matches!(&message,
-            Message::Select(_) | Message::SelectSetup(_) | Message::EditSetup(_) | Message::ClickOp(_)
-            | Message::BeginOp(_) | Message::Undo | Message::Redo | Message::RunJob | Message::ExportNc
-            | Message::ImportCad | Message::ReplaceCadAsset(_) | Message::RemoveCadAsset(_)
-            | Message::MoveOpen(_)) {
+        if self.move_draft.is_some()
+            && matches!(
+                &message,
+                Message::Select(_)
+                    | Message::SelectSetup(_)
+                    | Message::EditSetup(_)
+                    | Message::ClickOp(_)
+                    | Message::BeginOp(_)
+                    | Message::Undo
+                    | Message::Redo
+                    | Message::RunJob
+                    | Message::ExportNc
+                    | Message::ImportCad
+                    | Message::ReplaceCadAsset(_)
+                    | Message::RemoveCadAsset(_)
+                    | Message::MoveOpen(_)
+            )
+        {
             self.status = "Apply or cancel the move first.".into();
             return iced::Task::none();
         }
@@ -5110,11 +5123,15 @@ impl App {
                     draft.clear_handle();
                 }
             }
-            Message::MoveHandleStart(index, base, direction) => self.start_move_handle(index, base, direction),
+            Message::MoveHandleStart(index, base, direction) => {
+                self.start_move_handle(index, base, direction)
+            }
             Message::MoveHandleDelta(value) => self.set_move_handle(value, format!("{value:.2}")),
             Message::MoveHandleInput(value) => {
                 if let Ok(number) = value.trim().parse::<f64>() {
-                    if number.is_finite() { self.set_move_handle(number, value.clone()); }
+                    if number.is_finite() {
+                        self.set_move_handle(number, value.clone());
+                    }
                 }
                 self.set_move_handle_text(value);
             }
@@ -15035,7 +15052,9 @@ impl Viewport {
             selected.to_vec()
         } else {
             let mut selected = controller.cad_selection().to_vec();
-            if let Some(instance) = tree_body.and_then(|id| controller.geometry_state().instance(id)) {
+            if let Some(instance) =
+                tree_body.and_then(|id| controller.geometry_state().instance(id))
+            {
                 if let Some(asset) = controller.geometry_state().asset(instance.asset_id) {
                     selected.push(EntityRef {
                         asset_id: asset.id,
@@ -16089,7 +16108,13 @@ impl shader::Program<Message> for Viewport {
             cone_vertices: Arc::new(cone_vertices),
             cone_indices: Arc::new(cone_indices),
             grid_vertices: Arc::new(
-                grid_view::GridLayout::new(self.camera(), bounds.size(), self.grid_size, self.grid_frame).vertices(),
+                grid_view::GridLayout::new(
+                    self.camera(),
+                    bounds.size(),
+                    self.grid_size,
+                    self.grid_frame,
+                )
+                .vertices(),
             ),
             vertices: self.vertices.clone(),
             overlay_vertices: Arc::new(overlays),
