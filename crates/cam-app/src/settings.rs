@@ -95,6 +95,8 @@ pub struct Settings {
     pub snapping: SnapPrefs,
     pub panes: PanePrefs,
     pub simulation: SimulationPrefs,
+    /// Allow a local MCP client to connect when the desktop starts.
+    pub mcp_enabled: bool,
     pub session: SessionState,
     pub tool_table: ToolTablePrefs,
     /// Shortcut overrides; an empty value disables a command.
@@ -453,6 +455,7 @@ impl Default for Settings {
             snapping: SnapPrefs::default(),
             panes: PanePrefs::default(),
             simulation: SimulationPrefs::default(),
+            mcp_enabled: false,
             session: SessionState::default(),
             tool_table: ToolTablePrefs::default(),
             shortcuts: Default::default(),

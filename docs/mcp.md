@@ -1,6 +1,6 @@
 # MCP automation
 
-OpenCAMStudio exposes its application commands through an MCP stdio server. The
+OpenCAMStudio exposes its application commands to MCP clients over stdio. The
 same controller implements GUI edits and MCP edits, including undo/redo, linked
 CAD validation, toolpath invalidation, collision verification and export gates.
 `tools/list` discovers the command names, argument schemas and read-only hints.
@@ -16,7 +16,28 @@ first and call `update_setup` with `{"patch":{"stock":"PreviousSetup"}}`.
 Generation and simulation recalculate the preceding setup's included operations.
 `get_setup_bounds` reports the enclosing original blank in the active setup's axes.
 
-## Build and launch
+## Connect to an open desktop window
+
+1. In Open CAM Studio, open **Preferences → MCP**, select **Enable MCP**, and click **OK**.
+2. Reopen **Preferences → MCP**, select **Copy client configuration** and add the `opencamstudio` entry to your MCP client's configuration. Reload the server in the client if required.
+3. The client can now use tools such as `get_state` with the project in the open window.
+
+The setting is saved and starts MCP each time you open the desktop app. Turn it
+off to disconnect the client and stop automatic startup. Quitting the app also
+disconnects the client.
+
+The app listens on `127.0.0.1` and shows the current port. The copied client
+configuration uses the stdio bridge `opencamstudio-mcp --mcp-connect`, which finds
+the current port and access token in the per-user configuration directory. Reuse
+the same client configuration after restarting the app. If the client stays open,
+reload its MCP server to reconnect. Each window accepts one client at a time.
+When several windows have MCP enabled, the bridge uses the most recently
+published connection.
+
+If you set up the older client configuration with an explicit port and token,
+copy the new configuration once to enable automatic discovery.
+
+## Launch a new session from the client
 
 ```sh
 # Headless server; no graphics or windowing dependencies.
@@ -53,9 +74,8 @@ A typical MCP client's server configuration is:
 ```
 
 Omit `--mcp-gui` for a headless session. Each server process owns one project
-session. In desktop mode the MCP client launches the window and commands control
-that window's actual controller and undo history. It does not attach to a window
-started by an unrelated process. Closing the window or closing the MCP client's
+session. With `--mcp-gui` the MCP client launches a new window and commands control
+that window's controller and undo history. Closing the window or closing the MCP client's
 stdin ends the desktop server. Headless mode exits on stdin EOF.
 
 ## Available commands

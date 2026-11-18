@@ -35,7 +35,9 @@ fn main() -> std::process::ExitCode {
         println!("{}", cli::USAGE);
         return std::process::ExitCode::SUCCESS;
     }
-    let result = if args.mcp {
+    let result = if let Some(cli::ConnectDesktop { port }) = args.mcp_connect {
+        cam_app::mcp::connect_desktop(port)
+    } else if args.mcp {
         serve_mcp(args.setup)
     } else if args.mcp_gui {
         launch_mcp_gui(args.setup)

@@ -172,12 +172,16 @@ shop_catalog! {
     get_preferences [true] "Inspect viewport, snapping, simulation, pane and session preferences." {} |c,_a| {serialized(&c.settings)}
     update_preferences [false] "Patch preferences and clamp numeric values to supported ranges." {"patch":object("Partial Settings fields")} |c,a| {
         let mut settings:crate::Settings=patched(c.settings,a.get("patch")?)?;
+        if settings.mcp_enabled != c.settings.mcp_enabled {
+            return Err("Change MCP access in the desktop Preferences.".into());
+        }
         settings.settings_version=crate::SETTINGS_VERSION; settings.clamp_all();
         c.controller.set_simulation_accuracy(settings.simulation.accuracy); *c.settings=settings;
         serialized(&c.settings)
     }
     restore_preferences [false] "Restore default preferences in this session." {} |c,_a| {
-        *c.settings=crate::Settings::default(); c.controller.set_simulation_accuracy(c.settings.simulation.accuracy); serialized(&c.settings)
+        *c.settings=crate::Settings{mcp_enabled:c.settings.mcp_enabled,..Default::default()};
+        c.controller.set_simulation_accuracy(c.settings.simulation.accuracy); serialized(&c.settings)
     }
     save_shop [false] "Persist the current tool library, machine library and preferences to their normal per-user files." {} |c,_a| {
         // Use fallible writes so an MCP caller never receives success for an I/O failure.

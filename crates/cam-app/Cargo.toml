@@ -25,7 +25,7 @@ path = "src/mcp_main.rs"
 default = []
 # Native CAD is optional; planar/headless builds need no OCCT SDK.
 occt = ["cam-kernel/occt", "cam-import/occt"]
-gui = ["dep:iced", "dep:wgpu", "dep:rfd", "cam-render/gpu"]
+gui = ["dep:getrandom", "dep:iced", "dep:tempfile", "dep:wgpu", "dep:rfd", "cam-render/gpu"]
 
 [dependencies]
 rayon.workspace = true
@@ -41,6 +41,8 @@ cam-render = { path = "../cam-render" }
 cam-sim = { path = "../cam-sim" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+getrandom = { version = "0.3", features = ["std"], optional = true }
+tempfile = { version = "3", optional = true }
 zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
 iced = { version = "0.14", features = ["wgpu", "svg", "canvas", "tokio", "advanced"], optional = true }
 wgpu = { version = "27", optional = true }

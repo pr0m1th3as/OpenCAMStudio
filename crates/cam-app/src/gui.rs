@@ -14,6 +14,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[path = "gui_preferences.rs"]
+mod preferences;
+
 #[path = "gui_mcp.rs"]
 mod mcp;
 
@@ -452,15 +455,20 @@ const SAMPLE_DXF: &str = "\
 
 /// Launch the desktop application.
 pub fn run() -> iced::Result {
-    run_app(App::new)
+    run_app(|| {
+        let (mut app, task) = App::new();
+        app.restore_local_mcp();
+        (app, task)
+    })
 }
 
 /// Open a saved setup/project before launching the desktop application.
 /// Load errors are returned before creating a window so automation can detect them.
 pub fn run_with_setup(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let initial = App::new_with_setup(path)
+    let (mut app, task) = App::new_with_setup(path)
         .map_err(|error| format!("Could not load setup {}: {error}", path.display()))?;
-    let initial = std::cell::RefCell::new(Some(initial));
+    app.restore_local_mcp();
+    let initial = std::cell::RefCell::new(Some((app, task)));
     run_app(move || initial.borrow_mut().take().expect("application boots once"))?;
     Ok(())
 }
@@ -478,16 +486,44 @@ pub fn run_with_mcp(path: Option<&Path>) -> Result<(), Box<dyn std::error::Error
 }
 
 fn run_app(boot: impl iced::application::BootFn<App, Message> + 'static) -> iced::Result {
-    iced::application(boot, App::update, App::view)
-        .title(App::window_title)
-        .theme(theme)
-        .subscription(App::subscription)
-        .exit_on_close_request(false)
-        .run()
+    iced::daemon(
+        move || {
+            let (mut app, task) = boot.boot();
+            let (id, open) = iced::window::open(iced::window::Settings {
+                exit_on_close_request: false,
+                ..Default::default()
+            });
+            app.main_window = Some(id);
+            (app, open.discard().chain(task))
+        },
+        App::update,
+        App::window_view,
+    )
+    .title(App::title_for_window)
+    .theme(|app: &App, id| {
+        if app.is_preferences_window(id) {
+            preferences::theme()
+        } else {
+            iced::Theme::Dark
+        }
+    })
+    .subscription(App::subscription)
+    .run()
 }
 
-fn theme(_state: &App) -> iced::Theme {
-    iced::Theme::Dark
+fn window_events(
+    window: iced::window::Id,
+    handle: fn(iced::Event, iced::event::Status) -> Option<Message>,
+) -> iced::Subscription<Message> {
+    iced::event::listen_with(|event, status, id| Some((id, event, status)))
+        .with((window, handle))
+        .filter_map(|((window, handle), (id, event, status))| {
+            if window == id {
+                handle(event, status)
+            } else {
+                None
+            }
+        })
 }
 
 /// Prompt (native dialog) for an existing file matching `exts`, returning its path.
@@ -2190,7 +2226,9 @@ struct App {
     controller: AppController,
     pending_discard: Option<DiscardAction>,
     discarding_confirmed: bool,
-    mcp: Option<std::sync::mpsc::Receiver<mcp::Request>>,
+    mcp: Option<mcp::DesktopMcp>,
+    mcp_feedback: Option<String>,
+    mcp_task: iced::Task<Message>,
     viewport_cache: std::cell::RefCell<Option<(workspace_view::ViewportKey, Viewport)>>,
     profile_contour_cache: std::cell::RefCell<profile_sides::ProfileContourCache>,
     cad_scene_cache: std::cell::RefCell<Option<(workspace_view::CadSceneKey, Arc<CadScene>)>>,
@@ -2286,11 +2324,8 @@ struct App {
     project_px: f32,
     inspector_px: f32,
     output_px: f32,
-    /// The preferences panel is open.
-    show_prefs: bool,
-    shortcut_capture: Option<&'static str>,
-    shortcut_feedback: String,
-    show_stock_palette: bool,
+    main_window: Option<iced::window::Id>,
+    preferences: Option<preferences::Preferences>,
     /// Every machine this installation knows about. The **active** one is mirrored into
     /// the controller (which gates exports against it); this is the set to pick from.
     machines: crate::MachineLibrary,
@@ -3085,33 +3120,16 @@ enum Message {
     /// A continuous control has settled (slider released) — write preferences now
     /// rather than on every intermediate value.
     SettingsSettled,
-    SetNumberDecimals(u8),
     /// Make this machine the active one — and adopt its control with it.
     ActiveMachineChanged(String),
     /// Add a machine to the library: a copy of the active one, ready to edit.
     NewMachine,
     /// Remove the active machine (never the last).
     DeleteMachine,
-    /// Open / close the preferences panel.
     ShowPrefs,
-    ClosePrefs,
-    CaptureShortcut(&'static str),
-    ClearShortcut(&'static str),
+    Preferences(preferences::Edit),
     ShortcutKey(Option<char>, iced::keyboard::Modifiers),
-    /// Pickbox aperture, logical px. The object-snap catch distance follows it.
-    SetPickbox(f32),
-    /// Snap marker size, as a multiple of the catch aperture.
-    SetMarkerScale(f32),
-    /// The smallest `pane` may be dragged to, logical px.
-    /// Workpiece-origin marker size, as a multiple of the shipped size.
-    SetOriginMarker(f32),
-    /// Stock surface RGB channel, in the range 0–1.
-    ToggleStockPalette,
-    SetStockColor([f32; 3]),
-    SetStockTransparency(f32),
     SetSimulationAccuracy(f32),
-    /// Put every preference back to its shipped value.
-    RestoreDefaults,
     PaneResized(pane_grid::ResizeEvent),
     PaneDragged(pane_grid::DragEvent),
     /// The window was resized (tracked for pixel-accurate pane minimums).
@@ -3872,6 +3890,8 @@ impl App {
             pending_discard: None,
             discarding_confirmed: false,
             mcp: None,
+            mcp_feedback: None,
+            mcp_task: iced::Task::none(),
             viewport_cache: Default::default(),
             profile_contour_cache: Default::default(),
             cad_scene_cache: Default::default(),
@@ -3953,10 +3973,8 @@ impl App {
             inspector_active: false,
             inspector_enabled: true,
             show_license: false,
-            show_prefs: false,
-            shortcut_capture: None,
-            shortcut_feedback: String::new(),
-            show_stock_palette: false,
+            main_window: None,
+            preferences: None,
             window: iced::Size::new(1280.0, 800.0),
             project_px: settings.panes.project_px,
             inspector_px: settings.panes.inspector_px,
@@ -4113,10 +4131,12 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> iced::Task<Message> {
-        if matches!(message, Message::CadEscape) && self.shortcut_capture.is_some() {
-            self.shortcut_capture = None;
-            self.shortcut_feedback = "Shortcut change cancelled.".into();
-            return iced::Task::none();
+        match message {
+            Message::Preferences(edit) => return self.edit_preferences(edit),
+            Message::CloseRequested(id) if self.is_preferences_window(id) => {
+                return self.close_preferences();
+            }
+            _ => {}
         }
         if matches!(message, Message::CadEscape) && self.operation_rename.is_some() {
             self.operation_rename = None;
@@ -4147,11 +4167,14 @@ impl App {
         }
         // Handle window-manager close requests even when another editor/dialog is open.
         if let Message::CloseRequested(id) = message {
+            if self.main_window.is_some_and(|main| id != main) {
+                return iced::Task::none();
+            }
             if !self.discarding_confirmed && self.has_changes_to_discard() {
                 self.pending_discard = Some(DiscardAction::Close(id));
                 return iced::Task::none();
             }
-            return iced::window::close(id);
+            return iced::exit();
         }
         if matches!(message, Message::PollMcp) {
             return self.poll_mcp();
@@ -8077,12 +8100,6 @@ impl App {
                 // decision. `SettingsSettled` fires on release.
                 self.gizmo_size = v.clamp(GIZMO_SIZE_MIN, GIZMO_SIZE_MAX)
             }
-            Message::SetNumberDecimals(digits) => {
-                self.settings.number_decimals = digits.min(8);
-                self.edited_preset_input = None;
-                self.edited_tool_input = None;
-                self.remember();
-            }
             Message::SettingsSettled => {
                 if self
                     .controller
@@ -8141,74 +8158,22 @@ impl App {
                     self.status = format!("Machine: {}.", self.active_machine);
                 }
             }
-            Message::ShowPrefs => self.show_prefs = true,
-            Message::ClosePrefs => {
-                self.shortcut_capture = None;
-                self.show_prefs = false;
-                self.show_stock_palette = false;
-                self.remember();
-            }
-            Message::CaptureShortcut(id) => {
-                self.shortcut_capture = Some(id);
-                self.shortcut_feedback = "Press a shortcut, or Escape to cancel.".into();
-            }
-            Message::ClearShortcut(id) => {
-                self.settings.shortcuts.insert(id.into(), String::new());
-                self.shortcut_capture = None;
-                self.shortcut_feedback = "Shortcut cleared.".into();
-                self.settings.save();
-            }
+            Message::ShowPrefs => return self.open_preferences(),
+            Message::Preferences(_) => unreachable!(),
             Message::ShortcutKey(key, modifiers) => {
-                if let Some(id) = self.shortcut_capture {
-                    if let Some(binding) = shortcut_binding(key, modifiers) {
-                        if ["Cmd+A", "Cmd+C", "Cmd+V", "Cmd+X"].contains(&binding.as_str()) {
-                            self.shortcut_feedback =
-                                "That shortcut is reserved for text editing.".into();
-                        } else if let Some((_, label, _)) =
-                            SHORTCUTS.iter().find(|(other, _, _)| {
-                                *other != id && shortcut_value(&self.settings, other) == binding
-                            })
-                        {
-                            self.shortcut_feedback =
-                                format!("Already assigned to {label}. Choose another shortcut.");
-                        } else {
-                            self.settings.shortcuts.insert(id.into(), binding);
-                            self.shortcut_capture = None;
-                            self.shortcut_feedback = "Shortcut saved.".into();
-                            self.settings.save();
-                        }
-                    } else {
-                        self.shortcut_feedback =
-                            "Use Command/Ctrl with a letter or number, optionally with Shift."
-                                .into();
-                    }
-                } else if !self.show_prefs {
-                    if let Some(binding) = shortcut_binding(key, modifiers) {
-                        if let Some(id) = shortcut_for_binding(&self.settings, &binding) {
-                            if let Some(action) = shortcut_action(id) {
-                                if !matches!(action, Message::BeginOp(_))
-                                    || (self.controller.has_geometry()
-                                        && !self.controller.setups().is_empty()
-                                        && !self.library.tools.is_empty())
-                                {
-                                    return self.update(action);
-                                }
+                if let Some(binding) = shortcut_binding(key, modifiers) {
+                    if let Some(id) = shortcut_for_binding(&self.settings, &binding) {
+                        if let Some(action) = shortcut_action(id) {
+                            if !matches!(action, Message::BeginOp(_))
+                                || (self.controller.has_geometry()
+                                    && !self.controller.setups().is_empty()
+                                    && !self.library.tools.is_empty())
+                            {
+                                return self.update(action);
                             }
                         }
                     }
                 }
-            }
-            Message::SetPickbox(v) => {
-                let (lo, hi) = crate::PICKBOX_RANGE;
-                self.settings.snapping.pickbox_px = v.clamp(lo, hi);
-            }
-            Message::SetMarkerScale(v) => {
-                let (lo, hi) = crate::MARKER_SCALE_RANGE;
-                self.settings.snapping.marker_scale = v.clamp(lo, hi);
-            }
-            Message::SetOriginMarker(v) => {
-                let (lo, hi) = crate::ORIGIN_MARKER_RANGE;
-                self.settings.view.origin_marker_scale = v.clamp(lo, hi);
             }
             Message::SetSimulationAccuracy(value) => {
                 let (lo, hi) = crate::SIMULATION_ACCURACY_RANGE;
@@ -8216,51 +8181,6 @@ impl App {
                 if let Some(player) = &mut self.simulation {
                     player.options.accuracy = self.settings.simulation.accuracy;
                 }
-            }
-            Message::ToggleStockPalette => self.show_stock_palette = !self.show_stock_palette,
-            Message::SetStockColor(color) => {
-                self.settings.view.stock_color = color;
-                if let Some(player) = &mut self.simulation {
-                    player.configure(&self.settings.simulation, color);
-                }
-                self.show_stock_palette = false;
-                self.remember();
-            }
-            Message::SetStockTransparency(value) => {
-                self.settings.view.stock_transparency = value.clamp(0.0, 1.0);
-            }
-            Message::RestoreDefaults => {
-                // The only escape from a layout the user cannot otherwise undo, so it
-                // resets *everything* — pane sizes and minimums included — and applies
-                // at once rather than behind a confirm they might not be able to reach.
-                self.shortcut_capture = None;
-                self.shortcut_feedback.clear();
-                self.settings = crate::Settings::default();
-                self.restore_tool_table_preferences();
-                self.edited_preset_input = None;
-                self.edited_tool_input = None;
-                let s = &self.settings;
-                self.show_stock = s.view.show_stock;
-                self.show_gizmo = s.view.show_gizmo;
-                self.show_origin = s.view.show_origin;
-                self.tooltips = s.view.tooltips;
-                self.gizmo_size = s.view.gizmo_size;
-                self.snaps = s.snapping.default_snaps.clone();
-                // origin_marker_scale and the default post are read straight from
-                // `settings` wherever they are used, so resetting the struct is enough.
-                self.project_px = s.panes.project_px;
-                self.inspector_px = s.panes.inspector_px;
-                self.output_px = s.panes.output_px;
-                self.restore_pane_preferences();
-                self.apply_fixed_layout();
-                if self
-                    .controller
-                    .set_simulation_accuracy(self.settings.simulation.accuracy)
-                {
-                    self.rerun();
-                }
-                self.settings.save();
-                self.status = "Preferences restored to defaults.".to_string();
             }
             Message::PaneResized(pane_grid::ResizeEvent { split, ratio }) => {
                 let ratio = self.clamp_resize(split, ratio);
@@ -9250,87 +9170,86 @@ impl App {
             } else {
                 iced::Subscription::none()
             },
-            iced::window::resize_events().map(|(_id, size)| Message::WindowResized(size)),
-            iced::event::listen_with(|event, _, _| match event {
-                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
-                    iced::mouse::Button::Left,
-                ))
-                | iced::Event::Keyboard(iced::keyboard::Event::KeyReleased { .. }) => {
-                    Some(Message::CheckHeightFocus)
-                }
-                _ => None,
-            }),
-            iced::event::listen_with(|event, _, _| match event {
-                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
-                    iced::mouse::Button::Left,
-                )) => Some(Message::CheckOperationRenameFocus),
-                _ => None,
-            }),
-            iced::event::listen_with(|event, _, _| match event {
-                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
-                    iced::mouse::Button::Left,
-                )) => Some(Message::ToolColumnRelease),
-                _ => None,
-            }),
-            if self.shortcut_capture.is_some() {
-                iced::event::listen_with(|event, status, _| match event {
-                    iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                        key: iced::keyboard::Key::Character(key),
-                        modifiers,
-                        repeat: false,
-                        ..
-                    }) if status == iced::event::Status::Captured => {
-                        Some(Message::ShortcutKey(key.chars().next(), modifiers))
-                    }
-                    _ => None,
-                })
-            } else {
-                iced::Subscription::none()
-            },
-            // Track the window-absolute cursor so overlays (the op context menu)
-            // anchor exactly under the pointer — widget-local positions are offset
-            // by the pane's origin, which is what caused the menu to appear astray.
-            iced::event::listen_with(|event, status, _window| match event {
-                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
-                    iced::mouse::Button::Left,
-                )) => Some(Message::Tree(TreeMessage::Release)),
-                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
-                    Some(Message::WindowCursor(position))
-                }
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Character(key),
-                    modifiers,
-                    repeat: false,
-                    ..
-                }) if status == iced::event::Status::Ignored => {
-                    Some(Message::ShortcutKey(key.chars().next(), modifiers))
-                }
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
-                    modifiers,
-                    ..
-                }) if status == iced::event::Status::Ignored
-                    && !modifiers.control()
-                    && !modifiers.alt()
-                    && !modifiers.logo() =>
-                {
-                    Some(Message::TraverseFocus(modifiers.shift()))
-                }
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::F8),
-                    ..
-                }) => Some(Message::ToggleStock),
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
-                    ..
-                }) => Some(Message::CadEscape),
-                // Live modifiers, so an op-row click can tell plain from ⌘/Ctrl.
-                iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(m)) => {
-                    Some(Message::ModifiersChanged(m))
-                }
-                _ => None,
-            }),
+            self.preferences
+                .as_ref()
+                .map_or_else(iced::Subscription::none, |prefs| {
+                    window_events(prefs.id, preferences::keyboard_event)
+                }),
+            self.main_window
+                .map_or_else(iced::Subscription::none, |id| {
+                    iced::Subscription::batch([
+                        window_events(id, Self::main_window_event),
+                        window_events(id, |event, _| match event {
+                            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                                iced::mouse::Button::Left,
+                            ))
+                            | iced::Event::Keyboard(iced::keyboard::Event::KeyReleased {
+                                ..
+                            }) => Some(Message::CheckHeightFocus),
+                            _ => None,
+                        }),
+                        window_events(id, |event, _| match event {
+                            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                                iced::mouse::Button::Left,
+                            )) => Some(Message::CheckOperationRenameFocus),
+                            _ => None,
+                        }),
+                        window_events(id, |event, _| match event {
+                            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                                iced::mouse::Button::Left,
+                            )) => Some(Message::ToolColumnRelease),
+                            _ => None,
+                        }),
+                    ])
+                }),
         ])
+    }
+
+    fn main_window_event(event: iced::Event, status: iced::event::Status) -> Option<Message> {
+        match event {
+            iced::Event::Window(iced::window::Event::Resized(size)) => {
+                Some(Message::WindowResized(size))
+            }
+            // Track the window-absolute cursor so overlays anchor under the pointer.
+            iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+                Some(Message::WindowCursor(position))
+            }
+            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => {
+                Some(Message::Tree(TreeMessage::Release))
+            }
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Character(key),
+                modifiers,
+                repeat: false,
+                ..
+            }) if status == iced::event::Status::Ignored => {
+                Some(Message::ShortcutKey(key.chars().next(), modifiers))
+            }
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
+                modifiers,
+                ..
+            }) if status == iced::event::Status::Ignored
+                && !modifiers.control()
+                && !modifiers.alt()
+                && !modifiers.logo() =>
+            {
+                Some(Message::TraverseFocus(modifiers.shift()))
+            }
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::F8),
+                ..
+            }) => Some(Message::ToggleStock),
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                ..
+            }) => Some(Message::CadEscape),
+            // Live modifiers, so an op-row click can tell plain from ⌘/Ctrl.
+            iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(m)) => {
+                Some(Message::ModifiersChanged(m))
+            }
+            _ => None,
+        }
     }
 
     /// Clamp a split's new `ratio` so neither side falls below its panes' pixel
@@ -11075,6 +10994,24 @@ impl App {
         };
     }
 
+    fn title_for_window(&self, id: iced::window::Id) -> String {
+        if self.is_preferences_window(id) {
+            "Preferences".into()
+        } else {
+            self.window_title()
+        }
+    }
+
+    fn window_view(&self, id: iced::window::Id) -> Element<'_, Message> {
+        if let Some(prefs) = self.preferences.as_ref().filter(|prefs| prefs.id == id) {
+            prefs.view(self).map(Message::Preferences)
+        } else if self.main_window == Some(id) {
+            self.view()
+        } else {
+            Space::new().into()
+        }
+    }
+
     fn window_title(&self) -> String {
         let project_name = self
             .controller
@@ -11157,11 +11094,6 @@ impl App {
         }
         if let Some(pickbox) = self.pickbox_overlay() {
             layers = layers.push(pickbox);
-        }
-        if let Some(card) = self.prefs_overlay() {
-            let catcher = mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
-                .on_press(Message::ClosePrefs);
-            layers = layers.push(catcher).push(card);
         }
         if let Some(card) = self.license_overlay() {
             // Same catcher pattern as the menus: a click anywhere off the card closes.
@@ -11269,300 +11201,6 @@ impl App {
                     .align_y(Alignment::Center)
             ]
             .into(),
-        )
-    }
-
-    /// The preferences panel. `None` unless open.
-    ///
-    /// **Only settings with no other control appear here.** The View ribbon already
-    /// toggles stock/cube/origin/tips and sizes the cube, and the snap buttons arm the
-    /// object snaps — duplicating those would create two places to change one thing and
-    /// the inevitable question of which is authoritative. What has no home anywhere
-    /// else includes picking tolerances and stock appearance.
-    ///
-    /// **Live-apply, not Apply-on-dirty.** The two-commit-class convention governs edits
-    /// to the *model* — the thing that becomes G-code. These are not that, and a
-    /// tolerance you cannot see change while dragging is a tolerance you cannot set.
-    fn prefs_overlay(&self) -> Option<Element<'_, Message>> {
-        if !self.show_prefs {
-            return None;
-        }
-        let heading = |t: &'static str| text(t).size(14);
-        let note = |t: String| text(t).size(11);
-
-        // A labelled slider with its value shown, the shape every row here takes.
-        let row_for = |label: &'static str,
-                       range: (f32, f32),
-                       value: f32,
-                       step: f32,
-                       shown: String,
-                       msg: fn(f32) -> Message|
-         -> Element<'_, Message> {
-            row![
-                text(label).size(12).width(Length::Fixed(150.0)),
-                slider(range.0..=range.1, value, msg)
-                    .step(step)
-                    .on_release(Message::SettingsSettled)
-                    .width(Length::Fixed(190.0)),
-                text(shown).size(12).width(Length::Fixed(64.0)),
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center)
-            .into()
-        };
-
-        let snapping = column![
-            heading("Picking and snapping"),
-            row_for(
-                "Pickbox size",
-                crate::PICKBOX_RANGE,
-                self.settings.snapping.pickbox_px,
-                1.0,
-                format!("{:.0} px", self.settings.snapping.pickbox_px),
-                Message::SetPickbox,
-            ),
-            // Shown, not settable. The catch distance is a fixed multiple of the
-            // pickbox on purpose: two absolute knobs would let it be set *smaller*
-            // than the box that feeds it. Showing the derived number keeps the
-            // relationship visible instead of merely documented.
-            note(format!(
-                "Object snaps catch within {:.0} px — {:.1}× the pickbox.",
-                self.settings.snap_catch_px(),
-                crate::SNAP_CATCH_MULTIPLE,
-            )),
-            row_for(
-                "Snap marker size",
-                crate::MARKER_SCALE_RANGE,
-                self.settings.snapping.marker_scale,
-                0.1,
-                format!("{:.1}×", self.settings.snapping.marker_scale),
-                Message::SetMarkerScale,
-            ),
-            row_for(
-                "Origin marker size",
-                crate::ORIGIN_MARKER_RANGE,
-                self.settings.view.origin_marker_scale,
-                0.1,
-                format!("{:.1}×", self.settings.view.origin_marker_scale),
-                Message::SetOriginMarker,
-            ),
-        ]
-        .spacing(6);
-
-        let [r, g, b] = self.settings.view.stock_color;
-        let swatch = button(Space::new().width(42).height(22))
-            .padding(2)
-            .style(move |_, _| iced::widget::button::Style {
-                background: Some(Background::Color(Color::from_rgb(r, g, b))),
-                border: Border {
-                    color: Color::WHITE,
-                    width: 1.0,
-                    radius: 3.0.into(),
-                },
-                ..Default::default()
-            })
-            .on_press(Message::ToggleStockPalette);
-        let mut stock = column![
-            row![
-                heading("Stock color"),
-                swatch,
-                text("Click to choose a color").size(11)
-            ]
-            .spacing(12)
-            .align_y(Alignment::Center),
-            row_for(
-                "Transparency",
-                (0.0, 1.0),
-                self.settings.view.stock_transparency,
-                0.01,
-                format!("{:.0}%", self.settings.view.stock_transparency * 100.0),
-                Message::SetStockTransparency,
-            ),
-            note("Used when transparent stock is enabled.".into()),
-        ]
-        .spacing(6);
-        if self.show_stock_palette {
-            // A grid of hue, saturation and brightness choices, plus neutral grays.
-            for level in 0..6 {
-                let mut colors = row![].spacing(3);
-                for hue in 0..12 {
-                    let h = hue as f32 / 2.0;
-                    let c = if level < 3 {
-                        1.0 - level as f32 * 0.25
-                    } else {
-                        1.0
-                    };
-                    let value = if level < 3 {
-                        1.0
-                    } else {
-                        1.0 - (level - 2) as f32 * 0.22
-                    };
-                    let x = c * (1.0 - ((h % 2.0) - 1.0).abs());
-                    let (rr, gg, bb) = match hue / 2 {
-                        0 => (c, x, 0.0),
-                        1 => (x, c, 0.0),
-                        2 => (0.0, c, x),
-                        3 => (0.0, x, c),
-                        4 => (x, 0.0, c),
-                        _ => (c, 0.0, x),
-                    };
-                    let m = 1.0 - c;
-                    let color = [(rr + m) * value, (gg + m) * value, (bb + m) * value];
-                    colors = colors.push(
-                        button(Space::new().width(26).height(20))
-                            .padding(0)
-                            .style(move |_, _| iced::widget::button::Style {
-                                background: Some(Background::Color(Color::from_rgb(
-                                    color[0], color[1], color[2],
-                                ))),
-                                border: Border {
-                                    color: Color::from_rgb(0.4, 0.4, 0.4),
-                                    width: 1.0,
-                                    radius: 2.0.into(),
-                                },
-                                ..Default::default()
-                            })
-                            .on_press(Message::SetStockColor(color)),
-                    );
-                }
-                stock = stock.push(colors);
-            }
-            let mut grays = row![].spacing(3);
-            for n in 0..12 {
-                let v = n as f32 / 11.0;
-                let color = [v, v, v];
-                grays = grays.push(
-                    button(Space::new().width(26).height(20))
-                        .padding(0)
-                        .style(move |_, _| iced::widget::button::Style {
-                            background: Some(Background::Color(Color::from_rgb(v, v, v))),
-                            border: Border {
-                                color: Color::from_rgb(0.4, 0.4, 0.4),
-                                width: 1.0,
-                                radius: 2.0.into(),
-                            },
-                            ..Default::default()
-                        })
-                        .on_press(Message::SetStockColor(color)),
-                );
-            }
-            stock = stock.push(grays);
-        }
-
-        let simulation = column![
-            heading("Stock cut simulation"),
-            row_for(
-                "Accuracy",
-                crate::SIMULATION_ACCURACY_RANGE,
-                self.settings.simulation.accuracy,
-                0.25,
-                format!("{:.2}×", self.settings.simulation.accuracy),
-                Message::SetSimulationAccuracy,
-            ),
-            note("Higher accuracy resolves finer cuts and uses more time and memory. Rebuilds the simulation when released; also applies to playback.".into()),
-        ].spacing(6);
-
-        let btn = |label: &'static str, msg: Message| {
-            button(
-                text(label)
-                    .size(13)
-                    .line_height(iced::widget::text::LineHeight::Relative(1.0))
-                    .align_y(Alignment::Center),
-            )
-            .padding(Padding::from([5.0, 14.0]))
-            .on_press(msg)
-        };
-
-        let mut shortcuts = column![heading("Keyboard shortcuts"), note("Select Change, then press Command/Ctrl and a letter or number (Shift is optional). Escape cancels.".into())].spacing(5);
-        for &(id, label, _) in SHORTCUTS {
-            let shown = if self.shortcut_capture == Some(id) {
-                "Press shortcut…".to_string()
-            } else {
-                display_shortcut(shortcut_value(&self.settings, id))
-            };
-            shortcuts = shortcuts.push(
-                row![
-                    text(label).size(12).width(160),
-                    text(shown).size(12).width(150),
-                    button(text("Change").size(12)).on_press(Message::CaptureShortcut(id)),
-                    button(text("Clear").size(12)).on_press(Message::ClearShortcut(id)),
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center),
-            );
-        }
-        shortcuts = shortcuts.push(text(&self.shortcut_feedback).size(11));
-
-        let card = container(
-            column![
-                text("Preferences").size(20),
-                note(
-                    "Saved to settings.json in your configuration folder, and applied as \
-                     you change them."
-                        .to_string()
-                ),
-                scrollable(
-                    column![
-                        column![
-                            heading("Number display"),
-                            row![
-                                text("Decimal places").size(12).width(150),
-                                pick_list(
-                                    (0u8..=8).collect::<Vec<_>>(),
-                                    Some(self.settings.number_decimals),
-                                    Message::SetNumberDecimals,
-                                )
-                                .text_size(12)
-                                .padding([7, 9])
-                                .style(inspector_picker)
-                                .width(100),
-                            ]
-                            .spacing(10)
-                            .align_y(Alignment::Center),
-                        ]
-                        .spacing(6),
-                        snapping,
-                        stock,
-                        simulation,
-                        shortcuts
-                    ]
-                    .spacing(12)
-                )
-                .height(Length::Shrink),
-                row![
-                    // Left, away from Close: it is destructive, and the two should not
-                    // be adjacent when one of them is the escape from an unusable layout.
-                    btn("Restore defaults", Message::RestoreDefaults),
-                    Space::new().width(Length::Fill),
-                    btn("Close", Message::ClosePrefs),
-                ]
-                .align_y(Alignment::Center),
-            ]
-            .spacing(12)
-            .padding(4),
-        )
-        .width(520)
-        .max_height((self.window.height - 40.0).max(200.0))
-        .padding(16)
-        .style(|theme: &iced::Theme| container::Style {
-            background: Some(Background::Color(
-                theme.extended_palette().background.weak.color,
-            )),
-            border: Border {
-                color: theme.extended_palette().background.strong.color,
-                width: 1.0,
-                radius: 6.0.into(),
-            },
-            ..Default::default()
-        });
-
-        Some(
-            container(card)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .align_x(Alignment::Center)
-                .align_y(Alignment::Center)
-                .into(),
         )
     }
 

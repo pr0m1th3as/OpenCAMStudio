@@ -381,8 +381,8 @@ a different machine legitimately changes the height of its lifts.
 
 ### Preferences
 
-**Preferences** sits beside **About**, right of the ribbon tabs. It holds the settings
-that have no other control:
+**Preferences** sits beside **About**, right of the ribbon tabs. It opens a separate
+window with General, Snapping, Stock, Simulation, Shortcuts, and MCP tabs.
 
 - **Pickbox size** — the aperture of the square that follows the cursor during a pick.
   Its half-size is also the vertex-snap tolerance. The object-snap catch distance is
@@ -423,9 +423,9 @@ group, and it is remembered between runs as where you left off — not nominated
 default. Neither creating a project nor opening someone else's changes it: which control
 you cut on is a property of your shop.
 
-Changes apply as you drag, and are written when you let go. **Restore defaults** puts
-everything back — including the pane sizes and minimums, since it is the way out of a
-layout that has left no room for the viewport.
+**OK** applies and saves your edits across all tabs. **Cancel** and the window's close
+button discard pending edits. **Restore defaults** stages a reset including pane sizes
+and minimums. Click **OK** to confirm the reset.
 
 Everything else that is remembered has its control where you already use it: the View
 toggles, the cube-size slider, the armed object snaps and the pane sizes you drag to
@@ -526,14 +526,11 @@ can be hidden, and a refusal is the one message that must not be missable.
 Because the GUI is the one part that cannot be verified by automated tests, the
 things worth eyeballing:
 
-- **The Preferences panel:** open it (beside About). Drag **Pickbox size** and watch
-  the pick square change *while you drag* — then check the catch-distance line beneath
-  it tracks the pickbox rather than standing still. Drag a **pane minimum** up and
-  confirm that divider now refuses to go past it. Then the escape hatch: push every
-  pane minimum to maximum until the viewport is unusable, and confirm **Restore
-  defaults** gets you back in one click without a confirmation step you might not be
-  able to reach. Check the pane rows name their axis — **Output (height)**, the rest
-  **(width)**. Drag **Origin marker size** and watch the datum cross grow.
+- **Preferences:** open it beside About, then adjust **Pickbox size** under **Snapping**
+  and check that the catch distance updates in the window. Switch tabs and return to
+  verify that the draft is retained. Click **Cancel** and reopen to verify the original
+  value, then repeat with **OK** to verify the new value is saved. **Restore defaults**
+  requires **OK** to reset the layout and other settings.
 - **Apply means Apply:** on the Machinery tab, type a new machine name — **Apply** must
   light up, and the name must *not* change until you click it. Same for the post. Then
   switch machines with *Active* mid-edit: the pending edit should be dropped, not carried
@@ -651,10 +648,9 @@ things worth eyeballing:
   slopes from the selected toolpaths in the configured stock colour (green by
   default). Earlier unselected operations stay grey, including upper wall sections
   when a later operation deepens a pocket; rewinding restores the grey stock.
-  Transparency applies to both colours. Preferences → Stock cut
-  simulation → Accuracy adjusts grid density from 0.25× to 2×; higher values resolve
-  smaller cuts and use more time and memory. Releasing the slider rebuilds the
-  simulation. Playback uses the same grid as the completed preview, with cached
+  Transparency applies to both colours. The Accuracy slider under **Preferences → Simulation**
+  adjusts grid density from 0.25× to 2×. Higher values resolve smaller cuts and use
+  more time and memory. Clicking **OK** applies the selected accuracy. Playback uses the same grid as the completed preview, with cached
   complete moves and bounded checkpoints for seeking. Cut walls recover sub-cell
   contours from cutter sweeps; flat areas are merged into compact mesh patches.
   Verification still uses the sampled stock heights, within the same cell budget.

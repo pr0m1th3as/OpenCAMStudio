@@ -27,6 +27,9 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run(args: cli::Args) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(cli::ConnectDesktop { port }) = args.mcp_connect {
+        return cam_app::mcp::connect_desktop(port);
+    }
     if args.mcp_gui {
         #[cfg(feature = "gui")]
         return cam_app::gui::run_with_mcp(args.setup.as_deref());
