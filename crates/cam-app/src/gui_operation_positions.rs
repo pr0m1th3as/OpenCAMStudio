@@ -47,16 +47,21 @@ fn set_end(op: &mut Operation, point: Option<[f64; 2]>) {
 impl App {
     pub(super) fn operation_position_controls(&self, op: &Operation) -> Element<'_, Message> {
         let mut controls = iced::widget::Column::new().spacing(6);
+        let spiral = matches!(op, Operation::Spiral(_));
         for (kind, title, point) in [
             (
                 PositionKind::Entry,
-                "Lead-in position",
+                if spiral {
+                    "Spiral center"
+                } else {
+                    "Lead-in position"
+                },
                 operation_tabs::operation_start(op),
             ),
             (PositionKind::Exit, "Lead-out position", operation_end(op)),
         ] {
             if kind == PositionKind::Exit
-                && matches!(op, Operation::Parallel(p) if p.params.scallop)
+                && (spiral || matches!(op, Operation::Parallel(p) if p.params.scallop))
             {
                 continue;
             }
@@ -65,7 +70,11 @@ impl App {
                 row![
                     label_help(
                         title,
-                        "Select a point on the model: blue = entry, orange = exit. Positions resolve to eligible toolpath points. Use × to restore automatic placement.",
+                        if spiral {
+                            "Pick the center on the model. Clear the pick to use the center of the selected geometry."
+                        } else {
+                            "Select a point on the model: blue = entry, orange = exit. Positions resolve to eligible toolpath points. Use × to restore automatic placement."
+                        },
                         self.tooltips,
                     ),
                     help_wrap(
@@ -194,7 +203,9 @@ impl App {
         self.refresh_operation_fields();
         self.status = format!(
             "Preferred {} selected. Apply changes to save the operation.",
-            if kind == PositionKind::Entry {
+            if self.geometry_operation_kind() == Some(OpKind::Spiral) {
+                "spiral center"
+            } else if kind == PositionKind::Entry {
                 "entry"
             } else {
                 "exit"

@@ -140,6 +140,8 @@ impl OperationCache {
                 if p.clear.lead_in != cam_model::Lead::None || p.clear.lead_out != cam_model::Lead::None)),
             adaptive_domain_revision: if matches!(op, Operation::Parallel(_)) {
                 crate::ParallelStrategy::DOMAIN_REVISION
+            } else if matches!(op, Operation::Spiral(_)) {
+                crate::SpiralStrategy::DOMAIN_REVISION
             } else if matches!(op, Operation::Adaptive(_)) {
                 crate::AdaptiveStrategy::DOMAIN_REVISION
             } else {

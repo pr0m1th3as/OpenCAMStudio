@@ -7,6 +7,9 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use wide::{f64x4, CmpLe};
 mod scallop;
+mod spiral;
+mod surface_passes;
+pub use spiral::SpiralStrategy;
 type V = [f64; 3];
 fn sub(a: V, b: V) -> V {
     std::array::from_fn(|i| a[i] - b[i])
@@ -150,6 +153,16 @@ impl<'a> Grid<'a> {
     /// Cover the projected segment with exact triangle intervals. Even a narrow
     /// gap between two sampled rows must break a local linking chain.
     fn covers_segment(&self, a: V, b: V, cancel: &CancelToken) -> bool {
+        self.covers_segment_where(a, b, |_| true, cancel)
+    }
+
+    fn covers_segment_where(
+        &self,
+        a: V,
+        b: V,
+        allowed: impl Fn(&[V; 3]) -> bool,
+        cancel: &CancelToken,
+    ) -> bool {
         let mid = mul(add(a, b), 0.5);
         let half_xy = (a[0] - b[0]).hypot(a[1] - b[1]) * 0.5;
         let mut intervals = Vec::new();
@@ -159,7 +172,7 @@ impl<'a> Grid<'a> {
             }
             let triangle = &self.mesh[id];
             let normal = cross(sub(triangle[1], triangle[0]), sub(triangle[2], triangle[0]))[2];
-            if normal.abs() < 1e-12 {
+            if normal.abs() < 1e-12 || !allowed(triangle) {
                 continue;
             }
             let mut lo: f64 = 0.;
@@ -338,102 +351,37 @@ impl ParallelStrategy {
         {
             fail!("Parallel tolerance, stepover and feeds must be finite and positive; angle and offset must be finite");
         }
-        let Some(tool) = env.tool(op.tool) else {
-            fail!("Parallel tool is missing");
-        };
-        if tool.kind != ToolKind::BallMill {
-            fail!("3D Parallel currently requires a ball nose end mill");
-        }
-        if !tool.diameter.is_finite() || tool.diameter <= 0. {
-            fail!("Parallel tool diameter must be finite and positive");
-        }
-        if let Err(e) = op.entry_feeds.validate() {
-            fail!(e);
-        }
-        let (radial, axial) = self.stock.effective();
-        if [radial, axial].iter().any(|v| !v.is_finite() || *v < 0.) {
-            fail!("Parallel stock allowances must be finite and nonnegative");
-        }
-        if self.geometry.selected.is_empty() || self.geometry.triangles.is_empty() {
-            fail!("Parallel has no resolved CAD surface");
-        }
-        if self
-            .geometry
-            .triangles
-            .iter()
-            .flatten()
-            .flatten()
-            .any(|v| !v.is_finite())
-        {
-            fail!("Parallel CAD projection contains nonfinite coordinates");
-        }
-        if let Err(e) = self.geometry.heights.validate() {
-            fail!(e);
-        }
-        if !self.geometry.error_bound.is_finite() || self.geometry.error_bound < 0.0 {
-            fail!("Parallel CAD error bound must be finite and nonnegative");
-        }
-        if [
-            tool.length,
-            tool.flute_len(),
-            tool.shank_dia(),
-            tool.neck_dia(),
-        ]
-        .iter()
-        .any(|v| !v.is_finite() || *v < 0.)
-            || tool.flute_len() < tool.radius()
-        {
-            fail!("Parallel requires finite tool dimensions and flutes covering the ball nose");
-        }
-        let r = tool.radius() + radial;
-        let error = self.geometry.error_bound;
-        let contact_radius = r + error;
-        let lift = error + p.tolerance + axial;
-        if !r.is_finite() || !lift.is_finite() {
-            fail!("Parallel cutter envelope is not finite");
-        }
-        let top = self
-            .geometry
-            .triangles
-            .iter()
-            .flatten()
-            .map(|v| v[2])
-            .fold(f64::NEG_INFINITY, f64::max)
-            + lift;
-        let clearance = env.heights.clearance;
-        if !clearance.is_finite() || clearance <= top || clearance <= env.heights.top_of_stock {
-            fail!("Parallel clearance must be above the complete model, allowance and stock");
-        }
-        // The spherical tip is checked against every setup body. A larger shaft
-        // would require a separate swept-holder model and is rejected explicitly.
-        if tool.shank_dia() > tool.diameter + 1e-9 || tool.neck_dia() > tool.diameter + 1e-9 {
-            fail!("Parallel does not yet support shafts wider than the cutter");
-        }
         let angle = if p.scallop { 0. } else { p.angle.to_radians() };
-        let (s, c) = angle.sin_cos();
-        let local = |v: V| [c * v[0] + s * v[1], -s * v[0] + c * v[1], v[2]];
-        let world = |u: f64, v: f64| [c * u - s * v, s * u + c * v, 0.];
-        let mut lo = [f64::INFINITY; 2];
-        let mut hi = [f64::NEG_INFINITY; 2];
-        for v in self.geometry.selected.iter().flatten().copied().map(local) {
-            for a in 0..2 {
-                lo[a] = lo[a].min(v[a]);
-                hi[a] = hi[a].max(v[a]);
+        let projection = match SurfaceProjection::new(
+            "Parallel",
+            &self.geometry,
+            self.stock,
+            env,
+            SurfaceOptions {
+                tool: op.tool,
+                entry_feeds: op.entry_feeds,
+                tolerance: p.tolerance,
+                containment: p.containment,
+                additional_offset: p.additional_offset,
+                angle,
+            },
+            cancel,
+        ) {
+            Ok(projection) => projection,
+            Err(_) if cancel.is_cancelled() => {
+                out.cancelled = true;
+                return out;
             }
-        }
-        let inset = match p.containment {
-            AdaptiveContainment::Inside => r + p.additional_offset,
-            AdaptiveContainment::Center => -p.additional_offset,
-            AdaptiveContainment::Outside => -r - p.additional_offset,
+            Err(reason) => fail!(reason),
         };
-        for a in 0..2 {
-            lo[a] += inset;
-            hi[a] -= inset;
-        }
-        if (0..2).any(|a| lo[a] >= hi[a]) {
-            fail!("Parallel containment leaves no machining area");
-        }
+        let [lo, hi] = projection.bounds;
+        let r = projection.radius;
+        let error = projection.error;
+        let contact_radius = r + error;
+        let lift = error + p.tolerance + projection.axial;
         let step = (r * p.tolerance).sqrt().clamp(0.01, 0.5);
+        let (s, c) = angle.sin_cos();
+        let world = |u: f64, v: f64| [c * u - s * v, s * u + c * v, 0.];
         let rows = ((hi[1] - lo[1]) / p.stepover).ceil() as usize;
         let samples = ((hi[0] - lo[0]) / step).ceil() as usize;
         if !p.scallop
@@ -443,40 +391,11 @@ impl ParallelStrategy {
                 "Parallel exceeds the five-million sample budget; increase stepover or tolerance"
             );
         }
-        let grid = match Grid::new(&self.geometry.triangles, r.max(0.1) * 2., cancel) {
-            Ok(grid) => grid,
-            Err(reason) => {
-                if cancel.is_cancelled() {
-                    out.cancelled = true;
-                    return out;
-                }
-                fail!(reason);
-            }
-        };
-        let selected = match Grid::new(&self.geometry.selected, r.max(0.1) * 2., cancel) {
-            Ok(grid) => grid,
-            Err(reason) => {
-                if cancel.is_cancelled() {
-                    out.cancelled = true;
-                    return out;
-                }
-                fail!(reason);
-            }
-        };
-        let mut linking = PassLinker {
-            grid: &grid,
-            selected: &selected,
-            radius: r,
-            error,
-            axial,
-            clearance,
-            bottom: self.geometry.heights.bottom,
-            top: self.geometry.heights.top,
-            previous: None,
-            passes: 0,
-        };
+        let mut linking = projection.linker();
+        let grid = linking.grid;
+        let selected = linking.selected;
         if p.scallop {
-            return scallop::compute(&grid, &selected, &mut linking, op, lo, hi, cancel);
+            return scallop::compute(grid, selected, &mut linking, op, lo, hi, cancel);
         }
         // Bound queued work by both row count and nominal samples. Indexed
         // collection keeps row order independent of worker scheduling.
@@ -531,7 +450,7 @@ impl ParallelStrategy {
                 if let Some(prev) = path.last().copied() {
                     let previous_length = path.len();
                     if !refine(
-                        &grid,
+                        grid,
                         prev,
                         q,
                         r,
@@ -581,7 +500,7 @@ impl ParallelStrategy {
                 }
             }
         }
-        linking.retract(&mut out, op);
+        linking.retract(&mut out, op.id);
         if cancel.is_cancelled() {
             out.cancelled = true;
             return out;
@@ -597,6 +516,168 @@ impl ParallelStrategy {
         out
     }
 }
+fn containment_inset(containment: AdaptiveContainment, offset: f64, radius: f64) -> f64 {
+    match containment {
+        AdaptiveContainment::Inside => radius + offset,
+        AdaptiveContainment::Center => -offset,
+        AdaptiveContainment::Outside => -radius - offset,
+    }
+}
+
+struct SurfaceOptions {
+    tool: u32,
+    entry_feeds: cam_model::EntryFeeds,
+    tolerance: f64,
+    containment: AdaptiveContainment,
+    additional_offset: f64,
+    angle: f64,
+}
+
+struct SurfaceProjection<'mesh> {
+    grid: Grid<'mesh>,
+    selected: Grid<'mesh>,
+    bounds: [[f64; 2]; 2],
+    radius: f64,
+    error: f64,
+    axial: f64,
+    clearance: f64,
+    heights: cam_model::CuttingHeights,
+}
+
+impl<'mesh> SurfaceProjection<'mesh> {
+    fn new(
+        name: &str,
+        geometry: &'mesh ParallelGeometry,
+        stock: StockToLeave,
+        env: &JobEnv,
+        options: SurfaceOptions,
+        cancel: &CancelToken,
+    ) -> Result<Self, String> {
+        let Some(tool) = env.tool(options.tool) else {
+            return Err(format!("{name} tool is missing"));
+        };
+        if tool.kind != ToolKind::BallMill {
+            return Err(format!("3D {name} currently requires a ball nose end mill"));
+        }
+        if !tool.diameter.is_finite() || tool.diameter <= 0. {
+            return Err(format!("{name} tool diameter must be finite and positive"));
+        }
+        options.entry_feeds.validate()?;
+        let (radial, axial) = stock.effective();
+        if [radial, axial].iter().any(|v| !v.is_finite() || *v < 0.) {
+            return Err(format!(
+                "{name} stock allowances must be finite and nonnegative"
+            ));
+        }
+        if geometry.selected.is_empty() || geometry.triangles.is_empty() {
+            return Err(format!("{name} has no resolved CAD surface"));
+        }
+        if geometry
+            .triangles
+            .iter()
+            .flatten()
+            .flatten()
+            .any(|v| !v.is_finite())
+        {
+            return Err(format!(
+                "{name} CAD projection contains nonfinite coordinates"
+            ));
+        }
+        geometry.heights.validate()?;
+        if !geometry.error_bound.is_finite() || geometry.error_bound < 0.0 {
+            return Err(format!(
+                "{name} CAD error bound must be finite and nonnegative"
+            ));
+        }
+        if [
+            tool.length,
+            tool.flute_len(),
+            tool.shank_dia(),
+            tool.neck_dia(),
+        ]
+        .iter()
+        .any(|v| !v.is_finite() || *v < 0.)
+            || tool.flute_len() < tool.radius()
+        {
+            return Err(format!(
+                "{name} requires finite tool dimensions and flutes covering the ball nose"
+            ));
+        }
+        let r = tool.radius() + radial;
+        let error = geometry.error_bound;
+        let lift = error + options.tolerance + axial;
+        if !r.is_finite() || !lift.is_finite() {
+            return Err(format!("{name} cutter envelope is not finite"));
+        }
+        let top = geometry
+            .triangles
+            .iter()
+            .flatten()
+            .map(|v| v[2])
+            .fold(f64::NEG_INFINITY, f64::max)
+            + lift;
+        let clearance = env.heights.clearance;
+        if !clearance.is_finite() || clearance <= top || clearance <= env.heights.top_of_stock {
+            return Err(format!(
+                "{name} clearance must be above the complete model, allowance and stock"
+            ));
+        }
+        // The spherical tip is checked against every setup body. A larger shaft
+        // would require a separate swept-holder model and is rejected explicitly.
+        if tool.shank_dia() > tool.diameter + 1e-9 || tool.neck_dia() > tool.diameter + 1e-9 {
+            return Err(format!(
+                "{name} does not yet support shafts wider than the cutter"
+            ));
+        }
+        let (s, c) = options.angle.sin_cos();
+        let local = |v: V| [c * v[0] + s * v[1], -s * v[0] + c * v[1], v[2]];
+        let mut lo = [f64::INFINITY; 2];
+        let mut hi = [f64::NEG_INFINITY; 2];
+        for v in geometry.selected.iter().flatten().copied().map(local) {
+            for a in 0..2 {
+                lo[a] = lo[a].min(v[a]);
+                hi[a] = hi[a].max(v[a]);
+            }
+        }
+        let inset = containment_inset(options.containment, options.additional_offset, r);
+        for a in 0..2 {
+            lo[a] += inset;
+            hi[a] -= inset;
+        }
+        if (0..2).any(|a| !lo[a].is_finite() || !hi[a].is_finite() || lo[a] >= hi[a]) {
+            return Err(format!("{name} containment leaves no machining area"));
+        }
+        let grid_size = r.max(0.1) * 2.;
+        let build_grid =
+            |mesh| Grid::new(mesh, grid_size, cancel).map_err(|e| e.replace("Parallel", name));
+        Ok(Self {
+            grid: build_grid(&geometry.triangles)?,
+            selected: build_grid(&geometry.selected)?,
+            bounds: [lo, hi],
+            radius: r,
+            error,
+            axial,
+            clearance,
+            heights: geometry.heights,
+        })
+    }
+
+    fn linker(&self) -> PassLinker<'_, 'mesh> {
+        PassLinker {
+            grid: &self.grid,
+            selected: &self.selected,
+            radius: self.radius,
+            error: self.error,
+            axial: self.axial,
+            clearance: self.clearance,
+            bottom: self.heights.bottom,
+            top: self.heights.top,
+            previous: None,
+            passes: 0,
+        }
+    }
+}
+
 struct PassLinker<'a, 'mesh> {
     grid: &'a Grid<'mesh>,
     selected: &'a Grid<'mesh>,
@@ -688,11 +769,11 @@ impl PassLinker<'_, '_> {
         .then(|| vec![a, b])
     }
 
-    fn retract(&mut self, out: &mut StrategyResult, op: &ParallelOp) {
+    fn retract(&mut self, out: &mut StrategyResult, id: u32) {
         if let Some(p) = self.previous.take() {
             out.program.push(Step::Rapid {
                 to: Point3::new(p[0], p[1], self.clearance),
-                tag: Tag::new(op.id, MoveKind::Retract),
+                tag: Tag::new(id, MoveKind::Retract),
             });
         }
     }
@@ -738,7 +819,7 @@ impl PassLinker<'_, '_> {
                 }
                 self.previous = None;
             } else {
-                self.retract(out, op);
+                self.retract(out, op.id);
                 out.program.push(Step::Rapid {
                     to: Point3::new(p[0], p[1], self.clearance),
                     tag: Tag::new(op.id, MoveKind::Link),
@@ -760,10 +841,10 @@ impl PassLinker<'_, '_> {
             }
             self.previous = path.last().copied();
             if !continuous || !op.params.stay_down {
-                self.retract(out, op);
+                self.retract(out, op.id);
             }
         } else if !surface_turn {
-            self.retract(out, op);
+            self.retract(out, op.id);
         }
         path.clear();
     }

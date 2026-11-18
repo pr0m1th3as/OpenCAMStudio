@@ -173,6 +173,7 @@ impl App {
                     | OpKind::Thread
                     | OpKind::Adaptive
                     | OpKind::Parallel
+                    | OpKind::Spiral
             )
         ) {
             return;
@@ -368,7 +369,8 @@ impl App {
                     op.z_bottom = new.z_bottom;
                 }
                 (Operation::Adaptive(_), Operation::Adaptive(_))
-                | (Operation::Parallel(_), Operation::Parallel(_)) => {}
+                | (Operation::Parallel(_), Operation::Parallel(_))
+                | (Operation::Spiral(_), Operation::Spiral(_)) => {}
                 _ => return Err("Geometry does not match operation".into()),
             }
             if binding.recipe == cam_model::ExtractionRecipe::PocketBoundary {

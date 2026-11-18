@@ -86,6 +86,14 @@ pub(super) fn parameter(field: Field) -> Option<OperationParameter> {
         Field::ThreadSpringPasses => Some(OperationParameter::ThreadSpringPasses),
         Field::ThreadDrillClearance => Some(OperationParameter::ThreadDrillClearance),
         Field::ThreadBlindAllowance => Some(OperationParameter::ThreadBlindAllowance),
+        Field::SpiralAxialOffset => Some(OperationParameter::SpiralAxialOffset),
+        Field::SpiralStepdowns => Some(OperationParameter::SpiralStepdowns),
+        Field::SpiralStepover => Some(OperationParameter::SpiralStepover),
+        Field::SpiralInnerLimit => Some(OperationParameter::SpiralInnerLimit),
+        Field::SpiralOuterLimit => Some(OperationParameter::SpiralOuterLimit),
+        Field::SpiralFromSlope => Some(OperationParameter::SpiralFromSlope),
+        Field::SpiralToSlope => Some(OperationParameter::SpiralToSlope),
+        Field::SpiralStayDownDistance => Some(OperationParameter::SpiralStayDownDistance),
         Field::ParallelStepover => Some(OperationParameter::ParallelStepover),
         Field::ParallelAngle => Some(OperationParameter::ParallelAngle),
         Field::ScallopSafeDistance => Some(OperationParameter::ScallopSafeDistance),
@@ -1169,6 +1177,7 @@ mod tests {
             OpKind::Thread,
             OpKind::Adaptive,
             OpKind::Parallel,
+            OpKind::Spiral,
         ] {
             let operation = app.controller.operation_template(kind, 1);
             for parameter in OperationParameter::ALL {

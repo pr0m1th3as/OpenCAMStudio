@@ -22,7 +22,7 @@ mod profile_contours;
 mod profile_entries;
 mod surface_geometry;
 pub use adaptive::{
-    adaptive_heights, pocket_stock_shadow, resolve_adaptive, validate_adaptive_selection,
+    adaptive_heights, pocket_stock_shadow, projected_footprint, resolve_adaptive, validate_adaptive_selection,
     AdaptiveGeometry, AdaptiveLayer, AdaptiveResolveConfig,
 };
 use cam_geo::{Contour, Point, Polygon};
@@ -226,7 +226,9 @@ pub fn resolve_binding(
     }
     if matches!(
         binding.recipe,
-        ExtractionRecipe::AdaptiveClearing | ExtractionRecipe::ParallelFinishing
+        ExtractionRecipe::AdaptiveClearing
+            | ExtractionRecipe::ParallelFinishing
+            | ExtractionRecipe::SpiralFinishing
     ) {
         return Ok(ResolvedInput {
             chamfers: Vec::new(),
@@ -235,11 +237,13 @@ pub fn resolve_binding(
             holes,
             heights,
             fingerprint: state.binding_fingerprint(binding),
-            diagnostics: vec![if binding.recipe == ExtractionRecipe::ParallelFinishing {
-                "3D Parallel follows selected CAD surfaces and protects all setup bodies".into()
-            } else {
-                "3D Adaptive uses selected machining domains and complete setup-model obstacle shadows".into()
-            }],
+            diagnostics: vec![match binding.recipe {
+                ExtractionRecipe::ParallelFinishing =>
+                    "3D Parallel follows selected CAD surfaces and protects all setup bodies",
+                ExtractionRecipe::SpiralFinishing =>
+                    "3D Spiral projects radial passes onto selected CAD surfaces and protects all setup bodies",
+                _ => "3D Adaptive uses selected machining domains and complete setup-model obstacle shadows",
+            }.into()],
         });
     }
     let view = View::new(state, &binding.selected)?;
@@ -1198,7 +1202,9 @@ fn derive(
     }
     if matches!(
         binding.recipe,
-        ExtractionRecipe::AdaptiveClearing | ExtractionRecipe::ParallelFinishing
+        ExtractionRecipe::AdaptiveClearing
+            | ExtractionRecipe::ParallelFinishing
+            | ExtractionRecipe::SpiralFinishing
     ) {
         return Ok((
             Vec::new(),
@@ -1505,7 +1511,9 @@ fn derive(
             unreachable!()
         }
         ExtractionRecipe::ProfileSilhouette => Err("Select one body for its silhouette".into()),
-        ExtractionRecipe::AdaptiveClearing | ExtractionRecipe::ParallelFinishing => unreachable!(),
+        ExtractionRecipe::AdaptiveClearing
+        | ExtractionRecipe::ParallelFinishing
+        | ExtractionRecipe::SpiralFinishing => unreachable!(),
     }
 }
 fn derive_holes(

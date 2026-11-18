@@ -315,18 +315,10 @@ impl App {
                 ));
             }
             Operation::Parallel(p) if p.params.scallop => {
-                moves.push(profile_picker(
-                    "Retraction policy",
-                    "Full clearance, a checked raised link, or a checked direct feed link. Links blocked by stock are rerouted during verification.",
-                    self.tooltips,
-                    p.params.scallop_retraction,
-                    &[
-                        cam_model::ScallopRetraction::Full,
-                        cam_model::ScallopRetraction::Minimum,
-                        cam_model::ScallopRetraction::Shortest,
-                    ][..],
-                    Message::ScallopRetractionChanged,
-                ));
+                moves.push(self.finishing_retraction_control(p.params.scallop_retraction));
+            }
+            Operation::Spiral(p) => {
+                moves.push(self.finishing_retraction_control(p.params.retraction));
             }
             Operation::Adaptive(_) => {
                 moves.push(label_help(
@@ -573,6 +565,23 @@ impl App {
                 sections.push(self.operation_section(Section::Positions.id(), positions, None));
         }
         sections.into()
+    }
+    fn finishing_retraction_control(
+        &self,
+        policy: cam_model::ScallopRetraction,
+    ) -> Element<'_, Message> {
+        profile_picker(
+                    "Retraction policy",
+                    "Full clearance, a checked raised link, or a checked direct feed link. Links blocked by stock are rerouted during verification.",
+                    self.tooltips,
+                    policy,
+                    &[
+                        cam_model::ScallopRetraction::Full,
+                        cam_model::ScallopRetraction::Minimum,
+                        cam_model::ScallopRetraction::Shortest,
+                    ][..],
+                    Message::ScallopRetractionChanged,
+                )
     }
 }
 

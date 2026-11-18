@@ -232,6 +232,7 @@ enum Icon {
     Carve,
     Adaptive,
     Parallel,
+    Spiral,
     Face,
     NewTool,
     Materials,
@@ -258,7 +259,7 @@ impl Icon {
     /// Every icon, so tests can sweep the whole bundled set. Kept beside the enum:
     /// a variant added without a line here fails `every_icon_is_listed_in_all`.
     #[cfg(test)]
-    const ALL: [Icon; 40] = [
+    const ALL: [Icon; 41] = [
         Icon::New,
         Icon::Open,
         Icon::Save,
@@ -281,6 +282,7 @@ impl Icon {
         Icon::Carve,
         Icon::Adaptive,
         Icon::Parallel,
+        Icon::Spiral,
         Icon::Face,
         Icon::NewTool,
         Icon::Materials,
@@ -325,6 +327,7 @@ impl Icon {
             Icon::Chamfer => include_bytes!("../assets/icons/chamfer.svg"),
             Icon::Engrave => include_bytes!("../assets/icons/engrave.svg"),
             Icon::Carve => include_bytes!("../assets/icons/carve.svg"),
+            Icon::Spiral => include_bytes!("../assets/icons/spiral.svg"),
             Icon::Parallel => include_bytes!("../assets/icons/parallel.svg"),
             Icon::Adaptive => include_bytes!("../assets/icons/adaptive.svg"),
             Icon::Face => include_bytes!("../assets/icons/face.svg"),
@@ -384,6 +387,7 @@ impl Icon {
                             with a V-bit. Unlike engraving, the tool never touches the boundary: its \
                             flanks land on it, and the depth follows from the shape's own width."
             }
+            Icon::Spiral => "Add a 3D Spiral finishing operation for selected CAD bodies or faces.",
             Icon::Parallel => "Add a 3D Parallel or sampled Scallop finishing operation for selected CAD bodies or faces.",
             Icon::Adaptive => "Add a 3D Adaptive Clearing operation for selected CAD bodies or faces.",
             Icon::Face => "Add a Face operation — skim the top of the stock flat.",
@@ -1318,6 +1322,14 @@ enum Field {
     /// Drill dwell at the hole bottom (seconds); 0 = no dwell.
     Dwell,
     Stepdown,
+    SpiralAxialOffset,
+    SpiralStepdowns,
+    SpiralStepover,
+    SpiralInnerLimit,
+    SpiralOuterLimit,
+    SpiralFromSlope,
+    SpiralToSlope,
+    SpiralStayDownDistance,
     ParallelStepover,
     ParallelAngle,
     ScallopSafeDistance,
@@ -1507,6 +1519,14 @@ impl Field {
             Field::Profile(n) => n.label(),
             Field::PocketFinish(n) => n.label(),
             Field::Stepdown => "Stepdown (mm)",
+            Field::SpiralAxialOffset => "Axial offset (mm)",
+            Field::SpiralStepdowns => "Number of stepdowns",
+            Field::SpiralStepover => "Stepover (mm)",
+            Field::SpiralInnerLimit => "Inner limit (mm)",
+            Field::SpiralOuterLimit => "Outer limit (mm)",
+            Field::SpiralFromSlope => "From slope (deg)",
+            Field::SpiralToSlope => "To slope (deg)",
+            Field::SpiralStayDownDistance => "Maximum stay-down distance (mm)",
             Field::ParallelStepover => "Stepover (mm)",
             Field::ParallelAngle => "Pass angle (deg)",
             Field::ScallopSafeDistance => "Safe distance (mm)",
@@ -1590,6 +1610,14 @@ impl Field {
             Field::BoreLeadRadius => "Radius of the horizontal tangent lead. For holes it is limited to half the tool-centre orbit; for bosses the safe distance can increase it.",
 
             Field::OperationTop => "Absolute cutting top in setup Z, in millimetres.",
+            Field::SpiralAxialOffset => "Thickness above the final surface to remove across multiple passes.",
+            Field::SpiralStepdowns => "Enter zero to calculate the pass count from the maximum stepdown.",
+            Field::SpiralStepover => "Horizontal radial spacing between turns or concentric passes.",
+            Field::SpiralInnerLimit => "Minimum radius measured from the spiral center.",
+            Field::SpiralOuterLimit => "Maximum radius measured from the spiral center. Zero uses the machining boundary.",
+            Field::SpiralFromSlope => "Minimum selected surface inclination from horizontal.",
+            Field::SpiralToSlope => "Maximum selected surface inclination from horizontal.",
+            Field::SpiralStayDownDistance => "Maximum horizontal length for a checked low link. Zero uses clearance for separated passes.",
             Field::ParallelStepover => "Target distance between finishing passes, in millimetres. Scallop uses approximate surface distance.",
             Field::ParallelAngle => "Direction of the cutting rows measured counterclockwise from setup X, in degrees.",
             Field::ScallopSafeDistance => "Vertical clearance above the model for minimum retraction. Unsafe links return to full clearance.",
@@ -3159,6 +3187,16 @@ enum Message {
     ScallopSmoothingToggled(bool),
     ScallopRetractionChanged(cam_model::ScallopRetraction),
     ScallopOrderChanged(cam_model::ScallopOrder),
+    SpiralModeChanged(cam_model::SpiralMode),
+    SpiralOrderChanged(cam_model::SpiralOrder),
+    SpiralMillingChanged(cam_model::SpiralMilling),
+    SpiralCutDirectionChanged(cam_model::SpiralCutDirection),
+    SpiralBoundaryChanged(cam_model::SpiralBoundary),
+    SpiralContactOnlyToggled(bool),
+    SpiralDepthsToggled(bool),
+    SpiralDepthOrderToggled(bool),
+    SpiralLinkInsideOutToggled(bool),
+    SpiralClockwiseToggled(bool),
     ParallelStayDownToggled(bool),
     PocketKeepToolDownToggled(bool),
     AdaptiveClimbToggled(bool),
@@ -6861,7 +6899,7 @@ impl App {
                 if self.cad_filter != filter
                     && !matches!(
                         self.geometry_operation_kind(),
-                        Some(OpKind::Adaptive | OpKind::Parallel)
+                        Some(OpKind::Adaptive | OpKind::Parallel | OpKind::Spiral)
                     )
                 {
                     self.remove_operation_geometry(None);
@@ -7234,7 +7272,8 @@ impl App {
                             }
                         }
                         cam_model::ExtractionRecipe::AdaptiveClearing
-                        | cam_model::ExtractionRecipe::ParallelFinishing => {
+                        | cam_model::ExtractionRecipe::ParallelFinishing
+                        | cam_model::ExtractionRecipe::SpiralFinishing => {
                             match refs.first().map(|r| r.kind) {
                                 Some(EntityKind::Face) => CadFilter::Face,
                                 _ => CadFilter::Body,
@@ -7498,15 +7537,15 @@ impl App {
                 self.cad_filter_explicit = false;
                 self.operation_tools.clear();
                 self.operation_tab = OperationTab::Tool;
-                if matches!(kind, OpKind::Adaptive | OpKind::Parallel)
-                    && self.controller.geometry_state().instances.is_empty()
-                {
+                let surface = matches!(kind, OpKind::Adaptive | OpKind::Parallel | OpKind::Spiral);
+                if surface && self.controller.geometry_state().instances.is_empty() {
                     self.status =
-                        "Import a solid CAD model before creating 3D Adaptive Clearing.".into();
+                        "Import a solid CAD model before creating a 3D surface operation.".into();
                     return iced::Task::none();
                 }
                 if !self.controller.geometry_state().instances.is_empty()
-                    && (self.controller.regions().is_empty()
+                    && (surface
+                        || self.controller.regions().is_empty()
                         || !self.controller.cad_selection().is_empty())
                 {
                     self.cancel_setup_picks();
@@ -7528,16 +7567,20 @@ impl App {
                     self.cad_tool_pick = tool.map(|tool| tool.number);
                     self.cad_inspecting = false;
                     self.cad_editing_op = None;
-                    self.cad_filter = if matches!(kind, OpKind::Adaptive | OpKind::Parallel) {
-                        match self.controller.cad_selection().first().map(|r| r.kind) {
-                            Some(EntityKind::Face) => CadFilter::Face,
-                            _ => CadFilter::Body,
-                        }
-                    } else if matches!(kind, OpKind::Profile | OpKind::Chamfer | OpKind::Engrave) {
-                        CadFilter::Loop
-                    } else {
-                        CadFilter::Face
-                    };
+                    self.cad_filter =
+                        if matches!(kind, OpKind::Adaptive | OpKind::Parallel | OpKind::Spiral) {
+                            match self.controller.cad_selection().first().map(|r| r.kind) {
+                                Some(EntityKind::Face) => CadFilter::Face,
+                                _ => CadFilter::Body,
+                            }
+                        } else if matches!(
+                            kind,
+                            OpKind::Profile | OpKind::Chamfer | OpKind::Engrave
+                        ) {
+                            CadFilter::Loop
+                        } else {
+                            CadFilter::Face
+                        };
                     self.controller.cancel_operation();
                     self.seed_creation_editor(kind);
                     self.status = "Choose a tool, then select geometry on the Geometry tab.".into();
@@ -8439,18 +8482,18 @@ impl App {
                 self.refresh_operation_fields();
             }
             Message::ScallopSmoothingToggled(on) => {
-                self.edit_operation_draft(|op| {
-                    if let Operation::Parallel(p) = op {
-                        p.params.scallop_smoothing = on;
-                    }
+                self.edit_operation_draft(|op| match op {
+                    Operation::Parallel(p) => p.params.scallop_smoothing = on,
+                    Operation::Spiral(p) => p.params.smoothing = on,
+                    _ => {}
                 });
                 self.refresh_operation_fields();
             }
             Message::ScallopRetractionChanged(policy) => {
-                self.edit_operation_draft(|op| {
-                    if let Operation::Parallel(p) = op {
-                        p.params.scallop_retraction = policy;
-                    }
+                self.edit_operation_draft(|op| match op {
+                    Operation::Parallel(p) => p.params.scallop_retraction = policy,
+                    Operation::Spiral(p) => p.params.retraction = policy,
+                    _ => {}
                 });
                 self.refresh_operation_fields();
             }
@@ -8458,6 +8501,86 @@ impl App {
                 self.edit_operation_draft(|op| {
                     if let Operation::Parallel(p) = op {
                         p.params.scallop_order = order;
+                    }
+                });
+                self.refresh_operation_fields();
+            }
+            Message::SpiralModeChanged(value) => {
+                self.edit_operation_draft(|op| {
+                    if let Operation::Spiral(p) = op {
+                        p.params.mode = value;
+                    }
+                });
+                self.refresh_operation_fields();
+            }
+            Message::SpiralOrderChanged(value) => {
+                self.edit_operation_draft(|op| {
+                    if let Operation::Spiral(p) = op {
+                        p.params.order = value;
+                    }
+                });
+                self.refresh_operation_fields();
+            }
+            Message::SpiralMillingChanged(value) => {
+                self.edit_operation_draft(|op| {
+                    if let Operation::Spiral(p) = op {
+                        p.params.milling = value;
+                    }
+                });
+                self.refresh_operation_fields();
+            }
+            Message::SpiralCutDirectionChanged(value) => {
+                self.edit_operation_draft(|op| {
+                    if let Operation::Spiral(p) = op {
+                        p.params.cut_direction = value;
+                    }
+                });
+                self.refresh_operation_fields();
+            }
+            Message::SpiralBoundaryChanged(value) => {
+                self.edit_operation_draft(|op| {
+                    if let Operation::Spiral(p) = op {
+                        p.params.boundary = value;
+                    }
+                });
+                self.refresh_operation_fields();
+            }
+            Message::SpiralContactOnlyToggled(value) => {
+                self.edit_operation_draft(|op| {
+                    if let Operation::Spiral(p) = op {
+                        p.params.contact_only = value;
+                    }
+                });
+                self.refresh_operation_fields();
+            }
+            Message::SpiralDepthsToggled(value) => {
+                self.edit_operation_draft(|op| {
+                    if let Operation::Spiral(p) = op {
+                        p.params.multiple_depths = value;
+                    }
+                });
+                self.refresh_operation_fields();
+            }
+            Message::SpiralDepthOrderToggled(value) => {
+                self.edit_operation_draft(|op| {
+                    if let Operation::Spiral(p) = op {
+                        p.params.order_by_depth = value;
+                    }
+                });
+                self.refresh_operation_fields();
+            }
+            Message::SpiralLinkInsideOutToggled(value) => {
+                self.edit_operation_draft(|op| {
+                    if let Operation::Spiral(p) = op {
+                        p.params.link_inside_out = value;
+                    }
+                });
+                self.refresh_operation_fields();
+            }
+            Message::SpiralClockwiseToggled(value) => {
+                self.edit_operation_draft(|op| {
+                    if let Operation::Spiral(p) = op {
+                        p.params.clockwise = value;
                     }
                 });
                 self.refresh_operation_fields();
@@ -8487,13 +8610,11 @@ impl App {
                 self.refresh_operation_fields();
             }
             Message::AdaptiveContainmentChanged(value) => {
-                self.edit_operation_draft(|op| {
-                    if let Operation::Adaptive(adaptive) = op {
-                        adaptive.params.containment = value;
-                    }
-                    if let Operation::Parallel(p) = op {
-                        p.params.containment = value;
-                    }
+                self.edit_operation_draft(|op| match op {
+                    Operation::Adaptive(p) => p.params.containment = value,
+                    Operation::Parallel(p) => p.params.containment = value,
+                    Operation::Spiral(p) => p.params.containment = value,
+                    _ => {}
                 });
                 self.refresh_operation_fields();
             }
@@ -11821,6 +11942,16 @@ impl App {
                             display_shortcut(shortcut_value(&self.settings, "parallel"))
                         ),
                     ),
+                    cmd_help(
+                        Icon::Spiral,
+                        "3D Spiral",
+                        begin(OpKind::Spiral),
+                        format!(
+                            "{} ({})",
+                            Icon::Spiral.help(),
+                            display_shortcut(shortcut_value(&self.settings, "spiral"))
+                        ),
+                    ),
                 ],
             }],
             RibbonTab::Machinery => vec![GroupSpec {
@@ -12272,12 +12403,17 @@ impl App {
             || (profile && entity.kind != EntityKind::Silhouette)
             || matches!(
                 self.cad_pending_kind,
-                Some(OpKind::Adaptive | OpKind::Parallel)
+                Some(OpKind::Adaptive | OpKind::Parallel | OpKind::Spiral)
             )
             || self
                 .cad_editing_op
                 .and_then(|id| self.current_operation(id))
-                .is_some_and(|op| matches!(op, Operation::Adaptive(_) | Operation::Parallel(_)))
+                .is_some_and(|op| {
+                    matches!(
+                        op,
+                        Operation::Adaptive(_) | Operation::Parallel(_) | Operation::Spiral(_)
+                    )
+                })
             || matches!(
                 self.cad_pending_kind,
                 Some(
@@ -12308,12 +12444,15 @@ impl App {
         self.geometry_row_selection = None;
         let adaptive = matches!(
             self.cad_pending_kind,
-            Some(OpKind::Adaptive | OpKind::Parallel)
+            Some(OpKind::Adaptive | OpKind::Parallel | OpKind::Spiral)
         ) || self
             .cad_editing_op
             .and_then(|id| self.current_operation(id))
             .is_some_and(|operation| {
-                matches!(operation, Operation::Adaptive(_) | Operation::Parallel(_))
+                matches!(
+                    operation,
+                    Operation::Adaptive(_) | Operation::Parallel(_) | Operation::Spiral(_)
+                )
             });
         let selection_result = if adaptive {
             self.controller
@@ -12417,8 +12556,12 @@ impl App {
             (OpKind::Pocket | OpKind::Engrave, EntityKind::Edge) => CadFilter::Edge,
             (OpKind::Pocket | OpKind::Carve, EntityKind::Face) => CadFilter::Face,
             (OpKind::Thread | OpKind::Drill, EntityKind::Face) => CadFilter::Face,
-            (OpKind::Adaptive | OpKind::Parallel, EntityKind::Face) => CadFilter::Face,
-            (OpKind::Adaptive | OpKind::Parallel, EntityKind::Body) => CadFilter::Body,
+            (OpKind::Adaptive | OpKind::Parallel | OpKind::Spiral, EntityKind::Face) => {
+                CadFilter::Face
+            }
+            (OpKind::Adaptive | OpKind::Parallel | OpKind::Spiral, EntityKind::Body) => {
+                CadFilter::Body
+            }
             (OpKind::Face, EntityKind::Silhouette) => CadFilter::Silhouette,
             _ => self.cad_filter,
         };
@@ -13194,6 +13337,7 @@ const SHORTCUTS: &[(&str, &str, &str)] = &[
     ("carve", "Carve", "Cmd+Shift+V"),
     ("adaptive", "3D Adaptive Clearing", "Cmd+Shift+A"),
     ("parallel", "Parallel", "Cmd+Shift+L"),
+    ("spiral", "3D Spiral", "Cmd+Shift+I"),
 ];
 
 fn shortcut_value<'a>(settings: &'a crate::Settings, id: &str) -> &'a str {
@@ -13256,6 +13400,7 @@ fn shortcut_action(id: &str) -> Option<Message> {
         "carve" => Message::BeginOp(OpKind::Carve),
         "adaptive" => Message::BeginOp(OpKind::Adaptive),
         "parallel" => Message::BeginOp(OpKind::Parallel),
+        "spiral" => Message::BeginOp(OpKind::Spiral),
         _ => return None,
     })
 }
@@ -13451,6 +13596,7 @@ fn op_kind(op: &Operation) -> &'static str {
         Operation::Adaptive(_) => "3D Adaptive Clearing",
         Operation::Parallel(o) if o.params.scallop => "3D Scallop",
         Operation::Parallel(_) => "3D Parallel",
+        Operation::Spiral(_) => "3D Spiral",
     }
 }
 
@@ -13601,6 +13747,7 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Thread(o), Field::ThreadBlindAllowance) => Some(o.blind_allowance),
         (Operation::Thread(o), Field::Feed) => Some(o.feed),
         (Operation::Thread(o), Field::PlungeFeed) => Some(o.plunge_feed),
+        (op @ Operation::Spiral(_), field) => parameter_expressions::parameter(field)?.value(op),
         (Operation::Parallel(o), Field::ParallelStepover) => Some(o.params.stepover),
         (Operation::Parallel(o), Field::ParallelAngle) => Some(o.params.angle),
         (Operation::Parallel(o), Field::ScallopSafeDistance) => {
@@ -13959,6 +14106,53 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
             }
             if let Some(v) = get(Field::PlungeFeed) {
                 o.plunge_feed = v;
+            }
+        }
+        Operation::Spiral(o) => {
+            if let Some(v) = get(Field::SpiralAxialOffset) {
+                o.params.axial_offset = v;
+            }
+            if let Some(v) = get(Field::SpiralStepdowns) {
+                o.params.stepdowns = v as u32;
+            }
+            if let Some(v) = get(Field::Stepdown) {
+                o.params.max_stepdown = v;
+            }
+            if let Some(v) = get(Field::SpiralStepover) {
+                o.params.stepover = v;
+            }
+            if let Some(v) = get(Field::SpiralInnerLimit) {
+                o.params.inner_limit = v;
+            }
+            if let Some(v) = get(Field::SpiralOuterLimit) {
+                o.params.outer_limit = v;
+            }
+            if let Some(v) = get(Field::SpiralFromSlope) {
+                o.params.from_slope = v;
+            }
+            if let Some(v) = get(Field::SpiralToSlope) {
+                o.params.to_slope = v;
+            }
+            if let Some(v) = get(Field::SpiralStayDownDistance) {
+                o.params.max_stay_down_distance = v;
+            }
+            if let Some(v) = get(Field::AdaptiveTolerance) {
+                o.params.tolerance = v;
+            }
+            if let Some(v) = get(Field::AdaptiveOffset) {
+                o.params.additional_offset = v;
+            }
+            if let Some(v) = get(Field::Feed) {
+                o.params.feed = v;
+            }
+            if let Some(v) = get(Field::PlungeFeed) {
+                o.params.plunge_feed = v;
+            }
+            if let Some(v) = get(Field::ScallopSafeDistance) {
+                o.params.safe_distance = v;
+            }
+            if let Some(v) = get(Field::ScallopSmoothingTolerance) {
+                o.params.smoothing_tolerance = v;
             }
         }
         Operation::Parallel(o) => {
@@ -15254,12 +15448,14 @@ impl Viewport {
             OpKind::Drill | OpKind::Bore | OpKind::Thread => {
                 self.cad_scene.pick_drill_candidates(ray, aperture, through)
             }
-            OpKind::Adaptive | OpKind::Parallel => self.cad_scene.pick_any_candidates(
-                ray,
-                &[EntityKind::Face, EntityKind::Body],
-                aperture,
-                through,
-            ),
+            OpKind::Adaptive | OpKind::Parallel | OpKind::Spiral => {
+                self.cad_scene.pick_any_candidates(
+                    ray,
+                    &[EntityKind::Face, EntityKind::Body],
+                    aperture,
+                    through,
+                )
+            }
             OpKind::Face => self.cad_scene.pick_any_candidates(
                 ray,
                 &[EntityKind::Face, EntityKind::Silhouette],
@@ -15295,7 +15491,7 @@ impl Viewport {
                             EntityKind::Loop => 1,
                             _ => 2,
                         },
-                        OpKind::Adaptive | OpKind::Parallel => match entity.kind {
+                        OpKind::Adaptive | OpKind::Parallel | OpKind::Spiral => match entity.kind {
                             EntityKind::Face => 0,
                             EntityKind::Body => 1,
                             _ => 2,
@@ -16692,6 +16888,100 @@ mod multi_setup_draft_tests {
         send(&mut app, Message::CancelOperationDraft);
         assert!(
             matches!(app.controller.operation(id), Some(Operation::Parallel(p)) if p.params.both_ways && p.params.angle == 0.)
+        );
+    }
+
+    #[test]
+    fn spiral_editor_picks_center_and_applies_or_cancels_pass_settings() {
+        use cam_model::{ScallopRetraction, SpiralMode, SpiralOrder};
+        let mut app = blank_app();
+        let operation = app.controller.operation_template(OpKind::Spiral, 1);
+        let id = operation.id();
+        assert_eq!(
+            families_for(OpKind::Spiral),
+            &[crate::ToolKindPick::BallMill]
+        );
+        assert_eq!(
+            operation_tabs::field_tab(Field::SpiralInnerLimit),
+            OperationTab::Passes
+        );
+        assert_eq!(
+            operation_tabs::field_tab(Field::SpiralFromSlope),
+            OperationTab::Geometry
+        );
+        assert_eq!(
+            operation_tabs::field_tab(Field::SpiralStayDownDistance),
+            OperationTab::Linking
+        );
+        app.controller.add_operation(operation);
+        app.begin_operation_draft(id);
+        send(
+            &mut app,
+            Message::OperationPositionPick(operation_positions::PositionKind::Entry),
+        );
+        send(&mut app, Message::OperationPositionPicked([6., 7., 2.]));
+        send(
+            &mut app,
+            Message::SpiralModeChanged(SpiralMode::SpiralWithCircles),
+        );
+        send(
+            &mut app,
+            Message::SpiralOrderChanged(SpiralOrder::OutsideIn),
+        );
+        send(&mut app, Message::SpiralClockwiseToggled(true));
+        send(
+            &mut app,
+            Message::ScallopRetractionChanged(ScallopRetraction::Shortest),
+        );
+        send(
+            &mut app,
+            Message::FieldChanged(Field::SpiralInnerLimit, "1.5".into()),
+        );
+        send(
+            &mut app,
+            Message::FieldChanged(Field::SpiralOuterLimit, "8".into()),
+        );
+        send(&mut app, Message::Apply);
+        let Some(Operation::Spiral(saved)) = app.controller.operation(id) else {
+            panic!("Spiral operation is missing");
+        };
+        assert_eq!(saved.params.center, Some([6., 7.]));
+        assert_eq!(saved.params.mode, SpiralMode::SpiralWithCircles);
+        assert_eq!(saved.params.order, SpiralOrder::OutsideIn);
+        assert_eq!(saved.params.retraction, ScallopRetraction::Shortest);
+        assert_eq!(
+            [saved.params.inner_limit, saved.params.outer_limit],
+            [1.5, 8.]
+        );
+        assert!(saved.params.clockwise);
+        for tab in [
+            OperationTab::Tool,
+            OperationTab::Geometry,
+            OperationTab::Heights,
+            OperationTab::Passes,
+            OperationTab::Linking,
+        ] {
+            app.operation_tab = tab;
+            let _view = app.operation_inspector(id);
+        }
+        app.begin_operation_draft(id);
+        send(
+            &mut app,
+            Message::OperationPositionClear(operation_positions::PositionKind::Entry),
+        );
+        send(&mut app, Message::CancelOperationDraft);
+        assert_eq!(
+            app.controller
+                .operation(id)
+                .and_then(operation_tabs::operation_start),
+            Some([6., 7.])
+        );
+        assert!(app.controller.undo());
+        assert_eq!(
+            app.controller
+                .operation(id)
+                .and_then(operation_tabs::operation_start),
+            None
         );
     }
 

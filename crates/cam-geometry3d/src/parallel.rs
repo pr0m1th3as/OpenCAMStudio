@@ -11,9 +11,11 @@ pub fn resolve_parallel(
     state: &GeometryState,
     binding: &GeometryBinding,
 ) -> Result<ParallelGeometry, String> {
-    if binding.recipe != ExtractionRecipe::ParallelFinishing {
-        return Err("Parallel requires a ParallelFinishing binding".into());
-    }
+    let strategy = match binding.recipe {
+        ExtractionRecipe::ParallelFinishing => "Parallel",
+        ExtractionRecipe::SpiralFinishing => "Spiral",
+        _ => return Err("Surface finishing requires a finishing geometry binding".into()),
+    };
     validate_adaptive_selection(state, &binding.selected)?;
     let mut out = ParallelGeometry {
         triangles: vec![],
@@ -36,7 +38,7 @@ pub fn resolve_parallel(
             .find(|b| b.id == instance.body_id)
             .ok_or("Missing setup body")?;
         if !body.valid_solid {
-            return Err("Parallel requires valid solid setup bodies".into());
+            return Err(format!("{strategy} requires valid solid setup bodies"));
         }
         let projection = adaptive::checked_projection(&asset.topology)?;
         let faces: Vec<_> = asset
@@ -78,7 +80,9 @@ pub fn resolve_parallel(
         out.error_bound = out.error_bound.max(projection.chord_tolerance);
     }
     if out.selected.is_empty() {
-        return Err("Parallel selection contains no machining triangles".into());
+        return Err(format!(
+            "{strategy} selection contains no machining triangles"
+        ));
     }
     Ok(out)
 }

@@ -271,11 +271,16 @@ fn build_job_with_compute(
             completion: JobCompletion::Failed,
         };
     }
-    let adaptive_operation_ids: std::collections::HashSet<_> = setup
+    let surface_operation_ids: std::collections::HashSet<_> = setup
         .operations
         .iter()
         .filter(|operation| doc.operation_is_included(setup.id, operation.id()))
-        .filter(|operation| matches!(operation, Operation::Adaptive(_) | Operation::Parallel(_)))
+        .filter(|operation| {
+            matches!(
+                operation,
+                Operation::Adaptive(_) | Operation::Parallel(_) | Operation::Spiral(_)
+            )
+        })
         .map(Operation::id)
         .collect();
     if let Some(pattern) = setup.patterns.iter().find(|pattern| {
@@ -284,12 +289,12 @@ fn build_job_with_compute(
             && pattern
                 .members
                 .iter()
-                .any(|member| adaptive_operation_ids.contains(member))
+                .any(|member| surface_operation_ids.contains(member))
     }) {
         return JobResult {
             program,
             diagnostics: vec![Diagnostic::error(
-                "3D surface strategies cannot be repeated in an operation pattern because its path is resolved against the setup's actual model instances; create separate adaptive operations for each machining location",
+                "3D surface strategies cannot be repeated in an operation pattern because its path is resolved against the setup's actual model instances; create separate operations for each machining location",
             ).for_setup(setup.id).for_pattern(pattern.id, 1)],
             completion: JobCompletion::Failed,
         };
@@ -1029,6 +1034,7 @@ fn automatic_pattern_entry(operation: &Operation) -> Option<Operation> {
         Operation::Drill(_)
         | Operation::Face(_)
         | Operation::Parallel(_)
+        | Operation::Spiral(_)
         | Operation::Bore(_)
         | Operation::Thread(_) => return None,
     };
@@ -1106,7 +1112,7 @@ fn compute_at_heights(
             p.depth = depth;
             0.0
         }
-        Operation::Adaptive(_) | Operation::Parallel(_) => 0.0,
+        Operation::Adaptive(_) | Operation::Parallel(_) | Operation::Spiral(_) => 0.0,
         Operation::Carve(p) => {
             p.top = heights.top;
             p.depth = depth;
@@ -1173,6 +1179,7 @@ fn apply_feed_height(
         Operation::Face(o) => o.plunge_feed,
         Operation::Adaptive(o) => o.params.plunge_feed,
         Operation::Parallel(o) => o.params.plunge_feed,
+        Operation::Spiral(o) => o.params.plunge_feed,
         Operation::Drill(o) => o.feed,
         Operation::Bore(o) => o.plunge_feed,
         Operation::Thread(o) => o.plunge_feed,
@@ -1668,6 +1675,24 @@ fn compute_with_stock(
 ) -> StrategyResult {
     let (radial, axial) = stock_to_leave.effective();
     match operation {
+        Operation::Spiral(op) => {
+            let resolved = geometry_state
+                .bindings
+                .get(&op.id)
+                .ok_or_else(|| "Spiral geometry binding is missing".to_string())
+                .and_then(|binding| cam_geometry3d::resolve_parallel(geometry_state, binding));
+            match resolved {
+                Ok(mut geometry) => {
+                    geometry.heights = cutting_heights.unwrap_or(geometry.heights);
+                    crate::SpiralStrategy::new(op.clone(), stock_to_leave, geometry)
+                        .compute(env, cancel)
+                }
+                Err(reason) => StrategyResult {
+                    diagnostics: vec![Diagnostic::error(reason)],
+                    ..Default::default()
+                },
+            }
+        }
         Operation::Parallel(op) => {
             let resolved = geometry_state
                 .bindings
@@ -2678,7 +2703,7 @@ mod tests {
         assert_eq!(result.completion, JobCompletion::Failed);
         assert!(result.diagnostics.iter().any(|d| d
             .message
-            .contains("supported for Profile, Pocket, Face, Adaptive, and Parallel only")));
+            .contains("supported for Profile, Pocket, Face, Adaptive, Parallel, and Spiral only")));
     }
 
     #[test]

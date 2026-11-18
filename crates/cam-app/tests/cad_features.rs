@@ -2320,6 +2320,97 @@ fn parallel_creation_uses_setup_cad_and_survives_reopening() {
     assert_eq!(app.document(), reopened.document());
 }
 
+#[test]
+fn spiral_cad_operation_generates_verifies_posts_and_reopens() {
+    let mut fixture = Fixture::new();
+    let top = fixture.face(vec![square(0., 20., 0., 20., 0.)], [0., 0., 1.]);
+    fixture.face(vec![square(0., 20., 0., 20., -5.)], [0., 0., -1.]);
+    fixture.walls(0., 20., 0., 20., -5., 0.);
+    let mut mesh = CadMesh::default();
+    for wire in &fixture.t.loops {
+        let base = mesh.vertices.len() as u32;
+        for use_ in &wire.edge_uses {
+            let edge = fixture
+                .t
+                .edges
+                .iter()
+                .find(|e| e.id == use_.edge_id)
+                .unwrap();
+            let id = edge.vertices[usize::from(use_.reversed)];
+            mesh.vertices.push(
+                fixture
+                    .t
+                    .vertices
+                    .iter()
+                    .find(|v| v.id == id)
+                    .unwrap()
+                    .point,
+            );
+        }
+        mesh.triangles
+            .extend([[base, base + 1, base + 2], [base, base + 2, base + 3]]);
+        mesh.triangle_faces.extend([wire.face_id; 2]);
+    }
+    fixture.t.mesh = mesh.clone();
+    fixture.t.projection = Some(CadProjectionMesh {
+        mesh,
+        chord_tolerance: 0.0025,
+    });
+    let state = fixture.state();
+    let mut app = controller();
+    app.add_cad_asset(state.assets[0].clone(), state.instances)
+        .unwrap();
+    select_all_models(&mut app);
+    let tool = app.use_tool(Tool {
+        number: 5,
+        kind: ToolKind::BallMill,
+        diameter: 3.,
+        flute_length: 12.,
+        length: 24.,
+        ..Default::default()
+    });
+    let id = app
+        .create_cad_operation_with_tool(
+            OpKind::Spiral,
+            vec![reference(top, EntityKind::Face)],
+            tool,
+        )
+        .unwrap();
+    app.edit_operation(id, |op| {
+        let Operation::Spiral(spiral) = op else {
+            panic!("Spiral operation")
+        };
+        spiral.params.center = Some([9., 11.]);
+        spiral.params.inner_limit = 1.;
+        spiral.params.outer_limit = 6.;
+        spiral.params.mode = SpiralMode::SpiralWithCircles;
+        spiral.params.clockwise = true;
+        spiral.params.smoothing = true;
+        OperationParameter::SpiralStepover.set_source(op, "=1.2");
+    });
+    assert_eq!(
+        app.geometry_state().bindings[&id].recipe,
+        ExtractionRecipe::SpiralFinishing
+    );
+    let path = std::env::temp_dir().join(format!("spiral-roundtrip-{}.ocam", std::process::id()));
+    app.save_project(&path).unwrap();
+    let mut reopened = AppController::new(default_machine());
+    reopened.open_project(&path).unwrap();
+    std::fs::remove_file(path).unwrap();
+    assert_eq!(app.document(), reopened.document());
+    let result = reopened.run(&CancelToken::new());
+    assert_eq!(
+        result.completion,
+        JobCompletion::Complete,
+        "{:?}",
+        result.diagnostics
+    );
+    assert!(result.collisions.is_empty(), "{:?}", result.collisions);
+    assert!(result.program.validate().is_ok());
+    let nc = reopened.export_nc().unwrap();
+    assert!(nc.lines().any(|line| line.starts_with("G1 ")), "{nc}");
+}
+
 /// Built entirely from analytic topology: no imported CAD or saved project fixture.
 fn two_pockets() -> (GeometryState, Vec<EntityRef>) {
     let mut f = Fixture::new();

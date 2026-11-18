@@ -597,6 +597,11 @@ impl AppController {
                         &cam_toolpath::ParallelStrategy::DOMAIN_REVISION.to_le_bytes(),
                     );
                 }
+                if matches!(op, Operation::Spiral(_)) {
+                    bytes.extend_from_slice(
+                        &cam_toolpath::SpiralStrategy::DOMAIN_REVISION.to_le_bytes(),
+                    );
+                }
                 if op.rotary_wrap().is_some() {
                     bytes.extend_from_slice(&cam_toolpath::ROTARY_WRAP_REVISION.to_le_bytes());
                 }

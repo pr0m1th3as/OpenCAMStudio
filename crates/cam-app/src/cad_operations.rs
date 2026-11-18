@@ -225,6 +225,7 @@ pub(crate) fn recipe(
         OpKind::Profile => ExtractionRecipe::ProfileContours,
         OpKind::Face => ExtractionRecipe::FaceRegion,
         OpKind::Parallel => ExtractionRecipe::ParallelFinishing,
+        OpKind::Spiral => ExtractionRecipe::SpiralFinishing,
         OpKind::Adaptive => ExtractionRecipe::AdaptiveClearing,
     })
 }
@@ -370,6 +371,7 @@ pub(crate) fn operation_type(operation: &Operation) -> &'static str {
         Operation::Adaptive(_) => "3D Adaptive Clearing",
         Operation::Parallel(o) if o.params.scallop => "3D Scallop",
         Operation::Parallel(_) => "3D Parallel",
+        Operation::Spiral(_) => "3D Spiral",
     }
 }
 
@@ -464,7 +466,7 @@ pub(crate) fn create_operation(
     defaults: JobParams,
 ) -> Result<(Operation, GeometryBinding), String> {
     let geometry = geometry_for_operation(document, id)?;
-    if matches!(kind, OpKind::Adaptive | OpKind::Parallel) {
+    if matches!(kind, OpKind::Adaptive | OpKind::Parallel | OpKind::Spiral) {
         cam_geometry3d::validate_adaptive_selection(&geometry, &selected)?;
     } else {
         validate_selection(&geometry, &selected)?;
@@ -792,6 +794,21 @@ pub(crate) fn create_operation(
                 ..Default::default()
             },
         }),
+        OpKind::Spiral => Operation::Spiral(cam_model::SpiralOp {
+            parameter_expressions: Default::default(),
+            id,
+            tool,
+            work_offset,
+            spindle_rpm: defaults.spindle_rpm,
+            tool_preset: None,
+            cooling: Default::default(),
+            entry_feeds: Default::default(),
+            params: cam_model::SpiralParams {
+                feed: defaults.feed,
+                plunge_feed: defaults.plunge_feed,
+                ..Default::default()
+            },
+        }),
     };
     if binding.recipe == ExtractionRecipe::PocketBoundary {
         binding.heights.bottom = binding.heights.top - depth;
@@ -1000,7 +1017,9 @@ pub(crate) fn resolve_document_checked(
             }
             if matches!(
                 binding.recipe,
-                ExtractionRecipe::AdaptiveClearing | ExtractionRecipe::ParallelFinishing
+                ExtractionRecipe::AdaptiveClearing
+                    | ExtractionRecipe::ParallelFinishing
+                    | ExtractionRecipe::SpiralFinishing
             ) {
                 cam_geometry3d::validate_adaptive_selection(&resolved.geometry, &binding.selected)
                     .map_err(|e| format!("Operation {id}: {e}"))?;
@@ -1212,6 +1231,7 @@ pub(crate) fn resolve_document_checked(
                     p.start_offset = input.heights.top;
                 }
                 (Operation::Parallel(_), ExtractionRecipe::ParallelFinishing)
+                | (Operation::Spiral(_), ExtractionRecipe::SpiralFinishing)
                 | (Operation::Adaptive(_), ExtractionRecipe::AdaptiveClearing) => {
                     // Body heights and projected silhouette belong to the binding;
                     // the adaptive planner resolves conservative CAD-derived layers.
@@ -1309,7 +1329,10 @@ pub(crate) fn selection_height_defaults(
     if matches!(operation, Operation::Pocket(_)) {
         return settings;
     }
-    if matches!(operation, Operation::Adaptive(_) | Operation::Parallel(_)) {
+    if matches!(
+        operation,
+        Operation::Adaptive(_) | Operation::Parallel(_) | Operation::Spiral(_)
+    ) {
         *settings.definition_mut(HeightPlaneKind::Top) =
             HeightDefinition::new(HeightReference::StockTop, 0.);
         *settings.definition_mut(HeightPlaneKind::Bottom) =
@@ -1347,7 +1370,10 @@ pub(crate) fn capture_height_override(
     // Adaptive operations have no legacy cutting-height fields. Their interval
     // belongs to the binding and reference-height settings, so comparing it with
     // legacy_cutting would turn an unrelated edit into a spurious height shift.
-    if matches!(after, Operation::Adaptive(_) | Operation::Parallel(_)) {
+    if matches!(
+        after,
+        Operation::Adaptive(_) | Operation::Parallel(_) | Operation::Spiral(_)
+    ) {
         return;
     }
     let Some(binding) = binding else {
@@ -1378,7 +1404,10 @@ pub(crate) fn capture_height_override(
         Operation::Carve(p) => (before.depth(), p.depth),
         Operation::Bore(p) => (before.depth(), p.z_top - p.z_bottom),
         Operation::Thread(p) => (before.depth(), p.z_top - p.z_bottom),
-        Operation::Chamfer(_) | Operation::Adaptive(_) | Operation::Parallel(_) => return,
+        Operation::Chamfer(_)
+        | Operation::Adaptive(_)
+        | Operation::Parallel(_)
+        | Operation::Spiral(_) => return,
     };
     if after_depth != before_depth {
         binding.overrides.bottom = Some(binding.effective_heights().top - after_depth);

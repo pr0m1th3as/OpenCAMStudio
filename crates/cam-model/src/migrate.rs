@@ -275,6 +275,7 @@ fn step(from: u32, doc: &mut Value) -> Result<(), MigrationError> {
         43 => Ok(()), // Existing round-stock edge references retain their format.
         44 => Ok(()), // Existing operations have no fourth-axis index.
         45 => Ok(()), // Additive concave radius mill tools; existing tools are unchanged.
+        47 => Ok(()), // Additive 3D Spiral finishing operation.
         46 => Ok(()), // Optional expression maps; old operations retain their literal values.
         39 => Ok(()), // Optional cylindrical fourth-axis wrap settings.
         36 => Ok(()), // Fixture bodies default to empty; clearances default to 5 mm.

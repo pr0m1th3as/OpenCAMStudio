@@ -106,7 +106,8 @@ use crate::{BoreOp, Tool};
 /// v45: fixed fourth-axis indexes on individual operations.
 /// v46: concave radius mill tool geometry.
 /// v47: persistent numeric-operation parameter formulas.
-pub const SCHEMA_VERSION: u32 = 47;
+/// v48: 3D Spiral finishing.
+pub const SCHEMA_VERSION: u32 = 48;
 
 /// How repeated instances are traversed when executing a pattern.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1271,6 +1272,27 @@ pub struct ParallelOp {
     pub params: ParallelParams,
 }
 
+/// 3D spiral finishing over a CAD solid or selected faces.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SpiralOp {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub parameter_expressions: std::collections::BTreeMap<crate::OperationParameter, String>,
+    pub id: u32,
+    pub tool: u32,
+    #[serde(default)]
+    pub spindle_rpm: f64,
+    #[serde(default)]
+    pub tool_preset: Option<crate::ToolPreset>,
+    #[serde(default)]
+    pub cooling: crate::Cooling,
+    #[serde(default)]
+    pub entry_feeds: crate::EntryFeeds,
+    #[serde(default = "default_work_offset")]
+    pub work_offset: u32,
+    #[serde(default)]
+    pub params: crate::SpiralParams,
+}
+
 /// 3D adaptive roughing resolved from an independent CAD machining projection.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AdaptiveOp {
@@ -2081,6 +2103,8 @@ pub enum Operation {
     Adaptive(AdaptiveOp),
     /// Equally spaced, surface-following 3D finishing passes.
     Parallel(ParallelOp),
+    /// Project a spiral or concentric circles onto a CAD surface.
+    Spiral(SpiralOp),
     /// A facing operation.
     Face(FaceOp),
     /// A chamfering operation.
@@ -2104,6 +2128,7 @@ impl Operation {
             Operation::Pocket(op) => op.id,
             Operation::Adaptive(op) => op.id,
             Operation::Parallel(op) => op.id,
+            Operation::Spiral(op) => op.id,
             Operation::Face(op) => op.id,
             Operation::Chamfer(op) => op.id,
             Operation::Bore(op) => op.id,
@@ -2122,6 +2147,7 @@ impl Operation {
             Operation::Pocket(op) => op.tool,
             Operation::Adaptive(op) => op.tool,
             Operation::Parallel(op) => op.tool,
+            Operation::Spiral(op) => op.tool,
             Operation::Face(op) => op.tool,
             Operation::Chamfer(op) => op.tool,
             Operation::Bore(op) => op.tool,
@@ -2158,6 +2184,7 @@ impl Operation {
             Operation::Pocket(op) => op.spindle_rpm,
             Operation::Adaptive(op) => op.spindle_rpm,
             Operation::Parallel(op) => op.spindle_rpm,
+            Operation::Spiral(op) => op.spindle_rpm,
             Operation::Face(op) => op.spindle_rpm,
             Operation::Chamfer(op) => op.spindle_rpm,
             Operation::Bore(op) => op.spindle_rpm,
@@ -2175,6 +2202,7 @@ impl Operation {
             Operation::Pocket(op) => op.spindle_rpm = rpm,
             Operation::Adaptive(op) => op.spindle_rpm = rpm,
             Operation::Parallel(op) => op.spindle_rpm = rpm,
+            Operation::Spiral(op) => op.spindle_rpm = rpm,
             Operation::Face(op) => op.spindle_rpm = rpm,
             Operation::Chamfer(op) => op.spindle_rpm = rpm,
             Operation::Bore(op) => op.spindle_rpm = rpm,
@@ -2194,6 +2222,7 @@ impl Operation {
             Operation::Pocket(op) => op.work_offset,
             Operation::Adaptive(op) => op.work_offset,
             Operation::Parallel(op) => op.work_offset,
+            Operation::Spiral(op) => op.work_offset,
             Operation::Face(op) => op.work_offset,
             Operation::Chamfer(op) => op.work_offset,
             Operation::Bore(op) => op.work_offset,
@@ -2211,6 +2240,7 @@ impl Operation {
             Operation::Pocket(op) => op.work_offset = work_offset,
             Operation::Adaptive(op) => op.work_offset = work_offset,
             Operation::Parallel(op) => op.work_offset = work_offset,
+            Operation::Spiral(op) => op.work_offset = work_offset,
             Operation::Face(op) => op.work_offset = work_offset,
             Operation::Chamfer(op) => op.work_offset = work_offset,
             Operation::Bore(op) => op.work_offset = work_offset,
@@ -2228,6 +2258,7 @@ impl Operation {
             Operation::Pocket(op) => op.id = id,
             Operation::Adaptive(op) => op.id = id,
             Operation::Parallel(op) => op.id = id,
+            Operation::Spiral(op) => op.id = id,
             Operation::Face(op) => op.id = id,
             Operation::Chamfer(op) => op.id = id,
             Operation::Bore(op) => op.id = id,
@@ -2247,6 +2278,7 @@ impl Operation {
             Operation::Pocket(op) => op.tool = tool,
             Operation::Adaptive(op) => op.tool = tool,
             Operation::Parallel(op) => op.tool = tool,
+            Operation::Spiral(op) => op.tool = tool,
             Operation::Face(op) => op.tool = tool,
             Operation::Chamfer(op) => op.tool = tool,
             Operation::Bore(op) => op.tool = tool,
@@ -2421,7 +2453,8 @@ impl Setup {
                 Operation::Profile(_)
                 | Operation::Pocket(_)
                 | Operation::Adaptive(_)
-                | Operation::Parallel(_) => true,
+                | Operation::Parallel(_)
+                | Operation::Spiral(_) => true,
                 Operation::Face(_) => {
                     if radial > 0.0 {
                         return Err(format!("operation {operation_id}: Face supports axial stock to leave only; radial allowance must be 0 mm"));
@@ -2436,7 +2469,7 @@ impl Setup {
                 | Operation::Carve(_) => false,
             };
             if !supported && (radial > 0.0 || axial > 0.0) {
-                return Err(format!("operation {operation_id}: stock to leave is supported for Profile, Pocket, Face, Adaptive, and Parallel only"));
+                return Err(format!("operation {operation_id}: stock to leave is supported for Profile, Pocket, Face, Adaptive, Parallel, and Spiral only"));
             }
         }
         Ok(())

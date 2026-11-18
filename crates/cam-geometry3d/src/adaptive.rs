@@ -195,7 +195,8 @@ fn bounds_polygon(bounds: [[f64; 3]; 2]) -> Result<Polygon, String> {
     .map_err(|e| e.to_string())
 }
 
-fn project_triangles(triangles: &[[[f64; 3]; 3]]) -> Result<Vec<Polygon>, String> {
+/// Union of all nondegenerate triangle projections in setup XY.
+pub fn projected_footprint(triangles: &[[[f64; 3]; 3]]) -> Result<Vec<Polygon>, String> {
     let mut polygons = Vec::new();
     for triangle in triangles {
         let contour = Contour::new(
@@ -460,7 +461,7 @@ pub fn resolve_adaptive(
             let projection = checked_projection(&asset.topology)?;
             let triangles =
                 triangles_for_faces(&projection.mesh, &[reference.id], instance.placement)?;
-            let mut polygons = project_triangles(&triangles)?;
+            let mut polygons = projected_footprint(&triangles)?;
             // A vertical face has zero area when each tessellation triangle
             // is flattened independently. Accept the useful full cylindrical
             // case only when its analytic circle and closed topology wire,

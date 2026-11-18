@@ -599,7 +599,7 @@ impl ToolLibrary {
                 .or_else(|| middle(|k| matches!(k, ToolKind::RoughingMill))),
             OpKind::Adaptive => middle(|k| matches!(k, ToolKind::RoughingMill))
                 .or_else(|| middle(|k| matches!(k, ToolKind::EndMill))),
-            OpKind::Parallel => middle(|k| matches!(k, ToolKind::BallMill)),
+            OpKind::Parallel | OpKind::Spiral => middle(|k| matches!(k, ToolKind::BallMill)),
             OpKind::Drill => middle(|k| matches!(k, ToolKind::Drill { .. })),
             OpKind::Bore => middle(|k| matches!(k, ToolKind::EndMill))
                 .or_else(|| middle(|k| matches!(k, ToolKind::RoughingMill))),
@@ -794,7 +794,7 @@ pub fn families_for(kind: OpKind) -> &'static [ToolKindPick] {
             F::ThreadMill,
             F::VBit,
         ],
-        OpKind::Parallel => &[F::BallMill],
+        OpKind::Parallel | OpKind::Spiral => &[F::BallMill],
         OpKind::Thread => &[F::ThreadMill],
         // A chamfer is cut by the flank, which both of these have.
         OpKind::Chamfer => &[F::ChamferMill, F::VBit, F::RadiusMill],

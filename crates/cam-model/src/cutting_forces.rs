@@ -139,6 +139,7 @@ impl Operation {
             Self::Pocket(o) => o.clear.feed,
             Self::Adaptive(o) => o.params.feed,
             Self::Parallel(o) => o.params.feed,
+            Self::Spiral(o) => o.params.feed,
             Self::Face(o) => o.feed,
             Self::Drill(o) => o.feed,
             Self::Chamfer(o) => o.feed,

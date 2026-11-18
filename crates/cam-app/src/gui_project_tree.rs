@@ -1351,6 +1351,7 @@ fn operation_icon(op: &Operation) -> Icon {
         Operation::Carve(_) => Icon::Carve,
         Operation::Adaptive(_) => Icon::Adaptive,
         Operation::Parallel(_) => Icon::Parallel,
+        Operation::Spiral(_) => Icon::Spiral,
     }
 }
 

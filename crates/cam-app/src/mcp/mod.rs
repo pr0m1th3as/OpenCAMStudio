@@ -229,7 +229,7 @@ pub(crate) fn choice(values: &[&str]) -> Value {
 pub(crate) fn kind() -> Value {
     choice(&[
         "Profile", "Pocket", "Drill", "Face", "Chamfer", "Thread", "Bore", "Engrave", "Carve",
-        "Adaptive", "Parallel",
+        "Adaptive", "Parallel", "Spiral",
     ])
 }
 

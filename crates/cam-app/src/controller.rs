@@ -97,6 +97,7 @@ pub enum OpKind {
     Carve,
     Adaptive,
     Parallel,
+    Spiral,
 }
 
 /// Whether an operation kind restricts geometry selection to **circular** loops.
@@ -983,7 +984,7 @@ impl AppController {
         entities: &[cam_model::EntityRef],
     ) -> Result<cam_geometry3d::ResolvedInput, String> {
         let geometry = self.setup_geometry_state()?;
-        if matches!(kind, OpKind::Adaptive | OpKind::Parallel) {
+        if matches!(kind, OpKind::Adaptive | OpKind::Parallel | OpKind::Spiral) {
             cam_geometry3d::validate_adaptive_selection(&geometry, entities)?;
         } else {
             crate::cad_operations::validate_selection(&geometry, entities)?;
@@ -1161,6 +1162,7 @@ impl AppController {
                     | OpKind::Thread
                     | OpKind::Adaptive
                     | OpKind::Parallel
+                    | OpKind::Spiral
                     | OpKind::Bore
             ) {
             crate::cad_operations::selection_height_defaults(&preview, &op)
@@ -1185,7 +1187,7 @@ impl AppController {
         let mut doc = self.document().clone();
         if matches!(
             self.operation(id),
-            Some(Operation::Adaptive(_) | Operation::Parallel(_))
+            Some(Operation::Adaptive(_) | Operation::Parallel(_) | Operation::Spiral(_))
         ) {
             cam_geometry3d::validate_adaptive_selection(self.geometry_state(), &entities)?;
         } else {
@@ -2582,6 +2584,17 @@ impl AppController {
                 work_offset: 1,
                 params: ParallelParams::default(),
             }),
+            OpKind::Spiral => Operation::Spiral(cam_model::SpiralOp {
+                parameter_expressions: Default::default(),
+                id: 0,
+                tool,
+                spindle_rpm,
+                tool_preset: None,
+                cooling: Default::default(),
+                entry_feeds: Default::default(),
+                work_offset: 1,
+                params: cam_model::SpiralParams::default(),
+            }),
         };
         if let Some(cooling) = self
             .setup()
@@ -3393,6 +3406,7 @@ fn op_kind_of(op: &Operation) -> OpKind {
         Operation::Carve(_) => OpKind::Carve,
         Operation::Adaptive(_) => OpKind::Adaptive,
         Operation::Parallel(_) => OpKind::Parallel,
+        Operation::Spiral(_) => OpKind::Spiral,
     }
 }
 
@@ -3643,7 +3657,7 @@ mod tests {
             Operation::Engrave(o) => o.depth,
             Operation::Carve(o) => o.depth,
             Operation::Adaptive(o) => o.params.stepdown,
-            Operation::Parallel(_) => 1.0,
+            Operation::Parallel(_) | Operation::Spiral(_) => 1.0,
         }
     }
 

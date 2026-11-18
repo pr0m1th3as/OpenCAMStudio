@@ -446,7 +446,7 @@ pub fn legacy_cutting(op: &Operation, h: &Heights) -> CuttingHeights {
             top: o.top,
             bottom: o.top - o.depth,
         },
-        Operation::Parallel(_) => CuttingHeights {
+        Operation::Parallel(_) | Operation::Spiral(_) => CuttingHeights {
             top: h.top_of_stock,
             bottom: h.top_of_stock - 1.0,
         },
@@ -572,7 +572,10 @@ impl Document {
                 bottom: wrap.surface_z - depth,
             };
         }
-        if matches!(op, Operation::Adaptive(_) | Operation::Parallel(_)) {
+        if matches!(
+            op,
+            Operation::Adaptive(_) | Operation::Parallel(_) | Operation::Spiral(_)
+        ) {
             if let Some(binding) = self.geometry.bindings.get(&op.id()) {
                 return binding.effective_heights();
             }

@@ -410,7 +410,7 @@ impl JobInputs {
         let mut result = verify(program, simulation).ok_or_else(stopped)?;
         if self.preview_program.is_none() {
             if let Some(repaired) =
-                self.reroute_parallel_stock_links(program, &result.collisions, cancel)
+                self.reroute_finishing_stock_links(program, &result.collisions, cancel)
             {
                 *program = repaired;
                 // Re-run the unchanged collision checks on the actual output.
@@ -476,8 +476,8 @@ impl JobInputs {
 
     /// CAD clearance is not proof of cleared stock: a ball nose leaves scallops
     /// and the next row may still be uncut. Preserve non-cutting link semantics
-    /// and replace only blocked Parallel links with the normal clearance entry.
-    fn reroute_parallel_stock_links(
+    /// and replace blocked surface-finishing links with the normal clearance entry.
+    fn reroute_finishing_stock_links(
         &self,
         program: &Program,
         collisions: &[Collision],
@@ -497,21 +497,29 @@ impl JobInputs {
             .operations
             .iter()
             .filter_map(|op| {
-                let cam_model::Operation::Parallel(parallel) = op else {
-                    return None;
+                let plunge_feed = match op {
+                    cam_model::Operation::Parallel(o)
+                        if (o.params.scallop
+                            && o.params.scallop_retraction
+                                != cam_model::ScallopRetraction::Full)
+                            || (!o.params.scallop
+                                && o.params.stay_down
+                                && o.params.lift_height > 0.) =>
+                    {
+                        o.params.plunge_feed
+                    }
+                    cam_model::Operation::Spiral(o)
+                        if o.params.retraction != cam_model::ScallopRetraction::Full =>
+                    {
+                        o.params.plunge_feed
+                    }
+                    _ => return None,
                 };
-                let scallop_links = parallel.params.scallop
-                    && parallel.params.scallop_retraction != cam_model::ScallopRetraction::Full;
-                if !scallop_links
-                    && (!parallel.params.stay_down || parallel.params.lift_height <= 0.)
-                {
-                    return None;
-                }
                 let clearance = match setup.height_settings.get(&op.id()) {
                     Some(settings) => settings.resolve(&self.document, op).ok()?.clearance,
                     None => setup.heights_for(op.id()).clearance,
                 };
-                Some((op.id(), (clearance, parallel.params.plunge_feed)))
+                Some((op.id(), (clearance, plunge_feed)))
             })
             .collect();
         let mut output = Program::new();

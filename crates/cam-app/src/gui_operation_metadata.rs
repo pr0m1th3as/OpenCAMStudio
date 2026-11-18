@@ -203,6 +203,34 @@ pub(super) fn operation_fields(op: &Operation) -> Vec<Field> {
             }
             fields
         }
+        Operation::Spiral(o) => {
+            let mut fields = vec![
+                Field::AdaptiveOffset,
+                Field::SpiralFromSlope,
+                Field::SpiralToSlope,
+                Field::AdaptiveTolerance,
+                Field::SpiralStepover,
+                Field::SpiralInnerLimit,
+                Field::SpiralOuterLimit,
+                Field::SpindleRpm,
+                Field::Feed,
+                Field::PlungeFeed,
+            ];
+            if o.params.retraction != cam_model::ScallopRetraction::Full {
+                fields.extend([Field::ScallopSafeDistance, Field::SpiralStayDownDistance]);
+            }
+            if o.params.multiple_depths {
+                fields.extend([
+                    Field::SpiralAxialOffset,
+                    Field::Stepdown,
+                    Field::SpiralStepdowns,
+                ]);
+            }
+            if o.params.smoothing {
+                fields.push(Field::ScallopSmoothingTolerance);
+            }
+            fields
+        }
         Operation::Parallel(o) => {
             let mut fields = Vec::new();
             if !o.params.scallop {
