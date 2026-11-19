@@ -107,7 +107,9 @@ use crate::{BoreOp, Tool};
 /// v46: concave radius mill tool geometry.
 /// v47: persistent numeric-operation parameter formulas.
 /// v48: 3D Spiral finishing.
-pub const SCHEMA_VERSION: u32 = 48;
+/// v49: Parallel cutting turns and repositioning policy.
+/// v50: Parallel transition type.
+pub const SCHEMA_VERSION: u32 = 50;
 
 /// How repeated instances are traversed when executing a pattern.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

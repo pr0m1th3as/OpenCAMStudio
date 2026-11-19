@@ -10,13 +10,6 @@ fn tray_parallel_stay_down_verifies_against_remaining_stock() {
     let mut app = AppController::new(default_machine());
     app.open_project(root.join("testfiles/tray-parallel.ocam"))
         .unwrap();
-    app.edit_operation(0, |op| {
-        let Operation::Parallel(p) = op else {
-            panic!("the tray fixture must contain Parallel #0")
-        };
-        p.params.stay_down = true;
-        p.params.lift_height = 0.;
-    });
     let run = app.run(&CancelToken::new());
     assert_eq!(
         run.completion,

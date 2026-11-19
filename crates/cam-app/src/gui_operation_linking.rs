@@ -308,20 +308,18 @@ impl App {
                     Message::PlungeKindChanged,
                 ));
             }
-            Operation::Parallel(p) if !p.params.scallop => {
-                moves.push(help_wrap(
-                    row![
-                        text("Keep tool down").size(12).width(Length::Fill),
-                        checkbox(p.params.stay_down)
-                            .size(15)
-                            .on_toggle(Message::ParallelStayDownToggled),
-                    ].spacing(8).align_y(Alignment::Center),
-                    "Enable short transitions between neighboring passes when the swept cutter clears the model. At 0 mm Lift height, the tool continues finishing along the surface without an added lift. Gaps and unsafe transitions retract to clearance. Use on pre-roughed stock.",
-                    self.tooltips,
-                ));
-            }
-            Operation::Parallel(p) if p.params.scallop => {
-                moves.push(self.finishing_retraction_control(p.params.scallop_retraction));
+            Operation::Parallel(p) => {
+                moves.push(self.finishing_retraction_control(p.params.retraction_policy()));
+                if !p.params.scallop {
+                    leads.push(profile_picker(
+                        "Transition type",
+                        "No contact retracts between passes. Straight line joins the pass ends at the boundary. Shortest path prefers the shortest checked cutting connection. Smooth rounds beyond the pass ends where the cutter can clear the model.",
+                        self.tooltips,
+                        p.params.transition,
+                        &cam_model::ParallelTransition::ALL[..],
+                        Message::ParallelTransitionChanged,
+                    ));
+                }
             }
             Operation::Spiral(p) => {
                 moves.push(self.finishing_retraction_control(p.params.retraction));
@@ -578,7 +576,7 @@ impl App {
     ) -> Element<'_, Message> {
         profile_picker(
                     "Retraction policy",
-                    "Full clearance, a checked raised link, or a checked direct feed link. Links blocked by stock are rerouted during verification.",
+                    "Choose a full retract, a checked raised traverse, or a checked straight feed link between disconnected passes.",
                     self.tooltips,
                     policy,
                     &[

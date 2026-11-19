@@ -499,12 +499,7 @@ impl JobInputs {
             .filter_map(|op| {
                 let plunge_feed = match op {
                     cam_model::Operation::Parallel(o)
-                        if (o.params.scallop
-                            && o.params.scallop_retraction
-                                != cam_model::ScallopRetraction::Full)
-                            || (!o.params.scallop
-                                && o.params.stay_down
-                                && o.params.lift_height > 0.) =>
+                        if o.params.retraction_policy() != cam_model::ScallopRetraction::Full =>
                     {
                         o.params.plunge_feed
                     }
@@ -1329,7 +1324,7 @@ mod tests {
     }
 
     #[test]
-    fn parallel_links_use_clearance_only_when_remaining_stock_blocks_them() {
+    fn surface_finishing_links_use_clearance_only_when_remaining_stock_blocks_them() {
         use cam_cldata::{MoveKind, Point3, Step, Tag};
         let mut app = drilled_blank();
         app.edit_tool(0, |tool| tool.kind = cam_model::ToolKind::BallMill);
@@ -1346,8 +1341,7 @@ mod tests {
                 cooling: Default::default(),
                 entry_feeds: Default::default(),
                 params: cam_model::ParallelParams {
-                    stay_down: true,
-                    lift_height: 2.,
+                    retraction: cam_model::ScallopRetraction::Minimum,
                     plunge_feed: 60.,
                     ..Default::default()
                 },
@@ -1452,26 +1446,30 @@ mod tests {
             cam_model::ScallopRetraction::Minimum,
             cam_model::ScallopRetraction::Shortest,
         ] {
-            let mut scallop_inputs = inputs.clone();
-            let operation = std::sync::Arc::make_mut(&mut scallop_inputs.document)
-                .setup_mut()
-                .operations
-                .iter_mut()
-                .find(|op| op.id() == 7)
-                .unwrap();
-            if let Operation::Parallel(parallel) = operation {
-                parallel.params.scallop = true;
-                parallel.params.stay_down = false;
-                parallel.params.scallop_retraction = policy;
+            let Operation::Parallel(mut scallop) = inputs.document.setup().operations[0].clone()
+            else {
+                unreachable!()
+            };
+            scallop.params.scallop = true;
+            scallop.params.scallop_retraction = policy;
+
+            let Operation::Spiral(mut spiral) = app.operation_template(crate::OpKind::Spiral, 1)
+            else {
+                unreachable!()
+            };
+            spiral.id = 7;
+            spiral.params.retraction = policy;
+            spiral.params.plunge_feed = 60.;
+            for operation in [Operation::Parallel(scallop), Operation::Spiral(spiral)] {
+                let mut policy_inputs = inputs.clone();
+                std::sync::Arc::make_mut(&mut policy_inputs.document)
+                    .setup_mut()
+                    .operations = vec![operation];
+                let mut program = original.clone();
+                let result = simulate(&policy_inputs, &mut program, None);
+                assert!(result.is_clean(), "{policy:?}: {:?}", result.collisions);
+                assert_eq!(program, repaired);
             }
-            let mut program = original.clone();
-            let result = simulate(&scallop_inputs, &mut program, None);
-            assert!(result.is_clean(), "{policy:?}: {:?}", result.collisions);
-            assert_eq!(
-                program.len(),
-                original.len() + 2,
-                "blocked Scallop links need the same stock repair"
-            );
         }
 
         let mut unrelated = original.clone();

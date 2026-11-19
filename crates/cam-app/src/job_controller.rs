@@ -223,8 +223,8 @@ impl AppController {
                 inputs.document.active_setup_id,
                 &inputs.document.rotary_indexes,
                 env!("CARGO_PKG_VERSION"),
-                // Rebuild stock generated before same-depth wall sweeps were retained.
-                2u32,
+                // Verified programs and stock must reflect the current linking rules.
+                7u32,
             ),
             &inputs.document.excluded_operations,
             &inputs.document.disabled_origins,

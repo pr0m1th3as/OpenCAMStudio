@@ -6,6 +6,7 @@ use cam_model::{AdaptiveContainment, ParallelOp, StockToLeave, ToolKind};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use wide::{f64x4, CmpLe};
+mod rows;
 mod scallop;
 mod spiral;
 mod surface_passes;
@@ -163,12 +164,44 @@ impl<'a> Grid<'a> {
         allowed: impl Fn(&[V; 3]) -> bool,
         cancel: &CancelToken,
     ) -> bool {
-        let mid = mul(add(a, b), 0.5);
-        let half_xy = (a[0] - b[0]).hypot(a[1] - b[1]) * 0.5;
-        let mut intervals = Vec::new();
-        for id in self.indices(mid, half_xy) {
+        self.covered_intervals(a, b, allowed, cancel)
+            .is_some_and(|intervals| {
+                matches!(intervals.as_slice(), [(lo, hi)]
+                if *lo <= 1e-10 && *hi >= 1. - 1e-10)
+            })
+    }
+
+    /// Union of the selected triangles' XY intervals along a segment.
+    fn covered_intervals(
+        &self,
+        a: V,
+        b: V,
+        allowed: impl Fn(&[V; 3]) -> bool,
+        cancel: &CancelToken,
+    ) -> Option<Vec<(f64, f64)>> {
+        // Reconstructing rotated rows in setup coordinates can leave their
+        // endpoints a few floating-point units outside an exact boundary.
+        const EDGE_ROUNDOFF: f64 = 1e-10;
+        let delta = sub(b, a);
+        let length = delta[0].hypot(delta[1]);
+        // Query along the segment in pieces so a long row does not search
+        // the full disk around its midpoint.
+        let chunks = (length / (8. * self.size)).ceil().max(1.) as usize;
+        let radius = length / (2. * chunks as f64) + EDGE_ROUNDOFF;
+        let mut candidates = Vec::new();
+        for index in 0..chunks {
             if cancel.is_cancelled() {
-                return false;
+                return None;
+            }
+            let mid = add(a, mul(delta, (index as f64 + 0.5) / chunks as f64));
+            candidates.extend(self.indices(mid, radius));
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        let mut intervals = Vec::new();
+        for id in candidates {
+            if cancel.is_cancelled() {
+                return None;
             }
             let triangle = &self.mesh[id];
             let normal = cross(sub(triangle[1], triangle[0]), sub(triangle[2], triangle[0]))[2];
@@ -180,8 +213,10 @@ impl<'a> Grid<'a> {
             for i in 0..3 {
                 let p = triangle[i];
                 let edge = sub(triangle[(i + 1) % 3], p);
-                let side =
-                    |q: V| normal.signum() * (edge[0] * (q[1] - p[1]) - edge[1] * (q[0] - p[0]));
+                let roundoff = EDGE_ROUNDOFF * edge[0].hypot(edge[1]);
+                let side = |q: V| {
+                    normal.signum() * (edge[0] * (q[1] - p[1]) - edge[1] * (q[0] - p[0])) + roundoff
+                };
                 let (fa, fb) = (side(a), side(b));
                 if fa < 0. && fb < 0. {
                     hi = -1.;
@@ -199,17 +234,14 @@ impl<'a> Grid<'a> {
             }
         }
         intervals.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-        let mut covered: f64 = 0.;
+        let mut merged: Vec<(f64, f64)> = Vec::new();
         for (lo, hi) in intervals {
-            if lo > covered + 1e-10 {
-                return false;
-            }
-            covered = covered.max(hi);
-            if covered >= 1. - 1e-10 {
-                return true;
+            match merged.last_mut() {
+                Some((_, end)) if lo <= *end + 1e-10 => *end = end.max(hi),
+                _ => merged.push((lo, hi)),
             }
         }
-        false
+        Some(merged)
     }
 }
 
@@ -280,11 +312,11 @@ fn filter_bounds(ids: &mut Vec<usize>, bounds: &[Bounds4], p: V, r: f64) {
     ids.truncate(written);
 }
 
-fn split_row(fragments: &mut Vec<(Vec<V>, bool)>, path: &mut Vec<V>) {
-    // Consecutive empty trims have the same linker effect. Keep the first so a
-    // gap still retracts, without queuing millions of empty vectors over air.
-    if !path.is_empty() || fragments.last().is_none_or(|(last, _)| !last.is_empty()) {
-        fragments.push((std::mem::take(path), false));
+fn split_row(fragments: &mut Vec<Vec<V>>, path: &mut Vec<V>) {
+    if path.len() > 1 {
+        fragments.push(std::mem::take(path));
+    } else {
+        path.clear();
     }
 }
 #[derive(Clone, Debug)]
@@ -294,7 +326,7 @@ pub struct ParallelStrategy {
     geometry: ParallelGeometry,
 }
 impl ParallelStrategy {
-    pub const DOMAIN_REVISION: u32 = 10;
+    pub const DOMAIN_REVISION: u32 = 15;
     pub fn new(op: ParallelOp, stock: StockToLeave, geometry: ParallelGeometry) -> Self {
         Self {
             op,
@@ -340,9 +372,6 @@ impl ParallelStrategy {
             out.cancelled = true;
             return out;
         }
-        if !p.lift_height.is_finite() || p.lift_height < 0. {
-            fail!("Parallel lift height must be finite and nonnegative");
-        }
         if [p.tolerance, p.stepover, p.feed, p.plunge_feed]
             .iter()
             .any(|v| !v.is_finite() || *v <= 0.)
@@ -377,15 +406,16 @@ impl ParallelStrategy {
         let [lo, hi] = projection.bounds;
         let r = projection.radius;
         let error = projection.error;
-        let contact_radius = r + error;
         let lift = error + p.tolerance + projection.axial;
         let step = (r * p.tolerance).sqrt().clamp(0.01, 0.5);
         let (s, c) = angle.sin_cos();
         let world = |u: f64, v: f64| [c * u - s * v, s * u + c * v, 0.];
-        let rows = ((hi[1] - lo[1]) / p.stepover).ceil() as usize;
+        let row_count = ((hi[1] - lo[1]) / p.stepover).ceil() as usize;
         let samples = ((hi[0] - lo[0]) / step).ceil() as usize;
         if !p.scallop
-            && (rows > 100_000 || samples > 1_000_000 || rows.saturating_mul(samples) > 5_000_000)
+            && (row_count > 100_000
+                || samples > 1_000_000
+                || row_count.saturating_mul(samples) > 5_000_000)
         {
             fail!(
                 "Parallel exceeds the five-million sample budget; increase stepover or tolerance"
@@ -397,10 +427,13 @@ impl ParallelStrategy {
         if p.scallop {
             return scallop::compute(grid, selected, &mut linking, op, lo, hi, cancel);
         }
+        if !p.safe_distance.is_finite() || p.safe_distance < 0. {
+            fail!("Parallel safe distance must be finite and nonnegative");
+        }
         // Bound queued work by both row count and nominal samples. Indexed
         // collection keeps row order independent of worker scheduling.
         let batch_rows = (16_384 / (samples + 1)).clamp(1, 32);
-        let sample_row = |row: usize| -> Option<Vec<(Vec<V>, bool)>> {
+        let sample_row = |row: usize| -> Option<Vec<Vec<V>>> {
             if cancel.is_cancelled() {
                 return None;
             }
@@ -408,97 +441,108 @@ impl ParallelStrategy {
             let top = self.geometry.heights.top;
             let mut fragments = Vec::new();
             let v = lo[1] + (row as f64 * p.stepover).min(hi[1] - lo[1]);
+            let center_on_boundary = p.containment == AdaptiveContainment::Center;
+            let reverse = p.both_ways && row % 2 == 1;
+            let a = world(lo[0], v);
+            let b = world(hi[0], v);
+            let mut spans = if center_on_boundary {
+                selected.covered_intervals(a, b, |_| true, cancel)?
+            } else {
+                vec![(0., 1.)]
+            };
+            if reverse {
+                spans.reverse();
+            }
             let mut path: Vec<V> = Vec::new();
-            let mut continuous = true;
-            for j in 0..=samples {
-                if j % 256 == 0 && cancel.is_cancelled() {
-                    return None;
-                }
-                let k = if p.both_ways && row % 2 == 1 {
-                    samples - j
-                } else {
-                    j
-                };
-                let mut q = world(lo[0] + (hi[0] - lo[0]) * k as f64 / samples as f64, v);
-                // Contact-only trimming prevents cutting across openings or
-                // separate selected faces. Every disconnected run retracts.
-                if !selected.contact(q) && selected.height(q, r).is_none() {
-                    split_row(&mut fragments, &mut path);
-                    continuous = false;
+            for (start, end) in spans {
+                if start >= end {
                     continue;
                 }
-                let Some(z) = grid.height(q, contact_radius) else {
-                    split_row(&mut fragments, &mut path);
-                    continuous = false;
-                    continue;
-                };
-                q[2] = z + lift;
-                // Protect the cylindrical flute above the ball: no triangle
-                // within its XY disk may reach above the sphere centre. Tall
-                // walls are handled by lifting the cutter conservatively.
-                let ids = grid.indices(q, contact_radius);
-                let wall = ids
-                    .iter()
-                    .filter_map(|i| flat_height(q, &grid.mesh[*i], contact_radius))
-                    .fold(f64::NEG_INFINITY, f64::max);
-                q[2] = q[2].max(wall - r + lift).max(bottom);
-                if q[2] > top + lift {
-                    split_row(&mut fragments, &mut path);
-                    continuous = false;
-                    continue;
-                }
-                if let Some(prev) = path.last().copied() {
-                    let previous_length = path.len();
-                    if !refine(
-                        grid,
-                        prev,
-                        q,
-                        r,
-                        error,
-                        lift,
-                        p.tolerance,
-                        bottom,
-                        0,
-                        &mut path,
-                        cancel,
-                    ) {
-                        if cancel.is_cancelled() {
-                            return None;
-                        }
-                        // A vertical contact discontinuity cannot be followed
-                        // continuously. Discard the attempted connector and
-                        // restart from clearance rather than cutting a shortcut.
-                        path.truncate(previous_length);
+                let count = (samples as f64 * (end - start)).ceil() as usize;
+                for j in 0..=count {
+                    if j % 256 == 0 && cancel.is_cancelled() {
+                        return None;
+                    }
+                    let k = if reverse { count - j } else { j };
+                    let t = if k == count {
+                        end
+                    } else {
+                        start + (end - start) * k as f64 / count as f64
+                    };
+                    let mut q = world(lo[0] + (hi[0] - lo[0]) * t, v);
+                    // Contact-only trimming prevents cutting across openings or
+                    // separate selected faces. Every disconnected run retracts.
+                    if !center_on_boundary
+                        && !selected.contact(q)
+                        && selected.height(q, r).is_none()
+                    {
                         split_row(&mut fragments, &mut path);
-                        continuous = false;
+                        continue;
+                    }
+                    let Some(z) = row_tip_height(grid, q, r, error, lift, bottom) else {
+                        split_row(&mut fragments, &mut path);
+                        continue;
+                    };
+                    q[2] = z;
+                    if q[2] > top + lift {
+                        split_row(&mut fragments, &mut path);
+                        continue;
+                    }
+                    if let Some(prev) = path.last().copied() {
+                        let previous_length = path.len();
+                        if !refine(
+                            grid,
+                            prev,
+                            q,
+                            r,
+                            error,
+                            lift,
+                            p.tolerance,
+                            bottom,
+                            0,
+                            &mut path,
+                            cancel,
+                        ) {
+                            if cancel.is_cancelled() {
+                                return None;
+                            }
+                            // A vertical contact discontinuity cannot be followed
+                            // continuously. Discard the attempted connector and
+                            // restart from clearance rather than cutting a shortcut.
+                            path.truncate(previous_length);
+                            split_row(&mut fragments, &mut path);
+                            path.push(q);
+                        }
+                    } else {
                         path.push(q);
                     }
-                } else {
-                    path.push(q);
                 }
+                split_row(&mut fragments, &mut path);
             }
-            fragments.push((path, continuous));
             Some(fragments)
         };
-        for first in (0..=rows).step_by(batch_rows) {
-            let end = (first + batch_rows).min(rows + 1);
+        let mut rows = rows::ScanRows::default();
+        for first in (0..=row_count).step_by(batch_rows) {
+            let end = (first + batch_rows).min(row_count + 1);
             let batch: Option<Vec<_>> = (first..end).into_par_iter().map(&sample_row).collect();
             let Some(batch) = batch else {
                 out.cancelled = true;
                 return out;
             };
             for fragments in batch {
-                for (mut path, continuous) in fragments {
-                    if cancel.is_cancelled() {
-                        out.cancelled = true;
-                        return out;
-                    }
-                    linking.emit(&mut out, &mut path, op, continuous, cancel);
+                if cancel.is_cancelled() {
+                    out.cancelled = true;
+                    return out;
                 }
-                if out.program.steps().len() > 2_000_000 {
+                if !rows.push(fragments, &linking, op, [c, s, 0.], cancel) {
                     fail!("Parallel exceeds the two-million motion budget; increase tolerance or stepover");
                 }
             }
+        }
+        if !rows.emit(&mut out, &mut linking, op, projection.retract, cancel)
+            && !cancel.is_cancelled()
+        {
+            fail!("Parallel exceeds the two-million motion budget; increase tolerance or stepover");
         }
         linking.retract(&mut out, op.id);
         if cancel.is_cancelled() {
@@ -541,6 +585,7 @@ struct SurfaceProjection<'mesh> {
     error: f64,
     axial: f64,
     clearance: f64,
+    retract: f64,
     heights: cam_model::CuttingHeights,
 }
 
@@ -658,6 +703,11 @@ impl<'mesh> SurfaceProjection<'mesh> {
             error,
             axial,
             clearance,
+            retract: if env.heights.retract > top.max(env.heights.top_of_stock) {
+                env.heights.retract.min(clearance)
+            } else {
+                clearance
+            },
             heights: geometry.heights,
         })
     }
@@ -721,54 +771,6 @@ impl PassLinker<'_, '_> {
             })
     }
 
-    fn local_link(&self, from: V, to: V, op: &ParallelOp, cancel: &CancelToken) -> Option<Vec<V>> {
-        let distance = (from[0] - to[0]).hypot(from[1] - to[1]);
-        // Bound spatial queries even with an arbitrarily large user stepover.
-        if distance > (1.5 * op.params.stepover).min(4. * self.radius) {
-            return None;
-        }
-        if !self.selected.covers_segment(from, to, cancel) {
-            return None;
-        }
-        if op.params.lift_height == 0. {
-            // A zero-lift turnaround continues the finishing cut. Derive and
-            // certify its Z against the surface just like the scan rows, so it
-            // can machine the intervening scallop instead of demanding air.
-            let margin = self.error + op.params.tolerance + self.axial;
-            let mut path = Vec::new();
-            if refine(
-                self.grid,
-                from,
-                to,
-                self.radius,
-                self.error,
-                margin,
-                op.params.tolerance,
-                self.bottom,
-                0,
-                &mut path,
-                cancel,
-            ) && path
-                .iter()
-                .all(|q| q[2] <= self.top + margin && q[2] < self.clearance)
-            {
-                return Some(path);
-            }
-            return None;
-        }
-        let z = (from[2].max(to[2]) + op.params.lift_height).min(self.clearance);
-        // Once the requested lift reaches clearance, use the usual rapid link.
-        if z >= self.clearance {
-            return None;
-        }
-        let a = [from[0], from[1], z];
-        let b = [to[0], to[1], z];
-        (self.segment_clear(from, a, cancel)
-            && self.segment_clear(a, b, cancel)
-            && self.segment_clear(b, to, cancel))
-        .then(|| vec![a, b])
-    }
-
     fn retract(&mut self, out: &mut StrategyResult, id: u32) {
         if let Some(p) = self.previous.take() {
             out.program.push(Step::Rapid {
@@ -776,77 +778,6 @@ impl PassLinker<'_, '_> {
                 tag: Tag::new(id, MoveKind::Retract),
             });
         }
-    }
-
-    fn emit(
-        &mut self,
-        out: &mut StrategyResult,
-        path: &mut Vec<V>,
-        op: &ParallelOp,
-        continuous: bool,
-        cancel: &CancelToken,
-    ) {
-        // A trimmed row can still meet the next row on one continuous face.
-        // For surface-cutting turns, let the exact selection coverage and
-        // surface checks decide continuity instead of retracting on any trim.
-        let surface_turn = op.params.stay_down && op.params.lift_height == 0.;
-        let continuous = continuous || surface_turn;
-        if path.len() > 1 {
-            self.passes += 1;
-            let p = path[0];
-            let local = self
-                .previous
-                .filter(|_| continuous && op.params.stay_down)
-                .and_then(|from| self.local_link(from, p, op, cancel));
-            let at_depth = local.is_some() && op.params.lift_height == 0.;
-            if let Some(raised) = local {
-                for q in raised {
-                    if self.previous == Some(q) {
-                        continue;
-                    }
-                    out.program.push(Step::Linear {
-                        to: Point3::new(q[0], q[1], q[2]),
-                        feed: op.params.feed,
-                        tag: Tag::new(
-                            op.id,
-                            if at_depth {
-                                MoveKind::Cutting
-                            } else {
-                                MoveKind::Link
-                            },
-                        ),
-                    });
-                }
-                self.previous = None;
-            } else {
-                self.retract(out, op.id);
-                out.program.push(Step::Rapid {
-                    to: Point3::new(p[0], p[1], self.clearance),
-                    tag: Tag::new(op.id, MoveKind::Link),
-                });
-            }
-            if !at_depth {
-                out.program.push(Step::Linear {
-                    to: Point3::new(p[0], p[1], p[2]),
-                    feed: op.params.plunge_feed,
-                    tag: Tag::new(op.id, MoveKind::Plunge),
-                });
-            }
-            for p in path.iter().skip(1) {
-                out.program.push(Step::Linear {
-                    to: Point3::new(p[0], p[1], p[2]),
-                    feed: op.params.feed,
-                    tag: Tag::new(op.id, MoveKind::Cutting),
-                });
-            }
-            self.previous = path.last().copied();
-            if !continuous || !op.params.stay_down {
-                self.retract(out, op.id);
-            }
-        } else if !surface_turn {
-            self.retract(out, op.id);
-        }
-        path.clear();
     }
 }
 
@@ -891,6 +822,25 @@ fn flat_height(p: V, t: &[V; 3], r: f64) -> Option<f64> {
     }
     best.is_finite().then_some(best)
 }
+// Protect the cylindrical flute above the ball as well as the ball itself.
+fn row_tip_height(
+    grid: &Grid,
+    q: V,
+    radius: f64,
+    error: f64,
+    margin: f64,
+    bottom: f64,
+) -> Option<f64> {
+    let reach = radius + error;
+    let z = grid.height(q, reach)?;
+    let wall = grid
+        .indices(q, reach)
+        .into_iter()
+        .filter_map(|i| flat_height(q, &grid.mesh[i], reach))
+        .fold(f64::NEG_INFINITY, f64::max);
+    Some((z + margin).max(wall - radius + margin).max(bottom))
+}
+
 // Keep the recursive segment's geometry and safety limits explicit at call sites.
 #[allow(clippy::too_many_arguments)]
 fn refine(
@@ -1109,7 +1059,7 @@ mod tests {
             },
         }
     }
-    fn op() -> ParallelOp {
+    pub(super) fn op() -> ParallelOp {
         ParallelOp {
             parameter_expressions: Default::default(),
             id: 7,
@@ -1120,6 +1070,7 @@ mod tests {
             cooling: Default::default(),
             entry_feeds: Default::default(),
             params: ParallelParams {
+                retraction: cam_model::ScallopRetraction::Full,
                 stepover: 1.,
                 ..Default::default()
             },
@@ -1251,10 +1202,14 @@ mod tests {
             .build()
             .unwrap();
         for scallop in [false, true] {
-            for stay_down in [false, true] {
+            for retraction in [
+                cam_model::ScallopRetraction::Full,
+                cam_model::ScallopRetraction::Shortest,
+            ] {
                 let mut operation = op();
                 operation.params.scallop = scallop;
-                operation.params.stay_down = stay_down;
+                operation.params.retraction = retraction;
+                operation.params.scallop_retraction = retraction;
                 operation.params.containment = AdaptiveContainment::Center;
                 let mut geometry = surface();
                 // Separate selections exercise trims, empty fragments and retracts.
@@ -1822,7 +1777,6 @@ mod tests {
         };
         let mut operation = op();
         operation.params.scallop = true;
-        operation.params.stay_down = true;
         operation.params.containment = AdaptiveContainment::Center;
         let result = run(operation, geometry);
         assert!(!result.has_errors(), "{:?}", result.diagnostics);
@@ -1953,35 +1907,49 @@ mod tests {
         operation.params.containment = AdaptiveContainment::Center;
         let full = run(operation.clone(), geometry.clone());
         assert!(!full.has_errors(), "{:?}", full.diagnostics);
-        let count_links = |result: &StrategyResult| {
+        let link_heights = |result: &StrategyResult| {
             result
                 .program
                 .steps()
                 .iter()
-                .filter(|s| matches!(s, Step::Linear {tag, ..} if tag.kind == MoveKind::Link))
+                .filter_map(|s| match s {
+                    Step::Linear { to, tag, .. } if tag.kind == MoveKind::Link => Some(to.z),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let count_retracts = |result: &StrategyResult| {
+            result
+                .program
+                .steps()
+                .iter()
+                .filter(|s| matches!(s, Step::Rapid { tag, .. } if tag.kind == MoveKind::Retract))
                 .count()
         };
-        assert_eq!(count_links(&full), 0);
-        for policy in [
-            cam_model::ScallopRetraction::Minimum,
-            cam_model::ScallopRetraction::Shortest,
+        assert!(link_heights(&full).is_empty());
+        for (policy, height) in [
+            (
+                cam_model::ScallopRetraction::Minimum,
+                geometry.error_bound + operation.params.safe_distance,
+            ),
+            (
+                cam_model::ScallopRetraction::Shortest,
+                geometry.error_bound + operation.params.tolerance,
+            ),
         ] {
             operation.params.scallop_retraction = policy;
             let linked = run(operation.clone(), geometry.clone());
             assert!(!linked.has_errors(), "{:?}", linked.diagnostics);
             assert!(linked.program.validate().is_ok());
-            assert!(count_links(&linked) > 0, "no links for {policy:?}");
-            assert!(linked.program.steps().iter().filter(|s| matches!(s, Step::Rapid { tag, .. } if tag.kind == MoveKind::Retract)).count()
-                < full.program.steps().iter().filter(|s| matches!(s, Step::Rapid { tag, .. } if tag.kind == MoveKind::Retract)).count());
+            let heights = link_heights(&linked);
+            assert!(!heights.is_empty(), "no links for {policy:?}");
+            assert!(heights.iter().all(|z| (z - height).abs() < 1e-9));
+            assert!(count_retracts(&linked) < count_retracts(&full));
         }
         operation.params.scallop_retraction = cam_model::ScallopRetraction::Minimum;
-        operation.params.scallop_safe_distance = 20.;
+        operation.params.safe_distance = 20.;
         let fallback = run(operation, geometry);
-        assert_eq!(
-            count_links(&fallback),
-            0,
-            "clearance exceeding the safe plane must fall back to full retraction"
-        );
+        assert_eq!(fallback.program, full.program);
     }
 
     #[test]
@@ -2024,90 +1992,195 @@ mod tests {
     }
 
     #[test]
-    fn keep_tool_down_is_independent_of_lift_height_and_zero_does_not_lift() {
-        for angle in [0., 37.] {
+    fn parallel_straight_turns_use_the_pass_ends_for_each_containment_mode() {
+        let mut geometry = surface();
+        geometry.selected = rectangle(0., 0., 10., 10.).to_vec();
+        geometry.triangles = geometry.selected.clone();
+        for (containment, edges) in [
+            (AdaptiveContainment::Inside, [1., 9.]),
+            (AdaptiveContainment::Center, [0., 10.]),
+            (AdaptiveContainment::Outside, [-1., 11.]),
+        ] {
             let mut operation = op();
-            operation.params.angle = angle;
-            let baseline = run(operation.clone(), surface());
-            operation.params.lift_height = 2.;
-            let disabled = run(operation.clone(), surface());
-            assert_eq!(
-                disabled.program, baseline.program,
-                "unchecked must retract regardless of lift height"
-            );
-            operation.params.stay_down = true;
-            operation.params.lift_height = 0.;
-            let zero = run(operation, surface());
-            assert!(!zero.has_errors(), "{:?}", zero.diagnostics);
-            assert!(zero.program.validate().is_ok());
-            assert_eq!(
-                local_links(&zero),
-                0,
-                "zero-lift transitions continue cutting the surface"
-            );
-            let cuts = |result: &StrategyResult| {
-                result
-                    .program
-                    .steps()
-                    .iter()
-                    .filter_map(|s| match s {
-                        Step::Linear { to, tag, .. } if tag.kind == MoveKind::Cutting => Some(*to),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-            };
-            let zero_cuts = cuts(&zero);
-            let mut next = 0;
-            for point in cuts(&baseline) {
-                next += zero_cuts[next..]
-                    .iter()
-                    .position(|p| *p == point)
-                    .expect("original finishing cuts must be preserved")
-                    + 1;
-            }
-            let mut transitions = 0;
-            for pair in zero.program.steps().windows(2) {
-                if let [Step::Linear { to: from, .. }, Step::Linear { to, tag, feed }] = pair {
-                    if tag.kind == MoveKind::Cutting {
-                        let (s, c) = angle.to_radians().sin_cos();
-                        if (-s * (to.x - from.x) + c * (to.y - from.y)).abs() > 1e-8 {
-                            assert_eq!(*feed, 500.);
-                            if angle == 0. {
-                                assert_eq!(from.z, to.z);
-                            }
-                            transitions += 1;
-                        }
+            operation.params.containment = containment;
+            let result = run(operation, geometry.clone());
+            assert!(!result.has_errors(), "{:?}", result.diagnostics);
+            let mut seen = [false; 2];
+            for pair in result.program.steps().windows(2) {
+                if let [Step::Linear { to: from, .. }, Step::Linear { to, tag, .. }] = pair {
+                    if tag.kind == MoveKind::Cutting
+                        && (to.y - from.y).abs() > 1e-8
+                        && (1. ..9.).contains(&from.y)
+                        && (1. ..9.).contains(&to.y)
+                    {
+                        assert!(
+                            (to.x - from.x).abs() < 1e-8,
+                            "{containment:?}: {from:?} to {to:?}"
+                        );
+                        let edge = usize::from(to.x > 5.);
+                        assert!((to.x - edges[edge]).abs() < 1e-8, "{containment:?}: {to:?}");
+                        seen[edge] = true;
                     }
                 }
             }
-            assert!(transitions > 0);
-            if angle == 0. {
-                assert_eq!(
-                    zero.program
-                        .steps()
-                        .iter()
-                        .filter(|s| matches!(s, Step::Rapid { .. }))
-                        .count(),
-                    2,
-                    "only the initial approach and final retract should use clearance"
-                );
-                assert_eq!(
-                    zero.program
-                        .steps()
-                        .iter()
-                        .filter(|s| matches!(s,
-                    Step::Linear { tag, .. } if tag.kind == MoveKind::Plunge))
-                        .count(),
-                    1
-                );
-                assert!(
-                    zero.diagnostics
-                        .iter()
-                        .any(|d| d.message.contains("9 passes")),
-                    "{:?}",
-                    zero.diagnostics
-                );
+            assert_eq!(seen, [true; 2], "{containment:?}");
+        }
+    }
+
+    #[test]
+    fn parallel_smooth_leaves_the_row_ends_on_the_boundary_and_rounds_outward() {
+        let mut geometry = surface();
+        geometry.selected = rectangle(0., 0., 10., 10.).to_vec();
+        geometry.triangles = geometry.selected.clone();
+        let mut operation = op();
+        operation.params.containment = AdaptiveContainment::Center;
+        operation.params.transition = cam_model::ParallelTransition::Smooth;
+        let result = run(operation, geometry);
+        assert!(!result.has_errors(), "{:?}", result.diagnostics);
+        assert!(result.program.validate().is_ok());
+
+        let mut arcs = 0;
+        for steps in result.program.steps().windows(4) {
+            let [Step::Linear { to: before, .. }, Step::Linear { to: start, .. }, Step::Arc {
+                end,
+                center,
+                dir,
+                tag,
+                ..
+            }, Step::Linear { to: after, .. }] = steps
+            else {
+                continue;
+            };
+            assert_eq!(tag.kind, MoveKind::Cutting);
+            assert_eq!(start.z, end.z);
+            let radius = (start.x - center.x).hypot(start.y - center.y);
+            assert!((radius - 0.5).abs() < 1e-8);
+            let tangent = |p: &Point3| {
+                let sign = if *dir == cam_cldata::ArcDir::Ccw {
+                    1.
+                } else {
+                    -1.
+                };
+                [(center.y - p.y) * sign, (p.x - center.x) * sign]
+            };
+            let [sx, sy] = tangent(start);
+            let [ex, ey] = tangent(end);
+            assert!(sy.abs() < 1e-8 && ey.abs() < 1e-8);
+            assert!(sx * (start.x - before.x) > 0. && ex * (after.x - end.x) > 0.);
+            let edge = if sx > 0. { 10. } else { 0. };
+            assert!((start.x - edge).abs() < 1e-8 && (end.x - edge).abs() < 1e-8);
+            assert!((center.x - edge).abs() < 1e-8);
+            assert!(if sx > 0. {
+                center.x + radius > 10.
+            } else {
+                center.x - radius < 0.
+            });
+            arcs += 1;
+        }
+        assert_eq!(arcs, 10);
+    }
+
+    #[test]
+    fn parallel_smooth_projects_round_turns_onto_a_slope() {
+        let mut operation = op();
+        operation.params.transition = cam_model::ParallelTransition::Smooth;
+        let result = run(operation, surface());
+        assert!(!result.has_errors(), "{:?}", result.diagnostics);
+        assert!(result.program.validate().is_ok());
+        assert!(!result
+            .program
+            .steps()
+            .iter()
+            .any(|s| matches!(s, Step::Arc { .. })));
+        let mut round_segments = 0;
+        let mut changing_height = 0;
+        for pair in result.program.steps().windows(2) {
+            if let [Step::Linear { to: from, .. }, Step::Linear { to, tag, .. }] = pair {
+                if tag.kind == MoveKind::Cutting
+                    && (to.y - from.y).abs() > 1e-8
+                    && (to.x - from.x).abs() > 1e-8
+                {
+                    changing_height += usize::from((to.z - from.z).abs() > 1e-8);
+                    round_segments += 1;
+                }
             }
+        }
+        assert!(round_segments >= 8 * 8, "{round_segments} segments");
+        assert!(
+            changing_height >= 4 * 8,
+            "{changing_height} sloped segments"
+        );
+    }
+
+    #[test]
+    fn parallel_no_contact_lifts_between_passes_even_with_shortest_retraction() {
+        let mut operation = op();
+        operation.params.retraction = cam_model::ScallopRetraction::Shortest;
+        operation.params.transition = cam_model::ParallelTransition::NoContact;
+        let result = run(operation, surface());
+        assert!(!result.has_errors(), "{:?}", result.diagnostics);
+        assert!(result.program.validate().is_ok());
+        let mut raised = 0;
+        for steps in result.program.steps().windows(4) {
+            if let [Step::Linear {
+                to: from, tag: cut, ..
+            }, Step::Linear {
+                to: up, tag: lift, ..
+            }, Step::Linear {
+                to: across,
+                tag: traverse,
+                ..
+            }, Step::Linear {
+                to: down,
+                tag: plunge,
+                ..
+            }] = steps
+            {
+                if cut.kind == MoveKind::Cutting && lift.kind == MoveKind::Link {
+                    assert_eq!((from.x, from.y), (up.x, up.y));
+                    assert_eq!(traverse.kind, MoveKind::Link);
+                    assert_eq!(plunge.kind, MoveKind::Plunge);
+                    assert_eq!(up.z, across.z);
+                    assert!(up.z > from.z.max(down.z));
+                    raised += 1;
+                }
+            }
+        }
+        assert_eq!(raised, 8);
+    }
+
+    #[test]
+    fn parallel_rows_join_with_cutting_moves_under_every_retraction_policy() {
+        for retraction in [
+            cam_model::ScallopRetraction::Full,
+            cam_model::ScallopRetraction::Minimum,
+            cam_model::ScallopRetraction::Shortest,
+        ] {
+            let mut operation = op();
+            operation.params.retraction = retraction;
+            let feed_rate = operation.params.feed;
+            let result = run(operation, surface());
+            assert!(!result.has_errors(), "{:?}", result.diagnostics);
+            assert!(result.program.validate().is_ok());
+            assert_eq!(local_links(&result), 0);
+            let steps = result.program.steps();
+            assert_eq!(
+                steps
+                    .iter()
+                    .filter(|s| matches!(s, Step::Rapid { .. }))
+                    .count(),
+                2
+            );
+            let cutting_turns = steps
+                .windows(2)
+                .filter(|pair| {
+                    matches!(pair,
+                    [Step::Linear { to: from, .. }, Step::Linear { to, tag, feed }]
+                        if tag.kind == MoveKind::Cutting && *feed == feed_rate
+                            && (to.y - from.y).abs() > 1e-8 && (to.z - from.z).abs() < 1e-8)
+                })
+                .count();
+            assert_eq!(cutting_turns, 8);
         }
     }
 
@@ -2123,8 +2196,6 @@ mod tests {
         }
         geometry.selected = geometry.triangles.clone();
         let mut operation = op();
-        operation.params.stay_down = true;
-        operation.params.lift_height = 0.;
         operation.params.stepover = 4.;
         let result = run(operation, geometry.clone());
         assert!(!result.has_errors(), "{:?}", result.diagnostics);
@@ -2183,156 +2254,137 @@ mod tests {
     }
 
     #[test]
-    fn lifted_parallel_links_preserve_surface_cuts_and_return_to_depth() {
-        for (angle, stock) in [
-            (0., StockToLeave::default()),
-            (37., StockToLeave::default()),
-            (
-                0.,
-                StockToLeave {
-                    enabled: true,
-                    radial: 0.2,
-                    axial: 0.7,
-                },
-            ),
-        ] {
-            let mut operation = op();
-            operation.params.angle = angle;
-            let baseline = run_with_stock(operation.clone(), surface(), stock);
-            operation.params.stay_down = true;
-            operation.params.lift_height = 2.;
-            let lifted = run_with_stock(operation.clone(), surface(), stock);
-            assert!(!lifted.has_errors(), "{:?}", lifted.diagnostics);
-            assert!(lifted.program.validate().is_ok());
-            assert!(local_links(&lifted) > 0);
-            let cuts = |result: &StrategyResult| {
-                result
-                    .program
-                    .steps()
-                    .iter()
-                    .filter_map(|s| match s {
-                        Step::Linear { to, tag, .. } if tag.kind == MoveKind::Cutting => Some(*to),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-            };
-            assert_eq!(cuts(&lifted), cuts(&baseline));
-            let retracts =
-                |result: &StrategyResult| {
-                    result.program.steps().iter().filter(|s|
-                matches!(s, Step::Rapid { tag, .. } if tag.kind == MoveKind::Retract)).count()
-                };
-            assert!(retracts(&lifted) < retracts(&baseline));
-            for moves in lifted.program.steps().windows(5) {
-                if let [Step::Linear { to: from, tag, .. }, Step::Linear { to: up, .. }, Step::Linear { to: across, .. }, Step::Linear {
-                    to: down,
-                    feed,
-                    tag: entry,
-                }, Step::Linear { to: cut, .. }] = moves
-                {
-                    if tag.kind == MoveKind::Cutting && entry.kind == MoveKind::Plunge {
-                        assert_eq!(up.x, from.x);
-                        assert_eq!(up.y, from.y);
-                        assert_eq!(up.z, from.z.max(down.z) + 2.);
-                        assert_eq!(across.z, up.z);
-                        assert_eq!((across.x, across.y), (down.x, down.y));
-                        assert_eq!(*feed, operation.params.plunge_feed);
-                        let (s, c) = angle.to_radians().sin_cos();
-                        assert!((-s * (cut.x - down.x) + c * (cut.y - down.y)).abs() < 1e-8);
-                    }
-                }
-            }
-            assert!(
-                matches!(lifted.program.steps().last(), Some(Step::Rapid { to, tag })
-                if to.z == 10. && tag.kind == MoveKind::Retract)
-            );
-        }
-    }
-
-    #[test]
-    fn parallel_links_retract_for_excessive_lifts_long_returns_and_disconnected_rows() {
+    fn tool_center_stops_at_both_edges_of_a_gap_narrower_than_the_sample_spacing() {
+        let mut geometry = surface();
+        geometry.selected = [rectangle(0., 0., 4.09, 10.), rectangle(4.11, 0., 10., 10.)].concat();
+        geometry.triangles = rectangle(0., 0., 10., 10.).to_vec();
         let mut operation = op();
-        operation.params.stay_down = true;
-        operation.params.lift_height = 100.;
-        let high = run(operation.clone(), surface());
-        assert!(!high.has_errors());
-        assert_eq!(local_links(&high), 0);
-        operation.params.stay_down = true;
-        operation.params.lift_height = 2.;
-        operation.params.both_ways = false;
-        let one_way = run(operation.clone(), surface());
-        assert!(!one_way.has_errors());
-        assert_eq!(local_links(&one_way), 0);
-        operation.params.both_ways = true;
-        for (index, selected) in [
-            [rectangle(0., 0., 3., 10.), rectangle(7., 0., 10., 10.)].concat(),
-            [rectangle(0., 0., 10., 3.), rectangle(0., 7., 10., 10.)].concat(),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let mut geometry = surface();
-            geometry.selected = selected;
-            let split = run(operation.clone(), geometry);
-            assert!(!split.has_errors(), "{:?}", split.diagnostics);
-            // Missing samples and empty rows must break the linking chain.
-            let mut previous = None;
-            for step in split.program.steps() {
-                match step {
-                    Step::Linear { to, tag, .. } if tag.kind == MoveKind::Link => {
-                        if let Some(from) = previous {
-                            let from: Point3 = from;
-                            assert!((to.x - from.x).hypot(to.y - from.y) <= 1.5);
-                        }
-                        previous = Some(*to);
+        operation.params.containment = AdaptiveContainment::Center;
+        let result = run(operation, geometry);
+        assert!(!result.has_errors(), "{:?}", result.diagnostics);
+        assert!(result.program.validate().is_ok());
+
+        let mut current = None;
+        let mut edges = [false; 2];
+        for step in result.program.steps() {
+            match step {
+                Step::Linear { to, tag, .. }
+                    if matches!(tag.kind, MoveKind::Cutting | MoveKind::Plunge) =>
+                {
+                    let left = to.x <= 4.09 + 1e-8;
+                    assert!(
+                        left || to.x >= 4.11 - 1e-8,
+                        "tool centre entered the gap: {to:?}"
+                    );
+                    if tag.kind == MoveKind::Cutting {
+                        let from: Point3 = current.unwrap();
+                        assert_eq!(from.x <= 4.09 + 1e-8, left, "cut crossed the gap");
                     }
-                    Step::Linear { to, .. } => previous = Some(*to),
-                    Step::Rapid { .. } => previous = None,
-                    _ => {}
+                    edges[0] |= (to.x - 4.09).abs() < 1e-8;
+                    edges[1] |= (to.x - 4.11).abs() < 1e-8;
+                    current = Some(*to);
                 }
-            }
-            if index == 0 {
-                assert_eq!(
-                    local_links(&split),
-                    0,
-                    "rows split across their travel direction must retract"
-                );
+                Step::Rapid { to, .. } | Step::Linear { to, .. } => current = Some(*to),
+                _ => {}
             }
         }
+        assert_eq!(edges, [true; 2], "cuts should reach the selected boundary");
     }
 
     #[test]
-    fn a_narrow_unselected_ridge_blocks_a_parallel_link_between_clear_endpoints() {
-        for (height, stock) in [
-            (5., StockToLeave::default()),
+    fn parallel_finishes_both_sides_of_an_opening_in_cutting_chains() {
+        let mut geometry = surface();
+        geometry.selected = [
+            rectangle(0., 0., 4., 14.),
+            rectangle(10., 0., 14., 14.),
+            rectangle(4., 0., 10., 4.),
+            rectangle(4., 10., 10., 14.),
+        ]
+        .concat();
+        geometry.triangles = geometry.selected.clone();
+        let mut operation = op();
+        operation.params.containment = AdaptiveContainment::Center;
+        operation.params.angle = 90.;
+        operation.params.stepover = 0.5;
+        let result = run(operation, geometry);
+        assert!(!result.has_errors(), "{:?}", result.diagnostics);
+        assert!(result.program.validate().is_ok());
+        let mut cutting_turns = [0; 2];
+        let in_hole = |p: &Point3| {
+            (4.000_001..9.999_999).contains(&p.x) && (4.000_001..9.999_999).contains(&p.y)
+        };
+        for pair in result.program.steps().windows(2) {
+            if let [Step::Linear { to: a, .. }, Step::Linear { to: b, tag, .. }] = pair {
+                if tag.kind == MoveKind::Cutting {
+                    assert!(
+                        !in_hole(a) && !in_hole(b),
+                        "cut entered the opening: {a:?} to {b:?}"
+                    );
+                    if (5. ..9.).contains(&a.x) && (a.x - b.x).abs() > 1e-8 {
+                        cutting_turns[usize::from(a.y > 7.)] += 1;
+                    }
+                }
+            }
+        }
+        assert!(cutting_turns.iter().all(|n| *n >= 5), "{cutting_turns:?}");
+        let retracts = result
+            .program
+            .steps()
+            .iter()
+            .filter(|s| matches!(s, Step::Rapid { tag, .. } if tag.kind == MoveKind::Retract))
+            .count();
+        assert!(retracts <= 4, "unexpected retract count: {retracts}");
+    }
+
+    #[test]
+    fn parallel_reposition_policies_use_retract_height_minimum_or_direct_feed() {
+        let selected = [rectangle(0., 0., 4., 4.), rectangle(6., 0., 10., 4.)].concat();
+        let geometry = ParallelGeometry {
+            triangles: selected.clone(),
+            selected,
+            error_bound: 0.0025,
+            heights: CuttingHeights {
+                top: 3.,
+                bottom: -1.,
+            },
+        };
+        let mut operation = op();
+        operation.params.containment = AdaptiveContainment::Center;
+        operation.params.both_ways = false;
+        operation.params.safe_distance = 0.6;
+        for (policy, expected) in [
+            (cam_model::ScallopRetraction::Full, 5.),
             (
-                2.5,
-                StockToLeave {
-                    enabled: true,
-                    radial: 0.,
-                    axial: 2.,
-                },
+                cam_model::ScallopRetraction::Minimum,
+                geometry.error_bound + operation.params.tolerance + 0.6,
+            ),
+            (
+                cam_model::ScallopRetraction::Shortest,
+                geometry.error_bound + operation.params.tolerance,
             ),
         ] {
-            let mut geometry = surface();
-            geometry.triangles = rectangle(0., 0., 10., 10.).to_vec();
-            geometry.selected = geometry.triangles.clone();
-            geometry
-                .triangles
-                .push([[8.9, 3., 0.], [9.1, 3., 0.], [9., 3., height]]);
-            geometry.heights.top = 6.;
-            let mut operation = op();
-            operation.params.stepover = 4.;
-            operation.params.stay_down = true;
-            operation.params.lift_height = 2.;
-            let result = run_with_stock(operation, geometry, stock);
+            operation.params.retraction = policy;
+            let result = run(operation.clone(), geometry.clone());
             assert!(!result.has_errors(), "{:?}", result.diagnostics);
-            assert!(result.program.steps().iter().any(|s| matches!(s,
-            Step::Rapid { to, tag } if tag.kind == MoveKind::Retract
-                && to.x == 9. && to.y == 1. && to.z == 10.)));
+            assert!(result.program.validate().is_ok());
+            let steps = result.program.steps();
+            assert!(matches!(steps.first(), Some(Step::Rapid { to, .. }) if to.z == 10.));
+            assert!(matches!(steps.last(), Some(Step::Rapid { to, .. }) if to.z == 10.));
+            let links: Vec<_> = steps[1..]
+                .iter()
+                .filter_map(|step| match step {
+                    Step::Rapid { to, tag } | Step::Linear { to, tag, .. }
+                        if tag.kind == MoveKind::Link =>
+                    {
+                        Some(to.z)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(!links.is_empty());
             assert!(
-                local_links(&result) > 0,
-                "unblocked neighboring rows should still link locally"
+                links.iter().all(|z| (z - expected).abs() < 1e-9),
+                "{policy:?}: {links:?}"
             );
         }
     }
@@ -2342,14 +2394,12 @@ mod tests {
         let mut geometry = surface();
         geometry.triangles = rectangle(0., 0., 10., 10.).to_vec();
         geometry.selected = [rectangle(0., 0., 10., 1.4), rectangle(0., 1.6, 10., 10.)].concat();
-        let mut operation = op();
-        operation.params.stay_down = true;
-        operation.params.lift_height = 0.;
+        let operation = op();
         let result = run(operation, geometry);
         assert!(!result.has_errors(), "{:?}", result.diagnostics);
         assert!(result.program.steps().iter().any(|s| matches!(s,
             Step::Rapid { to, tag } if tag.kind == MoveKind::Retract
-                && to.x == 9. && to.y == 1. && to.z == 10.)));
+                && to.x == 9. && to.y == 1. && to.z == 5.)));
         assert_eq!(
             result
                 .program
@@ -2364,11 +2414,10 @@ mod tests {
     }
 
     #[test]
-    fn invalid_parallel_lift_heights_emit_no_motion() {
+    fn invalid_parallel_safe_distances_emit_no_motion() {
         for height in [-1., f64::NAN, f64::INFINITY] {
             let mut operation = op();
-            operation.params.stay_down = true;
-            operation.params.lift_height = height;
+            operation.params.safe_distance = height;
             let result = run(operation, surface());
             assert!(result.has_errors());
             assert!(result.program.steps().is_empty());
@@ -2393,7 +2442,7 @@ mod tests {
         assert!((segment_triangle([-1., 0., 3.], [1., 0., 3.], &t) - 1.).abs() < 1e-10);
     }
     #[test]
-    fn sloped_surface_has_variable_z_parallel_rows_and_full_clearance_links() {
+    fn sloped_surface_has_variable_z_and_one_way_rows_use_the_retract_plane() {
         let tool = Tool {
             kind: ToolKind::BallMill,
             diameter: 2.,
@@ -2411,7 +2460,9 @@ mod tests {
             stock: None,
             spindle: SpindleDir::Cw,
         };
-        let result = ParallelStrategy::new(op(), StockToLeave::default(), surface())
+        let mut operation = op();
+        operation.params.both_ways = false;
+        let result = ParallelStrategy::new(operation, StockToLeave::default(), surface())
             .compute(&env, &CancelToken::new());
         assert!(!result.has_errors(), "{:?}", result.diagnostics);
         let mut last: Option<f64> = None;
@@ -2428,7 +2479,7 @@ mod tests {
                     zmax = zmax.max(to.z);
                 }
                 Step::Rapid { to, .. } => {
-                    assert_eq!(to.z, 10.);
+                    assert!(to.z == 5. || to.z == 10.);
                     last = None;
                 }
                 _ => {}

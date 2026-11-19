@@ -18,7 +18,7 @@ pub struct SpiralStrategy {
 }
 
 impl SpiralStrategy {
-    pub const DOMAIN_REVISION: u32 = 1;
+    pub const DOMAIN_REVISION: u32 = 2;
 
     pub fn new(op: SpiralOp, stock: StockToLeave, geometry: ParallelGeometry) -> Self {
         Self {
@@ -961,35 +961,83 @@ mod tests {
     }
 
     #[test]
-    fn links_and_bad_inputs_follow_finishing_safety_rules() {
+    fn retraction_policies_control_links_between_spiral_passes() {
         let flat = geometry(rectangle([-10., 10.], [-10., 10.], |_, _| 0.).to_vec());
         let p = SpiralParams {
             mode: SpiralMode::ConcentricCircles,
             inner_limit: 2.,
             outer_limit: 5.,
             stepover: 1.,
-            retraction: ScallopRetraction::Shortest,
             ..Default::default()
         };
         let cancel = CancelToken::new();
-        let links =
-            |r: &StrategyResult| {
-                r.program.steps().iter().filter(|step| {
-            matches!(step, Step::Linear { tag, .. } if tag.kind == MoveKind::Link)
-        }).count()
-            };
-        assert_eq!(links(&run(p, flat.clone(), &cancel)), 3);
-        assert_eq!(
-            links(&run(
-                SpiralParams {
-                    max_stay_down_distance: 0.,
-                    ..p
-                },
-                flat.clone(),
-                &cancel
-            )),
-            0
-        );
+        let full = run(p, flat.clone(), &cancel);
+        for (retraction, links, retracts, height) in [
+            (ScallopRetraction::Full, 0, 4, 0.),
+            (
+                ScallopRetraction::Minimum,
+                6,
+                1,
+                flat.error_bound + p.safe_distance,
+            ),
+            (
+                ScallopRetraction::Shortest,
+                3,
+                1,
+                flat.error_bound + p.tolerance,
+            ),
+        ] {
+            let result = run(SpiralParams { retraction, ..p }, flat.clone(), &cancel);
+            assert!(!result.has_errors(), "{:?}", result.diagnostics);
+            assert!(result.program.validate().is_ok());
+            let steps = result.program.steps();
+            assert!(matches!(steps.first(), Some(Step::Rapid { to, tag })
+                if to.z == 10. && tag.kind == MoveKind::Link));
+            assert!(matches!(steps.last(), Some(Step::Rapid { to, tag })
+                if to.z == 10. && tag.kind == MoveKind::Retract));
+            assert_eq!(
+                steps
+                    .iter()
+                    .filter(|s| matches!(s,
+                Step::Rapid { tag, .. } if tag.kind == MoveKind::Retract))
+                    .count(),
+                retracts
+            );
+            let link_heights: Vec<_> = steps
+                .iter()
+                .filter_map(|s| match s {
+                    Step::Linear { to, tag, .. } if tag.kind == MoveKind::Link => Some(to.z),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(link_heights.len(), links);
+            assert!(link_heights.iter().all(|z| (z - height).abs() < 1e-9));
+        }
+        for fallback in [
+            SpiralParams {
+                retraction: ScallopRetraction::Shortest,
+                max_stay_down_distance: 0.,
+                ..p
+            },
+            SpiralParams {
+                retraction: ScallopRetraction::Minimum,
+                safe_distance: 10.,
+                ..p
+            },
+        ] {
+            assert_eq!(run(fallback, flat.clone(), &cancel).program, full.program);
+        }
+    }
+
+    #[test]
+    fn spiral_invalid_limits_and_cancellation_emit_no_motions() {
+        let flat = geometry(rectangle([-10., 10.], [-10., 10.], |_, _| 0.).to_vec());
+        let p = SpiralParams {
+            inner_limit: 2.,
+            outer_limit: 5.,
+            ..Default::default()
+        };
+        let cancel = CancelToken::new();
         let result = run(
             SpiralParams {
                 outer_limit: 1.,

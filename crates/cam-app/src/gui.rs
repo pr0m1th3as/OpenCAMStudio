@@ -3184,6 +3184,7 @@ enum Message {
     ClearingClimbToggled(bool),
     ParallelBothWaysToggled(bool),
     ParallelScallopToggled(bool),
+    ParallelTransitionChanged(cam_model::ParallelTransition),
     ScallopSmoothingToggled(bool),
     ScallopRetractionChanged(cam_model::ScallopRetraction),
     ScallopOrderChanged(cam_model::ScallopOrder),
@@ -3197,7 +3198,6 @@ enum Message {
     SpiralDepthOrderToggled(bool),
     SpiralLinkInsideOutToggled(bool),
     SpiralClockwiseToggled(bool),
-    ParallelStayDownToggled(bool),
     PocketKeepToolDownToggled(bool),
     AdaptiveClimbToggled(bool),
     AdaptiveContainmentChanged(cam_model::AdaptiveContainment),
@@ -8481,6 +8481,13 @@ impl App {
                 });
                 self.refresh_operation_fields();
             }
+            Message::ParallelTransitionChanged(transition) => {
+                self.edit_operation_draft(|op| {
+                    if let Operation::Parallel(p) = op {
+                        p.params.transition = transition;
+                    }
+                });
+            }
             Message::ScallopSmoothingToggled(on) => {
                 self.edit_operation_draft(|op| match op {
                     Operation::Parallel(p) => p.params.scallop_smoothing = on,
@@ -8491,7 +8498,8 @@ impl App {
             }
             Message::ScallopRetractionChanged(policy) => {
                 self.edit_operation_draft(|op| match op {
-                    Operation::Parallel(p) => p.params.scallop_retraction = policy,
+                    Operation::Parallel(p) if p.params.scallop => p.params.scallop_retraction = policy,
+                    Operation::Parallel(p) => p.params.retraction = policy,
                     Operation::Spiral(p) => p.params.retraction = policy,
                     _ => {}
                 });
@@ -8589,14 +8597,6 @@ impl App {
                 self.edit_operation_draft(|op| {
                     if let Operation::Pocket(p) = op {
                         p.clear.keep_tool_down = on;
-                    }
-                });
-                self.refresh_operation_fields();
-            }
-            Message::ParallelStayDownToggled(on) => {
-                self.edit_operation_draft(|op| {
-                    if let Operation::Parallel(p) = op {
-                        p.params.stay_down = on;
                     }
                 });
                 self.refresh_operation_fields();
@@ -9945,9 +9945,6 @@ impl App {
         if field == Field::ProfileOffset && self.geometry_operation_kind() == Some(OpKind::Profile)
         {
             return profile_parameters::WALL_ALLOWANCE_HELP;
-        }
-        if field == Field::LiftHeight && self.geometry_operation_kind() == Some(OpKind::Parallel) {
-            return "Lift above neighboring surface passes when Keep tool down is enabled, in millimetres. 0 continues the finishing cut along the surface without an added lift. With Keep tool down disabled, all passes retract to clearance. Gaps and unsafe transitions still use clearance; use on pre-roughed stock.";
         }
         use ToolKind::*;
         match (self.inspected_tool_kind(), field) {
@@ -13610,7 +13607,6 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Adaptive(o), Field::LeadInSize) => Some(o.params.lead_in_radius),
         (Operation::Adaptive(o), Field::LeadOutSize) => Some(o.params.lead_out_radius),
         (Operation::Adaptive(o), Field::LiftHeight) => Some(o.params.lift_height),
-        (Operation::Parallel(o), Field::LiftHeight) => Some(o.params.lift_height),
         (op, Field::StartX) => operation_tabs::operation_start(op).map(|point| point[0]),
         (op, Field::StartY) => operation_tabs::operation_start(op).map(|point| point[1]),
         (Operation::Engrave(op), Field::OperationTop) => Some(op.top),
@@ -13753,7 +13749,7 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Parallel(o), Field::ParallelStepover) => Some(o.params.stepover),
         (Operation::Parallel(o), Field::ParallelAngle) => Some(o.params.angle),
         (Operation::Parallel(o), Field::ScallopSafeDistance) => {
-            Some(o.params.scallop_safe_distance)
+            Some(o.params.safe_distance)
         }
         (Operation::Parallel(o), Field::ScallopSmoothingTolerance) => {
             Some(o.params.scallop_smoothing_tolerance)
@@ -13791,7 +13787,6 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
         match op {
             Operation::Pocket(o) => o.clear.lift_height = value,
             Operation::Adaptive(o) => o.params.lift_height = value,
-            Operation::Parallel(o) => o.params.lift_height = value,
             _ => {}
         }
     }
@@ -14165,7 +14160,7 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
                 o.params.angle = v;
             }
             if let Some(v) = get(Field::ScallopSafeDistance) {
-                o.params.scallop_safe_distance = v;
+                o.params.safe_distance = v;
             }
             if let Some(v) = get(Field::ScallopSmoothingTolerance) {
                 o.params.scallop_smoothing_tolerance = v;
@@ -17053,7 +17048,7 @@ mod multi_setup_draft_tests {
         assert!(
             matches!(app.controller.operation(id), Some(Operation::Parallel(p))
             if p.params.scallop_smoothing && p.params.scallop_smoothing_tolerance == 0.07
-                && p.params.scallop_safe_distance == 0.8 && p.params.scallop_start == Some([3., 4.])
+                && p.params.safe_distance == 0.8 && p.params.scallop_start == Some([3., 4.])
                 && p.params.scallop_order == cam_model::ScallopOrder::InsideOut
                 && p.params.scallop_retraction == cam_model::ScallopRetraction::Shortest),
             "{}",
@@ -17069,46 +17064,54 @@ mod multi_setup_draft_tests {
     }
 
     #[test]
-    fn parallel_keep_tool_down_checkbox_supports_zero_lift_apply_cancel_and_undo() {
+    fn parallel_transition_type_applies_cancels_and_undoes() {
+        use cam_model::ParallelTransition;
         let mut app = blank_app();
         let operation = app.controller.operation_template(OpKind::Parallel, 1);
         let id = operation.id();
         app.controller.add_operation(operation);
-        let checked = |op: &Operation| matches!(op, Operation::Parallel(p) if p.params.stay_down);
+        let mode = |op: &Operation| match op {
+            Operation::Parallel(p) => p.params.transition,
+            _ => unreachable!(),
+        };
         app.begin_operation_draft(id);
-        send(&mut app, Message::ParallelStayDownToggled(true));
-        assert!(checked(app.current_operation(id).unwrap()));
-        assert!(!checked(app.controller.operation(id).unwrap()));
-        assert_eq!(
-            op_field(app.current_operation(id).unwrap(), Field::LiftHeight),
-            Some(0.)
-        );
+        app.operation_tab = OperationTab::Linking;
+        let _ = app.operation_inspector(id);
+        send(&mut app, Message::ParallelTransitionChanged(ParallelTransition::NoContact));
+        assert_eq!(mode(app.current_operation(id).unwrap()), ParallelTransition::NoContact);
         send(&mut app, Message::CancelOperationDraft);
-        assert!(!checked(app.controller.operation(id).unwrap()));
+        assert_eq!(mode(app.controller.operation(id).unwrap()), ParallelTransition::StraightLine);
         app.begin_operation_draft(id);
-        send(&mut app, Message::ParallelStayDownToggled(true));
+        send(&mut app, Message::ParallelTransitionChanged(ParallelTransition::Smooth));
         send(&mut app, Message::Apply);
-        assert!(
-            checked(app.controller.operation(id).unwrap()),
-            "{}",
-            app.status
-        );
+        assert_eq!(mode(app.controller.operation(id).unwrap()), ParallelTransition::Smooth);
         assert!(app.controller.undo());
-        assert!(!checked(app.controller.operation(id).unwrap()));
-        assert!(app.controller.redo());
-        assert!(checked(app.controller.operation(id).unwrap()));
+        assert_eq!(mode(app.controller.operation(id).unwrap()), ParallelTransition::StraightLine);
+    }
+
+    #[test]
+    fn parallel_retraction_policy_supports_apply_cancel_and_undo() {
+        use cam_model::ScallopRetraction;
+        let mut app = blank_app();
+        let operation = app.controller.operation_template(OpKind::Parallel, 1);
+        let id = operation.id();
+        assert!(!operation_fields(&operation).contains(&Field::LiftHeight));
+        app.controller.add_operation(operation);
+        let minimum = |op: &Operation| {
+            matches!(op, Operation::Parallel(p) if p.params.retraction == ScallopRetraction::Minimum)
+        };
         app.begin_operation_draft(id);
-        send(
-            &mut app,
-            Message::FieldChanged(Field::LiftHeight, "2".into()),
-        );
-        send(&mut app, Message::ParallelStayDownToggled(false));
+        send(&mut app, Message::ScallopRetractionChanged(ScallopRetraction::Minimum));
+        assert!(minimum(app.current_operation(id).unwrap()));
+        assert!(operation_fields(app.current_operation(id).unwrap()).contains(&Field::ScallopSafeDistance));
+        send(&mut app, Message::CancelOperationDraft);
+        assert!(!minimum(app.controller.operation(id).unwrap()));
+        app.begin_operation_draft(id);
+        send(&mut app, Message::ScallopRetractionChanged(ScallopRetraction::Minimum));
         send(&mut app, Message::Apply);
-        assert!(!checked(app.controller.operation(id).unwrap()));
-        assert_eq!(
-            op_field(app.controller.operation(id).unwrap(), Field::LiftHeight),
-            Some(2.)
-        );
+        assert!(minimum(app.controller.operation(id).unwrap()), "{}", app.status);
+        assert!(app.controller.undo());
+        assert!(!minimum(app.controller.operation(id).unwrap()));
     }
 
     #[test]

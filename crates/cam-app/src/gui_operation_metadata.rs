@@ -232,18 +232,15 @@ pub(super) fn operation_fields(op: &Operation) -> Vec<Field> {
             fields
         }
         Operation::Parallel(o) => {
-            let mut fields = Vec::new();
-            if !o.params.scallop {
-                fields.push(Field::LiftHeight);
-            }
-            fields.push(Field::ParallelStepover);
+            let mut fields = vec![Field::ParallelStepover];
             if !o.params.scallop {
                 fields.push(Field::ParallelAngle);
-            } else {
+            }
+            if o.params.scallop && o.params.scallop_smoothing {
+                fields.push(Field::ScallopSmoothingTolerance);
+            }
+            if o.params.retraction_policy() != cam_model::ScallopRetraction::Full {
                 fields.push(Field::ScallopSafeDistance);
-                if o.params.scallop_smoothing {
-                    fields.push(Field::ScallopSmoothingTolerance);
-                }
             }
             fields.extend([
                 Field::AdaptiveTolerance,

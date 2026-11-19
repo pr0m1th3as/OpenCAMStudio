@@ -369,7 +369,7 @@ fn pass_settings(op: &ParallelOp) -> PassSettings {
         plunge_feed: p.plunge_feed,
         tolerance: p.tolerance,
         retraction: p.scallop_retraction,
-        safe_distance: p.scallop_safe_distance,
+        safe_distance: p.safe_distance,
         max_stay_down_distance: f64::INFINITY,
         smoothing_tolerance: p.scallop_smoothing.then_some(p.scallop_smoothing_tolerance),
     }
@@ -395,8 +395,8 @@ pub(super) fn compute(
     }
     if p.scallop_start
         .is_some_and(|point| point.iter().any(|v| !v.is_finite()))
-        || !p.scallop_safe_distance.is_finite()
-        || p.scallop_safe_distance < 0.
+        || !p.safe_distance.is_finite()
+        || p.safe_distance < 0.
         || (p.scallop_smoothing
             && (!p.scallop_smoothing_tolerance.is_finite() || p.scallop_smoothing_tolerance <= 0.))
     {
@@ -888,7 +888,7 @@ mod tests {
         let mut emitted = StrategyResult::default();
         emit_path(
             &mut emitted,
-            &mut path.clone(),
+            &path,
             &mut emitter,
             pass_settings(&operation),
             None,
@@ -1005,7 +1005,7 @@ mod tests {
             params: Default::default(),
         };
         operation.params.scallop_retraction = ScallopRetraction::Shortest;
-        operation.params.scallop_safe_distance = 1.;
+        operation.params.safe_distance = 1.;
         let path = vec![[8., 5., 0.0225], [8., 6., 0.0225]];
         let mut out = StrategyResult::default();
         emit_path(

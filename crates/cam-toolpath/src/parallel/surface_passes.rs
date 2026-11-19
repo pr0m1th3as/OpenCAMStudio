@@ -93,14 +93,67 @@ fn checked_line(a: V, b: V, linker: &PassLinker, tolerance: f64, cancel: &Cancel
 // tangents. Require that whole triangle to lie in one selected CAD triangle;
 // this certifies the arc cannot cross a small unselected gap between samples.
 fn arc_clear(
-    a: V,
-    b: V,
+    [a, b]: [V; 2],
     center: cam_geo::Point,
     ccw: bool,
     linker: &PassLinker,
     tolerance: f64,
     chord: ChordCheck,
     cancel: &CancelToken,
+) -> bool {
+    check_arc(
+        [a, b],
+        center,
+        ccw,
+        tolerance,
+        cancel,
+        |[p, q, tangent_intersection], sag| {
+            let mid = mul(add(p, q), 0.5);
+            let search = (p[0] - q[0]).hypot(p[1] - q[1]) + sag + 1e-8;
+            let candidates = linker.selected.indices(mid, search);
+            let contained = candidates.iter().any(|&id| {
+                let triangle = &linker.selected.mesh[id];
+                cross(sub(triangle[1], triangle[0]), sub(triangle[2], triangle[0]))[2].abs() > 1e-12
+                    && inside(p, triangle)
+                    && inside(q, triangle)
+                    && inside(tangent_intersection, triangle)
+            });
+            let contained = contained
+                || (chord.is_some()
+                    && covers_arc_hull(
+                        linker.selected,
+                        &[p, q, tangent_intersection],
+                        &candidates,
+                    ));
+            contained
+                && chord.is_none_or(|check| {
+                    check(p, q) && check(p, tangent_intersection) && check(tangent_intersection, q)
+                })
+                && linker.segment_clear_extra(p, q, sag + 1e-8, cancel)
+        },
+    )
+}
+
+pub(super) fn arc_sweep_clear(
+    [a, b]: [V; 2],
+    center: cam_geo::Point,
+    ccw: bool,
+    linker: &PassLinker,
+    tolerance: f64,
+    cancel: &CancelToken,
+) -> bool {
+    check_arc([a, b], center, ccw, tolerance, cancel, |[p, q, _], sag| {
+        linker.segment_clear_extra(p, q, sag + 1e-8, cancel)
+    })
+}
+
+fn check_arc(
+    [a, b]: [V; 2],
+    center: cam_geo::Point,
+    ccw: bool,
+    tolerance: f64,
+    cancel: &CancelToken,
+    check: impl Fn([V; 3], f64) -> bool,
 ) -> bool {
     let radius = (a[0] - center.x).hypot(a[1] - center.y);
     if !radius.is_finite() || radius < 1e-9 {
@@ -137,25 +190,7 @@ fn arc_clear(
         let p = if i == 0 { a } else { point(aa, radius) };
         let q = if i + 1 == count { b } else { point(bb, radius) };
         let tangent_intersection = point((aa + bb) * 0.5, radius / (delta * 0.5).cos());
-        let mid = mul(add(p, q), 0.5);
-        let search = (p[0] - q[0]).hypot(p[1] - q[1]) + sag + 1e-8;
-        let candidates = linker.selected.indices(mid, search);
-        let contained = candidates.iter().any(|&id| {
-            let triangle = &linker.selected.mesh[id];
-            cross(sub(triangle[1], triangle[0]), sub(triangle[2], triangle[0]))[2].abs() > 1e-12
-                && inside(p, triangle)
-                && inside(q, triangle)
-                && inside(tangent_intersection, triangle)
-        });
-        let contained = contained
-            || (chord.is_some()
-                && covers_arc_hull(linker.selected, &[p, q, tangent_intersection], &candidates));
-        if !contained
-            || chord.is_some_and(|check| {
-                !check(p, q) || !check(p, tangent_intersection) || !check(tangent_intersection, q)
-            })
-            || !linker.segment_clear_extra(p, q, sag + 1e-8, cancel)
-        {
+        if !check([p, q, tangent_intersection], sag) {
             return false;
         }
     }
@@ -215,7 +250,7 @@ pub(super) fn fitted_arcs(
             }
             cam_geo::PathSeg::Arc { end, center, ccw } => {
                 let to = [end.x, end.y, from[2]];
-                if !arc_clear(from, to, center, ccw, linker, tolerance, chord, cancel) {
+                if !arc_clear([from, to], center, ccw, linker, tolerance, chord, cancel) {
                     return None;
                 }
                 from = to;

@@ -2301,8 +2301,8 @@ fn parallel_creation_uses_setup_cad_and_survives_reopening() {
         let Operation::Parallel(p) = op else { panic!() };
         p.params.angle = 37.;
         p.params.stepover = 0.7;
-        p.params.stay_down = true;
-        p.params.lift_height = 2.;
+        p.params.retraction = cam_model::ScallopRetraction::Minimum;
+        p.params.safe_distance = 0.8;
         p.params.both_ways = false;
     });
     assert_eq!(
@@ -2315,7 +2315,7 @@ fn parallel_creation_uses_setup_cad_and_survives_reopening() {
     reopened.open_project(&path).unwrap();
     std::fs::remove_file(path).unwrap();
     assert!(
-        matches!(reopened.operation(id),Some(Operation::Parallel(p))if p.params.angle==37. && p.params.stepover==0.7 && p.params.lift_height==2. && p.params.stay_down && !p.params.both_ways)
+        matches!(reopened.operation(id),Some(Operation::Parallel(p))if p.params.angle==37. && p.params.stepover==0.7 && p.params.retraction == cam_model::ScallopRetraction::Minimum && p.params.safe_distance == 0.8 && !p.params.both_ways)
     );
     assert_eq!(app.document(), reopened.document());
 }

@@ -474,7 +474,6 @@ impl OperationParameter {
             (Operation::Adaptive(o), Self::LeadInSize) => Some(o.params.lead_in_radius),
             (Operation::Adaptive(o), Self::LeadOutSize) => Some(o.params.lead_out_radius),
             (Operation::Adaptive(o), Self::LiftHeight) => Some(o.params.lift_height),
-            (Operation::Parallel(o), Self::LiftHeight) => Some(o.params.lift_height),
             (Operation::Engrave(op), Self::OperationTop) => Some(op.top),
             (Operation::Carve(op), Self::OperationTop) => Some(op.top),
             (op, Self::SpindleRpm) => Some(op.spindle_rpm()),
@@ -629,9 +628,7 @@ impl OperationParameter {
             }
             (Operation::Parallel(o), Self::ParallelStepover) => Some(o.params.stepover),
             (Operation::Parallel(o), Self::ParallelAngle) => Some(o.params.angle),
-            (Operation::Parallel(o), Self::ScallopSafeDistance) => {
-                Some(o.params.scallop_safe_distance)
-            }
+            (Operation::Parallel(o), Self::ScallopSafeDistance) => Some(o.params.safe_distance),
             (Operation::Parallel(o), Self::ScallopSmoothingTolerance) => {
                 Some(o.params.scallop_smoothing_tolerance)
             }
@@ -776,9 +773,6 @@ impl OperationParameter {
                 o.params.lead_out_radius = value;
             }
             (Operation::Adaptive(o), Self::LiftHeight) => {
-                o.params.lift_height = value;
-            }
-            (Operation::Parallel(o), Self::LiftHeight) => {
                 o.params.lift_height = value;
             }
             (Operation::Engrave(op), Self::OperationTop) => {
@@ -1198,7 +1192,7 @@ impl OperationParameter {
                 o.params.angle = value;
             }
             (Operation::Parallel(o), Self::ScallopSafeDistance) => {
-                o.params.scallop_safe_distance = value;
+                o.params.safe_distance = value;
             }
             (Operation::Parallel(o), Self::ScallopSmoothingTolerance) => {
                 o.params.scallop_smoothing_tolerance = value;

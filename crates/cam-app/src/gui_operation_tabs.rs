@@ -215,7 +215,7 @@ pub(super) fn operation_field_invalid(op: &Operation, field: Field, value: f64) 
         | Field::AdaptiveFineStepdown
         | Field::MajorDia
         | Field::Pitch => value <= 0.0,
-        Field::StockLeaveRadial | Field::StockLeaveAxial | Field::ChamferTipOffset => value < 0.0,
+        Field::StockLeaveRadial | Field::StockLeaveAxial | Field::ChamferTipOffset | Field::ScallopSafeDistance => value < 0.0,
         Field::TabWidth | Field::TabSpacing => value <= 0.0,
         Field::TabHeight => value <= 0.0,
         Field::Engagement if matches!(op, Operation::Pocket(p) if p.clear.pocket_adaptive_enabled()) => {
@@ -1285,7 +1285,7 @@ impl App {
             Operation::Parallel(p) if tab == OperationTab::Geometry => {
                 list = list.push(profile_picker(
                     "Tool containment",
-                    "Position of the cutter relative to the selected model bounding box.",
+                    "Position of the cutter relative to the selected machining area. Tool center on boundary clips the scan rows to the selected face footprint, including around openings. Smooth turns can extend beyond the ends.",
                     self.tooltips,
                     p.params.containment,
                     &[
