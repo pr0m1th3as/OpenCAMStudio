@@ -1399,8 +1399,8 @@ enum Field {
     FaceStartOffset,
     /// Face: pass overlap as a percentage of the tool diameter.
     Overlap,
-    /// Absolute overlap between concentric pocket passes.
-    PocketOverlap,
+    /// Maximum horizontal spacing between concentric pocket passes.
+    PocketStepover,
     FaceOverlap,
     /// Face: overshoot past the stock edge before the turnaround (mm).
     FaceOvershoot,
@@ -1560,6 +1560,7 @@ impl Field {
             Field::ChamferTipOffset => "Chamfer tip offset (mm)",
             Field::ChamferStep => "Step (mm, 0=one pass)",
             Field::ContourRoughStepover => "Maximum stepover (mm)",
+            Field::PocketStepover => "Maximum Stepover (mm)",
             Field::ContourRoughCount => "Number of stepovers",
             Field::ContourRoughSmoothing => "Smoothing deviation (mm)",
             Field::LeadInSize => "Lead-in size (mm)",
@@ -1567,7 +1568,7 @@ impl Field {
             Field::LeadOverlap => "Lead overlap (mm)",
             Field::FaceStartOffset => "Start offset (mm)",
             Field::Overlap => "Overlap (%)",
-            Field::PocketOverlap | Field::FaceOverlap => "Overlap (mm)",
+            Field::FaceOverlap => "Overlap (mm)",
             Field::FaceOvershoot => "Overshoot (mm)",
             Field::Engagement => "Adaptive stepover (mm, 0=off)",
             Field::RingStep => "Ring step (mm, 0=auto)",
@@ -1881,7 +1882,7 @@ impl Field {
                 "Height of the first facing cut above the drawing reference (mm) — start \
                  above the true top to skim scale, or at 0 to cut to size."
             }
-            Field::PocketOverlap => "Distance shared by neighboring concentric cutting passes, in millimetres.",
+            Field::PocketStepover => "Maximum horizontal distance between adjacent concentric roughing passes. Enter a value up to the tool diameter.",
             Field::FaceOverlap => "Distance shared by neighboring facing passes, in millimetres.",
             Field::Overlap => {
                 "How much each facing pass overlaps the previous, as a percent of tool \
@@ -3535,27 +3536,6 @@ impl App {
         self.operation_binding_preview = None;
         self.drawing_editing_op = None;
         self.operation_draft = self.controller.operation(id).cloned();
-        if let Some(Operation::Pocket(p)) = &mut self.operation_draft {
-            if p.clear.pocket_overlap.is_none() {
-                if let Some(tool) = self
-                    .controller
-                    .inspection_setup()
-                    .tools
-                    .iter()
-                    .find(|t| t.number == p.tool)
-                {
-                    p.clear.pocket_overlap = Some(tool.diameter * p.clear.overlap);
-                    if p.parameter_expressions
-                        .contains_key(&cam_model::OperationParameter::Overlap)
-                    {
-                        cam_model::OperationParameter::PocketOverlap.set_source(
-                            self.operation_draft.as_mut().unwrap(),
-                            "=overlap * tool_diameter / 100",
-                        );
-                    }
-                }
-            }
-        }
         self.stock_to_leave_draft = Some(self.controller.inspection_setup().stock_to_leave_for(id));
         self.stock_to_leave_initialized = self.stock_to_leave_value().enabled;
         if matches!(self.operation_draft, Some(Operation::Profile(_))) {
@@ -4951,6 +4931,7 @@ impl App {
                 let parsed = self
                     .fields
                     .iter()
+                    .filter(|(&field, _)| field != Field::PocketStepover)
                     .filter_map(|(f, s)| {
                         s.parse::<f64>()
                             .ok()
@@ -4984,6 +4965,7 @@ impl App {
                 let parsed = self
                     .fields
                     .iter()
+                    .filter(|(&field, _)| field != Field::PocketStepover)
                     .filter_map(|(f, s)| {
                         s.parse::<f64>()
                             .ok()
@@ -5005,6 +4987,7 @@ impl App {
                 let parsed = self
                     .fields
                     .iter()
+                    .filter(|(&field, _)| field != Field::PocketStepover)
                     .filter_map(|(f, s)| {
                         s.parse::<f64>()
                             .ok()
@@ -13683,7 +13666,7 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Pocket(o), Field::Depth) => Some(o.depth),
         (Operation::Pocket(o), Field::Stepdown) => Some(o.clear.stepdown),
         (Operation::Pocket(o), Field::Overlap) => Some(o.clear.overlap * 100.0),
-        (Operation::Pocket(o), Field::PocketOverlap) => Some(o.clear.pocket_overlap.unwrap_or(0.0)),
+        (Operation::Pocket(o), Field::PocketStepover) => Some(o.maximum_stepover.unwrap_or(0.0)),
         (Operation::Pocket(o), Field::ProfileOffset) => Some(o.clear.offset),
         (Operation::Pocket(o), Field::LeadInSize) => Some(lead_size(o.clear.lead_in)),
         (Operation::Pocket(o), Field::LeadOutSize) => Some(lead_size(o.clear.lead_out)),
@@ -13901,8 +13884,8 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
             if let Some(v) = get(Field::Stepdown) {
                 o.clear.stepdown = v;
             }
-            if let Some(v) = get(Field::PocketOverlap) {
-                o.clear.pocket_overlap = Some(v);
+            if let Some(v) = get(Field::PocketStepover) {
+                o.maximum_stepover = Some(v);
             }
             if let Some(v) = get(Field::Engagement) {
                 o.clear.clearing.engagement = v.max(0.0);

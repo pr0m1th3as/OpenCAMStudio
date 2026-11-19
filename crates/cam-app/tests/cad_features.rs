@@ -842,6 +842,7 @@ fn positive_world_floor_uses_physical_depth_and_matches_an_independent_planar_cu
         ])
     };
     planar.add_operation(Operation::Pocket(PocketOp {
+        maximum_stepover: None,
         parameter_expressions: Default::default(),
         wrap: None,
         additional_regions: Vec::new(),

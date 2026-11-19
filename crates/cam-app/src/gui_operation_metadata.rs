@@ -56,7 +56,7 @@ pub(super) fn operation_fields(op: &Operation) -> Vec<Field> {
                 Field::LiftHeight,
                 Field::Depth,
                 Field::Stepdown,
-                Field::PocketOverlap,
+                Field::PocketStepover,
                 Field::Engagement,
                 Field::SpindleRpm,
                 Field::Feed,

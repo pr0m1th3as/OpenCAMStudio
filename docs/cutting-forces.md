@@ -77,7 +77,7 @@ Automatic estimates cover square/roughing end mills and face mills:
 | Operation | Axial engagement ap | Radial engagement ae |
 | --- | --- | --- |
 | Profile | Smaller of stepdown and resolved cutting depth | Radial stepover, capped at tool diameter; full-width slotting when stepover is zero |
-| Pocket | Smaller of stepdown and resolved cutting depth | Adaptive engagement cap when enabled; otherwise diameter × (1 − overlap) |
+| Pocket | Smaller of stepdown and resolved cutting depth | Adaptive engagement when enabled, or Maximum Stepover for concentric clearing |
 | Face | Smaller of stepdown and resolved cutting depth | Diameter × (1 − overlap) |
 | 3D Adaptive | Smaller of roughing stepdown and resolved cutting depth | Optimal load, capped at tool diameter |
 

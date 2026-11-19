@@ -377,9 +377,12 @@ impl Operation {
         if preset.overlap.is_some() {
             match self {
                 Self::Pocket(o) => {
+                    o.maximum_stepover = None;
                     o.clear.pocket_overlap = None;
-                    o.parameter_expressions
-                        .remove(&crate::OperationParameter::PocketOverlap);
+                    use crate::OperationParameter::{MaximumStepover, Overlap, PocketOverlap};
+                    for parameter in [MaximumStepover, Overlap, PocketOverlap] {
+                        o.parameter_expressions.remove(&parameter);
+                    }
                 }
                 Self::Face(o) => {
                     o.absolute_overlap = None;

@@ -97,8 +97,8 @@ impl App {
                 cam_model::OperationParameter::PocketFinishFeed.set_source(op, "=feed");
                 cam_model::OperationParameter::Stepdown
                     .set_source(op, pocket_parameters::DEFAULT_STEPDOWN);
-                cam_model::OperationParameter::PocketOverlap
-                    .set_source(op, pocket_parameters::DEFAULT_OVERLAP);
+                let stepover = cam_model::OperationParameter::MaximumStepover;
+                stepover.set_source(op, stepover.default_expression());
             }
             if let Operation::Profile(_) = op {
                 cam_model::OperationParameter::Stepdown

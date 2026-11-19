@@ -492,6 +492,7 @@ pub(crate) fn create_operation(
     };
     let op = match kind {
         OpKind::Pocket => Operation::Pocket(PocketOp {
+            maximum_stepover: None,
             parameter_expressions: Default::default(),
             wrap: None,
             additional_regions: resolved.regions.iter().skip(1).cloned().collect(),

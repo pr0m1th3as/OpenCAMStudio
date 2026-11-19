@@ -338,25 +338,15 @@ impl PocketStrategy {
 
         // Concentric rings, offsetting inward from the wall by the tool radius plus
         // the finishing allowance (so the skin is left on the boundary and every
-        // island), then by the ring spacing set by the overlap.
+        // island), then by the maximum stepover.
         let r = tool.radius();
-        let overlap = op
-            .clear
-            .pocket_overlap
-            .unwrap_or(tool.diameter * op.clear.overlap);
         let spacing = if op.clear.pocket_adaptive_enabled() {
             tool.diameter
         } else {
-            if !overlap.is_finite() || overlap < 0.0 || overlap >= tool.diameter {
-                fail!(
-                    "operation {}: overlap must be nonnegative and less than the tool diameter",
-                    op.id
-                );
-            }
-            tool.diameter - overlap
+            op.concentric_stepover(tool.diameter)
         };
-        if !spacing.is_finite() || spacing <= 1e-9 {
-            fail!("operation {}: overlap leaves no stepover", op.id);
+        if let Err(reason) = PocketOp::validate_maximum_stepover(spacing, tool.diameter) {
+            fail!("operation {}: {reason}", op.id);
         }
         let finish_allowance = if op.finishing.enabled {
             op.finishing.count as f64 * op.finishing.stepover
@@ -660,9 +650,9 @@ impl PocketStrategy {
         // walls. Never ship a frontier or link that crosses their cutter envelope.
         if op.clear.clearing.engagement > 0. {
             let diameter = env.tool(op.tool).unwrap().diameter;
-            op.clear.pocket_overlap = Some((diameter - op.clear.clearing.engagement).max(0.0));
+            op.maximum_stepover = Some(op.clear.clearing.engagement.min(diameter));
             op.parameter_expressions
-                .remove(&cam_model::OperationParameter::PocketOverlap);
+                .remove(&cam_model::OperationParameter::MaximumStepover);
             op.clear.clearing.engagement = 0.;
             op.clear.adaptive_enabled = Some(false);
             let mut fallback = Self::compute_stock_levels(&op, env, cancel);
@@ -928,6 +918,7 @@ mod tests {
                 cam_model::RotaryAxis::B => Point::new(angular, axial),
             };
             let op = PocketOp {
+                maximum_stepover: None,
                 parameter_expressions: Default::default(),
                 id: 0,
                 tool: 1,
@@ -1094,6 +1085,7 @@ mod tests {
     #[test]
     fn keep_tool_down_connects_levels_and_finishing_and_preserves_final_retract() {
         let mut op = PocketOp {
+            maximum_stepover: None,
             parameter_expressions: Default::default(),
             wrap: None,
             additional_regions: Vec::new(),
@@ -1171,6 +1163,7 @@ mod tests {
         // Depth 3 at 1.5 stepdown ⇒ 2 levels. Staying down means one plunge and one
         // retract *per level*, not per ring — and the rings are still all cut.
         let op = PocketOp {
+            maximum_stepover: None,
             parameter_expressions: Default::default(),
             wrap: None,
             additional_regions: Vec::new(),
@@ -1226,6 +1219,7 @@ mod tests {
     #[test]
     fn helix_plunge_pocket_enters_on_helical_arcs() {
         let op = PocketOp {
+            maximum_stepover: None,
             parameter_expressions: Default::default(),
             wrap: None,
             additional_regions: Vec::new(),
@@ -1296,6 +1290,7 @@ mod tests {
     #[test]
     fn tool_too_large_for_pocket_errors() {
         let op = PocketOp {
+            maximum_stepover: None,
             parameter_expressions: Default::default(),
             wrap: None,
             additional_regions: Vec::new(),
@@ -1363,6 +1358,7 @@ mod tests {
         // Finer overlap ⇒ smaller spacing ⇒ more rings ⇒ more cutting moves.
         let run = |overlap: f64| {
             let mut op = PocketOp {
+                maximum_stepover: None,
                 parameter_expressions: Default::default(),
                 wrap: None,
                 additional_regions: Vec::new(),
@@ -1422,6 +1418,7 @@ mod tests {
         // boundary, so the deepest cut into the +X wall is 2 mm shallower.
         let run = |offset: f64| {
             let op = PocketOp {
+                maximum_stepover: None,
                 parameter_expressions: Default::default(),
                 wrap: None,
                 additional_regions: Vec::new(),
@@ -1497,6 +1494,7 @@ mod tests {
 
     fn leaded_op(islands: Vec<Contour>) -> PocketOp {
         PocketOp {
+            maximum_stepover: None,
             parameter_expressions: Default::default(),
             wrap: None,
             additional_regions: Vec::new(),
@@ -1535,17 +1533,25 @@ mod tests {
     }
 
     #[test]
-    fn absolute_overlap_matches_legacy_fraction_and_is_ignored_by_adaptive() {
+    fn maximum_stepover_matches_legacy_overlap_and_is_ignored_by_adaptive() {
         let mut op = leaded_op(vec![]);
         let legacy = finishing_result(op.clone());
         op.clear.pocket_overlap = Some(4.0); // 50% of the test's 8 mm tool.
         let absolute = finishing_result(op.clone());
-        assert!(!absolute.has_errors(), "{:?}", absolute.diagnostics);
+        assert!(!legacy.has_errors() && !absolute.has_errors());
         assert_eq!(legacy.program, absolute.program);
+        op.clear.pocket_overlap = Some(7.0);
+        op.maximum_stepover = Some(4.0);
+        let stepover = finishing_result(op.clone());
+        assert!(!stepover.has_errors(), "{:?}", stepover.diagnostics);
+        assert_eq!(stepover.program, absolute.program);
+        op.maximum_stepover = Some(8.1);
+        assert!(finishing_result(op.clone()).has_errors());
+        op.maximum_stepover = Some(4.0);
         op.clear.clearing.engagement = 2.0;
         op.clear.clearing.climb = false; // Exercise the concentric adaptive fallback.
         let first = finishing_result(op.clone());
-        op.clear.pocket_overlap = Some(7.0);
+        op.maximum_stepover = Some(1.0);
         let second = finishing_result(op);
         assert!(!first.has_errors() && !second.has_errors());
         assert_eq!(first.program, second.program);
@@ -2256,6 +2262,7 @@ mod tests {
         // the geometric floor. The gate is 1.5·e = 3.0 — see
         // `frontadvance::CERT_ENGAGEMENT_SLACK`.
         let op = PocketOp {
+            maximum_stepover: None,
             parameter_expressions: Default::default(),
             wrap: None,
             additional_regions: Vec::new(),
@@ -2414,6 +2421,7 @@ mod tests {
         // arc), never emitted overshooting the boundary. High overlap gives the
         // multiple rings that put the wall ring on the leaded path in the first place.
         let small = PocketOp {
+            maximum_stepover: None,
             parameter_expressions: Default::default(),
             wrap: None,
             additional_regions: Vec::new(),

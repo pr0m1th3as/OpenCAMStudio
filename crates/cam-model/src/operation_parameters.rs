@@ -542,6 +542,7 @@ impl OperationParameter {
             (Operation::Profile(o), Self::PlungeB) => Some(plunge_params(o.plunge).1),
             (Operation::Pocket(o), Self::Depth) => Some(o.depth),
             (Operation::Pocket(o), Self::Stepdown) => Some(o.clear.stepdown),
+            (Operation::Pocket(o), Self::MaximumStepover) => Some(o.maximum_stepover.unwrap_or(0.)),
             (Operation::Pocket(o), Self::Overlap) => Some(o.clear.overlap * 100.0),
             (Operation::Pocket(o), Self::PocketOverlap) => {
                 Some(o.clear.pocket_overlap.unwrap_or(0.0))
@@ -946,6 +947,9 @@ impl OperationParameter {
             }
             (Operation::Pocket(o), Self::Stepdown) => {
                 o.clear.stepdown = value;
+            }
+            (Operation::Pocket(o), Self::MaximumStepover) => {
+                o.maximum_stepover = Some(value);
             }
             (Operation::Pocket(o), Self::Overlap) => {
                 o.clear.overlap = value / 100.;
@@ -1605,6 +1609,17 @@ impl Operation {
                     .get(&parameter)
                     .cloned()
                     .or_else(|| parameter.expression(self).map(str::to_owned))
+                    .or_else(|| match (self, parameter, tool) {
+                        (
+                            Operation::Pocket(pocket),
+                            OperationParameter::MaximumStepover,
+                            Some(tool),
+                        ) => Some(match pocket.legacy_stepover_expression() {
+                            Some(source) => source.into(),
+                            None => pocket.concentric_stepover(tool.diameter).to_string(),
+                        }),
+                        _ => None,
+                    })
                     .unwrap_or_else(|| value.to_string());
                 sources.insert(parameter.name().into(), source);
             }
@@ -1742,6 +1757,13 @@ impl Operation {
                 {
                     if bound(parameter) {
                         parameter.validate_value(self, value)?;
+                    }
+                    if parameter == OperationParameter::MaximumStepover {
+                        if let (Operation::Pocket(pocket), Some(tool)) = (self, tool) {
+                            if !pocket.clear.pocket_adaptive_enabled() {
+                                crate::PocketOp::validate_maximum_stepover(value, tool.diameter)?;
+                            }
+                        }
                     }
                 }
                 Ok(())

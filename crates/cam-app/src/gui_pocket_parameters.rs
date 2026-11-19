@@ -3,8 +3,6 @@ use super::*;
 use cam_model::PocketFinishing;
 
 pub(super) const DEFAULT_STEPDOWN: &str = "=min(tool_fluteLength * 0.75; tool_diameter * 2.5)";
-pub(super) const DEFAULT_OVERLAP: &str =
-    "=Math.max((tool_diameter - (2 * tool_cornerRadius)) * 0.95; tool_diameter * 0.20)";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Number {
@@ -345,29 +343,13 @@ mod tests {
     }
 
     #[test]
-    fn pocket_overlap_defaults_to_tool_formula_and_legacy_values_convert_to_mm() {
+    fn pocket_maximum_stepover_defaults_to_tool_formula() {
         let (mut app, _) = editor();
-        let Operation::Pocket(p) = app.operation_draft.as_ref().unwrap() else {
-            panic!("pocket")
-        };
-        let tool = app
-            .controller
-            .inspection_setup()
-            .tools
-            .iter()
-            .find(|t| t.number == p.tool)
-            .unwrap();
-        assert!(
-            (app.parsed_field_value(Field::PocketOverlap).unwrap()
-                - p.clear.overlap * tool.diameter)
-                .abs()
-                < 1e-8
-        );
         let _ = app.update(Message::CancelOperationDraft);
         let _ = app.update(Message::BeginOp(OpKind::Pocket));
         let tool = app.wizard_tool().unwrap();
-        let expected = (tool.diameter * 0.95).max(tool.diameter * 0.20);
-        assert!((app.parsed_field_value(Field::PocketOverlap).unwrap() - expected).abs() < 1e-8);
+        let field = Field::PocketStepover;
+        assert!((app.parsed_field_value(field).unwrap() - tool.diameter * 0.95).abs() < 1e-8);
         let mut ball = tool.clone();
         ball.kind = ToolKind::BallMill;
         let values = app
@@ -376,10 +358,73 @@ mod tests {
             .unwrap()
             .evaluate_parameter_sources(Some(&ball), &Default::default())
             .unwrap();
+        let stepover = values[&cam_model::OperationParameter::MaximumStepover];
+        assert!((stepover - ball.diameter * 0.20).abs() < 1e-8);
+    }
+
+    #[test]
+    fn saved_overlap_displays_as_stepover_and_can_be_overridden() {
+        use cam_model::OperationParameter::{MaximumStepover, Overlap, PocketOverlap};
+
+        let (mut app, id) = editor();
+        let tool_number = app.controller.operation(id).unwrap().tool();
+        let index = app
+            .controller
+            .inspection_setup()
+            .tools
+            .iter()
+            .position(|tool| tool.number == tool_number)
+            .unwrap();
+        app.controller.edit_tool(index, |tool| tool.diameter = 6.);
+        let field = Field::PocketStepover;
+        for (expression, value, expected) in [
+            (None, None, 3.0),
+            (None, Some(5.7), 0.3),
+            (Some(Overlap), None, 3.6),
+            (Some(PocketOverlap), Some(0.5), 0.3),
+        ] {
+            app.controller.edit_operation(id, |op| {
+                let Operation::Pocket(pocket) = op else {
+                    unreachable!()
+                };
+                pocket.clear.pocket_overlap = value;
+                pocket.parameter_expressions.clear();
+                match expression {
+                    Some(Overlap) => Overlap.set_source(op, "=40"),
+                    Some(PocketOverlap) => PocketOverlap.set_source(op, "=tool_diameter * 0.95"),
+                    _ => {}
+                }
+            });
+            app.begin_operation_draft(id);
+            assert!(!app.inspector_dirty());
+            assert!((app.parsed_field_value(field).unwrap() - expected).abs() < 1e-8);
+            let mut candidate = app.operation_draft.clone().unwrap();
+            app.apply_parameter_sources(&mut candidate).unwrap();
+            assert!(matches!(&candidate, Operation::Pocket(p) if p.maximum_stepover.is_none()));
+            assert!(MaximumStepover.expression(&candidate).is_none());
+        }
+        let _ = app.update(Message::FieldChanged(field, "6.1".into()));
+        assert!(app.field_invalid(field));
+        let _ = app.update(Message::FieldChanged(field, "6".into()));
+        assert!(!app.field_invalid(field));
+        let _ = app.update(Message::FieldChanged(field, "3.6".into()));
+        let _ = app.update(Message::Apply);
+        let saved = serde_json::to_string(app.controller.operation(id).unwrap()).unwrap();
         assert!(
-            (values[&cam_model::OperationParameter::PocketOverlap] - ball.diameter * 0.20).abs()
-                < 1e-8
+            matches!(serde_json::from_str::<Operation>(&saved).unwrap(), Operation::Pocket(p) if p.maximum_stepover == Some(3.6))
         );
+        app.begin_operation_draft(id);
+        assert_eq!(app.parsed_field_value(field).unwrap(), 3.6);
+    }
+
+    #[test]
+    fn maximum_stepover_can_drive_other_pass_parameters() {
+        let (mut app, _) = editor();
+        let _ = app.update(Message::FieldChanged(Field::PocketStepover, "1.6".into()));
+        let _ = app.update(Message::PocketFinishToggle(Toggle::Enabled, true));
+        let field = Field::PocketFinish(Number::Stepover);
+        let _ = app.update(Message::FieldChanged(field, "=maximumStepover / 4".into()));
+        assert_eq!(app.parsed_field_value(field).unwrap(), 0.4);
     }
 
     #[test]

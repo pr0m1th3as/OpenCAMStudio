@@ -200,9 +200,10 @@ A Pocket, and an outside Profile's roughing, can clear the bulk **adaptively**: 
 of concentric rings at a fixed spacing, the tool advances a front that keeps its radial
 width of cut roughly constant. For a Pocket, turn on **Adaptive clearing** and set the
 **Adaptive stepover**; new pockets start with 40% of the tool diameter. Turning it off
-uses concentric clearing and retains the stepover. In concentric mode, **Overlap**
-is the distance in millimetres shared by neighboring passes; it must be less than the
-tool diameter. Outside Profile roughing uses a positive adaptive stepover to enable it (`0` selects concentric clearing). Adaptive
+uses concentric clearing and retains the adaptive stepover. In concentric mode,
+**Maximum Stepover** is the horizontal distance between adjacent roughing passes.
+Enter a positive value in millimetres up to the tool diameter. Outside Profile
+roughing uses a positive adaptive stepover to enable it (`0` selects concentric clearing). Adaptive
 clearing is **climb-only**, and requesting a lead-in/out sends the whole clear back to
 concentric.
 
@@ -280,8 +281,8 @@ Where the depth cap leaves a flat floor, a cone cannot flatten it: adjacent pass
 leave ridges. Tick **Clear flat areas** and an end mill takes that floor **first**,
 before the V-bit runs — bulk removal with the strong tool, which also spares a fine
 carving tip from full-depth work. The Inspector then shows a second block of controls
-below the clearing tool, which are a pocket's: stepdown, overlap, allowance,
-engagement, feeds, plunge style, climb, leads.
+below the clearing tool for stepdown, overlap, allowance, engagement, feeds,
+plunge style, climb, and leads.
 
 - The clearing tool must be **flat-bottomed** (end mill or bull nose). A ball nose is
   refused — it cuts, but leaves the same scalloped floor the V-bit already would, so

@@ -2318,6 +2318,7 @@ impl AppController {
                     .map(|l| self.loop_contour(*l).cloned())
                     .collect::<Option<Vec<_>>>()?;
                 Operation::Pocket(PocketOp {
+                    maximum_stepover: None,
                     parameter_expressions: Default::default(),
                     wrap: None,
                     additional_regions: Vec::new(),
@@ -2919,6 +2920,7 @@ impl AppController {
                         }));
                     } else {
                         operations.push(Operation::Pocket(PocketOp {
+                            maximum_stepover: None,
                             parameter_expressions: Default::default(),
                             wrap: None,
                             additional_regions: Vec::new(),

@@ -197,14 +197,16 @@ impl Operation {
             }
             Self::Pocket(o) => {
                 let cap = if o.clear.pocket_adaptive_enabled() { o.clear.clearing.engagement } else { 0.0 };
-                let spacing = if cap > 0.0 { tool.diameter } else if let Some(overlap) = o.clear.pocket_overlap {
-                    if !overlap.is_finite() || overlap < 0.0 || overlap >= tool.diameter { return Err("Pocket overlap must be nonnegative and less than the tool diameter.".into()); }
-                    tool.diameter - overlap
-                } else { overlap_width(o.clear.overlap)? };
                 if !cap.is_finite() {
                     return Err("Pocket engagement must be finite.".into());
                 }
-                let radial = if cap > 0. { cap.min(tool.diameter) } else { spacing };
+                let radial = if cap > 0. {
+                    cap.min(tool.diameter)
+                } else {
+                    let stepover = o.concentric_stepover(tool.diameter);
+                    crate::PocketOp::validate_maximum_stepover(stepover, tool.diameter)?;
+                    stepover
+                };
                 (step_depth(cutting_depth_mm, if o.clear.multiple_depths.enabled { o.clear.stepdown } else { cutting_depth_mm })?, radial,
                  "Nominal clearing pass: stepdown and ring spacing or adaptive engagement cap; entries, corners and finishing may differ.")
             }

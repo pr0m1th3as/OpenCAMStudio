@@ -196,7 +196,9 @@ pub(super) fn operation_field_invalid(op: &Operation, field: Field, value: f64) 
         return true;
     }
     match field {
-        Field::ContourRoughStepover | Field::ContourRoughSmoothing => value <= 0.,
+        Field::ContourRoughStepover | Field::ContourRoughSmoothing | Field::PocketStepover => {
+            value <= 0.
+        }
         Field::ContourRoughCount => value < 1. || value > 1000. || value.fract() != 0.,
         Field::Profile(n) => n.invalid(value),
         Field::PocketFinish(n) => n.invalid(value),
@@ -250,7 +252,7 @@ pub(super) fn operation_field_invalid(op: &Operation, field: Field, value: f64) 
         Field::ThreadPasses => value < 1.0 || value.fract() != 0.0 || value > u32::MAX as f64,
         Field::ThreadSpringPasses => value < 0.0 || value.fract() != 0.0 || value > u32::MAX as f64,
         Field::Overlap | Field::ClearOverlap => !(0.0..=99.0).contains(&value),
-        Field::PocketOverlap | Field::FaceOverlap => value < 0.0,
+        Field::FaceOverlap => value < 0.0,
         Field::PlungeA | Field::ClearPlungeA => {
             let (main, clear) = App::op_plunge_styles(op);
             match if field == Field::ClearPlungeA {
@@ -671,7 +673,7 @@ impl App {
             if matches!(op, Operation::Pocket(_))
                 && matches!(
                     field,
-                    Field::Stepdown | Field::Engagement | Field::PocketOverlap
+                    Field::Stepdown | Field::Engagement | Field::PocketStepover
                 )
             {
                 continue;
@@ -879,13 +881,13 @@ impl App {
                     if !adaptive {
                         let value = self
                             .fields
-                            .get(&Field::PocketOverlap)
+                            .get(&Field::PocketStepover)
                             .cloned()
                             .unwrap_or_default();
                         list = list.push(self.parameter_field_row(
-                            Field::PocketOverlap,
-                            "Overlap (mm)",
-                            self.field_help(Field::PocketOverlap),
+                            Field::PocketStepover,
+                            self.field_label(Field::PocketStepover),
+                            self.field_help(Field::PocketStepover),
                             &value,
                         ));
                     }

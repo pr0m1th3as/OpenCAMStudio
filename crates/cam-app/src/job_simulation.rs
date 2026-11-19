@@ -1255,6 +1255,7 @@ mod tests {
                 thickness: 17.,
             };
             setup.operations = vec![Operation::Pocket(PocketOp {
+                maximum_stepover: None,
                 parameter_expressions: Default::default(),
                 wrap: None,
                 additional_regions: Vec::new(),

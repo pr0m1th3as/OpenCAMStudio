@@ -2461,6 +2461,7 @@ mod tests {
             spindle: SpindleDir::Cw,
         };
         let mut pocket = PocketOp {
+            maximum_stepover: None,
             parameter_expressions: Default::default(),
             wrap: None,
             id: 2,
@@ -2615,6 +2616,7 @@ mod tests {
             ])
         };
         let pocket = Operation::Pocket(cam_model::PocketOp {
+            maximum_stepover: None,
             parameter_expressions: Default::default(),
             wrap: None,
             additional_regions: Vec::new(),

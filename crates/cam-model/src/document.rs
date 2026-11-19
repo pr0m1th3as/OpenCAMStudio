@@ -1090,7 +1090,7 @@ pub struct ClearParams {
     /// Explicit pocket adaptive mode. Missing values preserve legacy behavior based on engagement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adaptive_enabled: Option<bool>,
-    /// Absolute overlap between concentric pocket passes, mm. Missing values use the legacy fraction.
+    /// Legacy absolute overlap between concentric pocket passes, mm.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pocket_overlap: Option<f64>,
     /// Pocket depth scheduling settings. Older operations retain their existing multi-pass behavior.
@@ -1234,7 +1234,11 @@ pub struct PocketOp {
     /// Preferred exit location in setup XY, reached along the completed toolpath.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end: Option<[f64; 2]>,
-    /// How this pocket is cleared — stepdown, ring overlap, wall allowance, feeds,
+    /// Maximum XY spacing between concentric roughing passes, mm.
+    /// Older operations derive this from their saved overlap and the cutter diameter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum_stepover: Option<f64>,
+    /// How this pocket is cleared — stepdown, wall allowance, feeds,
     /// plunge style, leads, and the engagement cap.
     ///
     /// The same [`ClearParams`] a [`CarveOp`]'s clearing pass carries (v10; before that
@@ -1251,6 +1255,43 @@ pub struct PocketOp {
     /// Optional radial wall finishing, with compensation computed in the toolpath.
     #[serde(default)]
     pub finishing: crate::PocketFinishing,
+}
+
+impl PocketOp {
+    pub fn concentric_stepover(&self, diameter: f64) -> f64 {
+        self.maximum_stepover.unwrap_or_else(|| {
+            diameter
+                - self
+                    .clear
+                    .pocket_overlap
+                    .unwrap_or(diameter * self.clear.overlap)
+        })
+    }
+
+    pub fn validate_maximum_stepover(stepover: f64, diameter: f64) -> Result<(), String> {
+        if stepover > 1e-9 && stepover <= diameter && diameter.is_finite() {
+            Ok(())
+        } else {
+            Err("Maximum stepover must be positive and at most the tool diameter".into())
+        }
+    }
+
+    /// Keeps older overlap formulas and their dependencies live in the inspector.
+    pub fn legacy_stepover_expression(&self) -> Option<&'static str> {
+        use crate::OperationParameter::{MaximumStepover, Overlap, PocketOverlap};
+        if self.maximum_stepover.is_some() || self.parameter_expressions.contains_key(&MaximumStepover)
+        {
+            None
+        } else if self.parameter_expressions.contains_key(&PocketOverlap) {
+            Some("tool_diameter - pocketOverlap")
+        } else if self.clear.pocket_overlap.is_none()
+            && self.parameter_expressions.contains_key(&Overlap)
+        {
+            Some("tool_diameter - tool_diameter * (overlap / 100)")
+        } else {
+            None
+        }
+    }
 }
 
 /// 3D surface finishing over a CAD solid or selected faces.

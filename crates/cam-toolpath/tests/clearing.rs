@@ -196,6 +196,7 @@ fn assert_no_rapid_onto_uncut_stock(program: &Program, floor: f64) {
 /// A 60×40 pocket with a 10×10 island, cleared in two levels by a ⌀6 end mill.
 fn pocket_doc() -> Document {
     let op = PocketOp {
+        maximum_stepover: None,
         parameter_expressions: Default::default(),
         wrap: None,
         additional_regions: Vec::new(),
