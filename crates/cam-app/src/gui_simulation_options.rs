@@ -258,9 +258,8 @@ impl SimulationPlayer {
             if run.steps.is_empty() {
                 return;
             }
-            let mut part = Scene::from_program(run);
+            let mut part = Scene::from_program_without_markers(run);
             scene.strips.append(&mut part.strips);
-            scene.path_cones.append(&mut part.path_cones);
             run.steps.clear();
         };
         let mut previous_end = None;
@@ -357,14 +356,6 @@ impl SimulationPlayer {
                     .to_world_vector(point.map(f64::from))
                     .map(|n| n as f32);
             }
-        }
-        for cone in &mut scene.path_cones {
-            cone.at = frame
-                .to_world_vector(cone.at.map(f64::from))
-                .map(|n| n as f32);
-            cone.direction = frame
-                .to_world_vector(cone.direction.map(f64::from))
-                .map(|n| n as f32);
         }
         scene
     }

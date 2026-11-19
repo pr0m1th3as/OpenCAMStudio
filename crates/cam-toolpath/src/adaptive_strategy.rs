@@ -18,7 +18,7 @@ pub struct AdaptiveStrategy {
 
 impl AdaptiveStrategy {
     /// Invalidate persisted paths when machining domain, linking or safety rules change.
-    pub const DOMAIN_REVISION: u32 = 10;
+    pub const DOMAIN_REVISION: u32 = 11;
 
     pub fn new(op: AdaptiveOp, stock_to_leave: StockToLeave, geometry: AdaptiveGeometry) -> Self {
         Self {
@@ -298,33 +298,26 @@ impl AdaptiveStrategy {
                     ),
                 }
             } else {
-                let mut selected_domains = Vec::new();
-                if !layer.body_domains.is_empty() {
-                    match offset(
-                        &layer.body_domains,
-                        domain_expansion - self.geometry.error_bound - 2.0 * cam_geo::GRID_MM,
-                        JoinStyle::Round,
-                    ) {
-                        Ok(regions) => selected_domains.extend(regions),
-                        Err(e) => fail!(
-                            "operation {}: could not expand the selected body machining domain: {e}",
-                            op.id
-                        ),
-                    }
-                }
-                if !layer.face_domains.is_empty() {
-                    match offset(
-                        &layer.face_domains,
-                        domain_expansion - self.geometry.error_bound - 2.0 * cam_geo::GRID_MM,
-                        JoinStyle::Round,
-                    ) {
-                        Ok(regions) => selected_domains.extend(regions),
-                        Err(e) => fail!(
-                            "operation {}: could not erode the selected face machining domain by the certified path error: {e}",
-                            op.id
-                        ),
-                    }
-                }
+                // Inset the combined selection, so shared edges between
+                // adjacent faces do not leave strips of untouched stock.
+                let selected = match cam_geo::union(&layer.body_domains, &layer.face_domains) {
+                    Ok(regions) => regions,
+                    Err(e) => fail!(
+                        "operation {}: could not combine the selected machining domains: {e}",
+                        op.id
+                    ),
+                };
+                let selected_domains = match offset(
+                    &selected,
+                    domain_expansion - self.geometry.error_bound - 2.0 * cam_geo::GRID_MM,
+                    JoinStyle::Round,
+                ) {
+                    Ok(regions) => regions,
+                    Err(e) => fail!(
+                        "operation {}: could not offset the selected machining domains by the certified path error: {e}",
+                        op.id
+                    ),
+                };
                 match cam_geo::intersection(&selected_domains, &stock_limit) {
                     Ok(regions) => regions,
                     Err(e) => fail!(
@@ -770,6 +763,50 @@ mod tests {
             .unwrap();
         assert!((exit.x - 5.).hypot(exit.y - 25.) < 3.0, "{exit:?}");
         // compute() certifies the new exit as well as every other emitted move.
+    }
+
+    #[test]
+    fn adjacent_face_domains_clear_the_shared_edge() {
+        let (mut strategy, tool) = fixture();
+        let rectangle = |x0, x1| {
+            Polygon::new(Contour::new(vec![
+                Point::new(x0, 0.),
+                Point::new(x1, 0.),
+                Point::new(x1, 20.),
+                Point::new(x0, 20.),
+            ]))
+            .unwrap()
+        };
+        strategy.op.params.climb = false;
+        strategy.stock_to_leave = StockToLeave::default();
+        let env = JobEnv {
+            heights: Heights::new(15., 12., 10.),
+            tools: std::slice::from_ref(&tool),
+            stock: Some(([0., 0.], [24., 20.])),
+            spindle: SpindleDir::Cw,
+        };
+        for (gap, expected_z) in [(0., 8.), (1., 10.)] {
+            strategy.geometry.layers = vec![cam_geometry3d::AdaptiveLayer {
+                z: 8.,
+                protected: vec![],
+                body_domains: vec![],
+                face_domains: vec![rectangle(0., 12.05), rectangle(12.05 + gap, 24.)],
+            }];
+            let result = strategy.compute(&env, &CancelToken::new());
+            assert!(!result.has_errors(), "{:?}", result.diagnostics);
+            let sim = cam_sim::simulate(
+                &result.program,
+                [0., 0., 0.],
+                [24., 20., 10.],
+                &cam_sim::SimOptions {
+                    resolution: 0.1,
+                    tool_radius: tool.radius(),
+                },
+                &[],
+            );
+            assert!(sim.is_clean(), "{:?}", sim.collisions);
+            assert_eq!(sim.field.sample(12.05 + gap / 2., 10.), expected_z);
+        }
     }
 
     #[test]

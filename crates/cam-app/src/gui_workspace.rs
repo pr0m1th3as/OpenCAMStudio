@@ -840,10 +840,6 @@ impl App {
                         {
                             vertex.position = rotate.point(vertex.position);
                         }
-                        for cone in Arc::make_mut(&mut viewport.path_cones).iter_mut() {
-                            cone.at = rotate.point(cone.at);
-                            cone.direction = rotate.vector(cone.direction);
-                        }
                         for mark in Arc::make_mut(&mut viewport.drill_marks).iter_mut() {
                             mark.at = rotate.point(mark.at);
                         }
