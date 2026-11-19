@@ -449,7 +449,7 @@ fn clear_concentric(
         return Err(RingsError::Cancelled);
     }
     let spacing = job.effective_spacing();
-    let mut rings = concentric_rings(region, job.first, spacing, cancel)?;
+    let mut rings = concentric_rings(region, job.first, spacing, job.radius, cancel)?;
     if rings.is_empty() {
         return Ok(0);
     }

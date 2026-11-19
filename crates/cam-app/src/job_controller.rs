@@ -223,8 +223,8 @@ impl AppController {
                 inputs.document.active_setup_id,
                 &inputs.document.rotary_indexes,
                 env!("CARGO_PKG_VERSION"),
-                // Verified programs and stock must reflect the current linking rules.
-                7u32,
+                // Verified programs and stock must reflect current machining rules.
+                11u32,
             ),
             &inputs.document.excluded_operations,
             &inputs.document.disabled_origins,
@@ -572,11 +572,9 @@ impl AppController {
                     .iter()
                     .filter(|tool| op.tools().contains(&tool.number))
                     .collect();
-                let binding = document
-                    .geometry
-                    .bindings
-                    .get(&id)
-                    .map(|binding| document.geometry.binding_fingerprint(binding));
+                let geometry_binding = document.geometry.bindings.get(&id);
+                let binding =
+                    geometry_binding.map(|binding| document.geometry.binding_fingerprint(binding));
                 let patterns: Vec<_> = setup
                     .patterns
                     .iter()
@@ -618,6 +616,14 @@ impl AppController {
                     bytes.extend_from_slice(
                         &cam_toolpath::PocketStrategy::STOCK_CONTOUR_REVISION.to_le_bytes(),
                     );
+                }
+                if geometry_binding
+                    .is_some_and(|b| b.recipe == cam_model::ExtractionRecipe::PocketFloor)
+                {
+                    bytes.extend_from_slice(&cam_geometry3d::POCKET_FLOOR_REVISION.to_le_bytes());
+                }
+                if let Some(revision) = cam_toolpath::concentric_clearing_revision(op) {
+                    bytes.extend_from_slice(&revision.to_le_bytes());
                 }
                 let own = cam_model::GeometryAsset::fingerprint_source(&bytes);
                 previous = cam_model::GeometryAsset::fingerprint_source(

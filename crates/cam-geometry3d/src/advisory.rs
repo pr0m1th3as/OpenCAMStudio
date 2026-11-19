@@ -153,8 +153,13 @@ fn fallback(
             let (region, z) = match refs[0].kind {
                 EntityKind::Face => {
                     let face = view.face(refs[0].id)?;
-                    let wire = view.wire(*face.loop_ids.first().ok_or("Face has no boundary")?)?;
-                    (view.region(face)?, view.contour(wire)?.1)
+                    let (_, z) = view.contour(view.outer_wire(face)?)?;
+                    let region = if binding.recipe == ExtractionRecipe::PocketFloor {
+                        view.region_from_loops(pocket_regions::floor_loop_ids(&view, face, z)?)?
+                    } else {
+                        view.region(face)?
+                    };
+                    (region, z)
                 }
                 EntityKind::Loop => {
                     let (contour, z) = view.contour(view.wire(refs[0].id)?)?;

@@ -798,7 +798,7 @@ fn emit_with_finishing(
         }
         let remaining = finish.count.saturating_sub(stage + 1);
         let distance = radius + op.clear.offset + remaining as f64 * finish.stepover;
-        let mut rings = concentric_rings(region, distance, 0., cancel)?;
+        let mut rings = concentric_rings(region, distance, 0., radius, cancel)?;
         if rings.is_empty() {
             return Err(RingsError::Limit(
                 "finishing pass does not fit inside the pocket".into(),

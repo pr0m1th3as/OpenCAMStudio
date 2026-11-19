@@ -54,7 +54,7 @@ use cam_cldata::{Program, SpindleDir};
 use cam_model::{Heights, Tool};
 
 pub use adaptive_strategy::AdaptiveStrategy;
-pub use cache::{CacheStats, OperationCache};
+pub use cache::{concentric_clearing_revision, CacheStats, OperationCache};
 pub use carve::{carve_shape, CarveShape, CarveStrategy};
 pub use chamfer::ChamferStrategy;
 pub use drill::DrillStrategy;

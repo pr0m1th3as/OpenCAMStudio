@@ -2,7 +2,7 @@
 //! the planner assembles links, datums, spindle and shutdown on every run.
 use crate::{CancelToken, JobEnv, StrategyResult};
 use cam_cldata::SpindleDir;
-use cam_model::{CuttingHeights, Heights, Operation, StockToLeave, Tool};
+use cam_model::{CuttingHeights, Heights, Operation, OperationParameter, StockToLeave, Tool};
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
@@ -22,6 +22,12 @@ struct Dependencies {
     keep_down_revision: u32,
     #[serde(default)]
     pocket_lead_revision: u32,
+    #[serde(
+        default,
+        alias = "concentric_link_revision",
+        skip_serializing_if = "Option::is_none"
+    )]
+    concentric_clearing_revision: Option<u32>,
     operation: Operation,
     heights: Heights,
     tools: Vec<Tool>,
@@ -61,6 +67,20 @@ pub(crate) struct CacheExtras {
     pub stock_to_leave: StockToLeave,
     pub geometry_fingerprint: Option<String>,
     pub cutting_heights: Option<CuttingHeights>,
+}
+
+/// Revision for operations that can emit concentric clearing passes.
+pub fn concentric_clearing_revision(operation: &Operation) -> Option<u32> {
+    let can_clear = match operation {
+        Operation::Pocket(_) | Operation::Adaptive(_) => true,
+        Operation::Profile(p) => {
+            p.stepover > 0.
+                || p.parameter_expressions.contains_key(&OperationParameter::Stepover)
+        }
+        Operation::Carve(p) => p.clear.is_some(),
+        _ => false,
+    };
+    can_clear.then_some(2)
 }
 
 impl OperationCache {
@@ -138,6 +158,7 @@ impl OperationCache {
             // The first wall ring now uses the same leads as later wall rings.
             pocket_lead_revision: u32::from(matches!(op, Operation::Pocket(p)
                 if p.clear.lead_in != cam_model::Lead::None || p.clear.lead_out != cam_model::Lead::None)),
+            concentric_clearing_revision: concentric_clearing_revision(op),
             adaptive_domain_revision: if matches!(op, Operation::Parallel(_)) {
                 crate::ParallelStrategy::DOMAIN_REVISION
             } else if matches!(op, Operation::Spiral(_)) {

@@ -41,51 +41,90 @@ pub(crate) fn concentric_rings(
     region: &Polygon,
     first: f64,
     stepover: f64,
+    radius: f64,
     cancel: &CancelToken,
 ) -> Result<Vec<Ring>, RingsError> {
+    if cancel.is_cancelled() {
+        return Err(RingsError::Cancelled);
+    }
+    let at_offset = |distance: f64| {
+        offset(std::slice::from_ref(region), -distance, JoinStyle::Round)
+            .map_err(|e| RingsError::Offset(e.to_string()))
+    };
     let mut rings: Vec<Ring> = Vec::new();
     let mut d = first;
-    let mut is_wall = true; // the first offset hugs the walls
-    loop {
+    let mut offsets = at_offset(first)?;
+    while !offsets.is_empty() {
         if cancel.is_cancelled() {
             return Err(RingsError::Cancelled);
         }
-        let offsets = offset(std::slice::from_ref(region), -d, JoinStyle::Round)
-            .map_err(|e| RingsError::Offset(e.to_string()))?;
-        if offsets.is_empty() {
-            break;
+        let is_wall = d == first;
+        for poly in offsets {
+            rings.extend(boundary_rings(&poly, is_wall));
         }
-        for poly in &offsets {
-            rings.push(Ring {
-                pts: poly.outer().points().to_vec(),
-                is_wall,
-            });
-            for hole in poly.holes() {
-                rings.push(Ring {
-                    pts: hole.points().to_vec(),
-                    is_wall,
-                });
-            }
+        // A non-positive stepover takes only the requested wall pass.
+        if stepover <= 0.0 {
+            return if rings.len() > MAX_RINGS {
+                Err(RingsError::Limit(
+                    "Too many roughing rings; increase stepover".into(),
+                ))
+            } else {
+                Ok(rings)
+            };
         }
+
         let next = d + stepover;
-        if stepover > 0. && next == d {
+        if next == d {
             return Err(RingsError::Limit(
                 "Radial stepover is too small to advance the offset".into(),
             ));
         }
+        offsets = at_offset(next)?;
+        if stepover > radius && stepover <= 2.0 * radius {
+            // The current rings reach one cutter radius into their offset.
+            // The next rings reach one radius back out. When an offset lobe
+            // shrinks or disappears, some stock may be beyond both sweeps.
+            let inner = at_offset(d + radius)?;
+            let covered = offset(&offsets, radius, JoinStyle::Round)
+                .map_err(|e| RingsError::Offset(e.to_string()))?;
+            let gaps = cam_geo::difference(&inner, &covered)
+                .map_err(|e| RingsError::Offset(e.to_string()))?;
+            if !gaps.is_empty() {
+                let reach = offset(&gaps, radius, JoinStyle::Round)
+                    .map_err(|e| RingsError::Offset(e.to_string()))?;
+                for poly in inner {
+                    for ring in boundary_rings(&poly, false) {
+                        if cancel.is_cancelled() {
+                            return Err(RingsError::Cancelled);
+                        }
+                        let mut closed = ring.pts.clone();
+                        closed.push(ring.pts[0]);
+                        let hits = cam_geo::clip_path(&cam_geo::Polyline::new(closed), &reach, true)
+                            .map_err(|e| RingsError::Offset(e.to_string()))?;
+                        if !hits.is_empty() {
+                            rings.push(ring);
+                        }
+                    }
+                }
+            }
+        }
         d = next;
-        is_wall = false;
-        // A non-positive stepover would never advance; take the wall ring and stop.
         if rings.len() > MAX_RINGS {
             return Err(RingsError::Limit(
                 "Too many roughing rings; increase stepover".into(),
             ));
         }
-        if stepover <= 0.0 {
-            break;
-        }
     }
     Ok(rings)
+}
+
+fn boundary_rings(region: &Polygon, is_wall: bool) -> impl Iterator<Item = Ring> + '_ {
+    std::iter::once(region.outer())
+        .chain(region.holes())
+        .map(move |contour| Ring {
+            pts: contour.points().to_vec(),
+            is_wall,
+        })
 }
 
 /// Cut one closed ring (plus closure overlap) at `z`, returning the exit point.
@@ -169,7 +208,11 @@ fn enter_with_plunge(
         prog.push(Step::Linear {
             to: Point3::new(down_at.x, down_at.y, from_z),
             feed,
-            tag: link,
+            tag: if from_z < h.clearance {
+                Tag::new(id, MoveKind::Cutting)
+            } else {
+                link
+            },
         });
         if arrive_at < from_z {
             prog.push(Step::Linear {
@@ -254,7 +297,9 @@ fn approach(
     guard: &[Polygon],
 ) -> Option<f64> {
     let hop = (p.x - prev_end.x).hypot(p.y - prev_end.y);
-    if hop <= link_threshold && (lift_height == 0.0 || hop <= 1e-9) {
+    let local = hop <= link_threshold
+        && (guard.is_empty() || hop <= 1e-9 || crate::linking::contained(guard, prev_end, p));
+    if local && (lift_height == 0.0 || hop <= 1e-9) {
         prog.push(Step::Linear {
             to: Point3::new(p.x, p.y, z),
             feed,
@@ -265,7 +310,7 @@ fn approach(
     // A lead can start beyond the cleared area even when the ring-to-ring hop
     // is short. Retract before moving to that entry; a local lifted traverse
     // cannot establish clearance for the whole lead-in path.
-    if hop <= link_threshold && lead_path.is_empty() {
+    if local && lead_path.is_empty() && !guard.is_empty() {
         return enter_with_plunge(
             prog,
             p,

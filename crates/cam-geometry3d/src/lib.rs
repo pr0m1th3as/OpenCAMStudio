@@ -34,6 +34,8 @@ use std::{collections::BTreeSet, f64::consts::TAU};
 /// Recognition and machining budgets are independent of display tessellation.
 pub const RECOGNITION_TOLERANCE: f64 = 1e-5;
 pub const MACHINING_CHORD_TOLERANCE: f64 = 0.01;
+/// Version of the CAD pocket floor classification used by saved toolpaths.
+pub const POCKET_FLOOR_REVISION: u32 = 3;
 const T: f64 = RECOGNITION_TOLERANCE;
 
 /// Borrow only machining dependencies. Exact planar curves do not depend on
@@ -793,11 +795,23 @@ impl<'a> View<'a> {
         }
         Ok((c, z))
     }
+    fn outer_wire(&self, face: &CadFace) -> Result<&CadLoop, String> {
+        face.loop_ids
+            .iter()
+            .find_map(|&id| self.wire(id).ok().filter(|wire| wire.is_outer))
+            .ok_or("Face has no outer boundary".into())
+    }
     fn region(&self, f: &CadFace) -> Result<Polygon, String> {
+        self.region_from_loops(f.loop_ids.iter().copied())
+    }
+    fn region_from_loops(
+        &self,
+        loop_ids: impl IntoIterator<Item = EntityId>,
+    ) -> Result<Polygon, String> {
         let mut outer = None;
         let mut holes = vec![];
-        for id in &f.loop_ids {
-            let w = self.wire(*id)?;
+        for id in loop_ids {
+            let w = self.wire(id)?;
             let (c, _) = self.contour(w)?;
             if w.is_outer {
                 if outer.replace(c).is_some() {
@@ -1286,7 +1300,7 @@ fn derive(
             if normal[2] < 0.0 {
                 return Err("floor normal must face the machining direction".into());
             }
-            let region = view.region(f)?;
+            let region = view.region_from_loops(pocket_regions::floor_loop_ids(&view, f, floor)?)?;
             for face in view
                 .asset
                 .topology
@@ -1318,14 +1332,18 @@ fn derive(
                 }
             }
             let mut top: Option<f64> = None;
-            for id in &f.loop_ids {
-                for wall in view.walls(view.wire(*id)?)? {
+            for &id in &f.loop_ids {
+                let wire = view.wire(id)?;
+                if pocket_regions::descends_below_floor(&view, wire, floor) {
+                    continue;
+                }
+                for wall in view.walls(wire)? {
                     let (lo, hi) = view.extent(wall)?;
                     if (lo - floor).abs() > T || hi <= floor + T {
                         return Err("floor boundary is open, has a bore below it, or is not a rising pocket wall".into());
                     }
                     view.certify_wall(wall, lo, hi)?;
-                    view.certify_pocket_rim(wall, view.wire(*id)?, hi)?;
+                    view.certify_pocket_rim(wall, wire, hi)?;
                     if let Some(z) = top {
                         if (z - hi).abs() > T {
                             return Err("pocket walls have ambiguous or different openings".into());
@@ -2084,6 +2102,29 @@ mod tests {
         f.walls(8., 12., 8., 12., -5., 0.);
         f.face(rings(-5.), [0., 0., -1.]);
         (f.state(), reference(top, EntityKind::Face))
+    }
+
+    #[test]
+    fn advisory_pocket_face_bridges_certified_descending_cutouts() {
+        let (mut state, face) = plate_with_hole();
+        let selection = std::slice::from_ref(&face);
+        let binding =
+            resolve_selection_advisory(&state, selection, ExtractionRecipe::PocketFloor, 1.).unwrap();
+        let resolved = resolve_binding_advisory(&state, &binding).unwrap();
+        assert_eq!(
+            resolved.heights,
+            CuttingHeights { top: 1., bottom: 0. }
+        );
+        assert_eq!(resolved.regions[0].area(), 400.);
+        assert!(resolved.regions[0].holes().is_empty());
+        assert!(resolved
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("verification (info)")));
+
+        Arc::make_mut(&mut state.assets[0].topology).bodies[0].valid_solid = false;
+        let resolved = resolve_binding_advisory(&state, &binding).unwrap();
+        assert_eq!(resolved.regions[0].holes().len(), 1);
     }
 
     #[test]

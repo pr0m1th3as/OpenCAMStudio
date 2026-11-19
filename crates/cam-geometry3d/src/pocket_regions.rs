@@ -2,6 +2,86 @@
 //! across uncut material. A 2.5D operation has one common cutting interval.
 use super::*;
 
+/// Keep the selected floor's machining outline and its raised islands.
+/// Descending cutouts within that outline can be cleared across.
+pub(super) fn floor_loop_ids(
+    view: &View,
+    face: &CadFace,
+    floor: f64,
+) -> Result<Vec<EntityId>, String> {
+    let outer_center = circular_wire_center(view, view.outer_wire(face)?);
+    let mut kept = Vec::new();
+    for &id in &face.loop_ids {
+        let wire = view.wire(id)?;
+        if !descends_below_floor(view, wire, floor) || is_annular_inner_rim(view, wire, outer_center) {
+            kept.push(id);
+        }
+    }
+    Ok(kept)
+}
+
+fn is_annular_inner_rim(
+    view: &View,
+    wire: &CadLoop,
+    outer_center: Option<[f64; 3]>,
+) -> bool {
+    // Concentric closed wires define the two rims of an annular floor.
+    // The inner rim bounds the selected face at every diameter.
+    outer_center.is_some_and(|outer| {
+        circular_wire_center(view, wire).is_some_and(|inner| distance(outer, inner) <= T)
+    })
+}
+
+fn circular_wire_center(view: &View, wire: &CadLoop) -> Option<[f64; 3]> {
+    let mut common_center = None;
+    let mut sweep = 0.;
+    for usage in &wire.edge_uses {
+        let CadCurve::CircleArc {
+            center,
+            start_angle,
+            end_angle,
+            ..
+        } = view.edge(usage.edge_id).ok()?.curve
+        else {
+            return None;
+        };
+        if distance(center, *common_center.get_or_insert(center)) > T {
+            return None;
+        }
+        sweep += (end_angle - start_angle).abs();
+    }
+    common_center.filter(|_| (sweep - TAU).abs() <= T)
+}
+
+pub(super) fn descends_below_floor(view: &View, wire: &CadLoop, floor: f64) -> bool {
+    !wire.is_outer
+        && view.body.valid_solid
+        && !wire.edge_uses.is_empty()
+        && wire.edge_uses.iter().all(|usage| {
+            let Ok(edge) = view.edge(usage.edge_id) else {
+                return false;
+            };
+            let mut adjacent = edge.face_ids.iter().filter(|&&id| id != wire.face_id);
+            let (Some(&id), None) = (adjacent.next(), adjacent.next()) else {
+                return false;
+            };
+            let Ok(wall) = view.face(id) else {
+                return false;
+            };
+            let [[_, _, lo], [_, _, hi]] = view.bounds(wall.bounds);
+            if hi <= floor + T {
+                return lo < floor - T;
+            }
+            // Transforming a native bounding box can overestimate Z after a
+            // setup rotation. For planes and Z-aligned extrusions, the exact
+            // boundary controls the full height range.
+            (matches!(wall.surface, CadSurface::Plane { .. }) || view.vertical(wall))
+                && view
+                    .extent(wall)
+                    .is_ok_and(|(lo, hi)| lo < floor - T && hi <= floor + T)
+        })
+}
+
 pub(super) fn resolve(
     state: &GeometryState,
     binding: &GeometryBinding,

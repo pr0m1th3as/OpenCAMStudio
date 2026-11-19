@@ -118,7 +118,9 @@ impl Fixture {
     fn bore(&mut self, center: [f64; 2], radius: f64, top: u64, bottom: u64) -> u64 {
         let face = self.id();
         let mut loop_ids = vec![];
-        for (z, adjacent) in [(0., top), (-5., bottom)] {
+        let height = |id| self.t.faces.iter().find(|f| f.id == id).unwrap().bounds[0][2];
+        let (top_z, bottom_z) = (height(top), height(bottom));
+        for (z, adjacent) in [(top_z, top), (bottom_z, bottom)] {
             let vertex = self.vertex([center[0] + radius, center[1], z]);
             let edge = self.id();
             self.t.edges.push(CadEdge {
@@ -164,15 +166,15 @@ impl Fixture {
             id: face,
             body_id: 1,
             surface: CadSurface::Cylinder {
-                origin: [center[0], center[1], 0.],
+                origin: [center[0], center[1], top_z],
                 axis: [0., 0., 1.],
                 radius,
                 inward: true,
             },
             loop_ids,
             bounds: [
-                [center[0] - radius, center[1] - radius, -5.],
-                [center[0] + radius, center[1] + radius, 0.],
+                [center[0] - radius, center[1] - radius, bottom_z],
+                [center[0] + radius, center[1] + radius, top_z],
             ],
         });
         face
@@ -218,6 +220,9 @@ fn reference(id: u64, kind: EntityKind) -> EntityRef {
     }
 }
 fn pocket() -> (GeometryState, EntityRef) {
+    pocket_with_bores(&[])
+}
+fn pocket_with_bores(bores: &[([f64; 2], f64)]) -> (GeometryState, EntityRef) {
     let mut f = Fixture::new();
     let floor = f.face(
         vec![square(2., 18., 2., 18., -3.), square(8., 12., 8., 12., -3.)],
@@ -231,7 +236,10 @@ fn pocket() -> (GeometryState, EntityRef) {
     );
     f.face(vec![square(8., 12., 8., 12., 0.)], [0., 0., 1.]);
     f.walls(0., 20., 0., 20., -5., 0.);
-    f.face(vec![square(0., 20., 0., 20., -5.)], [0., 0., -1.]);
+    let bottom = f.face(vec![square(0., 20., 0., 20., -5.)], [0., 0., -1.]);
+    for &(center, radius) in bores {
+        f.bore(center, radius, floor, bottom);
+    }
     (f.state(), reference(floor, EntityKind::Face))
 }
 fn controller() -> AppController {
@@ -250,6 +258,115 @@ fn select_all_models(app: &mut AppController) {
         .map(|i| i.id)
         .collect();
     app.edit_setup(|setup| setup.model_instances = ids);
+}
+
+#[test]
+fn cad_pocket_toolpaths_bridge_bores_on_both_sides_of_the_cutter_diameter() {
+    let (state, floor) = pocket_with_bores(&[([5., 10.], 2.5), ([15., 15.], 1.)]);
+    let mut app = controller();
+    app.add_cad_asset(state.assets[0].clone(), state.instances)
+        .unwrap();
+    select_all_models(&mut app);
+    let id = app
+        .create_cad_operation(OpKind::Pocket, vec![floor])
+        .unwrap();
+    let Some(Operation::Pocket(operation)) = app.operation(id) else {
+        panic!("expected a pocket operation");
+    };
+    assert!(!operation.stock_contours.enabled);
+    assert_eq!(operation.islands.len(), 1);
+    assert_eq!(operation.islands[0].area(), 16.);
+
+    for adaptive in [false, true] {
+        app.edit_operation(id, |op| {
+            let Operation::Pocket(pocket) = op else {
+                unreachable!()
+            };
+            pocket.clear.adaptive_enabled = Some(adaptive);
+            pocket.clear.clearing.engagement = 1.;
+            pocket.clear.lift_height = 0.2;
+            pocket.clear.keep_tool_down = true;
+            pocket.maximum_stepover = Some(2.85);
+        });
+        let outcome = app.run(&CancelToken::new());
+        assert_eq!(
+            outcome.completion,
+            JobCompletion::Complete,
+            "{:?}",
+            outcome.diagnostics
+        );
+        assert!(!outcome.has_errors(), "{:?}", outcome.diagnostics);
+        let simulation = cam_sim::simulate(
+            &outcome.program,
+            [0., 0., -5.],
+            [20., 20., 0.],
+            &cam_sim::SimOptions {
+                resolution: 0.1,
+                tool_radius: 1.5,
+            },
+            &[],
+        );
+        assert!(simulation.is_clean(), "{:?}", simulation.collisions);
+        let stock = simulation.field;
+        assert_eq!(stock.sample(15., 15.), -3., "stock above the small bore");
+        assert_eq!(stock.sample(5., 10.), -3., "stock above the wider bore");
+        for x in [8.2, 10., 11.8] {
+            assert_eq!(stock.sample(x, 10.), 0., "raised island at X{x}");
+        }
+    }
+}
+
+fn circular_face_with_bores(inner_radius: f64) -> (GeometryState, EntityRef) {
+    let mut fixture = Fixture::new();
+    let mut plane = |z, normal| {
+        let id = fixture.id();
+        fixture.t.faces.push(CadFace {
+            id,
+            body_id: 1,
+            surface: CadSurface::Plane {
+                origin: [10., 10., z],
+                normal: [0., 0., normal],
+            },
+            loop_ids: vec![],
+            bounds: [[0., 0., z], [20., 20., z]],
+        });
+        id
+    };
+    let top = plane(0., 1.);
+    let bottom = plane(-5., -1.);
+    let outside = fixture.bore([10., 10.], 10., top, bottom);
+    let wall = fixture.t.faces.iter_mut().find(|f| f.id == outside).unwrap();
+    let CadSurface::Cylinder { inward, .. } = &mut wall.surface else {
+        unreachable!()
+    };
+    *inward = false;
+    for wire in &mut fixture.t.loops {
+        if wire.face_id == top || wire.face_id == bottom {
+            wire.is_outer = true;
+        }
+    }
+    fixture.bore([10., 10.], inner_radius, top, bottom);
+    fixture.bore([18., 10.], 1., top, bottom);
+    (fixture.state(), reference(top, EntityKind::Face))
+}
+
+#[test]
+fn cad_pocket_keeps_the_inner_rim_of_an_annular_face_at_different_diameters() {
+    for inner_radius in [1., 6.] {
+        let (state, selected) = circular_face_with_bores(inner_radius);
+        let binding = cam_geometry3d::resolve_selection_advisory(
+            &state,
+            &[selected],
+            ExtractionRecipe::PocketFloor,
+            1.,
+        )
+        .unwrap();
+        let resolved = cam_geometry3d::resolve_binding_advisory(&state, &binding).unwrap();
+        let region = &resolved.regions[0];
+        assert_eq!(region.holes().len(), 1);
+        assert!(!region.contains(Point::new(10., 10.)));
+        assert!(region.contains(Point::new(18., 10.)));
+    }
 }
 
 #[test]
