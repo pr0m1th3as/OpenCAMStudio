@@ -61,8 +61,8 @@ pub use drill::DrillStrategy;
 pub use engrave::EngraveStrategy;
 pub use face::FaceStrategy;
 pub use plan::{
-    build_job, build_job_cached, build_job_cached_with_progress, CalculationProgress,
-    JobCompletion, JobResult, PlanRequest,
+    build_job, build_job_cached, build_job_cached_with_preview, build_job_cached_with_progress,
+    CalculationProgress, JobCompletion, JobResult, PlanRequest,
 };
 mod cache;
 pub use pocket::PocketStrategy;

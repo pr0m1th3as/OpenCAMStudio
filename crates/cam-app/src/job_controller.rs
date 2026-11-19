@@ -461,6 +461,10 @@ impl AppController {
     pub(crate) fn run_preview(&self) -> Option<&RunOutcome> {
         self.jobs.preview()
     }
+    #[cfg(feature = "gui")]
+    pub(crate) fn run_preview_revision(&self) -> Option<usize> {
+        self.jobs.preview_revision()
+    }
     pub fn run_pending(&self) -> bool {
         self.jobs.pending()
     }

@@ -17,9 +17,9 @@
 
 use cam_cldata::{MoveKind, Point3, Program, SpindleDir, Step, Tag};
 use cam_geo::{Point, Polygon};
-use cam_model::{Clearing, Heights, Lead, Plunge};
+use cam_model::{Clearing, Heights, Lead, Plunge, Tool, ToolKind};
 
-use crate::rings::{concentric_rings, emit_stay_down, RingsError};
+use crate::rings::{concentric_rings, emit_stay_down, Ring, RingsError};
 use crate::CancelToken;
 
 /// Everything the clearing pass needs beyond the region geometry itself.
@@ -111,7 +111,7 @@ pub(crate) fn clear(
     levels: &[f64],
     cancel: &CancelToken,
 ) -> Result<usize, RingsError> {
-    clear_validated(prog, region, job, heights, levels, cancel, false, |_| true)
+    clear_validated(prog, region, job, heights, levels, cancel, None, |_| true)
         .map(|result| result.paths)
 }
 
@@ -121,7 +121,7 @@ pub(crate) struct ClearResult {
 }
 
 /// Allow a caller with additional model constraints to reject a frontier path
-/// and use the concentric fallback. With `prefer_stay_down`, compare a fragmented
+/// and use the concentric fallback. With the 3D tool, compare a fragmented
 /// frontier with the fallback and keep the safe path requiring fewer lifts.
 /// Validation never emits a rejected candidate, including the fallback.
 #[allow(clippy::too_many_arguments)]
@@ -132,7 +132,7 @@ pub(crate) fn clear_validated(
     heights: &Heights,
     levels: &[f64],
     cancel: &CancelToken,
-    prefer_stay_down: bool,
+    tool_3d: Option<&Tool>,
     accept: impl Fn(&Program) -> bool,
 ) -> Result<ClearResult, RingsError> {
     if !job.lift_height.is_finite() || job.lift_height < 0.0 {
@@ -140,6 +140,13 @@ pub(crate) fn clear_validated(
             "Lift height must be finite and nonnegative".into(),
         ));
     }
+    let prefer_stay_down = tool_3d.is_some();
+    let flat_floor = tool_3d.is_some_and(|tool| {
+        matches!(
+            tool.kind,
+            ToolKind::EndMill | ToolKind::RoughingMill | ToolKind::FaceMill
+        ) && tool.shank_dia().max(tool.neck_dia()) <= tool.diameter
+    });
     let mut adaptive_candidate = None;
     // **Adaptive dispatch: the front-advance clearer, behind the exact oracle.**
     //
@@ -175,10 +182,9 @@ pub(crate) fn clear_validated(
     //   change every shipped toolpath and regenerate every golden — a decision to take on its
     //   own evidence rather than as a side effect of adding islands. See `ADAPTIVE_PLAN.md`
     //   §10.
-    // - **Configured leads must fit.** Hole-free frontiers use `adaptive_linking`
-    //   to preserve adjoining seams and fit the requested leads into cleared
-    //   stock. An unsafe lead layout falls back to leaded concentric clearing.
-    //   Island steering still uses concentric clearing when leads are requested.
+    // - **Configured leads must fit.** In 2D, hole-free frontiers can preserve
+    //   adjoining seams with configured leads. 3D checks each raised floor
+    //   link and its lead arcs separately.
     //
     // **The gate is the exact oracle, never the raster.** Until 2026-07-17 an earlier
     // adaptive dispatch (the spiral-morph) gated on `raster.rs`, which is blind to slots —
@@ -202,8 +208,7 @@ pub(crate) fn clear_validated(
     if job.clearing.engagement > 0.0
         && !matches!(job.plunge, Plunge::Ramp { .. })
         && job.adaptive_may_run()
-        && job.lead_in == Lead::None
-        && job.lead_out == Lead::None
+        && (prefer_stay_down || (job.lead_in == Lead::None && job.lead_out == Lead::None))
         && !region.holes().is_empty()
     {
         // **Islands go to the steered generator** ([`crate::steer`]), which holds the radial
@@ -225,7 +230,25 @@ pub(crate) fn clear_validated(
             cancel,
         ) {
             let mut candidate = Program::new();
-            emit_adaptive_moves(&mut candidate, &moves, &air, job, heights, levels);
+            if prefer_stay_down {
+                let path = crate::frontadvance::LinkedFrontier {
+                    feed_links: vec![false; moves.len()],
+                    moves,
+                    air,
+                };
+                let arcs = flat_floor
+                    .then(|| crate::adaptive_linking::floor_links(&path, job, false, cancel));
+                emit_3d_adaptive(
+                    &mut candidate,
+                    &path,
+                    arcs.as_deref().unwrap_or_default(),
+                    job,
+                    heights,
+                    levels,
+                );
+            } else {
+                emit_adaptive_moves(&mut candidate, &moves, &air, job, heights, levels);
+            }
             if accept(&candidate) {
                 if !prefer_stay_down || clearance_lifts(&candidate, heights) <= levels.len() {
                     prog.extend(candidate);
@@ -253,56 +276,111 @@ pub(crate) fn clear_validated(
             job.start,
             job.simplification_tolerance,
         ) {
-            let mut candidate = Program::new();
-            if let Some(linked) = crate::frontadvance::link_cleared_travel(
-                &moves,
-                region,
-                job.radius,
-                job.finish,
-                job.clearing.engagement,
-            ) {
-                let configured = job.lead_in != Lead::None
-                    || job.lead_out != Lead::None
-                    || job.lead_overlap > 0.;
-                match crate::adaptive_linking::prepare(&linked, region, job) {
-                    Ok(Some(prepared)) => prepared.emit(&mut candidate, job, heights, levels),
-                    Err(_) if configured => {} // The leaded concentric fallback remains available.
-                    _ => emit_adaptive_moves_with_travel(
-                        &mut candidate,
-                        &linked.moves,
-                        AdaptiveTravel {
-                            air: &linked.air,
-                            feed_links: &linked.feed_links,
-                            minimum_lift: 0.2,
-                            guarded: true,
-                        },
-                        job,
-                        heights,
-                        levels,
-                    ),
-                }
-            } else if job.lead_in == Lead::None
-                && job.lead_out == Lead::None
-                && job.lead_overlap == 0.
-            {
-                emit_adaptive_moves(&mut candidate, &moves, &[], job, heights, levels);
-            }
-            if !candidate.steps().is_empty() && accept(&candidate) {
-                if !prefer_stay_down || clearance_lifts(&candidate, heights) <= levels.len() {
+            let configured_leads =
+                job.lead_in != Lead::None || job.lead_out != Lead::None || job.lead_overlap > 0.;
+            let ends = if prefer_stay_down && job.start.is_none() && job.end.is_none() {
+                crate::frontadvance::clear_pocket_ends(
+                    region,
+                    job.radius,
+                    job.clearing.engagement,
+                    job.simplification_tolerance,
+                    &moves,
+                    flat_floor,
+                    cancel,
+                )
+            } else {
+                None
+            };
+            if let Some(ends) = ends.as_ref().filter(|path| path.air.iter().any(|&air| air)) {
+                let mut candidate = Program::new();
+                let arcs = crate::adaptive_linking::floor_links(ends, job, true, cancel);
+                emit_3d_adaptive(&mut candidate, ends, &arcs, job, heights, levels);
+                if accept(&candidate) {
                     prog.extend(candidate);
                     return Ok(ClearResult {
                         paths: 1,
                         concentric: false,
                     });
                 }
-                adaptive_candidate = Some(candidate);
+            }
+            for moves in ends
+                .iter()
+                .map(|path| path.moves.as_slice())
+                .chain(std::iter::once(moves.as_slice()))
+            {
+                let mut candidate = Program::new();
+                if let Some(linked) = crate::frontadvance::link_cleared_travel(
+                    moves,
+                    region,
+                    job.radius,
+                    job.finish,
+                    job.clearing.engagement,
+                    cancel,
+                    prefer_stay_down.then_some(crate::frontadvance::MAX_3D_LINK_CHECK_VERTICES),
+                ) {
+                    if prefer_stay_down {
+                        let arcs = flat_floor.then(|| {
+                            crate::adaptive_linking::floor_links(&linked, job, true, cancel)
+                        });
+                        emit_3d_adaptive(
+                            &mut candidate,
+                            &linked,
+                            arcs.as_deref().unwrap_or_default(),
+                            job,
+                            heights,
+                            levels,
+                        );
+                    } else {
+                        match crate::adaptive_linking::prepare(&linked, region, job) {
+                            Ok(Some(prepared)) => {
+                                prepared.emit(&mut candidate, job, heights, levels)
+                            }
+                            Err(_) if configured_leads => {} // The leaded concentric fallback remains available.
+                            _ => emit_adaptive_moves_with_travel(
+                                &mut candidate,
+                                &linked.moves,
+                                AdaptiveTravel {
+                                    air: &linked.air,
+                                    feed_links: &linked.feed_links,
+                                    minimum_lift: 0.2,
+                                    guarded: true,
+                                    floor_links: &[],
+                                },
+                                job,
+                                heights,
+                                levels,
+                            ),
+                        }
+                    }
+                } else if !cancel.is_cancelled() && (prefer_stay_down || !configured_leads) {
+                    emit_adaptive_moves(&mut candidate, moves, &[], job, heights, levels);
+                }
+                if !candidate.steps().is_empty() && accept(&candidate) {
+                    if !prefer_stay_down || clearance_lifts(&candidate, heights) <= levels.len() {
+                        prog.extend(candidate);
+                        return Ok(ClearResult {
+                            paths: 1,
+                            concentric: false,
+                        });
+                    }
+                    adaptive_candidate = Some(candidate);
+                }
             }
         }
         // Uncertified — fall through to the proven concentric path below.
     }
 
     let mut fallback = Program::new();
-    let result = clear_concentric(&mut fallback, region, job, heights, levels, cancel);
+    let result = clear_concentric(
+        &mut fallback,
+        region,
+        job,
+        heights,
+        levels,
+        cancel,
+        prefer_stay_down,
+        &accept,
+    );
     if cancel.is_cancelled() {
         return Err(RingsError::Cancelled);
     }
@@ -356,6 +434,7 @@ fn clearance_lifts(program: &Program, heights: &Heights) -> usize {
     count
 }
 
+#[allow(clippy::too_many_arguments)]
 fn clear_concentric(
     prog: &mut Program,
     region: &Polygon,
@@ -363,6 +442,8 @@ fn clear_concentric(
     heights: &Heights,
     levels: &[f64],
     cancel: &CancelToken,
+    adaptive_3d: bool,
+    accept: impl Fn(&Program) -> bool,
 ) -> Result<usize, RingsError> {
     if cancel.is_cancelled() {
         return Err(RingsError::Cancelled);
@@ -372,6 +453,13 @@ fn clear_concentric(
     if rings.is_empty() {
         return Ok(0);
     }
+    // Short joins between offset rings can remove stock. They stay at depth
+    // in 3D, where Lift height applies only to verified cleared-floor links.
+    let (lift_height, lead_in, lead_out) = if adaptive_3d {
+        (0.0, Lead::None, Lead::None)
+    } else {
+        (job.lift_height, job.lead_in, job.lead_out)
+    };
     let n = rings.len();
     let vertices: usize = rings.iter().map(|r| r.pts.len()).sum();
     if vertices.saturating_mul(levels.len()).saturating_mul(34) > cam_model::MAX_PROFILE_MOVES {
@@ -388,8 +476,8 @@ fn clear_concentric(
                 crate::profile::loop_perimeter(&ring.pts),
             )
             .map_err(RingsError::Limit)?;
-            if job.lift_height > 0.0 {
-                let top = (z + job.lift_height)
+            if lift_height > 0.0 {
+                let top = (z + lift_height)
                     .min(heights.clearance)
                     .min(heights.top_of_stock);
                 crate::profile::validate_ramp_travel(
@@ -414,32 +502,91 @@ fn clear_concentric(
     }
     // `concentric_rings` yields wall-most first; carve inside-out (walls last).
     rings.reverse();
-
-    emit_stay_down(
-        prog,
-        &rings,
-        job.start,
-        job.end,
-        job.id,
-        job.feed,
-        job.plunge_feed,
-        job.entry_feeds,
-        job.plunge,
-        job.lift_height,
-        job.lead_overlap,
-        job.lead_in,
-        job.lead_out,
-        job.guard,
-        reversed,
-        heights,
-        levels,
-        1.5 * spacing,
-        cancel,
-    );
+    let emit = |program: &mut Program, rings: &[Ring]| {
+        emit_stay_down(
+            program,
+            rings,
+            job.start,
+            job.end,
+            job.id,
+            job.feed,
+            job.plunge_feed,
+            job.entry_feeds,
+            job.plunge,
+            lift_height,
+            job.lead_overlap,
+            lead_in,
+            lead_out,
+            job.guard,
+            reversed,
+            heights,
+            levels,
+            1.5 * spacing,
+            cancel,
+        );
+    };
+    if adaptive_3d && job.start.is_none() && job.end.is_none() {
+        if let Some(joined) = join_small_entry_rings(&rings, spacing, job.guard) {
+            let mut candidate = Program::new();
+            emit(&mut candidate, &joined);
+            if cancel.is_cancelled() {
+                return Err(RingsError::Cancelled);
+            }
+            if accept(&candidate) {
+                prog.extend(candidate);
+                return Ok(joined.len());
+            }
+        }
+    }
+    emit(prog, &rings);
     if cancel.is_cancelled() {
         return Err(RingsError::Cancelled);
     }
     Ok(n)
+}
+
+/// Merge a short offset fragment into an adjacent pass so it gets cut at
+/// depth instead of needing its own approach. Keep its winding and full loop.
+fn join_small_entry_rings(rings: &[Ring], spacing: f64, guard: &[Polygon]) -> Option<Vec<Ring>> {
+    if guard.is_empty() {
+        return None;
+    }
+    let short = rings
+        .iter()
+        .take_while(|ring| {
+            !ring.is_wall && crate::profile::loop_perimeter(&ring.pts) <= 2. * spacing
+        })
+        .count();
+    if short == 0 || short == rings.len() {
+        return None;
+    }
+    let mut joined = rings.to_vec();
+    let mut first_host = short;
+    for index in (0..short).rev() {
+        let small = &joined[index].pts;
+        let entry = small[0];
+        let attachment = (first_host..joined.len()).rev().find_map(|host| {
+            let host_path =
+                crate::profile::rotate_to_start(&joined[host].pts, Some([entry.x, entry.y]));
+            let anchor = host_path[0];
+            (anchor.distance(entry) <= spacing + 2. * cam_geo::GRID_MM
+                && cam_geo::clip_path(&cam_geo::Polyline::new(vec![anchor, entry]), guard, false)
+                    .is_ok_and(|outside| outside.is_empty()))
+            .then_some((host, host_path))
+        });
+        if let Some((host, host_path)) = attachment {
+            let anchor = host_path[0];
+            let mut merged = host_path;
+            merged.rotate_left(1);
+            // The host can clear its lap before returning to the attachment.
+            merged.extend_from_slice(small);
+            merged.extend([entry, anchor]);
+            joined[host].pts = merged;
+            joined.remove(index);
+            first_host -= 1;
+        }
+    }
+    (joined.len() < rings.len()).then_some(joined)
 }
 
 /// Emit a certified adaptive tool-centre path over the depth levels: per level,
@@ -471,9 +618,34 @@ fn emit_adaptive_moves(
             feed_links: &[],
             minimum_lift: 0.,
             guarded: false,
+            floor_links: &[],
         },
         job,
         h,
+        levels,
+    );
+}
+
+fn emit_3d_adaptive(
+    program: &mut Program,
+    path: &crate::frontadvance::LinkedFrontier,
+    floor_links: &[crate::adaptive_linking::FloorLink],
+    job: &ClearJob,
+    heights: &Heights,
+    levels: &[f64],
+) {
+    emit_adaptive_moves_with_travel(
+        program,
+        &path.moves,
+        AdaptiveTravel {
+            air: &[],
+            feed_links: &[],
+            minimum_lift: 0.2,
+            guarded: false,
+            floor_links,
+        },
+        job,
+        heights,
         levels,
     );
 }
@@ -484,6 +656,7 @@ struct AdaptiveTravel<'a> {
     minimum_lift: f64,
     /// Includes radial withdrawal from walls and reserved finishing stock.
     guarded: bool,
+    floor_links: &'a [crate::adaptive_linking::FloorLink],
 }
 
 fn emit_adaptive_moves_with_travel(
@@ -559,7 +732,18 @@ fn emit_adaptive_moves_with_travel(
         let lift_height = job.lift_height.max(travel.minimum_lift);
         let link_z = (z + lift_height).min(h.clearance);
         let mut lifted = false;
+        let mut links = travel.floor_links.iter().peekable();
+        let mut linked_through = 0;
         for i in 1..moves.len() {
+            if i <= linked_through {
+                continue;
+            }
+            if links.peek().is_some_and(|link| link.start == i) {
+                let link = links.next().unwrap();
+                link.emit(prog, job, z, link_z);
+                linked_through = link.end;
+                continue;
+            }
             let (p, is_cut) = moves[i];
             // Air flags certify the clearing region. With wall stock reserved,
             // the cutter can still graze material just outside that region, so
@@ -803,6 +987,33 @@ mod tests {
     }
 
     #[test]
+    fn short_entry_fragment_joins_only_a_reachable_pass() {
+        let ring = |x: f64, width: f64| Ring {
+            pts: vec![
+                Point::new(x, 0.),
+                Point::new(x + width, 0.),
+                Point::new(x + width, width),
+                Point::new(x, width),
+            ],
+            is_wall: false,
+        };
+        let fragment = ring(0., 0.5);
+        let host = ring(1., 10.);
+        let guard = [Polygon::new(Contour::new(vec![
+            Point::new(-1., -1.),
+            Point::new(15., -1.),
+            Point::new(15., 15.),
+            Point::new(-1., 15.),
+        ]))
+        .unwrap()];
+        let merged = join_small_entry_rings(&[fragment.clone(), host], 2.4, &guard).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].pts[0].x >= 1.);
+        assert!(fragment.pts.iter().all(|p| merged[0].pts.contains(p)));
+        assert!(join_small_entry_rings(&[fragment, ring(5., 8.)], 2.4, &guard).is_none());
+    }
+
+    #[test]
     fn adaptive_lift_spans_an_air_run_and_returns_to_depth_before_cutting() {
         let moves = [
             (Point::new(10., 10.), true),
@@ -918,6 +1129,7 @@ mod tests {
                     feed_links: &feed_links,
                     minimum_lift: 0.2,
                     guarded: true,
+                    floor_links: &[],
                 },
                 &job,
                 &h,
@@ -1025,7 +1237,7 @@ mod tests {
             &heights,
             &[-1.],
             &token,
-            false,
+            None,
             |candidate| {
                 assert!(!candidate.steps().is_empty());
                 checked.replace(true)
@@ -1053,15 +1265,8 @@ mod tests {
         let job = frame_clearjob(frame_job());
         let heights = Heights::new(5., 2., 0.);
         let token = CancelToken::new();
-        let mut original = Program::new();
-        clear(&mut original, &region, &job, &heights, &[-1.], &token).unwrap();
-        let original_lifts = clearance_lifts(&original, &heights);
-        assert!(
-            original_lifts > 1,
-            "fixture must have a fragmented frontier"
-        );
-
         for accept_fallback in [true, false] {
+            let original = std::cell::RefCell::new(None);
             let checked = std::cell::Cell::new(0);
             let mut actual = Program::new();
             let result = clear_validated(
@@ -1071,14 +1276,23 @@ mod tests {
                 &heights,
                 &[-1.],
                 &token,
-                true,
+                Some(&Tool::default()),
                 |candidate| {
-                    checked.set(checked.get() + 1);
-                    accept_fallback || *candidate == original
+                    let first = checked.replace(checked.get() + 1) == 0;
+                    if first {
+                        original.replace(Some(candidate.clone()));
+                    }
+                    first || accept_fallback
                 },
             )
             .unwrap();
             assert_eq!(checked.get(), 2, "validate both frontier and fallback");
+            let original = original.into_inner().unwrap();
+            let original_lifts = clearance_lifts(&original, &heights);
+            assert!(
+                original_lifts > 1,
+                "fixture must have a fragmented frontier"
+            );
             assert_eq!(result.concentric, accept_fallback);
             if accept_fallback {
                 assert!(clearance_lifts(&actual, &heights) < original_lifts);
@@ -1109,7 +1323,7 @@ mod tests {
             &heights,
             &[-1.],
             &CancelToken::new(),
-            true,
+            Some(&Tool::default()),
             |_| false,
         )
         .is_err());

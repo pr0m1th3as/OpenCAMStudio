@@ -68,6 +68,9 @@ const MAX_PASSES: usize = 800;
 /// it; legacy 2D clearing retains this value.
 pub(crate) const SIMPLIFY_EPS: f64 = 0.02;
 
+/// Bound the polygon checks for optional cleared-stock links on each 3D region.
+pub(crate) const MAX_3D_LINK_CHECK_VERTICES: usize = 150_000;
+
 /// Length of a loop-to-loop seam hand-off, in stepovers.
 ///
 /// **Not a tuning knob** — the peak engagement is flat from 1 to 12 (measured), because
@@ -1059,6 +1062,316 @@ pub(crate) fn front_advance_certified(
     None
 }
 
+/// Open the middle as a spiral, then advance each end on its own. The
+/// engagement and footprint checks let irregular shapes keep the full laps.
+pub(crate) fn clear_pocket_ends(
+    region: &Polygon,
+    r: f64,
+    e: f64,
+    tolerance: f64,
+    original: &[(Point, bool)],
+    flat_floor: bool,
+    cancel: &crate::CancelToken,
+) -> Option<LinkedFrontier> {
+    let outline = region.outer().points();
+    // The perimeter's dominant direction gives a rotation-independent long axis.
+    let (cos2, sin2) =
+        outline
+            .iter()
+            .zip(outline.iter().cycle().skip(1))
+            .fold((0., 0.), |(cx, sy), (a, b)| {
+                let (x, y) = (b.x - a.x, b.y - a.y);
+                let length = x.hypot(y).max(cam_geo::GRID_MM);
+                (cx + (x * x - y * y) / length, sy + 2. * x * y / length)
+            });
+    let angle = 0.5 * sin2.atan2(cos2);
+    let (s, c) = angle.sin_cos();
+    let coordinates = |p: Point| (p.x * c + p.y * s, -p.x * s + p.y * c);
+    let span = |points: &[Point], across: bool| {
+        let (lo, hi) = points
+            .iter()
+            .map(|&p| {
+                let (u, v) = coordinates(p);
+                if across {
+                    v
+                } else {
+                    u
+                }
+            })
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+                (lo.min(v), hi.max(v))
+            });
+        hi - lo
+    };
+    if span(outline, false) < 3. * span(outline, true) || cancel.is_cancelled() {
+        return None;
+    }
+    let tuning = Tuning {
+        simplification_tolerance: tolerance,
+        ..Tuning::new(r, e)
+    };
+    let f = frontier_tuned(region, r, 0., e, None, tuning)?;
+    if f.split {
+        return None;
+    }
+    let width = span(f.tc.outer().points(), true);
+    let rings: Vec<_> = f
+        .passes
+        .into_iter()
+        .map(|mut pass| pass.remove(0))
+        .collect();
+    let core = rings
+        .iter()
+        .position(|ring| span(ring, true) >= width - 0.1 * e)?;
+    if rings.len() < core + 5 {
+        return None;
+    }
+    let reliefs: Vec<_> = sharp_corners(&f.tc, tolerance)
+        .into_iter()
+        .map(|corner| {
+            (
+                corner.v,
+                corner_relief_tuned(corner, r, e, tuning.relief_reach, RELIEF_PITCH),
+            )
+        })
+        .filter(|(_, path)| path.len() > 2)
+        .collect();
+    let opening = connect_seam_spiral(
+        f.entry,
+        &rings[..=core],
+        e,
+        tuning.seam_arc,
+        &[],
+        r,
+        tuning.entry_target,
+    )?;
+    let entry_u = coordinates(f.entry).0;
+    let last_u = coordinates(opening.last()?.0).0;
+    let first_side = if last_u >= entry_u { 1. } else { -1. };
+    let mut passes = Vec::new();
+    for side in [first_side, -first_side] {
+        let along = |p: Point| side * (coordinates(p).0 - entry_u);
+        let mut previous = &rings[core];
+        for ring in &rings[core + 1..] {
+            if cancel.is_cancelled() {
+                return None;
+            }
+            let previous_tip = previous.iter().map(|&p| along(p)).fold(0., f64::max);
+            // Carry the next cap back onto the two already opened side walls.
+            // That overlap lets the tool round onto the front from cleared stock.
+            let start = (previous_tip - 0.5 * width - r - e).max(0.);
+            passes.push(clip_end(ring, along, start)?);
+            previous = ring;
+        }
+        for (corner, relief) in &reliefs {
+            if along(*corner) > 0. || (along(*corner) == 0. && side == first_side) {
+                passes.push(relief.clone());
+            }
+        }
+    }
+    let length = |moves: &[(Point, bool)]| {
+        moves
+            .windows(2)
+            .map(|pair| pair[0].0.distance(pair[1].0))
+            .sum::<f64>()
+    };
+    let original_length = length(original);
+    let cover_tol = 0.02 * total_area(&crate::clearsim::reachable(&f.to_clear, r)) + 1.;
+    // Reordering the laps changes their seams. Allow a small seam shift
+    // within the path tolerance when comparing retained stock, and check
+    // any extra cut outside the machining area against the actual footprint.
+    let edge_tolerance = (2. * tolerance).min(0.05);
+    // A two-dimensional footprint proves floor clearance for flat tools.
+    // A shaped tip can leave a scallop underneath that same footprint.
+    let options: &[(bool, bool)] = if flat_floor {
+        &[(true, true), (false, true), (false, false)]
+    } else {
+        &[(false, false)]
+    };
+    for &(trim_overlap, lift_links) in options {
+        let mut path = connect_pocket_passes(
+            &opening,
+            &passes,
+            &f.to_clear,
+            r,
+            trim_overlap,
+            lift_links,
+            cancel,
+        )?;
+        if length(&path.moves) > 0.95 * original_length {
+            continue;
+        }
+        break_gouging_segments(&mut path.moves, &f.tc);
+        if path.moves.iter().skip(1).any(|(_, cut)| !cut) {
+            continue;
+        }
+        let cuts = path.cut_moves();
+        let verdict = crate::clearsim::certify_moves(&cuts, r, &f.to_clear);
+        if verdict.max_engagement <= engagement_bound(e, r)
+            && verdict.uncut_area <= cover_tol
+            && verdict.gouge_area <= cover_tol
+            && swept_material_change(original, &cuts, r, &f.to_clear, edge_tolerance)
+                .is_some_and(|(lost, added)| lost <= 0.01 && added <= 0.005)
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn connect_pocket_passes(
+    opening: &[(Point, bool)],
+    passes: &[Vec<Point>],
+    material: &Polygon,
+    r: f64,
+    trim_overlap: bool,
+    lift_links: bool,
+    cancel: &crate::CancelToken,
+) -> Option<LinkedFrontier> {
+    use crate::clearsim::ClearedModel;
+
+    let mut path = LinkedFrontier {
+        moves: opening.to_vec(),
+        air: vec![false; opening.len()],
+        feed_links: vec![false; opening.len()],
+    };
+    let mut model = ClearedModel::bounded(r, material.clone());
+    model.seed_disc(opening.first()?.0);
+    for pair in opening.windows(2) {
+        if !pair[1].1 {
+            return None;
+        }
+        model.commit(pair[0].0, pair[1].0);
+    }
+    let mut footprint = ClearedFootprint {
+        remaining_check_vertices: Some(MAX_3D_LINK_CHECK_VERTICES),
+        ..Default::default()
+    };
+    for pass in passes {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        let clipped;
+        let pass = if trim_overlap {
+            clipped = trim_pocket_pass(pass, &model);
+            &clipped
+        } else {
+            pass
+        };
+        let from = path.moves.last()?.0;
+        let to = pass[0];
+        let anchors = if lift_links {
+            pocket_link_anchors(from, to, &model, &path, &mut footprint, r)
+        } else {
+            None
+        };
+        if let Some([a, b]) = anchors {
+            model.commit(from, a);
+            model.commit(b, to);
+            path.push(a, false);
+            path.push(b, true);
+        } else {
+            model.commit(from, to);
+        }
+        path.push(to, false);
+        for pair in pass.windows(2) {
+            model.commit(pair[0], pair[1]);
+            path.push(pair[1], false);
+        }
+    }
+    Some(path)
+}
+
+/// Propose an entry and exit near the edge of fresh stock. Retain half a
+/// millimetre of overlap at both ends. The final footprint check must still
+/// account for wall skims thinner than a cell of the stock grid.
+fn trim_pocket_pass(points: &[Point], model: &crate::clearsim::ClearedModel) -> Vec<Point> {
+    const OVERLAP: f64 = 0.5;
+    let distances = cum_len(points);
+    let length = distances[points.len() - 1];
+    let at = |d| at_len(points, &distances, d);
+    let n = (length / OVERLAP).ceil() as usize;
+    let clear = |i: usize| {
+        let d = length * i as f64 / n as f64;
+        let next = length * (i + 1) as f64 / n as f64;
+        model.sweeps_only_cleared(at(d), at(next), 0.15)
+    };
+    let Some(first_cut) = (0..n).find(|&i| !clear(i)) else {
+        return points.to_vec();
+    };
+    let last_cut = (first_cut..n).rfind(|&i| !clear(i)).unwrap_or(first_cut);
+    let start = length * first_cut.saturating_sub(1) as f64 / n as f64;
+    let end = length * (last_cut + 2).min(n) as f64 / n as f64;
+    let mut trimmed = vec![at(start)];
+    trimmed.extend(
+        points
+            .iter()
+            .zip(distances.iter().copied())
+            .filter(|(_, d)| start < *d && *d < end)
+            .map(|(&point, _)| point),
+    );
+    trimmed.push(at(end));
+    trimmed
+}
+
+/// Leave the wall at feed, lift across verified cleared stock, then feed
+/// back down and onto the next pass. Shorter withdrawals get first choice.
+fn pocket_link_anchors(
+    from: Point,
+    to: Point,
+    model: &crate::clearsim::ClearedModel,
+    path: &LinkedFrontier,
+    footprint: &mut ClearedFootprint,
+    r: f64,
+) -> Option<[Point; 2]> {
+    if footprint.remaining_check_vertices == Some(0) {
+        return None;
+    }
+    let length = from.distance(to);
+    let point = |d: f64| {
+        let t = d / length;
+        Point::new(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t)
+    };
+    for approach in [0.6, 1.2, 2.4, r.max(2.4)] {
+        if length < 2. * approach + 2. {
+            break;
+        }
+        let [a, b] = [point(approach), point(length - approach)];
+        if model.sweeps_only_cleared(a, b, 0.15)
+            && footprint.covers_traverse(path, a, b, r).unwrap_or(false)
+        {
+            return Some([a, b]);
+        }
+    }
+    None
+}
+
+/// Keep the single open arc on the advancing side of the cross-section.
+fn clip_end(ring: &[Point], along: impl Fn(Point) -> f64, start: f64) -> Option<Vec<Point>> {
+    let vertices = ring.len();
+    let entry = (0..vertices)
+        .find(|&i| along(ring[i]) < start && along(ring[(i + 1) % vertices]) >= start)?;
+    let mut arc = Vec::new();
+    let mut crossed = false;
+    for j in 0..vertices {
+        let a = ring[(entry + j) % vertices];
+        let b = ring[(entry + j + 1) % vertices];
+        let (u, v) = (along(a), along(b));
+        if (u < start) != (v < start) {
+            if crossed {
+                return None;
+            }
+            let t = (start - u) / (v - u);
+            arc.push(Point::new(a.x + t * (b.x - a.x), a.y + t * (b.y - a.y)));
+            crossed = u >= start;
+        }
+        if v > start {
+            arc.push(b);
+        }
+    }
+    (crossed && arc.len() >= 3).then_some(arc)
+}
+
 /// Stop following a frontier once it has reached an already machined wall.
 /// The grid only proposes redundant runs; polygon booleans below must confirm
 /// that the replacement preserves the original swept material. The normal
@@ -1154,45 +1467,76 @@ pub(crate) fn preserves_swept_material(
     material: &Polygon,
     tolerance: f64,
 ) -> bool {
+    swept_material_change(original, replacement, r, material, 0.)
+        .is_some_and(|(lost, added)| lost <= tolerance && added <= tolerance)
+}
+
+fn swept_material_change(
+    original: &[(Point, bool)],
+    replacement: &[(Point, bool)],
+    r: f64,
+    material: &Polygon,
+    edge_tolerance: f64,
+) -> Option<(f64, f64)> {
     use cam_geo::{difference, stroke_path, CapStyle, Polyline};
-    let check = || -> Option<bool> {
-        let footprint = |moves: &[(Point, bool)]| -> Option<Vec<Polygon>> {
-            let mut polys = Vec::new();
-            for run in crate::clearsim::cut_runs(moves) {
-                polys.extend(
-                    stroke_path(&Polyline::new(run), r, CapStyle::Round, JoinStyle::Round).ok()?,
-                );
-            }
-            Some(polys)
-        };
-        let before = footprint(original)?;
-        let after = footprint(replacement)?;
-        // A grid cell can hide a sliver. Limit loss of actual stock and additional
-        // gouging to polygon tessellation/grid noise, independently
-        // of the much larger coverage allowance used by the clearing certificate.
-        let lost = total_area(
-            &intersection(
-                &difference(&before, &after).ok()?,
-                std::slice::from_ref(material),
-            )
-            .ok()?,
-        );
-        let added = total_area(
-            &difference(
-                &difference(&after, &before).ok()?,
-                std::slice::from_ref(material),
-            )
-            .ok()?,
-        );
-        Some(lost <= tolerance && added <= tolerance)
+    let footprint = |moves: &[(Point, bool)]| -> Option<Vec<Polygon>> {
+        let mut polys = Vec::new();
+        for run in crate::clearsim::cut_runs(moves) {
+            polys.extend(
+                stroke_path(&Polyline::new(run), r, CapStyle::Round, JoinStyle::Round).ok()?,
+            );
+        }
+        Some(polys)
     };
-    check().unwrap_or(false)
+    let before = footprint(original)?;
+    let after = footprint(replacement)?;
+    // A grid cell can hide a sliver. Limit loss of actual stock and additional
+    // gouging to polygon tessellation/grid noise, independently
+    // of the much larger coverage allowance used by the clearing certificate.
+    let expanded;
+    let comparison = if edge_tolerance > 0. {
+        expanded = offset(&after, edge_tolerance, JoinStyle::Round).ok()?;
+        &expanded
+    } else {
+        &after
+    };
+    let lost = total_area(
+        &intersection(
+            &difference(&before, comparison).ok()?,
+            std::slice::from_ref(material),
+        )
+        .ok()?,
+    );
+    let added = total_area(
+        &difference(
+            &difference(&after, &before).ok()?,
+            std::slice::from_ref(material),
+        )
+        .ok()?,
+    );
+    Some((lost, added))
 }
 
 pub(crate) struct LinkedFrontier {
     pub moves: Vec<(Point, bool)>,
     pub air: Vec<bool>,
     pub feed_links: Vec<bool>,
+}
+
+impl LinkedFrontier {
+    fn push(&mut self, point: Point, air: bool) {
+        self.moves.push((point, true));
+        self.air.push(air);
+        self.feed_links.push(false);
+    }
+
+    fn cut_moves(&self) -> Vec<(Point, bool)> {
+        self.moves
+            .iter()
+            .enumerate()
+            .map(|(i, &(point, cut))| (point, cut && !self.air[i] && !self.feed_links[i]))
+            .collect()
+    }
 }
 
 /// Peel away from a finished wall before rapid travel, then feed back onto the
@@ -1205,6 +1549,8 @@ pub(crate) fn link_cleared_travel(
     r: f64,
     finish: f64,
     e: f64,
+    cancel: &crate::CancelToken,
+    check_vertex_budget: Option<usize>,
 ) -> Option<LinkedFrontier> {
     const MARGIN: f64 = 0.6;
     let material = largest(offset(std::slice::from_ref(region), -finish, JoinStyle::Round).ok()?)?;
@@ -1235,11 +1581,16 @@ pub(crate) fn link_cleared_travel(
         feed_links: vec![false],
     };
     let mut pending = Vec::new();
-    let flush = |result: &mut LinkedFrontier,
-                 pending: &mut Vec<Point>,
-                 model: &crate::clearsim::ClearedModel| {
+    let mut cleared = ClearedFootprint {
+        remaining_check_vertices: check_vertex_budget,
+        ..Default::default()
+    };
+    let mut flush = |result: &mut LinkedFrontier,
+                     pending: &mut Vec<Point>,
+                     model: &crate::clearsim::ClearedModel|
+     -> Option<()> {
         if pending.is_empty() {
-            return;
+            return Some(());
         }
         // Leave room at both ends of a cleared run: its end caps can still
         // skim fresh wall material even when the middle has already been cut.
@@ -1277,6 +1628,7 @@ pub(crate) fn link_cleared_travel(
             None
         };
         let mut linked = false;
+        let mut last_head = None;
         for attempt in 0..=6 {
             while head < tail && distance < r * attempt as f64 / 6. {
                 let p = pending[head];
@@ -1287,8 +1639,14 @@ pub(crate) fn link_cleared_travel(
                 result.feed_links.push(false);
                 head += 1;
             }
+            if head == tail {
+                break;
+            }
+            if last_head.replace(head) == Some(head) {
+                continue;
+            }
             let from = result.moves.last().unwrap().0;
-            let to = if tail > head { pending[tail - 1] } else { from };
+            let to = pending[tail - 1];
             let (Some(a), Some(b)) = (anchor(from), anchor(to)) else {
                 continue;
             };
@@ -1298,13 +1656,18 @@ pub(crate) fn link_cleared_travel(
                 && model.sweeps_only_cleared(a, b, MARGIN)
                 && model.sweeps_only_cleared(b, to, 0.15)
                 && segment_in_regions(a, b, &guards)
-                && cleared_link_footprint(result, &pending[head..tail], a, b, r, &material)
+                && cleared
+                    .permits_link(result, &pending[head..tail], [a, b], r, &material)
+                    .unwrap_or(false)
             {
                 result.moves.extend([(a, true), (b, true), (to, true)]);
                 result.air.extend([false, true, false]);
                 result.feed_links.extend([true, false, true]);
                 linked = true;
                 break;
+            }
+            if cleared.remaining_check_vertices == Some(0) {
+                return None;
             }
         }
         if !linked {
@@ -1314,17 +1677,16 @@ pub(crate) fn link_cleared_travel(
             result.air.resize(result.moves.len(), false);
             result.feed_links.resize(result.moves.len(), false);
         }
-        result
-            .moves
-            .extend(pending[tail..].iter().map(|&p| (p, true)));
-        result.air.resize(result.moves.len(), false);
-        result.feed_links.resize(result.moves.len(), false);
         pending.clear();
+        Some(())
     };
     for pair in path.windows(2) {
+        if cancel.is_cancelled() {
+            return None;
+        }
         let (from, (to, cut)) = (pair[0].0, pair[1]);
         if !cut {
-            flush(&mut result, &mut pending, &model);
+            flush(&mut result, &mut pending, &model)?;
             result.moves.push((to, false));
             result.air.push(false);
             result.feed_links.push(false);
@@ -1343,7 +1705,7 @@ pub(crate) fn link_cleared_travel(
             if model.sweeps_only_cleared(a, b, 0.15) {
                 pending.push(b);
             } else {
-                flush(&mut result, &mut pending, &model);
+                flush(&mut result, &mut pending, &model)?;
                 result.moves.push((b, true));
                 result.air.push(false);
                 result.feed_links.push(false);
@@ -1359,12 +1721,7 @@ pub(crate) fn link_cleared_travel(
     if !result.air.iter().any(|&air| air) {
         return None;
     }
-    let actual_cuts: Vec<_> = result
-        .moves
-        .iter()
-        .enumerate()
-        .map(|(i, &(p, cut))| (p, cut && !result.air[i] && !result.feed_links[i]))
-        .collect();
+    let actual_cuts = result.cut_moves();
     // Splitting a stroked polyline adds tessellated round caps. Each link is
     // checked against its actual cleared prefix above; allow only their small
     // aggregate polygon-grid discrepancy here (0.005 mm²).
@@ -1389,51 +1746,209 @@ fn segment_in_regions(a: Point, b: Point, regions: &[Polygon]) -> bool {
     })
 }
 
-/// A wall's first skim can be thinner than a grid cell. Keep it cutting even
-/// when the grid calls it air; only later visits may be lifted travel.
-fn cleared_link_footprint(
-    prefix: &LinkedFrontier,
-    pending: &[Point],
-    a: Point,
-    b: Point,
-    r: f64,
-    material: &Polygon,
-) -> bool {
-    use cam_geo::{difference, stroke_path, CapStyle, Polyline};
-    let check = || -> Option<bool> {
-        let cuts: Vec<_> = prefix
-            .moves
-            .iter()
-            .enumerate()
-            .map(|(i, &(p, cut))| (p, cut && !prefix.air[i] && !prefix.feed_links[i]))
-            .collect();
-        let mut cleared = Vec::new();
-        for run in crate::clearsim::cut_runs(&cuts) {
-            cleared.extend(
-                stroke_path(&Polyline::new(run), r, CapStyle::Round, JoinStyle::Round).ok()?,
-            );
+/// Bounding boxes of the actual stroked polygons. Keep contact within the
+/// clipping grid in the exact Boolean tests as well.
+fn footprint_bounds(polygons: &[Polygon]) -> [f64; 4] {
+    polygons.iter().flat_map(|p| p.outer().points()).fold(
+        [
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ],
+        |[left, bottom, right, top], p| {
+            [left.min(p.x), bottom.min(p.y), right.max(p.x), top.max(p.y)]
+        },
+    )
+}
+
+#[derive(Default)]
+pub(crate) struct ClearedFootprint {
+    scanned: usize,
+    active_run: Vec<Point>,
+    active_stroke: Vec<Polygon>,
+    completed: Vec<([f64; 4], Polygon)>,
+    remaining_check_vertices: Option<usize>,
+}
+
+impl ClearedFootprint {
+    pub(crate) fn bounded() -> Self {
+        Self {
+            remaining_check_vertices: Some(MAX_3D_LINK_CHECK_VERTICES),
+            ..Default::default()
         }
-        let mut run = vec![prefix.moves.last()?.0];
+    }
+
+    fn update(&mut self, prefix: &LinkedFrontier, radius: f64) -> Result<(), cam_geo::GeoError> {
+        // The prefix only grows. Once a cut is interrupted, its stroke never
+        // changes. Keep re-stroking the last run as a whole for identical joins.
+        let mut dirty = false;
+        for i in self.scanned.max(1)..prefix.moves.len() {
+            let (point, cut) = prefix.moves[i];
+            if cut && !prefix.air[i] && !prefix.feed_links[i] {
+                if self.active_run.is_empty() {
+                    self.active_run.push(prefix.moves[i - 1].0);
+                }
+                self.active_run.push(point);
+                dirty = true;
+            } else if !self.active_run.is_empty() {
+                if dirty {
+                    self.active_stroke = stroke_run(&self.active_run, radius)?;
+                }
+                self.completed.extend(
+                    self.active_stroke
+                        .drain(..)
+                        .map(|polygon| (footprint_bounds(std::slice::from_ref(&polygon)), polygon)),
+                );
+                self.active_run.clear();
+                dirty = false;
+            }
+        }
+        if dirty {
+            self.active_stroke = stroke_run(&self.active_run, radius)?;
+        }
+        self.scanned = prefix.moves.len();
+        Ok(())
+    }
+
+    /// A wall's first skim can be thinner than a grid cell. Check both the
+    /// material a shortcut would skip and the footprint it would traverse.
+    fn permits_link(
+        &mut self,
+        prefix: &LinkedFrontier,
+        pending: &[Point],
+        [a, b]: [Point; 2],
+        radius: f64,
+        material: &Polygon,
+    ) -> Option<bool> {
+        let from = prefix.moves.last()?.0;
+        let to = *pending.last()?;
+        let mut run = vec![from];
         run.extend_from_slice(pending);
-        let sweep = stroke_path(&Polyline::new(run), r, CapStyle::Round, JoinStyle::Round).ok()?;
-        let new = intersection(
-            &difference(&sweep, &cleared).ok()?,
-            std::slice::from_ref(material),
-        )
-        .ok()?;
-        let corridor = stroke_path(
-            &Polyline::new(vec![prefix.moves.last()?.0, a, b, *pending.last()?]),
-            r,
-            CapStyle::Round,
-            JoinStyle::Round,
-        )
-        .ok()?;
-        let unsafe_area = total_area(&difference(&corridor, &cleared).ok()?);
-        // Include withdrawal and approach: safe endpoints alone do not license
-        // a feed shortcut across a concave wall. Only polygon-grid noise is allowed.
-        Some(total_area(&new) <= 1e-6 && unsafe_area <= 1e-3)
-    };
-    check().unwrap_or(false)
+        let sweep = stroke_run(&run, radius).ok()?;
+        let corridor = stroke_run(&[from, a, b, to], radius).ok()?;
+        self.check_footprints(prefix, &sweep, &corridor, radius, Some(material))
+    }
+
+    fn covers_traverse(
+        &mut self,
+        prefix: &LinkedFrontier,
+        a: Point,
+        b: Point,
+        radius: f64,
+    ) -> Option<bool> {
+        self.covers_route(prefix, &[a, b], radius)
+    }
+
+    pub(crate) fn covers_route(
+        &mut self,
+        prefix: &LinkedFrontier,
+        points: &[Point],
+        radius: f64,
+    ) -> Option<bool> {
+        if self.remaining_check_vertices == Some(0) {
+            return None;
+        }
+        // The safety check is geometric and includes stock just outside the
+        // cutting region. Give the rapid a margin from its previously cut wall.
+        let corridor = stroke_run(points, radius + 0.05).ok()?;
+        self.check_footprints(prefix, &[], &corridor, radius, None)
+    }
+
+    fn check_footprints(
+        &mut self,
+        prefix: &LinkedFrontier,
+        sweep: &[Polygon],
+        corridor: &[Polygon],
+        radius: f64,
+        material: Option<&Polygon>,
+    ) -> Option<bool> {
+        use cam_geo::difference;
+
+        let [sx0, sy0, sx1, sy1] = footprint_bounds(sweep);
+        let [cx0, cy0, cx1, cy1] = footprint_bounds(corridor);
+        let [x0, y0, x1, y1] = [sx0.min(cx0), sy0.min(cy0), sx1.max(cx1), sy1.max(cy1)];
+        let grid = 2.0 * cam_geo::GRID_MM;
+        let overlaps = |[left, bottom, right, top]: [f64; 4]| {
+            left <= x1 + grid && right >= x0 - grid && bottom <= y1 + grid && top >= y0 - grid
+        };
+        if self.update(prefix, radius).is_err() {
+            *self = Self {
+                remaining_check_vertices: self.remaining_check_vertices,
+                ..Default::default()
+            };
+            return None;
+        }
+        let center = Point::new(x0 + (x1 - x0) * 0.5, y0 + (y1 - y0) * 0.5);
+        let mut cleared = Vec::new();
+        for polygon in self
+            .completed
+            .iter()
+            .filter(|(bounds, _)| overlaps(*bounds))
+            .map(|(_, polygon)| polygon)
+            .chain(
+                self.active_stroke
+                    .iter()
+                    .filter(|polygon| overlaps(footprint_bounds(std::slice::from_ref(*polygon)))),
+            )
+        {
+            // Long strokes may wrap around the query. When no boundary edge
+            // can reach its bounds, the entire query is inside or outside.
+            let touches_query =
+                std::iter::once(polygon.outer())
+                    .chain(polygon.holes())
+                    .any(|ring| {
+                        let points = ring.points();
+                        points
+                            .iter()
+                            .zip(points.iter().cycle().skip(1))
+                            .any(|(a, b)| {
+                                overlaps([a.x.min(b.x), a.y.min(b.y), a.x.max(b.x), a.y.max(b.y)])
+                            })
+                    });
+            if touches_query {
+                cleared.push(polygon.clone());
+            } else if polygon.contains(center) {
+                return Some(true);
+            }
+        }
+        // The overlay intersects the cleared polygons with one another as
+        // well. Bound repeated work on dense 3D regions and keep the original
+        // certified frontier if the optional rewrites exceed the budget.
+        if let Some(remaining) = &mut self.remaining_check_vertices {
+            let vertices: usize = cleared
+                .iter()
+                .chain(sweep)
+                .chain(corridor)
+                .flat_map(|polygon| std::iter::once(polygon.outer()).chain(polygon.holes()))
+                .map(|ring| ring.points().len())
+                .sum();
+            *remaining = remaining.saturating_sub(vertices);
+            if *remaining == 0 {
+                return None;
+            }
+        }
+        if let Some(material) = material {
+            let new = intersection(
+                &difference(sweep, &cleared).ok()?,
+                std::slice::from_ref(material),
+            )
+            .ok()?;
+            if total_area(&new) > 1e-6 {
+                return Some(false);
+            }
+        }
+        Some(total_area(&difference(corridor, &cleared).ok()?) <= 1e-3)
+    }
+}
+
+fn stroke_run(points: &[Point], radius: f64) -> Result<Vec<Polygon>, cam_geo::GeoError> {
+    cam_geo::stroke_path(
+        &cam_geo::Polyline::new(points.to_vec()),
+        radius,
+        cam_geo::CapStyle::Round,
+        JoinStyle::Round,
+    )
 }
 
 /// A rejected segment needs a lift, but its endpoint only needs a re-entry
@@ -1849,6 +2364,65 @@ mod tests {
     const E: f64 = 2.0;
 
     #[test]
+    fn elongated_pocket_clears_each_end_in_turn() {
+        let (s, c) = 0.37_f64.sin_cos();
+        let blank = Polygon::new(Contour::new(
+            [(-36., -4.), (36., -4.), (36., 4.), (-36., 4.)]
+                .map(|(u, v)| Point::new(u * c - v * s, u * s + v * c))
+                .to_vec(),
+        ))
+        .unwrap();
+        let region = offset(&[blank], 7., JoinStyle::Round).unwrap().remove(0);
+        let original = front_advance_certified(&region, R, 0., 2.4, None, 0.025).unwrap();
+        let ends = clear_pocket_ends(
+            &region,
+            R,
+            2.4,
+            0.025,
+            &original,
+            true,
+            &crate::CancelToken::new(),
+        )
+        .expect("a long, rounded pocket should use the shorter end passes");
+        let length = |path: &[(Point, bool)]| {
+            path.windows(2)
+                .map(|w| w[0].0.distance(w[1].0))
+                .sum::<f64>()
+        };
+        assert!(length(&ends.moves) < 0.95 * length(&original));
+        assert!(ends.air.iter().any(|&lifted| lifted));
+        let mut visited = Vec::new();
+        for (p, _) in ends.moves {
+            let u = p.x * c + p.y * s;
+            if u.abs() > 22. && visited.last() != Some(&u.is_sign_positive()) {
+                visited.push(u.is_sign_positive());
+            }
+        }
+        assert_eq!(visited.len(), 2);
+    }
+
+    #[test]
+    fn pocket_pass_trims_only_the_cleared_ends() {
+        let p = Point::new;
+        let mut model = crate::clearsim::ClearedModel::bounded(R, square(40.));
+        for y in [10., 12., 14.] {
+            model.commit(p(4., y), p(36., y));
+        }
+        let pass = [
+            p(5., 12.),
+            p(16., 12.),
+            p(16., 20.),
+            p(24., 20.),
+            p(24., 12.),
+            p(35., 12.),
+        ];
+        let trimmed = trim_pocket_pass(&pass, &model);
+        assert!(trimmed.first().unwrap().x > 10.);
+        assert!(trimmed.last().unwrap().x < 30.);
+        assert!(trimmed.contains(&p(16., 20.)) && trimmed.contains(&p(24., 20.)));
+    }
+
+    #[test]
     fn an_air_run_cannot_license_a_shortcut_through_virgin_stock() {
         let p = |x, y| Point::new(x, y);
         let prefix = LinkedFrontier {
@@ -1864,30 +2438,75 @@ mod tests {
         };
         let material = square(40.);
         let along_wall = [p(35., 5.)];
-        assert!(cleared_link_footprint(
-            &prefix,
-            &along_wall,
-            p(5., 5.),
-            p(35., 5.),
-            R,
-            &material
-        ));
-        assert!(!cleared_link_footprint(
-            &prefix,
-            &along_wall,
-            p(5., 5.),
-            p(35., 35.),
-            R,
-            &material
-        ));
-        assert!(!cleared_link_footprint(
-            &prefix,
-            &[p(35., 8.)],
-            p(5., 5.),
-            p(35., 5.),
-            R,
-            &material
-        ));
+        let mut limited = ClearedFootprint {
+            remaining_check_vertices: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            limited.permits_link(&prefix, &along_wall, [p(5., 5.), p(35., 5.)], R, &material),
+            None
+        );
+        assert_eq!(limited.remaining_check_vertices, Some(0));
+        let mut cleared = ClearedFootprint::default();
+        assert_eq!(
+            cleared.permits_link(&prefix, &along_wall, [p(5., 5.), p(35., 5.)], R, &material),
+            Some(true)
+        );
+        assert_eq!(
+            cleared.permits_link(&prefix, &along_wall, [p(5., 5.), p(35., 35.)], R, &material),
+            Some(false)
+        );
+        assert_eq!(
+            cleared.permits_link(
+                &prefix,
+                &[p(35., 8.)],
+                [p(5., 5.), p(35., 5.)],
+                R,
+                &material
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn swept_footprint_cache_matches_full_strokes_as_the_prefix_grows() {
+        let p = Point::new;
+        let mut prefix = LinkedFrontier {
+            moves: vec![
+                (p(1., 1.), false),
+                (p(8., 1.), true),
+                (p(8., 4.), true),
+                (p(20., 10.), true), // Travel across uncleared material.
+                (p(24., 10.), true),
+                (p(24., 14.), true),
+                (p(30., 20.), false),
+                (p(35., 20.), true),
+            ],
+            air: vec![false, false, false, true, false, false, false, false],
+            feed_links: vec![false, false, false, false, true, false, false, false],
+        };
+        let mut cache = ClearedFootprint::default();
+        let moves = std::mem::take(&mut prefix.moves);
+        for (i, motion) in moves.into_iter().enumerate() {
+            prefix.moves.push(motion);
+            cache.update(&prefix, R).unwrap();
+            let cuts: Vec<_> = prefix.moves[..=i]
+                .iter()
+                .enumerate()
+                .map(|(i, &(point, cut))| (point, cut && !prefix.air[i] && !prefix.feed_links[i]))
+                .collect();
+            let expected: Vec<_> = crate::clearsim::cut_runs(&cuts)
+                .iter()
+                .flat_map(|run| stroke_run(run, R).unwrap())
+                .collect();
+            let actual: Vec<_> = cache
+                .completed
+                .iter()
+                .map(|(_, polygon)| polygon)
+                .chain(&cache.active_stroke)
+                .collect();
+            assert_eq!(actual, expected.iter().collect::<Vec<_>>());
+        }
     }
 
     #[test]
@@ -1918,8 +2537,16 @@ mod tests {
             let certified = front_advance_certified(&region, R, 0., e, None, SIMPLIFY_EPS)
                 .expect("optimized pocket must remain certified");
             assert!(travel(&certified) < 0.90 * travel(&raw));
-            let linked = link_cleared_travel(&certified, &region, R, 0., e)
-                .expect("long cleared wall runs must become travel links");
+            let linked = link_cleared_travel(
+                &certified,
+                &region,
+                R,
+                0.,
+                e,
+                &crate::CancelToken::new(),
+                None,
+            )
+            .expect("long cleared wall runs must become travel links");
             let rapid_travel: f64 = linked
                 .moves
                 .windows(2)

@@ -13607,6 +13607,8 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
     }
     match (op, field) {
         (Operation::Pocket(o), Field::LiftHeight) => Some(o.clear.lift_height),
+        (Operation::Adaptive(o), Field::LeadInSize) => Some(o.params.lead_in_radius),
+        (Operation::Adaptive(o), Field::LeadOutSize) => Some(o.params.lead_out_radius),
         (Operation::Adaptive(o), Field::LiftHeight) => Some(o.params.lift_height),
         (Operation::Parallel(o), Field::LiftHeight) => Some(o.params.lift_height),
         (op, Field::StartX) => operation_tabs::operation_start(op).map(|point| point[0]),
@@ -14182,6 +14184,12 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
             }
         }
         Operation::Adaptive(o) => {
+            if let Some(v) = get(Field::LeadInSize) {
+                o.params.lead_in_radius = v;
+            }
+            if let Some(v) = get(Field::LeadOutSize) {
+                o.params.lead_out_radius = v;
+            }
             if let Some(v) = get(Field::AdaptiveTolerance) {
                 o.params.tolerance = v;
             }
@@ -14829,15 +14837,18 @@ impl Viewport {
                 scene
             }
         };
-        scene.strips.retain(|strip| {
-            preview.is_some()
-                || strip
-                    .op
-                    .is_none_or(|id| focus_ops.contains(&id) && !hidden_ops.contains(&id))
-        });
-        scene.path_cones.retain(|cone| {
-            preview.is_some() || (focus_ops.contains(&cone.op) && !hidden_ops.contains(&cone.op))
-        });
+        let show_run_preview = focus_ops.is_empty()
+            && outcome
+                .zip(controller.run_preview())
+                .is_some_and(|(shown, running)| std::ptr::eq(shown, running));
+        let operation_visible =
+            |id| !hidden_ops.contains(&id) && (focus_ops.contains(&id) || show_run_preview);
+        scene
+            .strips
+            .retain(|strip| preview.is_some() || strip.op.is_none_or(operation_visible));
+        scene
+            .path_cones
+            .retain(|cone| preview.is_some() || operation_visible(cone.op));
         // Drilling annotations from the backplot (peck rings + dwell bars), once a
         // run has produced a program. Anchors only — sized to the screen at draw.
         let drill_marks = outcome
@@ -17101,6 +17112,33 @@ mod multi_setup_draft_tests {
     }
 
     #[test]
+    fn adaptive_arc_sizes_are_linking_fields_and_can_be_edited_independently() {
+        let mut app = blank_app();
+        let mut operation = app.controller.operation_template(OpKind::Adaptive, 1);
+        let Operation::Adaptive(op) = &mut operation else {
+            unreachable!()
+        };
+        op.params.feed = 300.;
+        op.params.plunge_feed = 100.;
+        let id = operation.id();
+        for field in [Field::LeadInSize, Field::LeadOutSize] {
+            assert!(operation_fields(&operation).contains(&field));
+            assert_eq!(operation_tabs::field_tab(field), OperationTab::Linking);
+            assert_eq!(op_field(&operation, field), Some(0.6));
+            assert!(!operation_tabs::operation_field_invalid(&operation, field, 0.));
+            assert!(operation_tabs::operation_field_invalid(&operation, field, -1.));
+        }
+        app.controller.add_operation(operation);
+        app.begin_operation_draft(id);
+        send(&mut app, Message::FieldChanged(Field::LeadInSize, "0.9".into()));
+        send(&mut app, Message::FieldChanged(Field::LeadOutSize, "0".into()));
+        send(&mut app, Message::Apply);
+        let applied = app.controller.operation(id).unwrap();
+        assert_eq!(op_field(applied, Field::LeadInSize), Some(0.9));
+        assert_eq!(op_field(applied, Field::LeadOutSize), Some(0.));
+    }
+
+    #[test]
     fn lift_height_editor_supports_validation_apply_cancel_and_undo() {
         for kind in [OpKind::Pocket, OpKind::Adaptive, OpKind::Parallel] {
             let mut app = blank_app();
@@ -17111,7 +17149,7 @@ mod multi_setup_draft_tests {
             }
             let id = operation.id();
             let field = Field::LiftHeight;
-            let initial = if kind == OpKind::Pocket { 0.2 } else { 0.0 };
+            let initial = if kind == OpKind::Parallel { 0.0 } else { 0.2 };
             assert!(operation_fields(&operation).contains(&field));
             assert_eq!(operation_tabs::field_tab(field), OperationTab::Linking);
             assert_eq!(op_field(&operation, field), Some(initial));
@@ -17137,7 +17175,7 @@ mod multi_setup_draft_tests {
             app.begin_operation_draft(id);
             assert_eq!(
                 app.fields.get(&field).map(String::as_str),
-                Some(if kind == OpKind::Pocket { "0.2" } else { "0" })
+                Some(if kind == OpKind::Parallel { "0" } else { "0.2" })
             );
             send(&mut app, Message::FieldChanged(field, "2".into()));
             send(&mut app, Message::Apply);

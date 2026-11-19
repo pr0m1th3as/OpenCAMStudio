@@ -13,6 +13,7 @@ use crate::CancelToken;
 const MAX_RINGS: usize = 100_000;
 
 /// One concentric clearing ring.
+#[derive(Clone)]
 pub(crate) struct Ring {
     /// The loop to cut.
     pub pts: Vec<Point>,

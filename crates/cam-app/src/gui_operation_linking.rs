@@ -70,12 +70,18 @@ impl App {
                 continue;
             }
             let value = self.fields.get(&field).cloned().unwrap_or_default();
-            fields.push(self.parameter_field_row(
-                field,
-                self.field_label(field),
-                self.field_help(field),
-                &value,
-            ));
+            let (label, help) = match (op, field) {
+                (Operation::Adaptive(_), Field::LeadInSize) => (
+                    "Lead-in arc radius (mm)",
+                    "Radius of the tangent arc into the cut from a cleared link. Zero disables the arc.",
+                ),
+                (Operation::Adaptive(_), Field::LeadOutSize) => (
+                    "Lead-out arc radius (mm)",
+                    "Radius of the tangent arc away from the cut before a cleared link. Zero disables the arc.",
+                ),
+                _ => (self.field_label(field), self.field_help(field)),
+            };
+            fields.push(self.parameter_field_row(field, label, help, &value));
         }
         fields
     }

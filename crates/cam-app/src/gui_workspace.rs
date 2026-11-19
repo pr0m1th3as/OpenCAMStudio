@@ -232,9 +232,10 @@ pub(super) struct ViewportKey {
     selection: Selection,
     pending: Option<crate::PendingOp>,
     outcome: Option<crate::JobStamp>,
-    verifying_preview: bool,
+    run_preview_revision: Option<usize>,
     simulation: Option<SimulationViewportKey>,
     operation_preview: Option<crate::JobStamp>,
+    operation_preview_revision: Option<usize>,
     cad_selection: Vec<EntityRef>,
     cad_hover: Option<EntityRef>,
     cad_hidden: BTreeSet<InstanceId>,
@@ -664,6 +665,9 @@ impl App {
             _ => None,
         };
         let selected_geometry = self.editor_selected_geometry();
+        let operation_preview = self
+            .operation_preview_outcome()
+            .or_else(|| self.operation_preview.running_preview());
         // Playback geometry changes only when a new display frame is published.
         // Reuse its geometry during intervening ticks and camera/menu events.
         // Drafts have their own small semantic key as well.
@@ -681,7 +685,7 @@ impl App {
                 .outcome()
                 .or_else(|| self.controller.run_preview())
                 .and_then(|o| o.stamp.clone()),
-            verifying_preview: self.controller.run_preview().is_some(),
+            run_preview_revision: self.controller.run_preview_revision(),
             simulation: self
                 .simulation
                 .as_ref()
@@ -690,9 +694,8 @@ impl App {
                     options: player.options.clone(),
                     collision: player.collision_active(),
                 }),
-            operation_preview: self
-                .operation_preview_outcome()
-                .and_then(|o| o.stamp.clone()),
+            operation_preview: operation_preview.and_then(|o| o.stamp.clone()),
+            operation_preview_revision: self.operation_preview.preview_revision(),
             cad_selection: self.controller.cad_selection().to_vec(),
             cad_hover: self.cad_hover.clone(),
             cad_hidden: cad_hidden.clone(),
@@ -775,7 +778,7 @@ impl App {
                     .as_ref()
                     .filter(|_| !model_view)
                     .map(|player| &player.preview),
-                self.operation_preview_outcome(),
+                operation_preview,
                 if self.setup_model_pick {
                     EntityKind::Body
                 } else {

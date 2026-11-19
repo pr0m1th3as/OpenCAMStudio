@@ -2,18 +2,20 @@
 
 For **Pocket** and **3D Adaptive Clearing**, open **Lead-in and lead-out moves →
 Linking moves → Lift height (mm)**. The value is a distance above each cutting
-level. It defaults to **0 mm**, keeping the existing at-depth transitions.
+level. 3D Adaptive presets **0.2 mm** and uses that as the minimum for links
+over a verified cleared floor.
 
 For example, a 2 mm lift connects passes cutting at Z −5 mm at Z −3 mm, then
 returns to Z −5 mm before the next cut. This helps keep the tool off the floor
 during transitions and reduces witness marks.
 
-Local concentric ring links lift and traverse at cutting feed, then use the
-selected plunge, ramp or helix to return to depth. These links can still touch
-stock beside the next ring. Certified adaptive air transitions use rapid moves
-at the lifted height, remaining raised across consecutive air moves and feeding
-back down before cutting resumes. Continuous material-removing adaptive passes
-stay at their cutting depth.
+Local concentric ring links in **Pocket** can lift and traverse at cutting feed,
+then use the selected plunge, ramp or helix to return to depth. In **3D Adaptive**,
+joins that cut into stock stay at cutting depth. Verified floor links rise along
+the lead-out arc, traverse at lift height, then descend along the lead-in arc.
+Set their radii independently under **Leads and transitions**. Both default to
+**0.6 mm**. A zero radius disables that arc. When an arc cannot fit in the cleared
+area, the link can lift or descend vertically at a verified point.
 
 Lifts stop at the operation's clearance height. Disconnected regions and distant
 links still retract fully to clearance, and 3D Adaptive still checks the swept

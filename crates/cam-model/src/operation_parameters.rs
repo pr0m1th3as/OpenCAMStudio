@@ -471,6 +471,8 @@ impl OperationParameter {
         match (op, self) {
             (_, Self::CuttingSpeed | Self::FeedPerTooth) => Some(0.),
             (Operation::Pocket(o), Self::LiftHeight) => Some(o.clear.lift_height),
+            (Operation::Adaptive(o), Self::LeadInSize) => Some(o.params.lead_in_radius),
+            (Operation::Adaptive(o), Self::LeadOutSize) => Some(o.params.lead_out_radius),
             (Operation::Adaptive(o), Self::LiftHeight) => Some(o.params.lift_height),
             (Operation::Parallel(o), Self::LiftHeight) => Some(o.params.lift_height),
             (Operation::Engrave(op), Self::OperationTop) => Some(op.top),
@@ -766,6 +768,12 @@ impl OperationParameter {
         match (op, self) {
             (Operation::Pocket(o), Self::LiftHeight) => {
                 o.clear.lift_height = value;
+            }
+            (Operation::Adaptive(o), Self::LeadInSize) => {
+                o.params.lead_in_radius = value;
+            }
+            (Operation::Adaptive(o), Self::LeadOutSize) => {
+                o.params.lead_out_radius = value;
             }
             (Operation::Adaptive(o), Self::LiftHeight) => {
                 o.params.lift_height = value;

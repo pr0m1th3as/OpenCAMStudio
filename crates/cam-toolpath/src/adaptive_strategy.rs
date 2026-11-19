@@ -4,7 +4,10 @@ use cam_geo::{difference, offset, Contour, JoinStyle, Point, Polygon};
 use cam_geometry3d::AdaptiveGeometry;
 use cam_model::{AdaptiveOp, Clearing, Lead, Plunge, StockToLeave};
 
-use crate::{CancelToken, Diagnostic, JobEnv, Strategy, StrategyResult};
+use crate::{
+    clearing::ClearResult, rings::RingsError, CancelToken, Diagnostic, JobEnv, Strategy,
+    StrategyResult,
+};
 
 #[derive(Clone, Debug)]
 pub struct AdaptiveStrategy {
@@ -15,7 +18,7 @@ pub struct AdaptiveStrategy {
 
 impl AdaptiveStrategy {
     /// Invalidate persisted paths when machining domain, linking or safety rules change.
-    pub const DOMAIN_REVISION: u32 = 5;
+    pub const DOMAIN_REVISION: u32 = 10;
 
     pub fn new(op: AdaptiveOp, stock_to_leave: StockToLeave, geometry: AdaptiveGeometry) -> Self {
         Self {
@@ -32,8 +35,18 @@ impl Strategy for AdaptiveStrategy {
     }
 
     fn compute(&self, env: &JobEnv, cancel: &CancelToken) -> StrategyResult {
+        self.compute_with_preview(env, cancel, &mut |_| {})
+    }
+}
+impl AdaptiveStrategy {
+    pub(crate) fn compute_with_preview(
+        &self,
+        env: &JobEnv,
+        cancel: &CancelToken,
+        publish: &mut dyn FnMut(&Program),
+    ) -> StrategyResult {
         if self.op.parameter_expressions.is_empty() {
-            return self.compute_resolved_parameters(env, cancel);
+            return self.compute_resolved_parameters(env, cancel, publish);
         }
         let mut operation = cam_model::Operation::Adaptive(self.op.clone());
         if let Err(message) = operation.resolve_parameter_expressions(env.tools) {
@@ -45,11 +58,15 @@ impl Strategy for AdaptiveStrategy {
         let cam_model::Operation::Adaptive(op) = operation else {
             unreachable!()
         };
-        Self { op, ..self.clone() }.compute_resolved_parameters(env, cancel)
+        Self { op, ..self.clone() }.compute_resolved_parameters(env, cancel, publish)
     }
-}
-impl AdaptiveStrategy {
-    fn compute_resolved_parameters(&self, env: &JobEnv, cancel: &CancelToken) -> StrategyResult {
+
+    fn compute_resolved_parameters(
+        &self,
+        env: &JobEnv,
+        cancel: &CancelToken,
+        publish: &mut dyn FnMut(&Program),
+    ) -> StrategyResult {
         let op = &self.op;
         let mut diagnostics = Vec::new();
         macro_rules! fail { ($($arg:tt)*) => {{ diagnostics.push(Diagnostic::error(format!($($arg)*))); return StrategyResult { diagnostics, ..Default::default() }; }} }
@@ -61,6 +78,17 @@ impl AdaptiveStrategy {
                 "operation {}: lift height must be finite and nonnegative",
                 op.id
             );
+        }
+        for (name, radius) in [
+            ("lead-in", op.params.lead_in_radius),
+            ("lead-out", op.params.lead_out_radius),
+        ] {
+            if !radius.is_finite() || radius < 0.0 {
+                fail!(
+                    "operation {}: {name} arc radius must be finite and nonnegative",
+                    op.id
+                );
+            }
         }
         if !op.params.tolerance.is_finite() || op.params.tolerance <= 0.0 {
             fail!("operation {}: tolerance must be finite and positive", op.id);
@@ -211,12 +239,16 @@ impl AdaptiveStrategy {
         } else {
             0.0
         };
+        let safety_radius = largest_radius + allowance + self.geometry.error_bound;
         // Frontier simplification may move a chord inward. Reserve that motion
         // as well as arc refitting before the final swept-cutter check.
         let protected_growth = extra_shank
             + allowance
             + self.geometry.error_bound
             + op.params.simplification_tolerance();
+        let emitted_radius = largest_radius
+            + allowance
+            + (self.geometry.error_bound - crate::emit::ARCFIT_TOL).max(0.0);
         let mut program = Program::new();
         let mut cleared_levels = 0usize;
         let mut previous_z: Option<f64> = None;
@@ -270,9 +302,7 @@ impl AdaptiveStrategy {
                 if !layer.body_domains.is_empty() {
                     match offset(
                         &layer.body_domains,
-                        domain_expansion
-                            - self.geometry.error_bound
-                            - 2.0 * cam_geo::GRID_MM,
+                        domain_expansion - self.geometry.error_bound - 2.0 * cam_geo::GRID_MM,
                         JoinStyle::Round,
                     ) {
                         Ok(regions) => selected_domains.extend(regions),
@@ -285,9 +315,7 @@ impl AdaptiveStrategy {
                 if !layer.face_domains.is_empty() {
                     match offset(
                         &layer.face_domains,
-                        domain_expansion
-                            - self.geometry.error_bound
-                            - 2.0 * cam_geo::GRID_MM,
+                        domain_expansion - self.geometry.error_bound - 2.0 * cam_geo::GRID_MM,
                         JoinStyle::Round,
                     ) {
                         Ok(regions) => selected_domains.extend(regions),
@@ -320,7 +348,7 @@ impl AdaptiveStrategy {
             if !refinement {
                 cleared_slice.clear();
             }
-            let already_cleared = if refinement {
+            let already_cleared = if refinement && !cleared_slice.is_empty() {
                 match offset(
                     &cleared_slice,
                     (op.params.tolerance - self.geometry.error_bound).max(0.0),
@@ -343,134 +371,63 @@ impl AdaptiveStrategy {
                         cancelled: true,
                     };
                 }
-                if let Some(cleared) = &already_cleared {
-                    match difference(std::slice::from_ref(region), cleared) {
-                        Ok(rest) if rest.is_empty() => continue,
-                        Ok(_) => {}
+                let refinement_regions = if let Some(cleared) = &already_cleared {
+                    let rest = match difference(std::slice::from_ref(region), cleared) {
+                        Ok(rest) => rest,
                         Err(e) => fail!(
                             "operation {}: could not derive fine rest material: {e}",
                             op.id
                         ),
+                    };
+                    if rest.is_empty() {
+                        continue;
                     }
-                }
-                let radius = tool.radius();
-                let spacing = op.params.optimal_load.min(tool.diameter);
-                let guard = match offset(std::slice::from_ref(region), -radius, JoinStyle::Round) {
-                    Ok(regions) => regions,
-                    Err(e) => fail!(
-                        "operation {}: could not create the cutter-centre entry guard: {e}",
-                        op.id
-                    ),
+                    if op.params.start.is_none() && op.params.end.is_none() {
+                        fine_cutting_regions(region, &rest, tool.radius(), op.params.tolerance)
+                            .ok()
+                            .filter(|regions| !regions.is_empty())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
                 };
-                if guard.is_empty() {
-                    continue;
-                }
-                let fine_pitch = op.params.fine_stepdown.min(op.params.stepdown);
-                let job = crate::clearing::ClearJob {
-                    lift_height: op.params.lift_height,
-                    id: op.id,
-                    simplification_tolerance: op.params.simplification_tolerance(),
-                    radius,
-                    finish: 0.0,
-                    first: radius,
-                    spacing,
-                    clearing: Clearing {
-                        engagement: op.params.optimal_load,
-                        climb: op.params.climb,
-                    },
-                    spindle: env.spindle,
-                    plunge: Plunge::Helix {
-                        radius: (radius * 0.5).max(0.1),
-                        pitch: fine_pitch,
-                    },
-                    feed: op.params.feed,
-                    plunge_feed: op.params.plunge_feed,
-                    entry_feeds: op.entry_feeds,
-                    lead_overlap: 0.0,
-                    lead_in: Lead::None,
-                    lead_out: Lead::None,
-                    start: op.params.start,
-                    end: op.params.end,
-                    guard: &guard,
-                };
-                let mut layer_program = Program::new();
-                match crate::clearing::clear_validated(
-                    &mut layer_program,
-                    region,
-                    &job,
-                    &env.heights,
-                    &[layer.z],
-                    cancel,
-                    true,
-                    |candidate| {
-                        crate::adaptive_safety::certify_layer(
-                            candidate,
-                            &layer.protected,
-                            largest_radius + allowance + self.geometry.error_bound,
-                            layer.z,
-                            env.heights.clearance,
+                let generate = |regions: &[Polygon]| {
+                    let mut layer_program = Program::new();
+                    let mut cut_regions = Vec::new();
+                    let mut concentric = false;
+                    for region in regions {
+                        if cancel.is_cancelled() {
+                            return Err(RingsError::Cancelled);
+                        }
+                        let result = self.clear_region(
+                            &mut layer_program,
+                            region,
+                            layer,
+                            env,
+                            tool,
+                            safety_radius,
                             cancel,
-                        )
-                        .is_ok()
-                    },
-                ) {
-                    Ok(result) => {
+                        )?;
                         if result.paths > 0 {
-                            used_concentric |= result.concentric;
-                            // Validate the emitted moves independently of the
-                            // clearing generator. Reserve the arc-refitting
-                            // budget already included in the model envelope.
-                            let certified_radius = largest_radius
-                                + allowance
-                                + (self.geometry.error_bound - crate::emit::ARCFIT_TOL).max(0.0);
-                            match crate::adaptive_safety::certify_layer(
-                                &layer_program,
-                                &layer.protected,
-                                certified_radius,
-                                layer.z,
-                                env.heights.clearance,
-                                cancel,
-                            ) {
-                                Ok(()) => {}
-                                Err(crate::adaptive_safety::SafetyFailure::Cancelled) => {
-                                    return StrategyResult {
-                                        program,
-                                        diagnostics,
-                                        cancelled: true,
-                                    };
-                                }
-                                Err(crate::adaptive_safety::SafetyFailure::Motion {
-                                    index,
-                                    reason,
-                                }) => {
-                                    diagnostics.push(Diagnostic::error(format!(
-                                        "operation {}: 3D Adaptive safety check rejected move {} at Z{:.4}: {reason}",
-                                        op.id, index + 1, layer.z,
-                                    )).with_code(crate::DiagnosticCode::InvalidMotion).for_op(op.id));
-                                    return StrategyResult {
-                                        diagnostics,
-                                        ..Default::default()
-                                    };
-                                }
-                            }
-                            program.extend(layer_program);
-                            cleared_levels += 1;
-                            // Only advance the rest-material baseline when a
-                            // pass was emitted. Small skipped changes must
-                            // accumulate until they exceed the tolerance.
-                            cleared_slice = match cam_geo::union(
-                                &cleared_slice,
-                                std::slice::from_ref(region),
-                            ) {
-                                Ok(regions) => regions,
-                                Err(e) => fail!(
-                                    "operation {}: could not track cleared Adaptive regions: {e}",
-                                    op.id
-                                ),
-                            };
+                            cut_regions.push(region.clone());
+                            concentric |= result.concentric;
                         }
                     }
-                    Err(crate::rings::RingsError::Cancelled) => {
+                    Ok((layer_program, cut_regions, concentric))
+                };
+                let full_region = std::slice::from_ref(region);
+                let result = if let Some(regions) = refinement_regions.as_deref() {
+                    generate(regions).or_else(|e| match e {
+                        RingsError::Cancelled => Err(e),
+                        _ => generate(full_region),
+                    })
+                } else {
+                    generate(full_region)
+                };
+                let (layer_program, cut_regions, concentric) = match result {
+                    Ok(result) => result,
+                    Err(RingsError::Cancelled) => {
                         return StrategyResult {
                             program,
                             diagnostics,
@@ -482,7 +439,54 @@ impl AdaptiveStrategy {
                         op.id,
                         layer.z
                     ),
+                };
+                if cut_regions.is_empty() {
+                    continue;
                 }
+                // Validate the emitted moves independently, accounting for the
+                // arc-refitting budget included in the model envelope.
+                match crate::adaptive_safety::certify_layer(
+                    &layer_program,
+                    &layer.protected,
+                    emitted_radius,
+                    layer.z,
+                    env.heights.clearance,
+                    cancel,
+                ) {
+                    Ok(()) => {}
+                    Err(crate::adaptive_safety::SafetyFailure::Cancelled) => {
+                        return StrategyResult {
+                            program,
+                            diagnostics,
+                            cancelled: true,
+                        };
+                    }
+                    Err(crate::adaptive_safety::SafetyFailure::Motion { index, reason }) => {
+                        diagnostics.push(Diagnostic::error(format!(
+                            "operation {}: 3D Adaptive safety check rejected move {} at Z{:.4}: {reason}",
+                            op.id, index + 1, layer.z,
+                        )).with_code(crate::DiagnosticCode::InvalidMotion).for_op(op.id));
+                        return StrategyResult {
+                            diagnostics,
+                            ..Default::default()
+                        };
+                    }
+                }
+                used_concentric |= concentric;
+                cleared_levels += 1;
+                // Track only the regions with emitted cuts. A skipped change
+                // can accumulate into a later pass.
+                cleared_slice = match cam_geo::union(&cleared_slice, &cut_regions) {
+                    Ok(regions) => regions,
+                    Err(e) => fail!(
+                        "operation {}: could not track cleared Adaptive regions: {e}",
+                        op.id
+                    ),
+                };
+                if !cancel.is_cancelled() {
+                    publish(&layer_program);
+                }
+                program.extend(layer_program);
             }
         }
         if cleared_levels == 0 {
@@ -503,6 +507,104 @@ impl AdaptiveStrategy {
             cancelled: false,
         }
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn clear_region(
+        &self,
+        program: &mut Program,
+        region: &Polygon,
+        layer: &cam_geometry3d::AdaptiveLayer,
+        env: &JobEnv,
+        tool: &cam_model::Tool,
+        safety_radius: f64,
+        cancel: &CancelToken,
+    ) -> Result<ClearResult, RingsError> {
+        let op = &self.op;
+        let z = layer.z;
+        let protected = &layer.protected;
+        let spacing = op.params.optimal_load;
+        let radius = tool.radius();
+        let guard = offset(std::slice::from_ref(region), -radius, JoinStyle::Round)
+            .map_err(|e| RingsError::Offset(format!("cutter-centre entry guard: {e}")))?;
+        if guard.is_empty() {
+            return Ok(ClearResult {
+                paths: 0,
+                concentric: false,
+            });
+        }
+        let fine_pitch = op.params.fine_stepdown.min(op.params.stepdown);
+        let arc = |radius| {
+            if radius > 0.0 {
+                Lead::Arc { radius }
+            } else {
+                Lead::None
+            }
+        };
+        let job = crate::clearing::ClearJob {
+            lift_height: op.params.lift_height,
+            id: op.id,
+            simplification_tolerance: op.params.simplification_tolerance(),
+            radius,
+            finish: 0.0,
+            first: radius,
+            spacing,
+            clearing: Clearing {
+                engagement: op.params.optimal_load,
+                climb: op.params.climb,
+            },
+            spindle: env.spindle,
+            plunge: Plunge::Helix {
+                radius: (radius * 0.5).max(0.1),
+                pitch: fine_pitch,
+            },
+            feed: op.params.feed,
+            plunge_feed: op.params.plunge_feed,
+            entry_feeds: op.entry_feeds,
+            lead_overlap: 0.0,
+            lead_in: arc(op.params.lead_in_radius),
+            lead_out: arc(op.params.lead_out_radius),
+            start: op.params.start,
+            end: op.params.end,
+            guard: &guard,
+        };
+        crate::clearing::clear_validated(
+            program,
+            region,
+            &job,
+            &env.heights,
+            &[z],
+            cancel,
+            Some(tool),
+            |candidate| {
+                crate::adaptive_safety::certify_layer(
+                    candidate,
+                    protected,
+                    safety_radius,
+                    z,
+                    env.heights.clearance,
+                    cancel,
+                )
+                .is_ok()
+            },
+        )
+    }
+}
+
+/// A cutter touching newly exposed stock can reach at most one diameter into
+/// the previously cleared slice. Keep that overlap so the cropped target still
+/// admits every valid cutter position that can reach the new material.
+fn fine_cutting_regions(
+    region: &Polygon,
+    rest: &[Polygon],
+    radius: f64,
+    tolerance: f64,
+) -> Result<Vec<Polygon>, cam_geo::GeoError> {
+    let band = offset(
+        rest,
+        2.0 * radius + tolerance + 4.0 * cam_geo::GRID_MM,
+        JoinStyle::Round,
+    )?;
+    cam_geo::intersection(std::slice::from_ref(region), &band)
 }
 
 #[cfg(test)]
@@ -579,7 +681,36 @@ mod tests {
     }
 
     #[test]
-    fn lift_height_changes_layer_links_and_keeps_model_safety_checks() {
+    fn previews_checked_regions_in_program_order() {
+        let (mut strategy, tool) = fixture();
+        strategy.op.params.climb = false;
+        let env = JobEnv {
+            heights: Heights::new(15., 12., 10.),
+            tools: std::slice::from_ref(&tool),
+            stock: Some(([0., 0.], [30., 30.])),
+            spindle: SpindleDir::Cw,
+        };
+        let cancel = CancelToken::new();
+        let mut preview = Program::new();
+        let result = strategy.compute_with_preview(&env, &cancel, &mut |region| {
+            assert!(region.validate().is_ok());
+            preview.extend(region.clone());
+        });
+        assert!(!result.has_errors(), "{:?}", result.diagnostics);
+        assert!(!preview.is_empty());
+        assert_eq!(preview, result.program);
+
+        let mut regions = 0;
+        let result = strategy.compute_with_preview(&env, &cancel, &mut |_| {
+            regions += 1;
+            cancel.cancel();
+        });
+        assert!(result.cancelled);
+        assert_eq!(regions, 1);
+    }
+
+    #[test]
+    fn lift_height_does_not_raise_concentric_joins_into_uncut_stock() {
         let (mut strategy, tool) = fixture();
         strategy.geometry.layers.truncate(1);
         strategy.op.params.climb = false; // Exercise concentric layer links.
@@ -595,11 +726,7 @@ mod tests {
         let lifted = strategy.compute(&env, &CancelToken::new());
         assert!(!lifted.has_errors(), "{:?}", lifted.diagnostics);
         assert!(lifted.program.validate().is_ok());
-        assert_ne!(lifted.program, baseline.program);
-        assert!(lifted.program.steps().windows(2).any(|pair| matches!(pair,
-            [Step::Linear { to: a, tag, .. }, Step::Linear { to: b, .. }]
-                if tag.kind == cam_cldata::MoveKind::Link && a.z == 10. && b.z == 10.
-                    && (a.x != b.x || a.y != b.y))));
+        assert_eq!(lifted.program, baseline.program);
         for lift in [-1., f64::NAN, f64::INFINITY] {
             strategy.op.params.lift_height = lift;
             let result = strategy.compute(&env, &CancelToken::new());
@@ -702,6 +829,55 @@ mod tests {
             }
         }
         assert!(coarse > 0 && fine > 0);
+    }
+
+    #[test]
+    fn fine_passes_localize_a_terrace_within_a_connected_pocket() {
+        let (mut strategy, tool) = fixture();
+        let wall = |x: f64| {
+            Polygon::new(Contour::new(vec![
+                Point::new(0., -2.),
+                Point::new(x, -2.),
+                Point::new(x, 42.),
+                Point::new(0., 42.),
+            ]))
+            .unwrap()
+        };
+        strategy.op.params.climb = false;
+        strategy.stock_to_leave = StockToLeave::default();
+        strategy.geometry.layers = [(8., 30.), (9., 28.)]
+            .into_iter()
+            .map(|(z, x)| cam_geometry3d::AdaptiveLayer {
+                z,
+                protected: vec![wall(x)],
+                body_domains: vec![],
+                face_domains: vec![],
+            })
+            .collect();
+        let env = JobEnv {
+            heights: Heights::new(15., 12., 10.),
+            tools: std::slice::from_ref(&tool),
+            stock: Some(([0., 0.], [90., 40.])),
+            spindle: SpindleDir::Cw,
+        };
+        let result = strategy.compute(&env, &CancelToken::new());
+        assert!(!result.has_errors(), "{:?}", result.diagnostics);
+        assert!(result.program.validate().is_ok());
+        let fine_cuts: Vec<_> = result
+            .program
+            .steps()
+            .iter()
+            .filter_map(|step| match step {
+                Step::Linear { to, tag, .. } | Step::Arc { end: to, tag, .. }
+                    if tag.kind == cam_cldata::MoveKind::Cutting && to.z == 9. =>
+                {
+                    Some(to)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(fine_cuts.iter().any(|p| (p.x - 31.).abs() < 0.2));
+        assert!(fine_cuts.iter().all(|p| p.x < 34.));
     }
 
     #[test]
@@ -985,7 +1161,10 @@ mod tests {
             outside_offset.0 < outside.0 - 0.8,
             "outside positive offset should expand the region: {outside:?} -> {outside_offset:?}"
         );
-        assert!(inside.0 > center.0 && center.0 > outside.0, "tool center should move outward by containment mode: {inside:?}, {center:?}, {outside:?}");
+        assert!(
+            inside.0 > center.0 && center.0 > outside.0,
+            "tool center should move outward by containment mode: {inside:?}, {center:?}, {outside:?}"
+        );
     }
 
     #[test]
@@ -1001,9 +1180,10 @@ mod tests {
         let result = strategy.compute(&env, &CancelToken::new());
         assert!(result.has_errors());
         assert!(result.program.is_empty());
-        assert!(result.diagnostics.iter().any(|d| d
-            .message
-            .contains("clearance must be above every setup body")));
+        assert!(result.diagnostics.iter().any(|d| {
+            d.message
+                .contains("clearance must be above every setup body")
+        }));
     }
 
     #[test]
@@ -1174,8 +1354,10 @@ mod tests {
                     min_x = min_x.min(point.x);
                     max_x = max_x.max(point.x);
                 }
-                assert!((min_x - expected_min).abs() < 0.15,
-                    "{containment:?}, offset {extra}, body={body_selection}: min X {min_x}, expected {expected_min}");
+                assert!(
+                    (min_x - expected_min).abs() < 0.15,
+                    "{containment:?}, offset {extra}, body={body_selection}: min X {min_x}, expected {expected_min}"
+                );
                 assert!(
                     (max_x - (30.0 - expected_min)).abs() < 0.15,
                     "{containment:?}, offset {extra}, body={body_selection}: max X {max_x}"

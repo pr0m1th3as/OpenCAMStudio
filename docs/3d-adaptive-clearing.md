@@ -14,22 +14,37 @@ Selecting a body already includes its faces.
 | Direction | Climb or conventional milling. |
 | Stock to Leave | Separate radial wall and axial floor finishing allowances. |
 
-Fine passes work upward after a deep roughing level where more material becomes
-reachable. Unchanged vertical walls retain the primary stepdown. Optimal Load is
-not a universal engagement guarantee in a full-width channel; generation can fall
-back to concentric clearing and reports that fallback.
+Fine passes work upward after a deep roughing level. They focus on newly exposed
+terraces, with enough overlap into the previously cleared area for the cutter
+to reach the new stock. Unchanged vertical walls retain the primary stepdown.
+Optimal Load can be exceeded in a full-width channel. Generation reports when it
+uses concentric clearing.
+
+In long, narrow pockets, Adaptive can open the full width near the entry, then
+clear one end at a time. With a flat-bottomed tool, the passes can shorten
+overlap at both ends and use low links where the swept cutter clears the floor.
+If an innermost offset leaves a small fragment, a nearby concentric pass can
+include it and save a separate entry.
 
 When a frontier fragments into repeated retract/re-entry cycles, generation
 compares it with concentric clearing and uses the fallback only if it passes the
 model safety check and needs fewer clearance lifts. Otherwise it retains the
 certified frontier. The fallback warning also applies here: concentric links and
-corners can exceed Optimal Load.
+corners can exceed Optimal Load. Complex regions can exhaust the stay-down
+search budget. Their original frontier and any fallback still undergo the model
+safety checks.
+
+During calculation, the viewport shows each region as its moves pass the model
+safety check. The backplot is provisional until the complete job has been
+verified.
 
 Stock to Leave is also available in Profile and Pocket, and as an axial allowance
 in Face. Apply the edit before generating. Entry and exit preferences are described
 in [entry and exit positions](lead-positions.md).
 Use [Lift height](lift-height.md) in **Lead-in and lead-out moves → Linking moves**
-to raise local transitions above the cutting level.
+to raise verified local transitions above the cutting level. Under **Leads and
+transitions**, **Lead-in arc radius** and **Lead-out arc radius** set the arc sizes
+for those links.
 
 ## Machining boundaries
 

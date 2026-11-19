@@ -256,6 +256,8 @@ pub(super) fn operation_fields(op: &Operation) -> Vec<Field> {
         }
         Operation::Adaptive(_) => vec![
             Field::LiftHeight,
+            Field::LeadInSize,
+            Field::LeadOutSize,
             Field::AdaptiveTolerance,
             Field::AdaptiveOptimalLoad,
             Field::Stepdown,
@@ -327,6 +329,7 @@ pub(super) fn operation_fields(op: &Operation) -> Vec<Field> {
         || matches!(
             op,
             Operation::Pocket(_)
+                | Operation::Adaptive(_)
                 | Operation::Chamfer(_)
                 | Operation::Thread(_)
                 | Operation::Bore(_)

@@ -1319,9 +1319,14 @@ pub struct AdaptiveOp {
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AdaptiveParams {
     /// Vertical lift above the cutting level during stay-down transitions, mm.
-    /// Adaptive wall withdrawals use a minimum 0.2 mm lift.
-    #[serde(default)]
+    #[serde(default = "default_adaptive_lift_height")]
     pub lift_height: f64,
+    /// Radius of the tangent arc into a cut, mm. Zero disables the arc.
+    #[serde(default = "default_adaptive_lead_radius")]
+    pub lead_in_radius: f64,
+    /// Radius of the tangent arc out of a cut, mm. Zero disables the arc.
+    #[serde(default = "default_adaptive_lead_radius")]
+    pub lead_out_radius: f64,
     /// Preferred entry and exit locations in setup XY.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start: Option<[f64; 2]>,
@@ -1375,6 +1380,12 @@ impl std::fmt::Display for AdaptiveContainment {
     }
 }
 
+fn default_adaptive_lift_height() -> f64 {
+    0.2
+}
+fn default_adaptive_lead_radius() -> f64 {
+    0.6
+}
 fn default_adaptive_tolerance() -> f64 {
     0.1
 }
@@ -1400,7 +1411,9 @@ impl AdaptiveParams {
 impl Default for AdaptiveParams {
     fn default() -> Self {
         Self {
-            lift_height: 0.0,
+            lift_height: default_adaptive_lift_height(),
+            lead_in_radius: default_adaptive_lead_radius(),
+            lead_out_radius: default_adaptive_lead_radius(),
             start: None,
             end: None,
             tolerance: default_adaptive_tolerance(),
@@ -1421,13 +1434,17 @@ mod adaptive_params_tests {
     use super::{AdaptiveContainment, AdaptiveParams, ClearParams};
 
     #[test]
-    fn lift_height_defaults_to_zero_and_round_trips() {
+    fn lift_height_and_adaptive_lead_radii_default_and_round_trip() {
         let mut clear: ClearParams = serde_json::from_str("{}").unwrap();
         let mut adaptive: AdaptiveParams = serde_json::from_str("{}").unwrap();
         assert_eq!(clear.lift_height, 0.0);
-        assert_eq!(adaptive.lift_height, 0.0);
+        assert_eq!(adaptive.lift_height, 0.2);
+        assert_eq!(adaptive.lead_in_radius, 0.6);
+        assert_eq!(adaptive.lead_out_radius, 0.6);
         clear.lift_height = 2.0;
         adaptive.lift_height = 2.0;
+        adaptive.lead_in_radius = 0.35;
+        adaptive.lead_out_radius = 0.0;
         let restored: ClearParams =
             serde_json::from_value(serde_json::to_value(clear).unwrap()).unwrap();
         assert_eq!(restored, clear);
