@@ -451,7 +451,7 @@ dependencies = [
 
 [[package]]
 name = "cam-app"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "cam-cldata",
  "cam-geo",
@@ -478,14 +478,14 @@ dependencies = [
 
 [[package]]
 name = "cam-cldata"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "cam-geo"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "i_overlay",
  "serde",
@@ -493,7 +493,7 @@ dependencies = [
 
 [[package]]
 name = "cam-geometry3d"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "cam-geo",
  "cam-model",
@@ -503,7 +503,7 @@ dependencies = [
 
 [[package]]
 name = "cam-import"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "acadrust",
  "cam-cldata",
@@ -516,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "cam-kernel"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "cam-model",
  "cc",
@@ -526,7 +526,7 @@ dependencies = [
 
 [[package]]
 name = "cam-model"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "cam-cldata",
  "cam-geo",
@@ -536,7 +536,7 @@ dependencies = [
 
 [[package]]
 name = "cam-post"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "cam-cldata",
  "cam-model",
@@ -545,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "cam-render"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "ab_glyph",
  "bytemuck",
@@ -558,7 +558,7 @@ dependencies = [
 
 [[package]]
 name = "cam-sim"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "cam-cldata",
  "cam-geo",
@@ -571,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "cam-toolpath"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "cam-cldata",
  "cam-geo",

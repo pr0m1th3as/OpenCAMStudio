@@ -6,8 +6,8 @@ A CAM application for CNC toolpath generation, built in Rust.
 > import, toolpath generation, material-removal simulation and G-code export.
 > 3D Adaptive Clearing provides CAD-derived roughing levels; 3D Parallel finishing
 > follows freeform surfaces with a ball nose cutter on pre-roughed stock.
-> Sampled 3D Scallop finishing is also available; additional 3D finishing
-> strategies, turning and plugins remain roadmap work.
+> Sampled 3D Scallop and Spiral finishing are also available; additional 3D
+> finishing strategies, turning and plugins remain roadmap work.
 
 ![3D Parallel finishing toolpath generated for the tray project](docs/tray-parallel-toolpath.png)
 
@@ -39,6 +39,8 @@ A CAM application for CNC toolpath generation, built in Rust.
 - **3D Parallel finishing** — ball nose surface passes with scan angle, horizontal
   stepover, one-way or zigzag cutting, CAD body/face selection, bounding-box
   containment, automatic cutting turns and a retraction policy between cutting chains. See [controls and limits](docs/parallel.md).
+- **3D Spiral finishing** — projected spiral or concentric-circle surface passes
+  with selectable center, machining boundary, stepover, direction and depth controls.
 - **Stock to Leave** — shared radial and axial finishing allowances for Profile,
   Pocket, 3D Adaptive Clearing and 3D Parallel; axial allowance for Face. Disabled settings
   preserve existing toolpaths.
@@ -106,6 +108,8 @@ A CAM application for CNC toolpath generation, built in Rust.
   `iced` desktop GUI, with measurements shown in the 3D view. Hover over a setup or operation status indicator for its
   current state; click an indicator with warnings or errors to read the details.
   Toolpath diagnostics do not open dialogs automatically.
+  Move imported models or individual bodies with viewport controls or exact values;
+  a tabbed Preferences window includes the local desktop MCP settings.
 - **CPU acceleration** — multicore Parallel/Scallop surface calculation, stock
   mesh tiles and stock-to-CAD comparison; portable double-precision SIMD uses
   Apple Silicon NEON or x86-64 SSE2. See [performance controls and benchmarks](docs/performance.md).
