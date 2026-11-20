@@ -150,6 +150,22 @@ pub enum OperationParameter {
     ThreadDrillClearance,
     #[serde(rename = "threadBlindAllowance")]
     ThreadBlindAllowance,
+    #[serde(rename = "spiralAxialOffset")]
+    SpiralAxialOffset,
+    #[serde(rename = "spiralStepdowns")]
+    SpiralStepdowns,
+    #[serde(rename = "spiralStepover")]
+    SpiralStepover,
+    #[serde(rename = "spiralInnerLimit")]
+    SpiralInnerLimit,
+    #[serde(rename = "spiralOuterLimit")]
+    SpiralOuterLimit,
+    #[serde(rename = "spiralFromSlope")]
+    SpiralFromSlope,
+    #[serde(rename = "spiralToSlope")]
+    SpiralToSlope,
+    #[serde(rename = "spiralStayDownDistance")]
+    SpiralStayDownDistance,
     #[serde(rename = "parallelStepover")]
     ParallelStepover,
     #[serde(rename = "parallelAngle")]
@@ -180,6 +196,8 @@ pub enum OperationParameter {
     ProfileFinishDepths,
     #[serde(rename = "profileFinishDepthStep")]
     ProfileFinishDepthStep,
+    #[serde(rename = "profileTangentialExtensionDistance")]
+    ProfileTangentialExtensionDistance,
     #[serde(rename = "profileStartExtension")]
     ProfileStartExtension,
     #[serde(rename = "profileEndExtension")]
@@ -212,7 +230,7 @@ pub enum OperationParameter {
     StartY,
 }
 impl OperationParameter {
-    pub const ALL: [Self; 102] = [
+    pub const ALL: [Self; 111] = [
         Self::CuttingSpeed,
         Self::FeedPerTooth,
         Self::LiftHeight,
@@ -285,6 +303,14 @@ impl OperationParameter {
         Self::ThreadSpringPasses,
         Self::ThreadDrillClearance,
         Self::ThreadBlindAllowance,
+        Self::SpiralAxialOffset,
+        Self::SpiralStepdowns,
+        Self::SpiralStepover,
+        Self::SpiralInnerLimit,
+        Self::SpiralOuterLimit,
+        Self::SpiralFromSlope,
+        Self::SpiralToSlope,
+        Self::SpiralStayDownDistance,
         Self::ParallelStepover,
         Self::ParallelAngle,
         Self::ScallopSafeDistance,
@@ -300,6 +326,7 @@ impl OperationParameter {
         Self::ProfileFloorLeave,
         Self::ProfileFinishDepths,
         Self::ProfileFinishDepthStep,
+        Self::ProfileTangentialExtensionDistance,
         Self::ProfileStartExtension,
         Self::ProfileEndExtension,
         Self::ProfileTolerance,
@@ -390,6 +417,14 @@ impl OperationParameter {
             Self::ThreadSpringPasses => "threadSpringPasses",
             Self::ThreadDrillClearance => "threadDrillClearance",
             Self::ThreadBlindAllowance => "threadBlindAllowance",
+            Self::SpiralAxialOffset => "spiralAxialOffset",
+            Self::SpiralStepdowns => "spiralStepdowns",
+            Self::SpiralStepover => "spiralStepover",
+            Self::SpiralInnerLimit => "spiralInnerLimit",
+            Self::SpiralOuterLimit => "spiralOuterLimit",
+            Self::SpiralFromSlope => "spiralFromSlope",
+            Self::SpiralToSlope => "spiralToSlope",
+            Self::SpiralStayDownDistance => "spiralStayDownDistance",
             Self::ParallelStepover => "parallelStepover",
             Self::ParallelAngle => "parallelAngle",
             Self::ScallopSafeDistance => "scallopSafeDistance",
@@ -405,6 +440,7 @@ impl OperationParameter {
             Self::ProfileFloorLeave => "floorAllowance",
             Self::ProfileFinishDepths => "profileFinishDepths",
             Self::ProfileFinishDepthStep => "profileFinishDepthStep",
+            Self::ProfileTangentialExtensionDistance => "profileTangentialExtensionDistance",
             Self::ProfileStartExtension => "profileStartExtension",
             Self::ProfileEndExtension => "profileEndExtension",
             Self::ProfileTolerance => "arcTolerance",
@@ -435,8 +471,9 @@ impl OperationParameter {
         match (op, self) {
             (_, Self::CuttingSpeed | Self::FeedPerTooth) => Some(0.),
             (Operation::Pocket(o), Self::LiftHeight) => Some(o.clear.lift_height),
+            (Operation::Adaptive(o), Self::LeadInSize) => Some(o.params.lead_in_radius),
+            (Operation::Adaptive(o), Self::LeadOutSize) => Some(o.params.lead_out_radius),
             (Operation::Adaptive(o), Self::LiftHeight) => Some(o.params.lift_height),
-            (Operation::Parallel(o), Self::LiftHeight) => Some(o.params.lift_height),
             (Operation::Engrave(op), Self::OperationTop) => Some(op.top),
             (Operation::Carve(op), Self::OperationTop) => Some(op.top),
             (op, Self::SpindleRpm) => Some(op.spindle_rpm()),
@@ -505,6 +542,7 @@ impl OperationParameter {
             (Operation::Profile(o), Self::PlungeB) => Some(plunge_params(o.plunge).1),
             (Operation::Pocket(o), Self::Depth) => Some(o.depth),
             (Operation::Pocket(o), Self::Stepdown) => Some(o.clear.stepdown),
+            (Operation::Pocket(o), Self::MaximumStepover) => Some(o.maximum_stepover.unwrap_or(0.)),
             (Operation::Pocket(o), Self::Overlap) => Some(o.clear.overlap * 100.0),
             (Operation::Pocket(o), Self::PocketOverlap) => {
                 Some(o.clear.pocket_overlap.unwrap_or(0.0))
@@ -570,11 +608,28 @@ impl OperationParameter {
             (Operation::Thread(o), Self::ThreadBlindAllowance) => Some(o.blind_allowance),
             (Operation::Thread(o), Self::Feed) => Some(o.feed),
             (Operation::Thread(o), Self::PlungeFeed) => Some(o.plunge_feed),
+            (Operation::Spiral(o), Self::SpiralAxialOffset) => Some(o.params.axial_offset),
+            (Operation::Spiral(o), Self::SpiralStepdowns) => Some(o.params.stepdowns as f64),
+            (Operation::Spiral(o), Self::Stepdown) => Some(o.params.max_stepdown),
+            (Operation::Spiral(o), Self::SpiralStepover) => Some(o.params.stepover),
+            (Operation::Spiral(o), Self::SpiralInnerLimit) => Some(o.params.inner_limit),
+            (Operation::Spiral(o), Self::SpiralOuterLimit) => Some(o.params.outer_limit),
+            (Operation::Spiral(o), Self::SpiralFromSlope) => Some(o.params.from_slope),
+            (Operation::Spiral(o), Self::SpiralToSlope) => Some(o.params.to_slope),
+            (Operation::Spiral(o), Self::SpiralStayDownDistance) => {
+                Some(o.params.max_stay_down_distance)
+            }
+            (Operation::Spiral(o), Self::AdaptiveTolerance) => Some(o.params.tolerance),
+            (Operation::Spiral(o), Self::AdaptiveOffset) => Some(o.params.additional_offset),
+            (Operation::Spiral(o), Self::Feed) => Some(o.params.feed),
+            (Operation::Spiral(o), Self::PlungeFeed) => Some(o.params.plunge_feed),
+            (Operation::Spiral(o), Self::ScallopSafeDistance) => Some(o.params.safe_distance),
+            (Operation::Spiral(o), Self::ScallopSmoothingTolerance) => {
+                Some(o.params.smoothing_tolerance)
+            }
             (Operation::Parallel(o), Self::ParallelStepover) => Some(o.params.stepover),
             (Operation::Parallel(o), Self::ParallelAngle) => Some(o.params.angle),
-            (Operation::Parallel(o), Self::ScallopSafeDistance) => {
-                Some(o.params.scallop_safe_distance)
-            }
+            (Operation::Parallel(o), Self::ScallopSafeDistance) => Some(o.params.safe_distance),
             (Operation::Parallel(o), Self::ScallopSmoothingTolerance) => {
                 Some(o.params.scallop_smoothing_tolerance)
             }
@@ -601,6 +656,9 @@ impl OperationParameter {
             }
             (Operation::Profile(o), Self::ProfileFinishDepthStep) => {
                 Some(o.passes.finishing_stepdown)
+            }
+            (Operation::Profile(o), Self::ProfileTangentialExtensionDistance) => {
+                Some(o.passes.tangential_extension_distance)
             }
             (Operation::Profile(o), Self::ProfileStartExtension) => Some(o.passes.start_extension),
             (Operation::Profile(o), Self::ProfileEndExtension) => Some(o.passes.end_extension),
@@ -645,7 +703,9 @@ impl OperationParameter {
             (Operation::Carve(o), Self::StartY) => Some(o.start?[1]),
             (Operation::Adaptive(o), Self::StartX) => Some(o.params.start?[0]),
             (Operation::Adaptive(o), Self::StartY) => Some(o.params.start?[1]),
+            (Operation::Spiral(o), Self::StartX) => Some(o.params.center?[0]),
             (Operation::Parallel(o), Self::StartX) => Some(o.params.scallop_start?[0]),
+            (Operation::Spiral(o), Self::StartY) => Some(o.params.center?[1]),
             (Operation::Parallel(o), Self::StartY) => Some(o.params.scallop_start?[1]),
             _ => None,
         }
@@ -707,10 +767,13 @@ impl OperationParameter {
             (Operation::Pocket(o), Self::LiftHeight) => {
                 o.clear.lift_height = value;
             }
-            (Operation::Adaptive(o), Self::LiftHeight) => {
-                o.params.lift_height = value;
+            (Operation::Adaptive(o), Self::LeadInSize) => {
+                o.params.lead_in_radius = value;
             }
-            (Operation::Parallel(o), Self::LiftHeight) => {
+            (Operation::Adaptive(o), Self::LeadOutSize) => {
+                o.params.lead_out_radius = value;
+            }
+            (Operation::Adaptive(o), Self::LiftHeight) => {
                 o.params.lift_height = value;
             }
             (Operation::Engrave(op), Self::OperationTop) => {
@@ -884,6 +947,9 @@ impl OperationParameter {
             }
             (Operation::Pocket(o), Self::Stepdown) => {
                 o.clear.stepdown = value;
+            }
+            (Operation::Pocket(o), Self::MaximumStepover) => {
+                o.maximum_stepover = Some(value);
             }
             (Operation::Pocket(o), Self::Overlap) => {
                 o.clear.overlap = value / 100.;
@@ -1078,6 +1144,51 @@ impl OperationParameter {
             (Operation::Thread(o), Self::PlungeFeed) => {
                 o.plunge_feed = value;
             }
+            (Operation::Spiral(o), Self::SpiralAxialOffset) => {
+                o.params.axial_offset = value;
+            }
+            (Operation::Spiral(o), Self::SpiralStepdowns) => {
+                o.params.stepdowns = value as u32;
+            }
+            (Operation::Spiral(o), Self::Stepdown) => {
+                o.params.max_stepdown = value;
+            }
+            (Operation::Spiral(o), Self::SpiralStepover) => {
+                o.params.stepover = value;
+            }
+            (Operation::Spiral(o), Self::SpiralInnerLimit) => {
+                o.params.inner_limit = value;
+            }
+            (Operation::Spiral(o), Self::SpiralOuterLimit) => {
+                o.params.outer_limit = value;
+            }
+            (Operation::Spiral(o), Self::SpiralFromSlope) => {
+                o.params.from_slope = value;
+            }
+            (Operation::Spiral(o), Self::SpiralToSlope) => {
+                o.params.to_slope = value;
+            }
+            (Operation::Spiral(o), Self::SpiralStayDownDistance) => {
+                o.params.max_stay_down_distance = value;
+            }
+            (Operation::Spiral(o), Self::AdaptiveTolerance) => {
+                o.params.tolerance = value;
+            }
+            (Operation::Spiral(o), Self::AdaptiveOffset) => {
+                o.params.additional_offset = value;
+            }
+            (Operation::Spiral(o), Self::Feed) => {
+                o.params.feed = value;
+            }
+            (Operation::Spiral(o), Self::PlungeFeed) => {
+                o.params.plunge_feed = value;
+            }
+            (Operation::Spiral(o), Self::ScallopSafeDistance) => {
+                o.params.safe_distance = value;
+            }
+            (Operation::Spiral(o), Self::ScallopSmoothingTolerance) => {
+                o.params.smoothing_tolerance = value;
+            }
             (Operation::Parallel(o), Self::ParallelStepover) => {
                 o.params.stepover = value;
             }
@@ -1085,7 +1196,7 @@ impl OperationParameter {
                 o.params.angle = value;
             }
             (Operation::Parallel(o), Self::ScallopSafeDistance) => {
-                o.params.scallop_safe_distance = value;
+                o.params.safe_distance = value;
             }
             (Operation::Parallel(o), Self::ScallopSmoothingTolerance) => {
                 o.params.scallop_smoothing_tolerance = value;
@@ -1143,6 +1254,9 @@ impl OperationParameter {
             }
             (Operation::Profile(o), Self::ProfileFinishDepthStep) => {
                 o.passes.finishing_stepdown = value;
+            }
+            (Operation::Profile(o), Self::ProfileTangentialExtensionDistance) => {
+                o.passes.tangential_extension_distance = value;
             }
             (Operation::Profile(o), Self::ProfileStartExtension) => {
                 o.passes.start_extension = value;
@@ -1274,8 +1388,18 @@ impl OperationParameter {
                     point[0] = value;
                 }
             }
+            (Operation::Spiral(o), Self::StartX) => {
+                if let Some(point) = &mut o.params.center {
+                    point[0] = value;
+                }
+            }
             (Operation::Parallel(o), Self::StartY) => {
                 if let Some(point) = &mut o.params.scallop_start {
+                    point[1] = value;
+                }
+            }
+            (Operation::Spiral(o), Self::StartY) => {
+                if let Some(point) = &mut o.params.center {
                     point[1] = value;
                 }
             }
@@ -1292,6 +1416,7 @@ impl OperationParameter {
                 | Self::ProfileFinishDepths
                 | Self::ProfileSpringPasses
                 | Self::ProfileTabCount
+                | Self::SpiralStepdowns
                 | Self::ThreadPasses
                 | Self::ThreadSpringPasses
         )
@@ -1312,6 +1437,8 @@ impl OperationParameter {
             | Self::Feed
             | Self::PlungeFeed
             | Self::ParallelStepover
+            | Self::SpiralStepover
+            | Self::SpiralAxialOffset
             | Self::AdaptiveTolerance
             | Self::AdaptiveOptimalLoad
             | Self::AdaptiveFineStepdown
@@ -1336,6 +1463,8 @@ impl OperationParameter {
             Self::ProfileSpringPasses | Self::ProfileFinishDepths => value < 0. || value > 1000.,
             Self::BoreStepovers => !(0. ..=10000.).contains(&value),
             Self::ThreadPasses => value < 1.,
+            Self::SpiralStepdowns => !(0. ..=1000.).contains(&value),
+            Self::SpiralFromSlope | Self::SpiralToSlope => !(0. ..=90.).contains(&value),
             Self::BoreAngle => value <= 0. || value >= 90.,
             Self::ProfileLeadInSweep | Self::ProfileLeadOutSweep => value <= 0. || value > 170.,
             Self::ProfileTaper => value <= -80. || value > 0.,
@@ -1356,6 +1485,7 @@ impl OperationParameter {
                         | Operation::Face(_)
                         | Operation::Adaptive(_)
                         | Operation::Parallel(_)
+                        | Operation::Spiral(_)
                 ) =>
             {
                 value <= 0.
@@ -1411,6 +1541,7 @@ impl Operation {
             Self::Pocket(o) => &o.parameter_expressions,
             Self::Adaptive(o) => &o.parameter_expressions,
             Self::Parallel(o) => &o.parameter_expressions,
+            Self::Spiral(o) => &o.parameter_expressions,
             Self::Face(o) => &o.parameter_expressions,
             Self::Chamfer(o) => &o.parameter_expressions,
             Self::Thread(o) => &o.parameter_expressions,
@@ -1426,6 +1557,7 @@ impl Operation {
             Self::Pocket(o) => &mut o.parameter_expressions,
             Self::Adaptive(o) => &mut o.parameter_expressions,
             Self::Parallel(o) => &mut o.parameter_expressions,
+            Self::Spiral(o) => &mut o.parameter_expressions,
             Self::Face(o) => &mut o.parameter_expressions,
             Self::Chamfer(o) => &mut o.parameter_expressions,
             Self::Thread(o) => &mut o.parameter_expressions,
@@ -1477,6 +1609,17 @@ impl Operation {
                     .get(&parameter)
                     .cloned()
                     .or_else(|| parameter.expression(self).map(str::to_owned))
+                    .or_else(|| match (self, parameter, tool) {
+                        (
+                            Operation::Pocket(pocket),
+                            OperationParameter::MaximumStepover,
+                            Some(tool),
+                        ) => Some(match pocket.legacy_stepover_expression() {
+                            Some(source) => source.into(),
+                            None => pocket.concentric_stepover(tool.diameter).to_string(),
+                        }),
+                        _ => None,
+                    })
                     .unwrap_or_else(|| value.to_string());
                 sources.insert(parameter.name().into(), source);
             }
@@ -1614,6 +1757,13 @@ impl Operation {
                 {
                     if bound(parameter) {
                         parameter.validate_value(self, value)?;
+                    }
+                    if parameter == OperationParameter::MaximumStepover {
+                        if let (Operation::Pocket(pocket), Some(tool)) = (self, tool) {
+                            if !pocket.clear.pocket_adaptive_enabled() {
+                                crate::PocketOp::validate_maximum_stepover(value, tool.diameter)?;
+                            }
+                        }
                     }
                 }
                 Ok(())

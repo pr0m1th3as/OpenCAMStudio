@@ -208,16 +208,29 @@ impl Scene {
         Self::from_program_controlled(program, &|| false).unwrap()
     }
 
+    /// Build a backplot with motion lines only.
+    pub fn from_program_without_markers(program: &Program) -> Scene {
+        Self::build_backplot(program, false, &|| false).unwrap()
+    }
+
     /// Prepare a backplot off-thread, aborting between motions.
     pub fn from_program_controlled(
         program: &Program,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Option<Scene> {
+        Self::build_backplot(program, true, cancelled)
+    }
+
+    fn build_backplot(
+        program: &Program,
+        show_markers: bool,
         cancelled: &dyn Fn() -> bool,
     ) -> Option<Scene> {
         if cancelled() {
             return None;
         }
         if program.has_rotary_motion() {
-            return Self::from_program_controlled(&program.rotary_backplot(), cancelled);
+            return Self::build_backplot(&program.rotary_backplot(), show_markers, cancelled);
         }
         let mut scene = Scene::new();
         let mut cur: Option<Point3> = None;
@@ -263,8 +276,10 @@ impl Scene {
                 _ => {}
             }
         }
-        scene.path_cones = crate::path_markers::main_path_cones(program, cancelled)?;
-        scene.deduplicate_path_cones();
+        if show_markers {
+            scene.path_cones = crate::path_markers::main_path_cones(program, cancelled)?;
+            scene.deduplicate_path_cones();
+        }
         Some(scene)
     }
 
@@ -771,6 +786,10 @@ mod tests {
         assert_eq!(scene.path_cones[0].direction, [0., -1., 0.]);
         assert_eq!(scene.path_cones[1].at, [3., 1., 0.]);
         assert_eq!(scene.path_cones[1].direction, [0., 1., 0.]);
+
+        let motion_only = Scene::from_program_without_markers(&program);
+        assert!(motion_only.path_cones.is_empty());
+        assert_eq!(motion_only.strips.len(), scene.strips.len());
     }
 
     #[test]

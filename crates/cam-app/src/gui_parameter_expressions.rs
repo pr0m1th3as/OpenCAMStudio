@@ -54,7 +54,7 @@ pub(super) fn parameter(field: Field) -> Option<OperationParameter> {
         Field::ClearPlungeB => Some(OperationParameter::ClearPlungeB),
         Field::Engagement => Some(OperationParameter::Engagement),
         Field::Overlap => Some(OperationParameter::Overlap),
-        Field::PocketOverlap => Some(OperationParameter::PocketOverlap),
+        Field::PocketStepover => Some(OperationParameter::MaximumStepover),
         Field::FaceOverlap => Some(OperationParameter::FaceOverlap),
         Field::FaceStartOffset => Some(OperationParameter::FaceStartOffset),
         Field::FaceOvershoot => Some(OperationParameter::FaceOvershoot),
@@ -86,6 +86,14 @@ pub(super) fn parameter(field: Field) -> Option<OperationParameter> {
         Field::ThreadSpringPasses => Some(OperationParameter::ThreadSpringPasses),
         Field::ThreadDrillClearance => Some(OperationParameter::ThreadDrillClearance),
         Field::ThreadBlindAllowance => Some(OperationParameter::ThreadBlindAllowance),
+        Field::SpiralAxialOffset => Some(OperationParameter::SpiralAxialOffset),
+        Field::SpiralStepdowns => Some(OperationParameter::SpiralStepdowns),
+        Field::SpiralStepover => Some(OperationParameter::SpiralStepover),
+        Field::SpiralInnerLimit => Some(OperationParameter::SpiralInnerLimit),
+        Field::SpiralOuterLimit => Some(OperationParameter::SpiralOuterLimit),
+        Field::SpiralFromSlope => Some(OperationParameter::SpiralFromSlope),
+        Field::SpiralToSlope => Some(OperationParameter::SpiralToSlope),
+        Field::SpiralStayDownDistance => Some(OperationParameter::SpiralStayDownDistance),
         Field::ParallelStepover => Some(OperationParameter::ParallelStepover),
         Field::ParallelAngle => Some(OperationParameter::ParallelAngle),
         Field::ScallopSafeDistance => Some(OperationParameter::ScallopSafeDistance),
@@ -114,6 +122,9 @@ pub(super) fn parameter(field: Field) -> Option<OperationParameter> {
         }
         Field::Profile(profile_parameters::Number::FinishDepthStep) => {
             Some(OperationParameter::ProfileFinishDepthStep)
+        }
+        Field::Profile(profile_parameters::Number::TangentialExtensionDistance) => {
+            Some(OperationParameter::ProfileTangentialExtensionDistance)
         }
         Field::Profile(profile_parameters::Number::StartExtension) => {
             Some(OperationParameter::ProfileStartExtension)
@@ -267,6 +278,13 @@ impl App {
             OperationParameter::ALL
                 .iter()
                 .filter(|&&p| Some(p) != parameter(field) && p.value(op).is_some())
+                .filter(|&&p| {
+                    !matches!(op, Operation::Pocket(_))
+                        || !matches!(
+                            p,
+                            OperationParameter::Overlap | OperationParameter::PocketOverlap
+                        )
+                })
                 .map(|p| p.name()),
         );
         names
@@ -428,7 +446,8 @@ impl App {
                     .ok_or_else(|| "Cutting data unavailable".into());
                 }
             }
-            if !op.has_parameter_expressions()
+            if field != Field::PocketStepover
+                && !op.has_parameter_expressions()
                 && !self
                     .fields
                     .values()
@@ -458,8 +477,21 @@ impl App {
             .ok_or_else(|| "Enter a finite number".into())
     }
     pub(super) fn apply_parameter_sources(&self, op: &mut Operation) -> Result<(), String> {
-        let overrides = self.parameter_overrides()?;
-        // Resolve before mutating the candidate, including plain invalid literals.
+        let mut overrides = self.parameter_overrides()?;
+        let stepover = OperationParameter::MaximumStepover;
+        if let (Some(source), Operation::Pocket(pocket)) = (overrides.get(&stepover), &mut *op) {
+            if self
+                .parameter_operation()
+                .and_then(|op| self.legacy_pocket_stepover_source(op))
+                .as_ref()
+                == Some(source)
+            {
+                // The inspector's displayed conversion can still follow a later tool change.
+                overrides.remove(&stepover);
+                pocket.maximum_stepover = None;
+            }
+        }
+        // Validate the source graph before writing the pending edits.
         let values = op.evaluate_parameter_sources(self.parameter_tool(op), &overrides)?;
         for (parameter, source) in &overrides {
             if matches!(
@@ -484,7 +516,30 @@ impl App {
             .collect();
         op.resolve_parameter_expressions(&tools)
     }
+    fn legacy_pocket_stepover_source(&self, op: &Operation) -> Option<String> {
+        let Operation::Pocket(pocket) = op else {
+            return None;
+        };
+        if pocket.maximum_stepover.is_some()
+            || OperationParameter::MaximumStepover.expression(op).is_some()
+        {
+            return None;
+        }
+        if let Some(source) = pocket.legacy_stepover_expression() {
+            return Some(format!("={source}"));
+        }
+        let tool = self.parameter_tool(op)?;
+        Some(fmt_num(pocket.concentric_stepover(tool.diameter)))
+    }
     pub(super) fn saved_field_source(&self, field: Field) -> Option<String> {
+        if field == Field::PocketStepover {
+            if let Some(source) = self
+                .parameter_operation()
+                .and_then(|op| self.legacy_pocket_stepover_source(op))
+            {
+                return Some(source);
+            }
+        }
         if field == Field::FaceOverlap {
             if let Some(op @ Operation::Face(face)) = self.parameter_operation() {
                 if face.absolute_overlap.is_none()
@@ -1166,6 +1221,7 @@ mod tests {
             OpKind::Thread,
             OpKind::Adaptive,
             OpKind::Parallel,
+            OpKind::Spiral,
         ] {
             let operation = app.controller.operation_template(kind, 1);
             for parameter in OperationParameter::ALL {
@@ -1419,7 +1475,7 @@ mod tests {
             let pixels =
                 Headless::screenshot(&mut renderer, iced::Size::new(380, 440), 1., Color::WHITE);
             let mut ppm = b"P6\n380 440\n255\n".to_vec();
-            for pixel in pixels.chunks_exact(4) {
+            for pixel in pixels.as_chunks::<4>().0 {
                 ppm.extend_from_slice(&pixel[..3]);
             }
             std::fs::write(

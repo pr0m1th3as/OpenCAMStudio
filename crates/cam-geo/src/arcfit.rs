@@ -43,6 +43,10 @@ const MAX_ARC_RADIUS: f64 = 1.0e5;
 /// covers, so emitting lines is both safer and no less accurate.
 const MAX_ARC_RADIUS_PER_EXTENT: f64 = 20.0;
 
+/// The fit tolerance applies to samples inside a run. A controller needs
+/// the endpoints of each emitted arc to be on the same circle.
+const ARC_ENDPOINT_RADIUS_EPS: f64 = 1.0e-6;
+
 /// Fit arcs to a polyline, returning the reconstructed segments in order.
 pub fn fit_arcs(points: &[Point], tol: f64) -> Vec<PathSeg> {
     let n = points.len();
@@ -61,16 +65,27 @@ pub fn fit_arcs(points: &[Point], tol: f64) -> Vec<PathSeg> {
             // dialect reads identically.
             if points[i].distance(points[end_idx]) <= tol {
                 let mid = i + (end_idx - i) / 2;
-                segs.push(PathSeg::Arc {
-                    end: points[mid],
-                    center,
-                    ccw,
-                });
-                segs.push(PathSeg::Arc {
-                    end: points[end_idx],
-                    center,
-                    ccw,
-                });
+                let start = points[i];
+                let split = points[mid];
+                let end = points[end_idx];
+                let split_radius = center.distance(split);
+                if [start, end].into_iter().all(|p| {
+                    p.distance(split) > ARC_ENDPOINT_RADIUS_EPS
+                        && (center.distance(p) - split_radius).abs() <= ARC_ENDPOINT_RADIUS_EPS
+                }) {
+                    segs.push(PathSeg::Arc {
+                        end: split,
+                        center,
+                        ccw,
+                    });
+                    segs.push(PathSeg::Arc { end, center, ccw });
+                } else {
+                    segs.extend(
+                        points[i + 1..=end_idx]
+                            .iter()
+                            .map(|&end| PathSeg::Line { end }),
+                    );
+                }
                 i = end_idx;
                 continue;
             }
@@ -171,6 +186,7 @@ fn grow_arc(points: &[Point], i: usize, tol: f64) -> Option<(Point, bool, usize)
     if !radius.is_finite()
         || radius > MAX_ARC_RADIUS
         || radius > MAX_ARC_RADIUS_PER_EXTENT * extent
+        || (refined.distance(points[end]) - radius).abs() > ARC_ENDPOINT_RADIUS_EPS
         || run
             .iter()
             .any(|p| (refined.distance(*p) - radius).abs() > tol)
@@ -545,6 +561,31 @@ mod full_circle_guard_tests {
                 assert!(cur.distance(end) > 1e-6, "an arc closed on itself");
             }
             cur = end;
+        }
+    }
+
+    #[test]
+    fn a_nearly_circular_loop_cannot_emit_off_radius_split_endpoints() {
+        let mut points: Vec<_> = (0..64)
+            .map(|i| {
+                let angle = std::f64::consts::TAU * f64::from(i) / 64.;
+                let radius = if i == 32 { 6.002 } else { 6. };
+                Point::new(radius * angle.cos(), radius * angle.sin())
+            })
+            .collect();
+        points.push(points[0]);
+        let mut start = points[0];
+        for seg in fit_arcs(&points, 0.01) {
+            start = match seg {
+                PathSeg::Line { end } => end,
+                PathSeg::Arc { end, center, .. } => {
+                    assert!(
+                        (center.distance(start) - center.distance(end)).abs()
+                            <= ARC_ENDPOINT_RADIUS_EPS
+                    );
+                    end
+                }
+            };
         }
     }
 

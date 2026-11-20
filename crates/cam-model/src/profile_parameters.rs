@@ -140,6 +140,8 @@ pub struct ProfilePasses {
     pub rough_final: bool,
     pub order: ProfileOrder,
     pub preserve_order: bool,
+    /// Linear extension at both ends of each compensated open toolpath.
+    pub tangential_extension_distance: f64,
     pub start_extension: f64,
     pub end_extension: f64,
     pub both_ways: bool,
@@ -186,6 +188,7 @@ impl Default for ProfilePasses {
             rough_final: true,
             order: ProfileOrder::Contour,
             preserve_order: true,
+            tangential_extension_distance: 0.,
             start_extension: 0.,
             end_extension: 0.,
             both_ways: false,
@@ -410,6 +413,7 @@ impl ProfileOp {
             p.finish_feed,
             p.floor_allowance,
             p.finishing_stepdown,
+            p.tangential_extension_distance,
             p.start_extension,
             p.end_extension,
             p.tolerance,
@@ -422,6 +426,7 @@ impl ProfileOp {
             || p.finish_feed < 0.
             || p.lead_end_distance < 0.
             || p.ramp_rpm < 0.
+            || p.tangential_extension_distance < 0.
             || p.start_extension < 0.
             || p.end_extension < 0.
             || p.tolerance <= 0.
@@ -528,11 +533,11 @@ impl ProfileOp {
             );
         }
         if self.contours().any(|c| !c.closed)
-            && (self.tabs.enabled || self.comp != Comp::Computed || self.lead_overlap != 0.)
+            && (self.tabs.enabled
+                || self.comp != Comp::Computed
+                || (self.lead_overlap != 0. && self.contours().any(|c| c.closed)))
         {
-            return Err(
-                "Open profiles require computed compensation and no tabs or closure overlap".into(),
-            );
+            return Err("Open profiles require computed compensation and no tabs; mixed open and closed profiles cannot use closure overlap".into());
         }
         if self.comp != Comp::Computed
             && (!caps.control

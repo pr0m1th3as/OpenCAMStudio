@@ -79,12 +79,15 @@ pub(super) fn field_tab(field: Field) -> OperationTab {
         | Field::TabWidth
         | Field::TabHeight
         | Field::TabSpacing
-        | Field::AdaptiveOffset => OperationTab::Geometry,
+        | Field::AdaptiveOffset
+        | Field::SpiralFromSlope
+        | Field::SpiralToSlope => OperationTab::Geometry,
         Field::BoreDiameter | Field::BoreTaper => OperationTab::Geometry,
         Field::LiftHeight
         | Field::BoreSafeDistance
         | Field::BoreLeadRadius
-        | Field::ScallopSafeDistance => OperationTab::Linking,
+        | Field::ScallopSafeDistance
+        | Field::SpiralStayDownDistance => OperationTab::Linking,
         Field::Clearance
         | Field::Retract
         | Field::TopOfStock
@@ -133,6 +136,7 @@ pub(super) fn operation_start(op: &Operation) -> Option<[f64; 2]> {
         Operation::Engrave(o) if o.closed => o.start,
         Operation::Carve(o) => o.start,
         Operation::Adaptive(o) => o.params.start,
+        Operation::Spiral(o) => o.params.center,
         Operation::Parallel(o) if o.params.scallop => o.params.scallop_start,
         _ => None,
     }
@@ -145,6 +149,13 @@ pub(super) fn set_operation_start(op: &mut Operation, enabled: bool) {
         Operation::Engrave(o) if o.closed => &mut o.start,
         Operation::Carve(o) => &mut o.start,
         Operation::Adaptive(o) => &mut o.params.start,
+        Operation::Spiral(o) => {
+            o.parameter_expressions
+                .remove(&cam_model::OperationParameter::StartX);
+            o.parameter_expressions
+                .remove(&cam_model::OperationParameter::StartY);
+            &mut o.params.center
+        }
         Operation::Parallel(o) if o.params.scallop => &mut o.params.scallop_start,
         _ => return,
     };
@@ -165,6 +176,7 @@ pub(super) fn set_operation_start_coordinate(op: &mut Operation, axis: usize, va
         Operation::Engrave(o) if o.closed => &mut o.start,
         Operation::Carve(o) => &mut o.start,
         Operation::Adaptive(o) => &mut o.params.start,
+        Operation::Spiral(o) => &mut o.params.center,
         Operation::Parallel(o) if o.params.scallop => &mut o.params.scallop_start,
         _ => return,
     };
@@ -184,7 +196,9 @@ pub(super) fn operation_field_invalid(op: &Operation, field: Field, value: f64) 
         return true;
     }
     match field {
-        Field::ContourRoughStepover | Field::ContourRoughSmoothing => value <= 0.,
+        Field::ContourRoughStepover | Field::ContourRoughSmoothing | Field::PocketStepover => {
+            value <= 0.
+        }
         Field::ContourRoughCount => value < 1. || value > 1000. || value.fract() != 0.,
         Field::Profile(n) => n.invalid(value),
         Field::PocketFinish(n) => n.invalid(value),
@@ -193,6 +207,8 @@ pub(super) fn operation_field_invalid(op: &Operation, field: Field, value: f64) 
         | Field::Feed
         | Field::PlungeFeed
         | Field::ParallelStepover
+        | Field::SpiralStepover
+        | Field::SpiralAxialOffset
         | Field::CuttingSpeed
         | Field::FeedPerTooth
         | Field::AdaptiveTolerance
@@ -201,7 +217,7 @@ pub(super) fn operation_field_invalid(op: &Operation, field: Field, value: f64) 
         | Field::AdaptiveFineStepdown
         | Field::MajorDia
         | Field::Pitch => value <= 0.0,
-        Field::StockLeaveRadial | Field::StockLeaveAxial | Field::ChamferTipOffset => value < 0.0,
+        Field::StockLeaveRadial | Field::StockLeaveAxial | Field::ChamferTipOffset | Field::ScallopSafeDistance => value < 0.0,
         Field::TabWidth | Field::TabSpacing => value <= 0.0,
         Field::TabHeight => value <= 0.0,
         Field::Engagement if matches!(op, Operation::Pocket(p) if p.clear.pocket_adaptive_enabled()) => {
@@ -220,6 +236,7 @@ pub(super) fn operation_field_invalid(op: &Operation, field: Field, value: f64) 
                     | Operation::Face(_)
                     | Operation::Adaptive(_)
                     | Operation::Parallel(_)
+                    | Operation::Spiral(_)
             ) =>
         {
             value <= 0.0
@@ -227,13 +244,15 @@ pub(super) fn operation_field_invalid(op: &Operation, field: Field, value: f64) 
         Field::BoreDiameter | Field::BorePitch | Field::BoreTolerance | Field::BoreSafeDistance => {
             value <= 0.
         }
+        Field::SpiralStepdowns => !(0. ..=1000.).contains(&value) || value.fract() != 0.,
+        Field::SpiralFromSlope | Field::SpiralToSlope => !(0. ..=90.).contains(&value),
         Field::BoreAngle => value <= 0. || value >= 90.,
         Field::BoreStepovers => value < 0. || value.fract() != 0. || value > 10000.,
         Field::BoreTaper | Field::BoreRadialStock | Field::BoreAxialStock => false,
         Field::ThreadPasses => value < 1.0 || value.fract() != 0.0 || value > u32::MAX as f64,
         Field::ThreadSpringPasses => value < 0.0 || value.fract() != 0.0 || value > u32::MAX as f64,
         Field::Overlap | Field::ClearOverlap => !(0.0..=99.0).contains(&value),
-        Field::PocketOverlap | Field::FaceOverlap => value < 0.0,
+        Field::FaceOverlap => value < 0.0,
         Field::PlungeA | Field::ClearPlungeA => {
             let (main, clear) = App::op_plunge_styles(op);
             match if field == Field::ClearPlungeA {
@@ -316,6 +335,7 @@ fn stock_offset_fields(operation: &Operation) -> Vec<Field> {
             | Operation::Pocket(_)
             | Operation::Adaptive(_)
             | Operation::Parallel(_)
+            | Operation::Spiral(_)
     ) {
         fields.push(Field::StockLeaveRadial);
     }
@@ -326,6 +346,7 @@ fn stock_offset_fields(operation: &Operation) -> Vec<Field> {
             | Operation::Face(_)
             | Operation::Adaptive(_)
             | Operation::Parallel(_)
+            | Operation::Spiral(_)
     ) {
         fields.push(Field::StockLeaveAxial);
     }
@@ -575,22 +596,23 @@ impl App {
                 Operation::Drill(o) => format!("{} hole centres", o.points.len()),
                 Operation::Bore(o) => format!("{} bore centres", o.points.len()),
                 Operation::Thread(o) => format!("{} thread centres", o.points.len()),
-                Operation::Parallel(_) | Operation::Adaptive(_) => linked.map_or_else(
-                    || "Selected geometry".into(),
-                    |binding| {
-                        let bodies = binding
-                            .selected
-                            .iter()
-                            .filter(|entity| entity.kind == EntityKind::Body)
-                            .count();
-                        let faces = binding
-                            .selected
-                            .iter()
-                            .filter(|entity| entity.kind == EntityKind::Face)
-                            .count();
-                        format!("{bodies} bodies · {faces} faces")
-                    },
-                ),
+                Operation::Parallel(_) | Operation::Spiral(_) | Operation::Adaptive(_) => linked
+                    .map_or_else(
+                        || "Selected geometry".into(),
+                        |binding| {
+                            let bodies = binding
+                                .selected
+                                .iter()
+                                .filter(|entity| entity.kind == EntityKind::Body)
+                                .count();
+                            let faces = binding
+                                .selected
+                                .iter()
+                                .filter(|entity| entity.kind == EntityKind::Face)
+                                .count();
+                            format!("{bodies} bodies · {faces} faces")
+                        },
+                    ),
             };
             list = list.push(text(geometry).size(12));
             if let Some(binding) = linked {
@@ -641,6 +663,8 @@ impl App {
                     | Field::TabWidth
                     | Field::TabHeight
                     | Field::TabSpacing
+                    | Field::SpiralAxialOffset
+                    | Field::SpiralStepdowns
                     | Field::StartX
                     | Field::StartY
             ) {
@@ -649,12 +673,16 @@ impl App {
             if matches!(op, Operation::Pocket(_))
                 && matches!(
                     field,
-                    Field::Stepdown | Field::Engagement | Field::PocketOverlap
+                    Field::Stepdown | Field::Engagement | Field::PocketStepover
                 )
             {
                 continue;
             }
-            if matches!(op, Operation::Face(_) | Operation::Profile(_)) && field == Field::Stepdown
+            if (matches!(
+                op,
+                Operation::Face(_) | Operation::Profile(_) | Operation::Spiral(_)
+            ) && field == Field::Stepdown)
+                || (matches!(op, Operation::Spiral(_)) && field == Field::ScallopSmoothingTolerance)
             {
                 continue;
             }
@@ -853,13 +881,13 @@ impl App {
                     if !adaptive {
                         let value = self
                             .fields
-                            .get(&Field::PocketOverlap)
+                            .get(&Field::PocketStepover)
                             .cloned()
                             .unwrap_or_default();
                         list = list.push(self.parameter_field_row(
-                            Field::PocketOverlap,
-                            "Overlap (mm)",
-                            self.field_help(Field::PocketOverlap),
+                            Field::PocketStepover,
+                            self.field_label(Field::PocketStepover),
+                            self.field_help(Field::PocketStepover),
                             &value,
                         ));
                     }
@@ -1063,6 +1091,154 @@ impl App {
                     );
                 }
             }
+            Operation::Spiral(spiral) if tab == OperationTab::Passes => {
+                use cam_model::{SpiralCutDirection, SpiralMilling, SpiralMode, SpiralOrder};
+                let p = spiral.params;
+                list = list.section("Passes")
+                    .push(profile_picker(
+                        "Spiral mode",
+                        "Choose a continuous spiral, a spiral with circular limit passes, or separate concentric circles.",
+                        self.tooltips,
+                        p.mode,
+                        &[SpiralMode::Spiral, SpiralMode::SpiralWithCircles, SpiralMode::ConcentricCircles][..],
+                        Message::SpiralModeChanged,
+                    ))
+                    .push(profile_picker(
+                        "Inside/Outside direction",
+                        "Order passes from the center or from the outside. Shortest machining distance reduces repositioning between separate passes.",
+                        self.tooltips,
+                        p.order,
+                        &[SpiralOrder::InsideOut, SpiralOrder::OutsideIn, SpiralOrder::Shortest][..],
+                        Message::SpiralOrderChanged,
+                    ))
+                    .push(profile_picker(
+                        "Direction",
+                        "Climb or conventional uses the spindle and uncut side of the spiral. Both ways uses the Clockwise setting.",
+                        self.tooltips,
+                        p.cut_direction,
+                        &[SpiralCutDirection::Climb, SpiralCutDirection::Conventional, SpiralCutDirection::BothWays][..],
+                        Message::SpiralCutDirectionChanged,
+                    ));
+                if p.order == SpiralOrder::Shortest {
+                    list = list.push(
+                        row![
+                            text("Link from inside to outside").size(12),
+                            checkbox(p.link_inside_out)
+                                .size(15)
+                                .on_toggle(Message::SpiralLinkInsideOutToggled)
+                        ]
+                        .spacing(8),
+                    );
+                }
+                if p.cut_direction == SpiralCutDirection::BothWays {
+                    list = list.push(
+                        row![
+                            text("Clockwise").size(12),
+                            checkbox(p.clockwise)
+                                .size(15)
+                                .on_toggle(Message::SpiralClockwiseToggled)
+                        ]
+                        .spacing(8),
+                    );
+                }
+                list = list.push(profile_picker(
+                    "Up/Down milling",
+                    "Split passes at changes in elevation and orient each piece to cut uphill or downhill.",
+                    self.tooltips,
+                    p.milling,
+                    &[SpiralMilling::Both, SpiralMilling::Up, SpiralMilling::Down][..],
+                    Message::SpiralMillingChanged,
+                ));
+                list = list.optional_section(
+                    "Multiple Depths",
+                    p.multiple_depths,
+                    Some(Message::SpiralDepthsToggled),
+                );
+                if p.multiple_depths {
+                    for (field, label) in [
+                        (Field::SpiralAxialOffset, "Axial offset (mm)"),
+                        (Field::Stepdown, "Maximum stepdown (mm)"),
+                        (Field::SpiralStepdowns, "Number of stepdowns"),
+                    ] {
+                        let value = self.fields.get(&field).map_or("", String::as_str);
+                        list = list.push(self.parameter_field_row(
+                            field,
+                            label,
+                            self.field_help(field),
+                            value,
+                        ));
+                    }
+                    list = list.push(
+                        row![
+                            text("Order by depth").size(12),
+                            checkbox(p.order_by_depth)
+                                .size(15)
+                                .on_toggle(Message::SpiralDepthOrderToggled)
+                        ]
+                        .spacing(8),
+                    );
+                }
+                list = list.optional_section(
+                    "Smoothing",
+                    p.smoothing,
+                    Some(Message::ScallopSmoothingToggled),
+                );
+                if p.smoothing {
+                    let field = Field::ScallopSmoothingTolerance;
+                    let value = self.fields.get(&field).map_or("", String::as_str);
+                    list = list.push(self.parameter_field_row(
+                        field,
+                        self.field_label(field),
+                        self.field_help(field),
+                        value,
+                    ));
+                }
+            }
+            Operation::Spiral(spiral) if tab == OperationTab::Geometry => {
+                use cam_model::SpiralBoundary;
+                list = list.section("Geometry").push(profile_picker(
+                    "Machining boundary",
+                    "Use the selected geometry bounding box, its projected silhouette, or the setup stock bounding box.",
+                    self.tooltips,
+                    spiral.params.boundary,
+                    &[SpiralBoundary::BoundingBox, SpiralBoundary::Silhouette, SpiralBoundary::StockBox][..],
+                    Message::SpiralBoundaryChanged,
+                )).push(profile_picker(
+                    "Tool containment",
+                    "Position of the cutter relative to the machining boundary.",
+                    self.tooltips,
+                    spiral.params.containment,
+                    &[
+                        cam_model::AdaptiveContainment::Inside,
+                        cam_model::AdaptiveContainment::Center,
+                        cam_model::AdaptiveContainment::Outside,
+                    ][..],
+                    Message::AdaptiveContainmentChanged,
+                ));
+                list = list.push(help_wrap(
+                    row![
+                        text("Contact only").size(12),
+                        checkbox(spiral.params.contact_only).size(15).on_toggle(Message::SpiralContactOnlyToggled)
+                    ].spacing(8),
+                    "Trim cutting to selected surface footprints. Clear to extend to the machining boundary where the cutter can safely follow the model or bottom height.",
+                    self.tooltips,
+                ));
+                list = list.push(self.operation_position_controls(op));
+                if spiral.params.center.is_some() {
+                    for (field, label) in [
+                        (Field::StartX, "Center X (mm)"),
+                        (Field::StartY, "Center Y (mm)"),
+                    ] {
+                        let value = self.fields.get(&field).map_or("", String::as_str);
+                        list = list.push(self.parameter_field_row(
+                            field,
+                            label,
+                            "Spiral center in setup coordinates.",
+                            value,
+                        ));
+                    }
+                }
+            }
             Operation::Parallel(p) if tab == OperationTab::Passes => {
                 list = list.section("Passes").push(
                     row![
@@ -1111,7 +1287,7 @@ impl App {
             Operation::Parallel(p) if tab == OperationTab::Geometry => {
                 list = list.push(profile_picker(
                     "Tool containment",
-                    "Position of the cutter relative to the selected model bounding box.",
+                    "Position of the cutter relative to the selected machining area. Tool center on boundary clips the scan rows to the selected face footprint, including around openings. Smooth turns can extend beyond the ends.",
                     self.tooltips,
                     p.params.containment,
                     &[
@@ -1380,7 +1556,10 @@ impl App {
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         apply_op_fields(&mut operation, &fields);
-        if matches!(operation, Operation::Adaptive(_) | Operation::Parallel(_)) {
+        if matches!(
+            operation,
+            Operation::Adaptive(_) | Operation::Parallel(_) | Operation::Spiral(_)
+        ) {
             cam_geometry3d::validate_adaptive_selection(
                 self.controller.geometry_state(),
                 &selected,
@@ -2476,13 +2655,13 @@ mod tests {
                 .filter(|vertex| vertex.color == kind.color())
                 .collect();
             assert_eq!(cross.len(), 4, "show a live point cross at the snap");
-            for axis in 0..3 {
+            for (axis, target_coordinate) in target.iter().enumerate() {
                 let center = cross
                     .iter()
                     .map(|vertex| vertex.position[axis] as f64)
                     .sum::<f64>()
                     / cross.len() as f64;
-                assert!((center - target[axis]).abs() < 1e-5);
+                assert!((center - target_coordinate).abs() < 1e-5);
             }
             let _ = app.update(Message::SetupHover(position, hover));
             let action = viewport

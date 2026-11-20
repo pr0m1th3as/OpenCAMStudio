@@ -118,7 +118,9 @@ impl Fixture {
     fn bore(&mut self, center: [f64; 2], radius: f64, top: u64, bottom: u64) -> u64 {
         let face = self.id();
         let mut loop_ids = vec![];
-        for (z, adjacent) in [(0., top), (-5., bottom)] {
+        let height = |id| self.t.faces.iter().find(|f| f.id == id).unwrap().bounds[0][2];
+        let (top_z, bottom_z) = (height(top), height(bottom));
+        for (z, adjacent) in [(top_z, top), (bottom_z, bottom)] {
             let vertex = self.vertex([center[0] + radius, center[1], z]);
             let edge = self.id();
             self.t.edges.push(CadEdge {
@@ -164,15 +166,15 @@ impl Fixture {
             id: face,
             body_id: 1,
             surface: CadSurface::Cylinder {
-                origin: [center[0], center[1], 0.],
+                origin: [center[0], center[1], top_z],
                 axis: [0., 0., 1.],
                 radius,
                 inward: true,
             },
             loop_ids,
             bounds: [
-                [center[0] - radius, center[1] - radius, -5.],
-                [center[0] + radius, center[1] + radius, 0.],
+                [center[0] - radius, center[1] - radius, bottom_z],
+                [center[0] + radius, center[1] + radius, top_z],
             ],
         });
         face
@@ -218,6 +220,9 @@ fn reference(id: u64, kind: EntityKind) -> EntityRef {
     }
 }
 fn pocket() -> (GeometryState, EntityRef) {
+    pocket_with_bores(&[])
+}
+fn pocket_with_bores(bores: &[([f64; 2], f64)]) -> (GeometryState, EntityRef) {
     let mut f = Fixture::new();
     let floor = f.face(
         vec![square(2., 18., 2., 18., -3.), square(8., 12., 8., 12., -3.)],
@@ -231,7 +236,10 @@ fn pocket() -> (GeometryState, EntityRef) {
     );
     f.face(vec![square(8., 12., 8., 12., 0.)], [0., 0., 1.]);
     f.walls(0., 20., 0., 20., -5., 0.);
-    f.face(vec![square(0., 20., 0., 20., -5.)], [0., 0., -1.]);
+    let bottom = f.face(vec![square(0., 20., 0., 20., -5.)], [0., 0., -1.]);
+    for &(center, radius) in bores {
+        f.bore(center, radius, floor, bottom);
+    }
     (f.state(), reference(floor, EntityKind::Face))
 }
 fn controller() -> AppController {
@@ -250,6 +258,115 @@ fn select_all_models(app: &mut AppController) {
         .map(|i| i.id)
         .collect();
     app.edit_setup(|setup| setup.model_instances = ids);
+}
+
+#[test]
+fn cad_pocket_toolpaths_bridge_bores_on_both_sides_of_the_cutter_diameter() {
+    let (state, floor) = pocket_with_bores(&[([5., 10.], 2.5), ([15., 15.], 1.)]);
+    let mut app = controller();
+    app.add_cad_asset(state.assets[0].clone(), state.instances)
+        .unwrap();
+    select_all_models(&mut app);
+    let id = app
+        .create_cad_operation(OpKind::Pocket, vec![floor])
+        .unwrap();
+    let Some(Operation::Pocket(operation)) = app.operation(id) else {
+        panic!("expected a pocket operation");
+    };
+    assert!(!operation.stock_contours.enabled);
+    assert_eq!(operation.islands.len(), 1);
+    assert_eq!(operation.islands[0].area(), 16.);
+
+    for adaptive in [false, true] {
+        app.edit_operation(id, |op| {
+            let Operation::Pocket(pocket) = op else {
+                unreachable!()
+            };
+            pocket.clear.adaptive_enabled = Some(adaptive);
+            pocket.clear.clearing.engagement = 1.;
+            pocket.clear.lift_height = 0.2;
+            pocket.clear.keep_tool_down = true;
+            pocket.maximum_stepover = Some(2.85);
+        });
+        let outcome = app.run(&CancelToken::new());
+        assert_eq!(
+            outcome.completion,
+            JobCompletion::Complete,
+            "{:?}",
+            outcome.diagnostics
+        );
+        assert!(!outcome.has_errors(), "{:?}", outcome.diagnostics);
+        let simulation = cam_sim::simulate(
+            &outcome.program,
+            [0., 0., -5.],
+            [20., 20., 0.],
+            &cam_sim::SimOptions {
+                resolution: 0.1,
+                tool_radius: 1.5,
+            },
+            &[],
+        );
+        assert!(simulation.is_clean(), "{:?}", simulation.collisions);
+        let stock = simulation.field;
+        assert_eq!(stock.sample(15., 15.), -3., "stock above the small bore");
+        assert_eq!(stock.sample(5., 10.), -3., "stock above the wider bore");
+        for x in [8.2, 10., 11.8] {
+            assert_eq!(stock.sample(x, 10.), 0., "raised island at X{x}");
+        }
+    }
+}
+
+fn circular_face_with_bores(inner_radius: f64) -> (GeometryState, EntityRef) {
+    let mut fixture = Fixture::new();
+    let mut plane = |z, normal| {
+        let id = fixture.id();
+        fixture.t.faces.push(CadFace {
+            id,
+            body_id: 1,
+            surface: CadSurface::Plane {
+                origin: [10., 10., z],
+                normal: [0., 0., normal],
+            },
+            loop_ids: vec![],
+            bounds: [[0., 0., z], [20., 20., z]],
+        });
+        id
+    };
+    let top = plane(0., 1.);
+    let bottom = plane(-5., -1.);
+    let outside = fixture.bore([10., 10.], 10., top, bottom);
+    let wall = fixture.t.faces.iter_mut().find(|f| f.id == outside).unwrap();
+    let CadSurface::Cylinder { inward, .. } = &mut wall.surface else {
+        unreachable!()
+    };
+    *inward = false;
+    for wire in &mut fixture.t.loops {
+        if wire.face_id == top || wire.face_id == bottom {
+            wire.is_outer = true;
+        }
+    }
+    fixture.bore([10., 10.], inner_radius, top, bottom);
+    fixture.bore([18., 10.], 1., top, bottom);
+    (fixture.state(), reference(top, EntityKind::Face))
+}
+
+#[test]
+fn cad_pocket_keeps_the_inner_rim_of_an_annular_face_at_different_diameters() {
+    for inner_radius in [1., 6.] {
+        let (state, selected) = circular_face_with_bores(inner_radius);
+        let binding = cam_geometry3d::resolve_selection_advisory(
+            &state,
+            &[selected],
+            ExtractionRecipe::PocketFloor,
+            1.,
+        )
+        .unwrap();
+        let resolved = cam_geometry3d::resolve_binding_advisory(&state, &binding).unwrap();
+        let region = &resolved.regions[0];
+        assert_eq!(region.holes().len(), 1);
+        assert!(!region.contains(Point::new(10., 10.)));
+        assert!(region.contains(Point::new(18., 10.)));
+    }
 }
 
 #[test]
@@ -842,6 +959,7 @@ fn positive_world_floor_uses_physical_depth_and_matches_an_independent_planar_cu
         ])
     };
     planar.add_operation(Operation::Pocket(PocketOp {
+        maximum_stepover: None,
         parameter_expressions: Default::default(),
         wrap: None,
         additional_regions: Vec::new(),
@@ -1717,10 +1835,7 @@ fn pocket_and_drill_report_obstructed_approaches_as_advisory_findings() {
         app.create_cad_operation_with_tool(kind, vec![selected.clone()], tool)
             .unwrap();
         let outcome = app.run(&CancelToken::new());
-        assert_eq!(
-            outcome.completion,
-            JobCompletion::Complete
-        );
+        assert_eq!(outcome.completion, JobCompletion::Complete);
         let result = app.export_nc();
         assert!(result.is_ok(), "{result:?}");
 
@@ -2304,8 +2419,8 @@ fn parallel_creation_uses_setup_cad_and_survives_reopening() {
         let Operation::Parallel(p) = op else { panic!() };
         p.params.angle = 37.;
         p.params.stepover = 0.7;
-        p.params.stay_down = true;
-        p.params.lift_height = 2.;
+        p.params.retraction = cam_model::ScallopRetraction::Minimum;
+        p.params.safe_distance = 0.8;
         p.params.both_ways = false;
     });
     assert_eq!(
@@ -2318,9 +2433,100 @@ fn parallel_creation_uses_setup_cad_and_survives_reopening() {
     reopened.open_project(&path).unwrap();
     std::fs::remove_file(path).unwrap();
     assert!(
-        matches!(reopened.operation(id),Some(Operation::Parallel(p))if p.params.angle==37. && p.params.stepover==0.7 && p.params.lift_height==2. && p.params.stay_down && !p.params.both_ways)
+        matches!(reopened.operation(id),Some(Operation::Parallel(p))if p.params.angle==37. && p.params.stepover==0.7 && p.params.retraction == cam_model::ScallopRetraction::Minimum && p.params.safe_distance == 0.8 && !p.params.both_ways)
     );
     assert_eq!(app.document(), reopened.document());
+}
+
+#[test]
+fn spiral_cad_operation_generates_verifies_posts_and_reopens() {
+    let mut fixture = Fixture::new();
+    let top = fixture.face(vec![square(0., 20., 0., 20., 0.)], [0., 0., 1.]);
+    fixture.face(vec![square(0., 20., 0., 20., -5.)], [0., 0., -1.]);
+    fixture.walls(0., 20., 0., 20., -5., 0.);
+    let mut mesh = CadMesh::default();
+    for wire in &fixture.t.loops {
+        let base = mesh.vertices.len() as u32;
+        for use_ in &wire.edge_uses {
+            let edge = fixture
+                .t
+                .edges
+                .iter()
+                .find(|e| e.id == use_.edge_id)
+                .unwrap();
+            let id = edge.vertices[usize::from(use_.reversed)];
+            mesh.vertices.push(
+                fixture
+                    .t
+                    .vertices
+                    .iter()
+                    .find(|v| v.id == id)
+                    .unwrap()
+                    .point,
+            );
+        }
+        mesh.triangles
+            .extend([[base, base + 1, base + 2], [base, base + 2, base + 3]]);
+        mesh.triangle_faces.extend([wire.face_id; 2]);
+    }
+    fixture.t.mesh = mesh.clone();
+    fixture.t.projection = Some(CadProjectionMesh {
+        mesh,
+        chord_tolerance: 0.0025,
+    });
+    let state = fixture.state();
+    let mut app = controller();
+    app.add_cad_asset(state.assets[0].clone(), state.instances)
+        .unwrap();
+    select_all_models(&mut app);
+    let tool = app.use_tool(Tool {
+        number: 5,
+        kind: ToolKind::BallMill,
+        diameter: 3.,
+        flute_length: 12.,
+        length: 24.,
+        ..Default::default()
+    });
+    let id = app
+        .create_cad_operation_with_tool(
+            OpKind::Spiral,
+            vec![reference(top, EntityKind::Face)],
+            tool,
+        )
+        .unwrap();
+    app.edit_operation(id, |op| {
+        let Operation::Spiral(spiral) = op else {
+            panic!("Spiral operation")
+        };
+        spiral.params.center = Some([9., 11.]);
+        spiral.params.inner_limit = 1.;
+        spiral.params.outer_limit = 6.;
+        spiral.params.mode = SpiralMode::SpiralWithCircles;
+        spiral.params.clockwise = true;
+        spiral.params.smoothing = true;
+        OperationParameter::SpiralStepover.set_source(op, "=1.2");
+    });
+    assert_eq!(
+        app.geometry_state().bindings[&id].recipe,
+        ExtractionRecipe::SpiralFinishing
+    );
+    let path = std::env::temp_dir().join(format!("spiral-roundtrip-{}.ocam", std::process::id()));
+    app.save_project(&path).unwrap();
+    let mut reopened = AppController::new(default_machine());
+    reopened.open_project(&path).unwrap();
+    std::fs::remove_file(path).unwrap();
+    assert_eq!(app.document(), reopened.document());
+    let result = reopened.run(&CancelToken::new());
+    assert_eq!(
+        result.completion,
+        JobCompletion::Complete,
+        "{:?}",
+        result.diagnostics
+    );
+    assert!(result.collisions.is_empty(), "{:?}", result.collisions);
+    assert!(result.program.validate().is_ok());
+    let nc = reopened.export_nc().unwrap();
+    assert!(nc.lines().any(|line| line.starts_with("G1 ")), "{nc}");
 }
 
 /// Built entirely from analytic topology: no imported CAD or saved project fixture.
@@ -2609,4 +2815,55 @@ fn multiple_pockets_track_each_instances_placement_and_reject_incomplete_chains(
         0.
     )
     .is_err());
+}
+
+#[test]
+fn multi_body_placement_is_atomic_and_undoable() {
+    let (mut state, _) = pocket();
+    let mut second = state.instances[0].clone();
+    second.id = 2;
+    second.placement.translation = [10., 0., 0.];
+    state.instances.push(second);
+    let mut app = controller();
+    app.add_cad_asset(state.assets[0].clone(), state.instances)
+        .unwrap();
+    let first = RigidTransform {
+        translation: [3., 4., 0.],
+        ..Default::default()
+    };
+    let second = RigidTransform {
+        translation: [13., 4., 0.],
+        ..Default::default()
+    };
+    assert!(app
+        .place_cad_instances(vec![(1, first), (99, second)])
+        .is_err());
+    assert_eq!(
+        app.geometry_state()
+            .instance(1)
+            .unwrap()
+            .placement
+            .translation,
+        [0.; 3]
+    );
+    app.place_cad_instances(vec![(1, first), (2, second)])
+        .unwrap();
+    assert_eq!(app.geometry_state().instance(2).unwrap().placement, second);
+    assert!(app.undo());
+    assert_eq!(
+        app.geometry_state()
+            .instance(1)
+            .unwrap()
+            .placement
+            .translation,
+        [0.; 3]
+    );
+    assert_eq!(
+        app.geometry_state()
+            .instance(2)
+            .unwrap()
+            .placement
+            .translation,
+        [10., 0., 0.]
+    );
 }

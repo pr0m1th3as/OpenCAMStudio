@@ -359,7 +359,7 @@ pub(crate) fn prepare(
                     side,
                 )
             })
-            .find(|lead| clear_path(&lead.samples, &cleared, job.radius) || lead.lead == Lead::None)
+            .find(|lead| lead.lead == Lead::None || clear_path(&lead.samples, &cleared, job.radius))
             .ok_or("adaptive departing lead does not fit cleared stock")?;
         let arriving = [1., -1.]
             .into_iter()
@@ -372,7 +372,7 @@ pub(crate) fn prepare(
                     side,
                 )
             })
-            .find(|lead| clear_path(&lead.samples, &cleared, job.radius) || lead.lead == Lead::None)
+            .find(|lead| lead.lead == Lead::None || clear_path(&lead.samples, &cleared, job.radius))
             .ok_or("adaptive arriving lead does not fit cleared stock")?;
         let direct = vec![departing.off, arriving.off];
         let rapid_only = [departing.off, arriving.off].iter().all(|&p| {
@@ -617,6 +617,155 @@ impl PreparedPath {
     }
 }
 
+/// A lifted transition over a verified flat floor. The arcs rise from or
+/// descend to the cutting plane, keeping the connection tangent in XY.
+pub(crate) struct FloorLink {
+    pub start: usize,
+    pub end: usize,
+    departure: LeadPath,
+    arrival: LeadPath,
+    route: Vec<Point>,
+}
+
+impl FloorLink {
+    pub(crate) fn emit(&self, program: &mut Program, job: &ClearJob, z: f64, raised: f64) {
+        let tag = Tag::new(job.id, MoveKind::Link);
+        if self.departure.lead == Lead::None {
+            let p = self.departure.on;
+            program.push(Step::Rapid {
+                to: Point3::new(p.x, p.y, raised),
+                tag,
+            });
+        } else {
+            self.departure.emit(
+                program,
+                false,
+                raised,
+                job.entry_feeds.lead_out(job.feed),
+                job.id,
+            );
+        }
+        for &p in &self.route[1..] {
+            program.push(Step::Rapid {
+                to: Point3::new(p.x, p.y, raised),
+                tag,
+            });
+        }
+        if self.arrival.lead == Lead::None {
+            let p = self.arrival.on;
+            program.push(Step::Linear {
+                to: Point3::new(p.x, p.y, z),
+                feed: job.plunge_feed,
+                tag: Tag::new(job.id, MoveKind::Plunge),
+            });
+        } else {
+            self.arrival
+                .emit(program, true, z, job.entry_feeds.lead_in(job.feed), job.id);
+        }
+    }
+}
+
+pub(crate) fn floor_links(
+    path: &LinkedFrontier,
+    job: &ClearJob,
+    verified_air: bool,
+    cancel: &crate::CancelToken,
+) -> Vec<FloorLink> {
+    use crate::frontadvance::ClearedFootprint;
+
+    let Some(&first) = path.moves.first() else {
+        return Vec::new();
+    };
+    let mut links = Vec::new();
+    let mut footprint = ClearedFootprint::bounded();
+    let mut prefix = LinkedFrontier {
+        moves: vec![first],
+        air: vec![false],
+        feed_links: vec![false],
+    };
+    let mut i = 1;
+    while i < path.moves.len() && !cancel.is_cancelled() {
+        if !path.air.get(i).copied().unwrap_or(false) {
+            prefix.moves.push(path.moves[i]);
+            prefix.air.push(false);
+            prefix
+                .feed_links
+                .push(path.feed_links.get(i).copied().unwrap_or(false));
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < path.moves.len() && path.air.get(i).copied().unwrap_or(false) {
+            i += 1;
+        }
+        let end = i - 1;
+        let from = path.moves[start - 1].0;
+        let to = path.moves[end].0;
+        let outgoing = path.moves[..start - 1]
+            .iter()
+            .rev()
+            .find_map(|&(p, _)| {
+                (p != from).then(|| crate::profile::unit(from.x - p.x, from.y - p.y))
+            })
+            .unwrap_or((1., 0.));
+        let incoming = path.moves[i..]
+            .iter()
+            .find_map(|&(p, _)| (p != to).then(|| crate::profile::unit(p.x - to.x, p.y - to.y)))
+            .unwrap_or((1., 0.));
+
+        let lead_options = |p, direction, lead, incoming| {
+            let mut options = Vec::new();
+            if lead != Lead::None {
+                options.extend(
+                    [1., -1.].map(|side| LeadPath::new(p, direction, lead, incoming, side)),
+                );
+            }
+            options.push(LeadPath::new(p, direction, Lead::None, incoming, 1.));
+            options
+        };
+        let departures = lead_options(from, outgoing, job.lead_out, false);
+        let arrivals = lead_options(to, incoming, job.lead_in, true);
+        let mut chosen = None;
+        'arcs: for count in (0..=2).rev() {
+            for departure in &departures {
+                for arrival in &arrivals {
+                    let arcs = usize::from(departure.lead != Lead::None)
+                        + usize::from(arrival.lead != Lead::None);
+                    if arcs != count {
+                        continue;
+                    }
+                    let mut route = vec![departure.off];
+                    route.extend(path.moves[start..end].iter().map(|&(p, _)| p));
+                    route.push(arrival.off);
+                    let mut sweep = departure.samples.clone();
+                    sweep.extend_from_slice(&route[1..]);
+                    sweep.extend_from_slice(&arrival.samples[1..]);
+                    if (arcs == 0 && verified_air)
+                        || footprint
+                            .covers_route(&prefix, &sweep, job.radius)
+                            .unwrap_or(false)
+                    {
+                        chosen = Some(FloorLink {
+                            start,
+                            end,
+                            departure: departure.clone(),
+                            arrival: arrival.clone(),
+                            route,
+                        });
+                        break 'arcs;
+                    }
+                }
+            }
+        }
+        let air = chosen.is_some();
+        links.extend(chosen);
+        prefix.moves.extend_from_slice(&path.moves[start..i]);
+        prefix.air.resize(prefix.moves.len(), air);
+        prefix.feed_links.resize(prefix.moves.len(), false);
+    }
+    links
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,6 +840,52 @@ mod tests {
             },
             region,
         )
+    }
+
+    #[test]
+    fn cleared_floor_link_rises_and_descends_on_the_configured_arcs() {
+        let p = Point::new;
+        let mut path = LinkedFrontier {
+            moves: vec![
+                (p(5., 10.), false),
+                (p(35., 10.), true),
+                (p(35., 13.), true),
+                (p(5., 13.), true),
+                (p(5., 16.), true),
+                (p(35., 16.), true),
+                (p(12., 13.), true),
+                (p(13., 13.), true),
+                (p(27., 13.), true),
+                (p(28., 13.), true),
+            ],
+            air: vec![false; 10],
+            feed_links: vec![false; 10],
+        };
+        path.air[8] = true;
+        let configured = job(Lead::Arc { radius: 0.7 }, Lead::Arc { radius: 0.4 }, 0.);
+        let links = floor_links(&path, &configured, false, &crate::CancelToken::new());
+        assert_eq!(links.len(), 1);
+        let tag = Tag::new(configured.id, MoveKind::Cutting);
+        let mut program = Program::new();
+        program.push(Step::Linear {
+            to: Point3::new(13., 13., -2.),
+            feed: 300.,
+            tag,
+        });
+        links[0].emit(&mut program, &configured, -2., -1.8);
+        assert!(program.validate().is_ok());
+        let motions = program.steps();
+        assert!(
+            matches!(motions[1], Step::Arc { end, center, feed: 89., tag, .. }
+            if tag.kind == MoveKind::LeadOut && end.z == -1.8 && ((center.x - 13.).hypot(center.y - 13.) - 0.4).abs() < 1e-9)
+        );
+        assert!(matches!(motions[2], Step::Rapid { to, .. } if to.z == -1.8));
+        assert!(
+            matches!(motions[3], Step::Arc { end, center, feed: 67., tag, .. }
+            if tag.kind == MoveKind::LeadIn && end == Point3::new(27., 13., -2.) && ((center.x - 27.).hypot(center.y - 13.) - 0.7).abs() < 1e-9)
+        );
+        path.moves[8].0 = p(27., 30.);
+        assert!(floor_links(&path, &configured, false, &crate::CancelToken::new()).is_empty());
     }
 
     #[test]
@@ -861,7 +1056,16 @@ mod tests {
         .unwrap();
         let raw =
             crate::frontadvance::front_advance_certified(&region, 3., 0., 2.4, None, 0.02).unwrap();
-        let linked = crate::frontadvance::link_cleared_travel(&raw, &region, 3., 0., 2.4).unwrap();
+        let linked = crate::frontadvance::link_cleared_travel(
+            &raw,
+            &region,
+            3.,
+            0.,
+            2.4,
+            &crate::CancelToken::new(),
+            None,
+        )
+        .unwrap();
         let configured = job(Lead::Arc { radius: 0.6 }, Lead::Arc { radius: 0.6 }, 0.);
         let prepared = prepare(&linked, &region, &configured).unwrap().unwrap();
         assert!(prepared.links.len() >= 4);

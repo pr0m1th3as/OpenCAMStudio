@@ -58,6 +58,7 @@ fn modes(kind: OpKind, cad: bool) -> Vec<(CadFilter, &'static str, &'static str)
         OpKind::Carve => vec![(CadFilter::Loop, "chain", "Add Chain. Select a closed drawing boundary; its holes remain uncut islands.")],
         OpKind::Bore => vec![(CadFilter::Face, "bore", "Select cylindrical holes or bosses with equal diameter and heights, or circular drawing loops.")],
         OpKind::Thread => vec![(CadFilter::Face, "thread", "Add Thread Centres. Select cylindrical bores or bosses with the same diameter and cutting heights; for a drawing, select circular holes.")],
+        OpKind::Spiral => vec![(CadFilter::Body, "silhouette", "Add solid bodies to 3D Spiral finishing."), (CadFilter::Face, "face", "Add machining faces. All setup bodies remain protected.")],
         OpKind::Parallel => vec![(CadFilter::Body, "silhouette", "Add solid bodies to 3D Parallel finishing."), (CadFilter::Face, "face", "Add machining faces. All setup bodies remain protected.")],
         OpKind::Adaptive => vec![
             (CadFilter::Body, "silhouette", "Add solid bodies to 3D Adaptive Clearing. Multiple bodies and instances can be selected."),
@@ -144,6 +145,7 @@ impl App {
                 | Operation::Face(_)
                 | Operation::Adaptive(_)
                 | Operation::Parallel(_)
+                | Operation::Spiral(_)
         )
     }
 
@@ -221,7 +223,7 @@ impl App {
                     "bore"
                 } else if kind == OpKind::Thread {
                     "thread"
-                } else if matches!(kind, OpKind::Adaptive | OpKind::Parallel)
+                } else if matches!(kind, OpKind::Adaptive | OpKind::Parallel | OpKind::Spiral)
                     && sources
                         .get(index)
                         .is_some_and(|r| r.kind == EntityKind::Body)
@@ -294,7 +296,7 @@ impl App {
                 "Bore selection"
             } else if kind == OpKind::Thread {
                 "Thread selection"
-            } else if matches!(kind, OpKind::Adaptive | OpKind::Parallel) {
+            } else if matches!(kind, OpKind::Adaptive | OpKind::Parallel | OpKind::Spiral) {
                 "Machining geometry"
             } else {
                 "Contour selection"
@@ -449,6 +451,7 @@ impl App {
                     | Operation::Pocket(_)
                     | Operation::Adaptive(_)
                     | Operation::Parallel(_)
+                    | Operation::Spiral(_)
             ) {
                 fields.push(Field::StockLeaveRadial);
             }
@@ -459,6 +462,7 @@ impl App {
                     | Operation::Face(_)
                     | Operation::Adaptive(_)
                     | Operation::Parallel(_)
+                    | Operation::Spiral(_)
             ) {
                 fields.push(Field::StockLeaveAxial);
             }
@@ -573,7 +577,8 @@ impl App {
                     | OpKind::Bore
                     | OpKind::Thread
                     | OpKind::Adaptive
-                    | OpKind::Parallel),
+                    | OpKind::Parallel
+                    | OpKind::Spiral),
                 ) = self.geometry_operation_kind()
                 else {
                     return;
@@ -865,6 +870,7 @@ impl App {
                 OpKind::Bore => "Bore",
                 OpKind::Thread => "Thread",
                 OpKind::Parallel => "3D Parallel",
+                OpKind::Spiral => "3D Spiral",
                 OpKind::Adaptive => "3D Adaptive Clearing",
                 _ => unreachable!(),
             }
@@ -886,7 +892,7 @@ impl App {
                 icon(
                     if kind == OpKind::Thread {
                         "thread"
-                    } else if matches!(kind, OpKind::Adaptive | OpKind::Parallel) {
+                    } else if matches!(kind, OpKind::Adaptive | OpKind::Parallel | OpKind::Spiral) {
                         if self.cad_filter == CadFilter::Body {
                             "silhouette"
                         } else {
@@ -935,6 +941,7 @@ impl App {
                     | OpKind::Carve
                     | OpKind::Adaptive
                     | OpKind::Parallel
+                    | OpKind::Spiral
             )
         {
             let options = if editor.stock {
@@ -951,7 +958,7 @@ impl App {
                         "Connected edges forming a closed stock boundary",
                     ),
                 ]
-            } else if matches!(kind, OpKind::Adaptive | OpKind::Parallel) {
+            } else if matches!(kind, OpKind::Adaptive | OpKind::Parallel | OpKind::Spiral) {
                 vec![
                     (CadFilter::Body, "silhouette", "Whole solid body"),
                     (
@@ -1035,6 +1042,7 @@ impl App {
             OpKind::Carve => "Select one closed region. Face selection preserves its inner boundaries as islands.",
             OpKind::Bore => "Select cylindrical holes or bosses, or circular drawing loops. Selected features must share diameter and cutting heights.",
             OpKind::Thread => "Select cylindrical bores or bosses, or circular drawing holes. Selected features must share diameter and cutting heights. A verified rounded entrance is supported; only the cylinder is threaded. Choose a thread mill, then review the suggested standard size in Geometry > Thread or enter a custom major diameter and pitch.",
+            OpKind::Spiral => "Select solid bodies or machining faces for spiral finishing with a ball nose tool.",
             OpKind::Parallel => "Select solid bodies or machining faces for ball nose finishing. Containment uses the selected geometry bounding box.",
             OpKind::Adaptive => "Select whole solid bodies, individual faces, or both. Body selection includes all of its faces; face selection limits machining to the chosen face footprint.",
             _ => unreachable!(),
@@ -1151,7 +1159,7 @@ mod tests {
         let _ = app.update(Message::OperationGeometry(GeometryMessage::Edit));
         assert!(app.wrapped_pocket_geometry_editor());
         assert!(app.operation_geometry_preview().strips.is_empty());
-        assert_eq!(app.controller.cad_selection(), &[face.clone()]);
+        assert_eq!(app.controller.cad_selection(), std::slice::from_ref(&face));
         let _ = app.operation_geometry_settings();
         let larger_face = EntityRef {
             id: 2,
@@ -1172,7 +1180,7 @@ mod tests {
         assert_eq!(viewport.cad_filter, EntityKind::Loop);
         assert_eq!(viewport.cad_operation_kind, Some(OpKind::Engrave));
         let _ = app.update(Message::CadSelect(boundary.clone()));
-        assert_eq!(app.controller.cad_selection(), &[boundary.clone()]);
+        assert_eq!(app.controller.cad_selection(), std::slice::from_ref(&boundary));
         assert_eq!(app.editor_selected_geometry(), vec![boundary.clone()]);
         assert!(
             app.geometry_settings_valid().is_ok(),

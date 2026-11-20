@@ -25,6 +25,8 @@ impl App {
             .controller
             .run_progress()
             .or_else(|| self.operation_preview.progress())?;
+        let has_preview = self.controller.run_preview().is_some()
+            || self.operation_preview.running_preview().is_some();
         let label = match progress.phase {
             JobPhase::Queued => "Waiting to calculate…".into(),
             JobPhase::GeometryResolution => "Resolving machining geometry…".into(),
@@ -32,18 +34,23 @@ impl App {
                 let operation = progress
                     .operation
                     .map_or(String::new(), |id| format!(" · operation #{id}"));
-                format!("Calculating toolpaths{operation}…")
+                let preview = if has_preview {
+                    " · partial preview"
+                } else {
+                    ""
+                };
+                format!("Calculating toolpaths{operation}{preview}…")
             }
             JobPhase::Verification if progress.total > 0 => format!(
                 "Verifying toolpaths{} · {:.0}%",
-                if self.controller.run_preview().is_some() {
+                if has_preview {
                     " · preview is unverified"
                 } else {
                     ""
                 },
                 (progress.completed as f64 / progress.total as f64).clamp(0.0, 1.0) * 100.0
             ),
-            JobPhase::Verification if self.controller.run_preview().is_some() => {
+            JobPhase::Verification if has_preview => {
                 "Verifying toolpaths · preview is unverified…".into()
             }
             JobPhase::Verification => "Verifying toolpaths…".into(),

@@ -196,6 +196,7 @@ fn assert_no_rapid_onto_uncut_stock(program: &Program, floor: f64) {
 /// A 60×40 pocket with a 10×10 island, cleared in two levels by a ⌀6 end mill.
 fn pocket_doc() -> Document {
     let op = PocketOp {
+        maximum_stepover: None,
         parameter_expressions: Default::default(),
         wrap: None,
         additional_regions: Vec::new(),
@@ -564,7 +565,7 @@ fn lifted_pocket_links_preserve_floor_coverage_and_simulate_clean() {
         (2., Plunge::Straight, false),
     ] {
         let mut baseline = None;
-        for lift in [0., 2., 100.] {
+        for lift in [0., 0.2, 2., 100.] {
             let mut doc = pocket_doc();
             let Operation::Pocket(op) = &mut doc.setups[0].operations[0] else {
                 unreachable!()
@@ -617,6 +618,52 @@ fn lifted_pocket_links_preserve_floor_coverage_and_simulate_clean() {
                     difference.residual_volume <= 1.,
                     "lift left extra stock: {difference:?}, {plunge:?}"
                 );
+            }
+        }
+    }
+}
+
+#[test]
+fn concentric_pocket_clears_lobes_that_disappear_before_the_next_ring() {
+    let mut doc = pocket_doc();
+    let setup = &mut doc.setups[0];
+    setup.tools = vec![end_mill(1, 3.)];
+    let Operation::Pocket(op) = &mut setup.operations[0] else {
+        unreachable!()
+    };
+    let center = Point::new(11., 10.5);
+    let island = Contour::new(
+        (0..96)
+            .map(|i| {
+                let angle = f64::from(i) * std::f64::consts::TAU / 96.;
+                Point::new(center.x + 2.5 * angle.cos(), center.y + 2.5 * angle.sin())
+            })
+            .collect(),
+    );
+    op.boundary = rect(0., 0., 29., 19.5);
+    op.islands = vec![island];
+    op.maximum_stepover = Some(2.);
+    op.clear.lift_height = 0.2;
+    let (program, _) = post(&doc, "concentric-collapse");
+    let sim = cam_sim::simulate(
+        &program,
+        [-2., -2., -5.],
+        [31., 21.5, TOP],
+        &cam_sim::SimOptions {
+            resolution: 0.1,
+            tool_radius: 1.5,
+        },
+        &[],
+    );
+    assert!(sim.is_clean(), "{:?}", sim.collisions);
+    for i in 8..138 {
+        for j in 8..90 {
+            let point = Point::new(f64::from(i) * 0.2, f64::from(j) * 0.2);
+            let z = sim.field.sample(point.x, point.y);
+            if point.distance(center) > 2.7 {
+                assert!(z <= -2.99, "stock left at {point:?}: Z{z}");
+            } else if point.distance(center) < 2.3 {
+                assert_eq!(z, TOP as f32, "island cut at {point:?}");
             }
         }
     }

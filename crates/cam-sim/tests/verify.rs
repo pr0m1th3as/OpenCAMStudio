@@ -124,6 +124,7 @@ fn run(doc: &Document) -> cam_sim::SimResult {
 #[test]
 fn a_pocket_clears_its_floor_without_collisions() {
     let op = PocketOp {
+        maximum_stepover: None,
         parameter_expressions: Default::default(),
         wrap: None,
         additional_regions: Vec::new(),
@@ -207,6 +208,7 @@ fn pocket_target(intended_depth: f64) -> Heightfield {
 
 fn pocket_op() -> PocketOp {
     PocketOp {
+        maximum_stepover: None,
         parameter_expressions: Default::default(),
         wrap: None,
         additional_regions: Vec::new(),

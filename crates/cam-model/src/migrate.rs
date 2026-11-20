@@ -275,12 +275,67 @@ fn step(from: u32, doc: &mut Value) -> Result<(), MigrationError> {
         43 => Ok(()), // Existing round-stock edge references retain their format.
         44 => Ok(()), // Existing operations have no fourth-axis index.
         45 => Ok(()), // Additive concave radius mill tools; existing tools are unchanged.
+        47 => Ok(()), // Additive 3D Spiral finishing operation.
+        48 => {
+            migrate_parallel_links(doc);
+            Ok(())
+        }
+        49 => Ok(()), // Parallel keeps its straight-line cutting turns by default.
         46 => Ok(()), // Optional expression maps; old operations retain their literal values.
         39 => Ok(()), // Optional cylindrical fourth-axis wrap settings.
         36 => Ok(()), // Fixture bodies default to empty; clearances default to 5 mm.
         29 => Ok(()), // Additive Parallel finishing operations and surface bindings.
         28 => Ok(()), // Additive Bore operations and cylindrical geometry bindings.
         _ => Err(MigrationError::MissingStep { from }),
+    }
+}
+
+fn migrate_parallel_links(doc: &mut Value) {
+    let Some(setups) = doc.get_mut("setups").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for setup in setups {
+        let Some(operations) = setup.get_mut("operations").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for op in operations
+            .iter_mut()
+            .filter_map(|op| op.get_mut("Parallel"))
+        {
+            let lift = op
+                .pointer("/params/lift_height")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.);
+            if let Some(expressions) = op
+                .get_mut("parameter_expressions")
+                .and_then(Value::as_object_mut)
+            {
+                expressions.remove("liftHeight");
+                let replacement = format!("({lift})");
+                for expression in expressions.values_mut() {
+                    if let Some(formula) = expression.as_str().filter(|s| s.contains("liftHeight"))
+                    {
+                        // Operation parameters are identifier tokens. Keep any
+                        // formulas that used the now-retired value working.
+                        let mut rewritten = String::with_capacity(formula.len());
+                        for identifier in formula.split_inclusive(|c: char| {
+                            !c.is_ascii_alphanumeric() && c != '_' && c != '.'
+                        }) {
+                            let name = identifier.trim_end_matches(|c: char| {
+                                !c.is_ascii_alphanumeric() && c != '_' && c != '.'
+                            });
+                            rewritten.push_str(if name == "liftHeight" {
+                                &replacement
+                            } else {
+                                name
+                            });
+                            rewritten.push_str(&identifier[name.len()..]);
+                        }
+                        *expression = Value::String(rewritten);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -481,6 +536,28 @@ mod tests {
         doc["setups"][0]["operations"][0]["Pocket"]
             .as_object()
             .expect("the fixture has one pocket")
+    }
+
+    #[test]
+    fn old_parallel_lift_expressions_use_the_last_resolved_value() {
+        let mut doc = serde_json::json!({"setups": [{"operations": [
+            {"Parallel": {"params": {"lift_height": 0.2}, "parameter_expressions": {
+                "liftHeight": "tool.diameter / 10",
+                "parallelStepover": "2 * liftHeight",
+                "feed": "tool.feed"
+            }}},
+            {"Pocket": {"parameter_expressions": {"liftHeight": "tool.diameter / 10"}}}
+        ]}]});
+        migrate_parallel_links(&mut doc);
+        let operations = &doc["setups"][0]["operations"];
+        let parallel = &operations[0]["Parallel"]["parameter_expressions"];
+        assert!(parallel.get("liftHeight").is_none());
+        assert_eq!(parallel["parallelStepover"], "2 * (0.2)");
+        assert_eq!(parallel["feed"], "tool.feed");
+        assert_eq!(
+            operations[1]["Pocket"]["parameter_expressions"]["liftHeight"],
+            "tool.diameter / 10"
+        );
     }
 
     #[test]

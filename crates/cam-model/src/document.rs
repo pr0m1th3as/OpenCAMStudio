@@ -106,7 +106,10 @@ use crate::{BoreOp, Tool};
 /// v45: fixed fourth-axis indexes on individual operations.
 /// v46: concave radius mill tool geometry.
 /// v47: persistent numeric-operation parameter formulas.
-pub const SCHEMA_VERSION: u32 = 47;
+/// v48: 3D Spiral finishing.
+/// v49: Parallel cutting turns and repositioning policy.
+/// v50: Parallel transition type.
+pub const SCHEMA_VERSION: u32 = 50;
 
 /// How repeated instances are traversed when executing a pattern.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1087,7 +1090,7 @@ pub struct ClearParams {
     /// Explicit pocket adaptive mode. Missing values preserve legacy behavior based on engagement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adaptive_enabled: Option<bool>,
-    /// Absolute overlap between concentric pocket passes, mm. Missing values use the legacy fraction.
+    /// Legacy absolute overlap between concentric pocket passes, mm.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pocket_overlap: Option<f64>,
     /// Pocket depth scheduling settings. Older operations retain their existing multi-pass behavior.
@@ -1231,7 +1234,11 @@ pub struct PocketOp {
     /// Preferred exit location in setup XY, reached along the completed toolpath.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end: Option<[f64; 2]>,
-    /// How this pocket is cleared — stepdown, ring overlap, wall allowance, feeds,
+    /// Maximum XY spacing between concentric roughing passes, mm.
+    /// Older operations derive this from their saved overlap and the cutter diameter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum_stepover: Option<f64>,
+    /// How this pocket is cleared — stepdown, wall allowance, feeds,
     /// plunge style, leads, and the engagement cap.
     ///
     /// The same [`ClearParams`] a [`CarveOp`]'s clearing pass carries (v10; before that
@@ -1248,6 +1255,43 @@ pub struct PocketOp {
     /// Optional radial wall finishing, with compensation computed in the toolpath.
     #[serde(default)]
     pub finishing: crate::PocketFinishing,
+}
+
+impl PocketOp {
+    pub fn concentric_stepover(&self, diameter: f64) -> f64 {
+        self.maximum_stepover.unwrap_or_else(|| {
+            diameter
+                - self
+                    .clear
+                    .pocket_overlap
+                    .unwrap_or(diameter * self.clear.overlap)
+        })
+    }
+
+    pub fn validate_maximum_stepover(stepover: f64, diameter: f64) -> Result<(), String> {
+        if stepover > 1e-9 && stepover <= diameter && diameter.is_finite() {
+            Ok(())
+        } else {
+            Err("Maximum stepover must be positive and at most the tool diameter".into())
+        }
+    }
+
+    /// Keeps older overlap formulas and their dependencies live in the inspector.
+    pub fn legacy_stepover_expression(&self) -> Option<&'static str> {
+        use crate::OperationParameter::{MaximumStepover, Overlap, PocketOverlap};
+        if self.maximum_stepover.is_some() || self.parameter_expressions.contains_key(&MaximumStepover)
+        {
+            None
+        } else if self.parameter_expressions.contains_key(&PocketOverlap) {
+            Some("tool_diameter - pocketOverlap")
+        } else if self.clear.pocket_overlap.is_none()
+            && self.parameter_expressions.contains_key(&Overlap)
+        {
+            Some("tool_diameter - tool_diameter * (overlap / 100)")
+        } else {
+            None
+        }
+    }
 }
 
 /// 3D surface finishing over a CAD solid or selected faces.
@@ -1269,6 +1313,27 @@ pub struct ParallelOp {
     pub work_offset: u32,
     #[serde(default)]
     pub params: ParallelParams,
+}
+
+/// 3D spiral finishing over a CAD solid or selected faces.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SpiralOp {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub parameter_expressions: std::collections::BTreeMap<crate::OperationParameter, String>,
+    pub id: u32,
+    pub tool: u32,
+    #[serde(default)]
+    pub spindle_rpm: f64,
+    #[serde(default)]
+    pub tool_preset: Option<crate::ToolPreset>,
+    #[serde(default)]
+    pub cooling: crate::Cooling,
+    #[serde(default)]
+    pub entry_feeds: crate::EntryFeeds,
+    #[serde(default = "default_work_offset")]
+    pub work_offset: u32,
+    #[serde(default)]
+    pub params: crate::SpiralParams,
 }
 
 /// 3D adaptive roughing resolved from an independent CAD machining projection.
@@ -1297,9 +1362,14 @@ pub struct AdaptiveOp {
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AdaptiveParams {
     /// Vertical lift above the cutting level during stay-down transitions, mm.
-    /// Adaptive wall withdrawals use a minimum 0.2 mm lift.
-    #[serde(default)]
+    #[serde(default = "default_adaptive_lift_height")]
     pub lift_height: f64,
+    /// Radius of the tangent arc into a cut, mm. Zero disables the arc.
+    #[serde(default = "default_adaptive_lead_radius")]
+    pub lead_in_radius: f64,
+    /// Radius of the tangent arc out of a cut, mm. Zero disables the arc.
+    #[serde(default = "default_adaptive_lead_radius")]
+    pub lead_out_radius: f64,
     /// Preferred entry and exit locations in setup XY.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start: Option<[f64; 2]>,
@@ -1353,6 +1423,12 @@ impl std::fmt::Display for AdaptiveContainment {
     }
 }
 
+fn default_adaptive_lift_height() -> f64 {
+    0.2
+}
+fn default_adaptive_lead_radius() -> f64 {
+    0.6
+}
 fn default_adaptive_tolerance() -> f64 {
     0.1
 }
@@ -1378,7 +1454,9 @@ impl AdaptiveParams {
 impl Default for AdaptiveParams {
     fn default() -> Self {
         Self {
-            lift_height: 0.0,
+            lift_height: default_adaptive_lift_height(),
+            lead_in_radius: default_adaptive_lead_radius(),
+            lead_out_radius: default_adaptive_lead_radius(),
             start: None,
             end: None,
             tolerance: default_adaptive_tolerance(),
@@ -1399,13 +1477,17 @@ mod adaptive_params_tests {
     use super::{AdaptiveContainment, AdaptiveParams, ClearParams};
 
     #[test]
-    fn lift_height_defaults_to_zero_and_round_trips() {
+    fn lift_height_and_adaptive_lead_radii_default_and_round_trip() {
         let mut clear: ClearParams = serde_json::from_str("{}").unwrap();
         let mut adaptive: AdaptiveParams = serde_json::from_str("{}").unwrap();
         assert_eq!(clear.lift_height, 0.0);
-        assert_eq!(adaptive.lift_height, 0.0);
+        assert_eq!(adaptive.lift_height, 0.2);
+        assert_eq!(adaptive.lead_in_radius, 0.6);
+        assert_eq!(adaptive.lead_out_radius, 0.6);
         clear.lift_height = 2.0;
         adaptive.lift_height = 2.0;
+        adaptive.lead_in_radius = 0.35;
+        adaptive.lead_out_radius = 0.0;
         let restored: ClearParams =
             serde_json::from_value(serde_json::to_value(clear).unwrap()).unwrap();
         assert_eq!(restored, clear);
@@ -2081,6 +2163,8 @@ pub enum Operation {
     Adaptive(AdaptiveOp),
     /// Equally spaced, surface-following 3D finishing passes.
     Parallel(ParallelOp),
+    /// Project a spiral or concentric circles onto a CAD surface.
+    Spiral(SpiralOp),
     /// A facing operation.
     Face(FaceOp),
     /// A chamfering operation.
@@ -2104,6 +2188,7 @@ impl Operation {
             Operation::Pocket(op) => op.id,
             Operation::Adaptive(op) => op.id,
             Operation::Parallel(op) => op.id,
+            Operation::Spiral(op) => op.id,
             Operation::Face(op) => op.id,
             Operation::Chamfer(op) => op.id,
             Operation::Bore(op) => op.id,
@@ -2122,6 +2207,7 @@ impl Operation {
             Operation::Pocket(op) => op.tool,
             Operation::Adaptive(op) => op.tool,
             Operation::Parallel(op) => op.tool,
+            Operation::Spiral(op) => op.tool,
             Operation::Face(op) => op.tool,
             Operation::Chamfer(op) => op.tool,
             Operation::Bore(op) => op.tool,
@@ -2158,6 +2244,7 @@ impl Operation {
             Operation::Pocket(op) => op.spindle_rpm,
             Operation::Adaptive(op) => op.spindle_rpm,
             Operation::Parallel(op) => op.spindle_rpm,
+            Operation::Spiral(op) => op.spindle_rpm,
             Operation::Face(op) => op.spindle_rpm,
             Operation::Chamfer(op) => op.spindle_rpm,
             Operation::Bore(op) => op.spindle_rpm,
@@ -2175,6 +2262,7 @@ impl Operation {
             Operation::Pocket(op) => op.spindle_rpm = rpm,
             Operation::Adaptive(op) => op.spindle_rpm = rpm,
             Operation::Parallel(op) => op.spindle_rpm = rpm,
+            Operation::Spiral(op) => op.spindle_rpm = rpm,
             Operation::Face(op) => op.spindle_rpm = rpm,
             Operation::Chamfer(op) => op.spindle_rpm = rpm,
             Operation::Bore(op) => op.spindle_rpm = rpm,
@@ -2194,6 +2282,7 @@ impl Operation {
             Operation::Pocket(op) => op.work_offset,
             Operation::Adaptive(op) => op.work_offset,
             Operation::Parallel(op) => op.work_offset,
+            Operation::Spiral(op) => op.work_offset,
             Operation::Face(op) => op.work_offset,
             Operation::Chamfer(op) => op.work_offset,
             Operation::Bore(op) => op.work_offset,
@@ -2211,6 +2300,7 @@ impl Operation {
             Operation::Pocket(op) => op.work_offset = work_offset,
             Operation::Adaptive(op) => op.work_offset = work_offset,
             Operation::Parallel(op) => op.work_offset = work_offset,
+            Operation::Spiral(op) => op.work_offset = work_offset,
             Operation::Face(op) => op.work_offset = work_offset,
             Operation::Chamfer(op) => op.work_offset = work_offset,
             Operation::Bore(op) => op.work_offset = work_offset,
@@ -2228,6 +2318,7 @@ impl Operation {
             Operation::Pocket(op) => op.id = id,
             Operation::Adaptive(op) => op.id = id,
             Operation::Parallel(op) => op.id = id,
+            Operation::Spiral(op) => op.id = id,
             Operation::Face(op) => op.id = id,
             Operation::Chamfer(op) => op.id = id,
             Operation::Bore(op) => op.id = id,
@@ -2247,6 +2338,7 @@ impl Operation {
             Operation::Pocket(op) => op.tool = tool,
             Operation::Adaptive(op) => op.tool = tool,
             Operation::Parallel(op) => op.tool = tool,
+            Operation::Spiral(op) => op.tool = tool,
             Operation::Face(op) => op.tool = tool,
             Operation::Chamfer(op) => op.tool = tool,
             Operation::Bore(op) => op.tool = tool,
@@ -2421,7 +2513,8 @@ impl Setup {
                 Operation::Profile(_)
                 | Operation::Pocket(_)
                 | Operation::Adaptive(_)
-                | Operation::Parallel(_) => true,
+                | Operation::Parallel(_)
+                | Operation::Spiral(_) => true,
                 Operation::Face(_) => {
                     if radial > 0.0 {
                         return Err(format!("operation {operation_id}: Face supports axial stock to leave only; radial allowance must be 0 mm"));
@@ -2436,7 +2529,7 @@ impl Setup {
                 | Operation::Carve(_) => false,
             };
             if !supported && (radial > 0.0 || axial > 0.0) {
-                return Err(format!("operation {operation_id}: stock to leave is supported for Profile, Pocket, Face, Adaptive, and Parallel only"));
+                return Err(format!("operation {operation_id}: stock to leave is supported for Profile, Pocket, Face, Adaptive, Parallel, and Spiral only"));
             }
         }
         Ok(())

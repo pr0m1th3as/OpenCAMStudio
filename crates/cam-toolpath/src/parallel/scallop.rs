@@ -1,8 +1,9 @@
 //! Sampled surface-distance contours. The distance field is computed on the
 //! accessible cutter-centre surface, then each contour is reprojected and
 //! certified by the same swept-cutter checks as Parallel.
+use super::surface_passes::{emit_path, PassSettings};
 use super::*;
-use cam_model::{ScallopOrder, ScallopRetraction};
+use cam_model::ScallopOrder;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, VecDeque};
 
@@ -197,7 +198,7 @@ const ORDER_BATCH: usize = 64;
 const ORDER_SAMPLES: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PathEntry {
+pub(super) enum PathEntry {
     Original,
     Reverse,
     Rotate(usize),
@@ -256,7 +257,7 @@ fn entry_end(path: &[V], entry: PathEntry) -> (V, V) {
 /// Greedy selection within each stepover level, in bounded batches. Never
 /// jump across levels to save travel: that can leave uncut stock between
 /// passes. Retain the original order if the XY estimate does not improve it.
-fn shortest_order(
+pub(super) fn shortest_order(
     paths: &[Vec<V>],
     levels: &[usize],
     allow_reorientation: bool,
@@ -354,297 +355,24 @@ fn accept_path(
         pending.push(std::mem::take(path));
         pending_levels.push(level);
     } else {
-        emit_path(out, path, linker, op, cancel);
+        emit_path(out, path, linker, pass_settings(op), None, cancel);
         path.clear();
     }
     true
 }
 
-// Remove vertices only when the entire old polyline stays within the filter
-// tolerance of the replacement chord, remains ordered, and the chord passes
-// the same selected-surface and swept-cutter checks as the original cut.
-fn simplify(path: &[V], linker: &PassLinker, op: &ParallelOp, cancel: &CancelToken) -> Vec<V> {
-    if !op.params.scallop_smoothing || path.len() < 3 {
-        return path.to_vec();
+fn pass_settings(op: &ParallelOp) -> PassSettings {
+    let p = op.params;
+    PassSettings {
+        id: op.id,
+        feed: p.feed,
+        plunge_feed: p.plunge_feed,
+        tolerance: p.tolerance,
+        retraction: p.scallop_retraction,
+        safe_distance: p.safe_distance,
+        max_stay_down_distance: f64::INFINITY,
+        smoothing_tolerance: p.scallop_smoothing.then_some(p.scallop_smoothing_tolerance),
     }
-    let tolerance = op.params.scallop_smoothing_tolerance;
-    let mut result = vec![path[0]];
-    let mut first = 0;
-    while first + 1 < path.len() && !cancel.is_cancelled() {
-        let last = (first + 64).min(path.len() - 1);
-        let mut chosen = first + 1;
-        'candidate: for end in (first + 2..=last).rev() {
-            let a = path[first];
-            let b = path[end];
-            let ab = sub(b, a);
-            let length2 = dot(ab, ab);
-            if length2 < 1e-20 {
-                continue;
-            }
-            let mut previous_t = 0.;
-            for point in &path[first + 1..end] {
-                let t = dot(sub(*point, a), ab) / length2;
-                if t < previous_t - 1e-10
-                    || !(0.0..=1.0).contains(&t)
-                    || dot(
-                        sub(*point, add(a, mul(ab, t))),
-                        sub(*point, add(a, mul(ab, t))),
-                    ) > tolerance * tolerance
-                {
-                    continue 'candidate;
-                }
-                previous_t = t;
-            }
-            if !linker.selected.covers_segment(a, b, cancel) {
-                continue;
-            }
-            let mut checked = Vec::new();
-            if refine(
-                linker.grid,
-                a,
-                b,
-                linker.radius,
-                linker.error,
-                linker.error + op.params.tolerance + linker.axial,
-                op.params.tolerance,
-                linker.bottom,
-                0,
-                &mut checked,
-                cancel,
-            ) && checked.len() == 1
-            {
-                chosen = end;
-                break;
-            }
-        }
-        result.push(path[chosen]);
-        first = chosen;
-    }
-    result
-}
-
-// Each short arc is enclosed by its endpoints and the intersection of their
-// tangents. Require that whole triangle to lie in one selected CAD triangle;
-// this certifies the arc cannot cross a small unselected gap between samples.
-fn arc_clear(
-    a: V,
-    b: V,
-    center: cam_geo::Point,
-    ccw: bool,
-    linker: &PassLinker,
-    tolerance: f64,
-    cancel: &CancelToken,
-) -> bool {
-    let radius = (a[0] - center.x).hypot(a[1] - center.y);
-    if !radius.is_finite() || radius < 1e-9 {
-        return false;
-    }
-    let start = (a[1] - center.y).atan2(a[0] - center.x);
-    let end = (b[1] - center.y).atan2(b[0] - center.x);
-    let sweep = if ccw {
-        (end - start).rem_euclid(std::f64::consts::TAU)
-    } else {
-        (start - end).rem_euclid(std::f64::consts::TAU)
-    };
-    if sweep < 1e-9 || sweep > std::f64::consts::TAU - 1e-9 {
-        return false;
-    }
-    // Keep the existing finite fallback when tolerance is NaN.
-    #[allow(clippy::manual_clamp)]
-    let max_sag = (tolerance * 0.125).min(0.005).max(1e-7);
-    let max_angle = (2. * (1. - (max_sag / radius).min(1.)).acos()).min(0.1);
-    let count = (sweep / max_angle).ceil() as usize;
-    if count == 0 || count > 10_000 {
-        return false;
-    }
-    let delta = sweep / count as f64;
-    let sag = radius * (1. - (delta * 0.5).cos());
-    let point = |angle: f64, r: f64| [center.x + r * angle.cos(), center.y + r * angle.sin(), a[2]];
-    let sign = if ccw { 1. } else { -1. };
-    for i in 0..count {
-        if cancel.is_cancelled() {
-            return false;
-        }
-        let aa = start + sign * delta * i as f64;
-        let bb = aa + sign * delta;
-        let p = if i == 0 { a } else { point(aa, radius) };
-        let q = if i + 1 == count { b } else { point(bb, radius) };
-        let tangent_intersection = point((aa + bb) * 0.5, radius / (delta * 0.5).cos());
-        let mid = mul(add(p, q), 0.5);
-        let search = (p[0] - q[0]).hypot(p[1] - q[1]) + sag + 1e-8;
-        let contained = linker.selected.indices(mid, search).into_iter().any(|id| {
-            let triangle = &linker.selected.mesh[id];
-            cross(sub(triangle[1], triangle[0]), sub(triangle[2], triangle[0]))[2].abs() > 1e-12
-                && inside(p, triangle)
-                && inside(q, triangle)
-                && inside(tangent_intersection, triangle)
-        });
-        if !contained || !linker.segment_clear_extra(p, q, sag + 1e-8, cancel) {
-            return false;
-        }
-    }
-    true
-}
-
-fn fitted_arcs(
-    path: &[V],
-    linker: &PassLinker,
-    op: &ParallelOp,
-    cancel: &CancelToken,
-) -> Option<Vec<cam_geo::PathSeg>> {
-    if !op.params.scallop_smoothing
-        || path.len() < 4
-        || path.iter().any(|p| (p[2] - path[0][2]).abs() > 1e-9)
-    {
-        return None;
-    }
-    let points: Vec<_> = path
-        .iter()
-        .map(|p| cam_geo::Point::new(p[0], p[1]))
-        .collect();
-    let fitted = cam_geo::fit_arcs(&points, op.params.scallop_smoothing_tolerance * 0.25);
-    let mut from = path[0];
-    let mut arcs = 0;
-    for segment in &fitted {
-        match *segment {
-            cam_geo::PathSeg::Line { end } => from = [end.x, end.y, from[2]],
-            cam_geo::PathSeg::Arc { end, center, ccw } => {
-                let to = [end.x, end.y, from[2]];
-                if !arc_clear(
-                    from,
-                    to,
-                    center,
-                    ccw,
-                    linker,
-                    op.params.scallop_smoothing_tolerance,
-                    cancel,
-                ) {
-                    return None;
-                }
-                from = to;
-                arcs += 1;
-            }
-        }
-    }
-    (arcs > 0).then_some(fitted)
-}
-
-fn emit_path(
-    out: &mut StrategyResult,
-    path: &mut Vec<V>,
-    linker: &mut PassLinker,
-    op: &ParallelOp,
-    cancel: &CancelToken,
-) {
-    if path.len() < 2 {
-        path.clear();
-        return;
-    }
-    let arcs = fitted_arcs(path, linker, op, cancel);
-    let path = if arcs.is_some() {
-        path.clone()
-    } else {
-        simplify(path, linker, op, cancel)
-    };
-    let to = path[0];
-    let mut at_depth = false;
-    if let Some(from) = linker.previous {
-        let policy = op.params.scallop_retraction;
-        // Bound the spatial-index query; long or uncertain links use full clearance.
-        let local = (from[0] - to[0]).hypot(from[1] - to[1]) / linker.grid.size <= 100.;
-        if policy == ScallopRetraction::Shortest && local && linker.segment_clear(from, to, cancel)
-        {
-            out.program.push(Step::Linear {
-                to: Point3::new(to[0], to[1], to[2]),
-                feed: op.params.feed,
-                tag: Tag::new(op.id, MoveKind::Link),
-            });
-            linker.previous = None;
-            at_depth = true;
-        } else if policy != ScallopRetraction::Full && local {
-            let mid = mul(add(from, to), 0.5);
-            let half = (from[0] - to[0]).hypot(from[1] - to[1]) * 0.5;
-            let reach = linker.radius + linker.error + half;
-            let highest = linker
-                .grid
-                .indices(mid, reach)
-                .iter()
-                .filter_map(|i| flat_height(mid, &linker.grid.mesh[*i], reach))
-                .fold(f64::NEG_INFINITY, f64::max);
-            let z = (highest + op.params.scallop_safe_distance + linker.error + linker.axial)
-                .max(from[2])
-                .max(to[2]);
-            let a = [from[0], from[1], z];
-            let b = [to[0], to[1], z];
-            if z.is_finite()
-                && z < linker.clearance
-                && linker.segment_clear(from, a, cancel)
-                && linker.segment_clear(a, b, cancel)
-                && linker.segment_clear(b, to, cancel)
-            {
-                for q in [a, b] {
-                    out.program.push(Step::Linear {
-                        to: Point3::new(q[0], q[1], q[2]),
-                        feed: op.params.feed,
-                        tag: Tag::new(op.id, MoveKind::Link),
-                    });
-                }
-                linker.previous = None;
-                at_depth = true;
-                out.program.push(Step::Linear {
-                    to: Point3::new(to[0], to[1], to[2]),
-                    feed: op.params.plunge_feed,
-                    tag: Tag::new(op.id, MoveKind::Plunge),
-                });
-            }
-        }
-    }
-    if !at_depth {
-        linker.retract(out, op);
-        out.program.push(Step::Rapid {
-            to: Point3::new(to[0], to[1], linker.clearance),
-            tag: Tag::new(op.id, MoveKind::Link),
-        });
-        out.program.push(Step::Linear {
-            to: Point3::new(to[0], to[1], to[2]),
-            feed: op.params.plunge_feed,
-            tag: Tag::new(op.id, MoveKind::Plunge),
-        });
-    }
-    if let Some(segments) = arcs {
-        for segment in segments {
-            let tag = Tag::new(op.id, MoveKind::Cutting);
-            match segment {
-                cam_geo::PathSeg::Line { end } => out.program.push(Step::Linear {
-                    to: Point3::new(end.x, end.y, to[2]),
-                    feed: op.params.feed,
-                    tag,
-                }),
-                cam_geo::PathSeg::Arc { end, center, ccw } => out.program.push(Step::Arc {
-                    end: Point3::new(end.x, end.y, to[2]),
-                    center: Point3::new(center.x, center.y, to[2]),
-                    dir: if ccw {
-                        cam_cldata::ArcDir::Ccw
-                    } else {
-                        cam_cldata::ArcDir::Cw
-                    },
-                    feed: op.params.feed,
-                    tag,
-                }),
-            }
-        }
-    } else {
-        for q in path.iter().skip(1) {
-            out.program.push(Step::Linear {
-                to: Point3::new(q[0], q[1], q[2]),
-                feed: op.params.feed,
-                tag: Tag::new(op.id, MoveKind::Cutting),
-            });
-        }
-    }
-    linker.previous = path.last().copied();
-    linker.passes += 1;
-    // The caller owns and clears its working buffer after this call.
 }
 
 pub(super) fn compute(
@@ -667,8 +395,8 @@ pub(super) fn compute(
     }
     if p.scallop_start
         .is_some_and(|point| point.iter().any(|v| !v.is_finite()))
-        || !p.scallop_safe_distance.is_finite()
-        || p.scallop_safe_distance < 0.
+        || !p.safe_distance.is_finite()
+        || p.safe_distance < 0.
         || (p.scallop_smoothing
             && (!p.scallop_smoothing_tolerance.is_finite() || p.scallop_smoothing_tolerance <= 0.))
     {
@@ -994,13 +722,13 @@ pub(super) fn compute(
             }
             let mut path = paths[index].take().expect("each contour is scheduled once");
             orient_path(&mut path, entry);
-            emit_path(&mut out, &mut path, linker, op, cancel);
+            emit_path(&mut out, &path, linker, pass_settings(op), None, cancel);
             if out.program.steps().len() > 2_000_000 {
                 fail!("Scallop exceeds the two-million motion budget");
             }
         }
     }
-    linker.retract(&mut out, op);
+    linker.retract(&mut out, op.id);
     if cancel.is_cancelled() {
         out.cancelled = true;
         return out;
@@ -1044,7 +772,9 @@ pub(super) fn compute(
 
 #[cfg(test)]
 mod tests {
+    use super::super::surface_passes::{fitted_arcs, simplify};
     use super::*;
+    use cam_model::ScallopRetraction;
 
     #[test]
     fn final_offset_adjustment_keeps_both_coverage_and_prior_stepover_bounded() {
@@ -1138,7 +868,7 @@ mod tests {
                 [5. * angle.cos(), 5. * angle.sin(), 0.0225]
             })
             .collect();
-        let fitted = fitted_arcs(&path, &linker, &operation, &cancel)
+        let fitted = fitted_arcs(&path, &linker, pass_settings(&operation), None, &cancel)
             .expect("safe planar circle should fit an arc");
         assert!(fitted
             .iter()
@@ -1158,9 +888,10 @@ mod tests {
         let mut emitted = StrategyResult::default();
         emit_path(
             &mut emitted,
-            &mut path.clone(),
+            &path,
             &mut emitter,
-            &operation,
+            pass_settings(&operation),
+            None,
             &cancel,
         );
         assert!(emitted
@@ -1171,7 +902,14 @@ mod tests {
         assert!(emitted.program.validate().is_ok());
         let mut nonplanar = path.clone();
         nonplanar[20][2] += 0.01;
-        assert!(fitted_arcs(&nonplanar, &linker, &operation, &cancel).is_none());
+        assert!(fitted_arcs(
+            &nonplanar,
+            &linker,
+            pass_settings(&operation),
+            None,
+            &cancel
+        )
+        .is_none());
         let obstructed_mesh = [triangle, [[3., 2., 2.], [5., 2., 2.], [4., 4., 2.]]];
         let obstructed = Grid::new(&obstructed_mesh, 4., &cancel).unwrap();
         let blocked = PassLinker {
@@ -1179,7 +917,7 @@ mod tests {
             ..linker
         };
         assert!(
-            fitted_arcs(&path, &blocked, &operation, &cancel).is_none(),
+            fitted_arcs(&path, &blocked, pass_settings(&operation), None, &cancel).is_none(),
             "arc must not cross a protected obstacle"
         );
     }
@@ -1220,7 +958,7 @@ mod tests {
                 [x, 1. + 0.02 * x.sin(), 0.0225]
             })
             .collect();
-        let reduced = simplify(&path, &linker, &operation, &cancel);
+        let reduced = simplify(&path, &linker, pass_settings(&operation), None, &cancel);
         assert!(reduced.len() < path.len() / 2);
         for point in &path {
             let d2 = reduced
@@ -1267,10 +1005,17 @@ mod tests {
             params: Default::default(),
         };
         operation.params.scallop_retraction = ScallopRetraction::Shortest;
-        operation.params.scallop_safe_distance = 1.;
-        let mut path = vec![[8., 5., 0.0225], [8., 6., 0.0225]];
+        operation.params.safe_distance = 1.;
+        let path = vec![[8., 5., 0.0225], [8., 6., 0.0225]];
         let mut out = StrategyResult::default();
-        emit_path(&mut out, &mut path, &mut linker, &operation, &cancel);
+        emit_path(
+            &mut out,
+            &path,
+            &mut linker,
+            pass_settings(&operation),
+            None,
+            &cancel,
+        );
         let links: Vec<_> = out
             .program
             .steps()

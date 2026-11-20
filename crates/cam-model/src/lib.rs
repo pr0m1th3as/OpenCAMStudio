@@ -18,6 +18,8 @@ mod pocket;
 pub use pocket::{MultipleDepths, PocketFinishing, StockContours};
 mod parallel;
 pub use parallel::*;
+mod spiral;
+pub use spiral::*;
 mod bore;
 pub use bore::{BoreOp, BoreOrder};
 mod thread_standards;
@@ -52,7 +54,7 @@ pub use document::{
     ExecutionItem, FaceOp, Hand, Heights, Lead, LinearPatternDirection, Operation,
     OperationPattern, Origin, ParallelOp, PatternDirection, PatternKind, PatternOptions,
     PatternOrder, PatternSpacing, Plunge, PocketOp, ProfileContour, ProfileOp, ProfileTabs, Setup,
-    Side, Stock, StockAxis, StockAxisReference, StockOriginAxis, StockToLeave, ThreadOp,
+    Side, SpiralOp, Stock, StockAxis, StockAxisReference, StockOriginAxis, StockToLeave, ThreadOp,
     SCHEMA_VERSION,
 };
 pub use geometry::*;

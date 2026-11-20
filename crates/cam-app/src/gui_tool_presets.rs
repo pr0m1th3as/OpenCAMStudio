@@ -1074,17 +1074,18 @@ impl App {
             (&mut *op, preset.overlap, tool_diameter)
         {
             if creating {
-                pocket.clear.pocket_overlap = None;
-                cam_model::OperationParameter::PocketOverlap
-                    .set_source(op, pocket_parameters::DEFAULT_OVERLAP);
+                let stepover = cam_model::OperationParameter::MaximumStepover;
+                let source = stepover.default_expression();
+                stepover.set_source(op, source);
                 self.fields.insert(
-                    Field::PocketOverlap,
-                    pocket_parameters::DEFAULT_OVERLAP.into(),
+                    Field::PocketStepover,
+                    format!("={source}"),
                 );
             } else {
-                pocket.clear.pocket_overlap = Some(overlap * diameter);
+                let stepover = diameter - overlap * diameter;
+                pocket.maximum_stepover = Some(stepover);
                 self.fields
-                    .insert(Field::PocketOverlap, fmt_num(overlap * diameter));
+                    .insert(Field::PocketStepover, fmt_num(stepover));
             }
         }
         if let (Operation::Face(face), Some(overlap), Some(diameter)) =

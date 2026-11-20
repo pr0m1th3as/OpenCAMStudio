@@ -195,7 +195,8 @@ fn bounds_polygon(bounds: [[f64; 3]; 2]) -> Result<Polygon, String> {
     .map_err(|e| e.to_string())
 }
 
-fn project_triangles(triangles: &[[[f64; 3]; 3]]) -> Result<Vec<Polygon>, String> {
+/// Union of all nondegenerate triangle projections in setup XY.
+pub fn projected_footprint(triangles: &[[[f64; 3]; 3]]) -> Result<Vec<Polygon>, String> {
     let mut polygons = Vec::new();
     for triangle in triangles {
         let contour = Contour::new(
@@ -216,6 +217,33 @@ fn project_triangles(triangles: &[[[f64; 3]; 3]]) -> Result<Vec<Polygon>, String
     }
     cam_geo::union(&polygons, &[])
         .map_err(|e| format!("could not union selected-face machining projection: {e}"))
+}
+
+/// Combine selected face projections before machining any of their boundaries.
+/// Shared CAD edges can be tessellated at different locations on either side.
+/// Remove enclosed gaps thinner than the projection error so they do not grow
+/// into cutter-sized obstacles during containment. Open gaps stay open.
+fn merge_face_projections(
+    domains: Vec<Polygon>,
+    chord_tolerance: f64,
+) -> Result<Vec<Polygon>, cam_geo::GeoError> {
+    if domains.len() <= 1 {
+        return Ok(domains);
+    }
+    let tolerance = chord_tolerance + 2.0 * cam_geo::GRID_MM;
+    cam_geo::union(&domains, &[])?
+        .into_iter()
+        .map(|region| {
+            let mut holes = Vec::new();
+            for hole in region.holes() {
+                let void = Polygon::new(hole.clone())?;
+                if !cam_geo::offset(&[void], -tolerance, cam_geo::JoinStyle::Round)?.is_empty() {
+                    holes.push(hole.clone());
+                }
+            }
+            Polygon::with_holes(region.outer().clone(), holes)
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -421,6 +449,7 @@ pub fn resolve_adaptive(
         });
     let mut body_domains = Vec::new();
     let mut face_domains = Vec::new();
+    let mut face_chord_tolerance: f64 = 0.0;
     let mut selected_face_floors = Vec::new();
     for reference in &binding.selected {
         if reference.kind == EntityKind::Face
@@ -458,9 +487,10 @@ pub fn resolve_adaptive(
                 .ok_or("selected face missing")?;
             selected_face_floors.push(transformed_bounds(face.bounds, instance.placement)[0][2]);
             let projection = checked_projection(&asset.topology)?;
+            face_chord_tolerance = face_chord_tolerance.max(projection.chord_tolerance);
             let triangles =
                 triangles_for_faces(&projection.mesh, &[reference.id], instance.placement)?;
-            let mut polygons = project_triangles(&triangles)?;
+            let mut polygons = projected_footprint(&triangles)?;
             // A vertical face has zero area when each tessellation triangle
             // is flattened independently. Accept the useful full cylindrical
             // case only when its analytic circle and closed topology wire,
@@ -482,6 +512,8 @@ pub fn resolve_adaptive(
             face_domains.extend(polygons);
         }
     }
+    let face_domains = merge_face_projections(face_domains, face_chord_tolerance)
+        .map_err(|e| format!("could not combine the selected face boundaries: {e}"))?;
     // Obstacles include every solid body instance in the setup, regardless of selection.
     let mut triangles = Vec::new();
     let mut obstacle_error_bound: f64 = 0.0;
@@ -821,6 +853,33 @@ fn clip_above(triangle: [[f64; 3]; 3], plane: f64) -> Vec<[f64; 3]> {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn face_projection_merging_closes_only_thin_enclosed_seams() {
+        let rectangle = |x0, y0, x1, y1| bounds_polygon([[x0, y0, 0.], [x1, y1, 0.]]).unwrap();
+        let left = Polygon::with_holes(
+            rectangle(0., 0., 5., 10.).outer().clone(),
+            vec![rectangle(1., 4., 2., 6.).outer().clone()],
+        )
+        .unwrap();
+        let domains = vec![
+            left,
+            rectangle(5.0012, 0., 10., 10.),
+            rectangle(4., 0., 6., 2.),
+        ];
+        let seam = Point::new(5.0006, 5.);
+        let intentional_hole = Point::new(1.5, 5.);
+
+        let open = merge_face_projections(domains.clone(), 0.0025).unwrap();
+        assert!(!open.iter().any(|polygon| polygon.contains(seam)));
+
+        let mut enclosed = domains;
+        enclosed.push(rectangle(4., 8., 6., 10.));
+        let merged = merge_face_projections(enclosed, 0.0025).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].contains(seam));
+        assert!(!merged[0].contains(intentional_hole));
+    }
 
     #[test]
     fn projected_cylindrical_face_requires_complete_boundary_wires() {

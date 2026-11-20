@@ -1,4 +1,4 @@
-//! Dimensioned world grid shared by the GPU line pass and canvas labels.
+//! Dimensioned work-coordinate grid shared by the GPU line pass and canvas labels.
 use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8,13 +8,18 @@ enum GridPlane {
     Yz,
 }
 impl GridPlane {
-    fn for_camera(camera: OrbitCamera) -> Self {
+    fn for_camera(camera: OrbitCamera, frame: cam_model::RigidTransform) -> Self {
         // Only cardinal side views switch planes; even a small orbit restores XY.
-        let normal = [
-            camera.orient[0][2],
-            camera.orient[1][2],
-            camera.orient[2][2],
+        let world_normal = [
+            camera.orient[0][2] as f64,
+            camera.orient[1][2] as f64,
+            camera.orient[2][2] as f64,
         ];
+        let normal: [f32; 3] = std::array::from_fn(|i| {
+            (0..3)
+                .map(|j| frame.rotation[j][i] * world_normal[j])
+                .sum::<f64>() as f32
+        });
         const EPSILON: f32 = 1e-5;
         if normal[2].abs() < EPSILON && normal[0].abs() < EPSILON {
             Self::Xz
@@ -52,18 +57,31 @@ impl GridPlane {
         point[b] = coordinates[1];
         point
     }
-    fn pick(self, camera: OrbitCamera, u: f32, v: f32, aspect: f32) -> Option<[f32; 2]> {
+    fn pick(
+        self,
+        camera: OrbitCamera,
+        frame: cam_model::RigidTransform,
+        u: f32,
+        v: f32,
+        aspect: f32,
+    ) -> Option<[f32; 2]> {
         let ray = camera.pick_ray(u, v, aspect);
+        let origin = frame.inverse_point(ray.origin);
+        let ray_direction: [f64; 3] = std::array::from_fn(|i| {
+            (0..3)
+                .map(|j| frame.rotation[j][i] * ray.direction[j])
+                .sum()
+        });
         let normal = self.normal_axis();
-        let direction = ray.direction[normal];
+        let direction = ray_direction[normal];
         if direction.abs() < 1e-8 {
             return None;
         }
-        let t = -ray.origin[normal] / direction;
+        let t = -origin[normal] / direction;
         let [a, b] = self.axes();
         Some([
-            (ray.origin[a] + t * ray.direction[a]) as f32,
-            (ray.origin[b] + t * ray.direction[b]) as f32,
+            (origin[a] + t * ray_direction[a]) as f32,
+            (origin[b] + t * ray_direction[b]) as f32,
         ])
     }
 }
@@ -71,6 +89,7 @@ impl GridPlane {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct GridLayout {
     plane: GridPlane,
+    frame: cam_model::RigidTransform,
     min: [f32; 2],
     max: [f32; 2],
     visible_min: [f32; 2],
@@ -78,10 +97,15 @@ pub(super) struct GridLayout {
     pub step: f32,
 }
 impl GridLayout {
-    pub(super) fn new(camera: OrbitCamera, size: iced::Size, machine_size: [f32; 3]) -> Self {
+    pub(super) fn new(
+        camera: OrbitCamera,
+        size: iced::Size,
+        machine_size: [f32; 3],
+        frame: cam_model::RigidTransform,
+    ) -> Self {
         // The machine gives a travel, not an absolute work origin. Center its
-        // footprint on the world origin, independently of the camera and job.
-        let plane = GridPlane::for_camera(camera);
+        // footprint on the active work origin.
+        let plane = GridPlane::for_camera(camera, frame);
         let axes = plane.axes();
         let half = axes.map(|axis| {
             let v = machine_size[axis];
@@ -96,7 +120,7 @@ impl GridLayout {
         let aspect = size.width / size.height.max(1.);
         let points: Vec<_> = [[-1., -1.], [-1., 1.], [1., -1.], [1., 1.]]
             .into_iter()
-            .filter_map(|[x, y]| plane.pick(camera, x, y, aspect))
+            .filter_map(|[x, y]| plane.pick(camera, frame, x, y, aspect))
             .filter(|p| p[0].is_finite() && p[1].is_finite())
             .collect();
         let visible_min = std::array::from_fn(|axis| {
@@ -120,12 +144,18 @@ impl GridLayout {
         let step = nice_step(raw.max(visible_span / 100.));
         Self {
             plane,
+            frame,
             min,
             max,
             visible_min,
             visible_max,
             step,
         }
+    }
+    fn point(&self, coordinates: [f32; 2]) -> [f32; 3] {
+        self.frame
+            .transform_point(self.plane.point(coordinates).map(f64::from))
+            .map(|v| v as f32)
     }
     fn ticks(&self, axis: usize) -> Vec<f32> {
         let start = (self.visible_min[axis] / self.step).ceil();
@@ -146,14 +176,14 @@ impl GridLayout {
                 let mut b = self.max;
                 a[axis] = tick;
                 b[axis] = tick;
-                scene.add_strip(vec![self.plane.point(a), self.plane.point(b)], color);
+                scene.add_strip(vec![self.point(a), self.point(b)], color);
             }
         }
         let [x, y] = self.max;
         scene.add_strip(
             [[-x, -y], [x, -y], [x, y], [-x, y], [-x, -y]]
                 .into_iter()
-                .map(|point| self.plane.point(point))
+                .map(|point| self.point(point))
                 .collect(),
             [0.30, 0.34, 0.38, 1.],
         );
@@ -240,6 +270,7 @@ fn clipped_line(
 pub(super) struct GridLabels {
     pub camera: OrbitCamera,
     pub grid_size: [f32; 3],
+    pub frame: cam_model::RigidTransform,
     pub measurement: Option<String>,
 }
 impl canvas::Program<Message> for GridLabels {
@@ -253,7 +284,7 @@ impl canvas::Program<Message> for GridLabels {
         _: iced::mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
         let size = bounds.size();
-        let layout = GridLayout::new(self.camera, size, self.grid_size);
+        let layout = GridLayout::new(self.camera, size, self.grid_size, self.frame);
         let mut frame = canvas::Frame::new(renderer, size);
         for axis in 0..2 {
             let mut previous: Option<iced::Point> = None;
@@ -263,8 +294,8 @@ impl canvas::Program<Message> for GridLabels {
                 a[axis] = tick;
                 b[axis] = tick;
                 let Some((a, b)) = clipped_line(
-                    project(self.camera, layout.plane.point(a), size),
-                    project(self.camera, layout.plane.point(b), size),
+                    project(self.camera, layout.point(a), size),
+                    project(self.camera, layout.point(b), size),
                     size,
                 ) else {
                     continue;
@@ -273,8 +304,19 @@ impl canvas::Program<Message> for GridLabels {
                 // The text baseline follows the projected grid axis.
                 let mut along = [0., 0., 0.];
                 along[layout.plane.axes()[axis]] = layout.step;
-                let origin = project(self.camera, [0., 0., 0.], size);
-                let direction = project(self.camera, along, size);
+                let origin = project(
+                    self.camera,
+                    layout.frame.translation.map(|v| v as f32),
+                    size,
+                );
+                let direction = project(
+                    self.camera,
+                    layout
+                        .frame
+                        .transform_point(along.map(f64::from))
+                        .map(|v| v as f32),
+                    size,
+                );
                 let mut angle = (direction.y - origin.y).atan2(direction.x - origin.x);
                 if angle > std::f32::consts::FRAC_PI_2 {
                     angle -= std::f32::consts::PI;
@@ -532,18 +574,18 @@ mod tests {
     fn grid_uses_machine_travel_and_adapts_to_zoom() {
         let mut camera = OrbitCamera::framed([-50., -50., 0.], [50., 50., 0.]);
         let size = iced::Size::new(800., 600.);
-        let grid = GridLayout::new(camera, size, [400., 200., 150.]);
+        let grid = GridLayout::new(camera, size, [400., 200., 150.], Default::default());
         assert_eq!(grid.min, [-200., -100.]);
         assert_eq!(grid.max, [200., 100.]);
         assert!(grid.ticks(0).contains(&0.));
         assert!(grid.vertices().iter().all(|v| v.position[2] == 0.));
         camera.zoom = 3.;
-        let zoomed = GridLayout::new(camera, size, [400., 200., 150.]);
+        let zoomed = GridLayout::new(camera, size, [400., 200., 150.], Default::default());
         assert!(zoomed.step < grid.step);
         assert_eq!(zoomed.min, grid.min);
         assert!(zoomed.ticks(0).len() <= 101);
         camera.zoom = 100.;
-        let close = GridLayout::new(camera, size, [400., 200., 150.]);
+        let close = GridLayout::new(camera, size, [400., 200., 150.], Default::default());
         assert!(close.step < zoomed.step);
         assert!(close.ticks(0).len() <= 101);
         assert_eq!(tick_text(-0.2, 0.1), "-0.2");
@@ -560,24 +602,67 @@ mod tests {
             (-FRAC_PI_2, GridPlane::Yz, 0, [100., 75.]),
         ] {
             camera.orient = cam_render::orientation(yaw, -FRAC_PI_2);
-            let grid = GridLayout::new(camera, size, [400., 200., 150.]);
+            let grid = GridLayout::new(camera, size, [400., 200., 150.], Default::default());
             assert_eq!(grid.plane, expected);
             assert_eq!(grid.max, half);
             assert!(grid.ticks(1).contains(&0.));
             assert!(grid.vertices().iter().all(|v| v.position[normal] == 0.));
             camera.zoom = 3.;
-            assert!(GridLayout::new(camera, size, [400., 200., 150.]).step < grid.step);
+            assert!(
+                GridLayout::new(camera, size, [400., 200., 150.], Default::default()).step
+                    < grid.step
+            );
             camera.zoom = 0.;
         }
         camera.orient = cam_render::orientation(0., -FRAC_PI_2 + 0.01);
-        assert_eq!(GridPlane::for_camera(camera), GridPlane::Xy);
+        assert_eq!(
+            GridPlane::for_camera(camera, Default::default()),
+            GridPlane::Xy
+        );
         camera.orient = cam_render::orientation(0.3, 0.8);
-        assert_eq!(GridPlane::for_camera(camera), GridPlane::Xy);
+        assert_eq!(
+            GridPlane::for_camera(camera, Default::default()),
+            GridPlane::Xy
+        );
         camera.orient = cam_render::orientation(0., 0.);
-        assert_eq!(GridPlane::for_camera(camera), GridPlane::Xy);
+        assert_eq!(
+            GridPlane::for_camera(camera, Default::default()),
+            GridPlane::Xy
+        );
         camera.orient = cam_render::orientation(0., PI);
-        assert_eq!(GridPlane::for_camera(camera), GridPlane::Xy);
+        assert_eq!(
+            GridPlane::for_camera(camera, Default::default()),
+            GridPlane::Xy
+        );
     }
+    #[test]
+    fn grid_geometry_and_picking_follow_work_frame() {
+        let mut camera = OrbitCamera::framed([-50.; 3], [50.; 3]);
+        camera.orient =
+            cam_render::orientation(std::f32::consts::FRAC_PI_2, -std::f32::consts::FRAC_PI_2);
+        let frame = cam_model::RigidTransform {
+            rotation: [[0., 0., 1.], [0., 1., 0.], [-1., 0., 0.]],
+            translation: [10., 20., 30.],
+        };
+        let size = iced::Size::new(800., 600.);
+        let grid = GridLayout::new(camera, size, [400., 200., 150.], frame);
+        assert_eq!(grid.plane, GridPlane::Xy);
+        assert_eq!(grid.point([0., 0.]), [10., 20., 30.]);
+        assert_eq!(grid.point([5., 7.]), [10., 27., 25.]);
+        assert!(grid
+            .vertices()
+            .iter()
+            .all(|v| (v.position[0] - 10.).abs() < 1e-5));
+        let picked = grid
+            .plane
+            .pick(camera, frame, 0., 0., size.width / size.height)
+            .unwrap();
+        let world = frame.transform_point(grid.plane.point(picked).map(f64::from));
+        assert!((world[0] - 10.).abs() < 1e-8);
+        camera.orient = cam_render::orientation(0., 0.);
+        assert_eq!(GridPlane::for_camera(camera, frame), GridPlane::Yz);
+    }
+
     #[test]
     fn clipping_keeps_labels_inside_the_viewport() {
         let (a, b) = clipped_line(

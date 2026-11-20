@@ -24,7 +24,7 @@ fn recommended_families(kind: OpKind) -> &'static [ToolKindPick] {
         }
         OpKind::Face => &[F::FaceMill, F::EndMill, F::RoughingMill],
         OpKind::Drill => &[F::Drill],
-        OpKind::Parallel => &[F::BallMill],
+        OpKind::Parallel | OpKind::Spiral => &[F::BallMill],
         OpKind::Thread => &[F::ThreadMill],
         OpKind::Chamfer => &[F::ChamferMill, F::VBit, F::RadiusMill],
         OpKind::Engrave => &[F::ChamferMill, F::VBit],
@@ -573,7 +573,7 @@ mod tests {
         let pixels =
             Headless::screenshot(&mut renderer, iced::Size::new(1200, 850), 1.0, Color::WHITE);
         let mut ppm = b"P6\n1200 850\n255\n".to_vec();
-        for pixel in pixels.chunks_exact(4) {
+        for pixel in pixels.as_chunks::<4>().0 {
             ppm.extend_from_slice(&pixel[..3]);
         }
         std::fs::write("/tmp/opencam-tools-workspace.ppm", ppm).unwrap();
@@ -626,7 +626,7 @@ mod tests {
         let pixels =
             Headless::screenshot(&mut renderer, iced::Size::new(1200, 850), 1.0, Color::WHITE);
         let mut ppm = b"P6\n1200 850\n255\n".to_vec();
-        for pixel in pixels.chunks_exact(4) {
+        for pixel in pixels.as_chunks::<4>().0 {
             ppm.extend_from_slice(&pixel[..3]);
         }
         std::fs::write("/tmp/opencam-operation-tool-selector.ppm", ppm).unwrap();

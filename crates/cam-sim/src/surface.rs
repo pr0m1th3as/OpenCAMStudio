@@ -10,6 +10,65 @@ struct Corner {
     normal: Option<[f32; 3]>,
 }
 
+// Sweeps near each mesh tile, used to reconstruct the union of overlapping
+// cutter passes. Very long sweeps are kept separately to bound index memory.
+struct SweepIndex {
+    width: usize,
+    bins: Vec<Vec<u32>>,
+    long: Vec<u32>,
+}
+
+impl SweepIndex {
+    fn new(field: &Heightfield, cancelled: &dyn Fn() -> bool) -> Option<Self> {
+        let width = field.nx.div_ceil(MESH_TILE_SIZE);
+        let height = field.ny.div_ceil(MESH_TILE_SIZE);
+        let mut index = Self {
+            width,
+            bins: vec![Vec::new(); width * height],
+            long: Vec::new(),
+        };
+        for (id, cut) in field.cuts.iter().enumerate() {
+            if id % 1024 == 0 && cancelled() {
+                return None;
+            }
+            // Thread teeth remove bounded intervals; their sweeps are not
+            // ordinary downward cuts and cannot join the heightfield union.
+            if matches!(cut.tool.shape, crate::ProfileShape::Thread { .. }) {
+                continue;
+            }
+            let r = cut.tool.radius + field.res * 2.;
+            let bin = |coordinate: f64, axis: usize, count: usize| {
+                (((coordinate - field.origin[axis]) / (field.res * MESH_TILE_SIZE as f64)).floor()
+                    as isize)
+                    .clamp(0, count as isize - 1) as usize
+            };
+            let x0 = bin(cut.a[0].min(cut.b[0]) - r, 0, width);
+            let x1 = bin(cut.a[0].max(cut.b[0]) + r, 0, width);
+            let y0 = bin(cut.a[1].min(cut.b[1]) - r, 1, height);
+            let y1 = bin(cut.a[1].max(cut.b[1]) + r, 1, height);
+            if (x1 - x0 + 1) * (y1 - y0 + 1) > 256 {
+                index.long.push(id as u32);
+            } else {
+                for y in y0..=y1 {
+                    for x in x0..=x1 {
+                        index.bins[y * width + x].push(id as u32);
+                    }
+                }
+            }
+        }
+        Some(index)
+    }
+
+    fn near(&self, x: usize, y: usize) -> impl Iterator<Item = u32> + '_ {
+        let bx = (x / MESH_TILE_SIZE).min(self.width - 1);
+        let by = (y / MESH_TILE_SIZE).min(self.bins.len() / self.width - 1);
+        self.bins[by * self.width + bx]
+            .iter()
+            .chain(&self.long)
+            .copied()
+    }
+}
+
 /// One mesh per stock tile, rebuilt only when cuts change it or its neighbours.
 /// Revisions belong to heightfield snapshots, so rewinds and disposable partial
 /// motions cannot reuse surfaces from a different state.
@@ -37,6 +96,7 @@ impl StockMeshCache {
             self.tiles = vec![None; field.mesh_revisions.len()];
         }
         let width = field.nx.div_ceil(MESH_TILE_SIZE);
+        let sweeps = SweepIndex::new(field, cancelled)?;
         // Tiles read one immutable stock snapshot and own disjoint cache slots.
         // Assembly below stays in tile order, preserving vertex/provenance indices.
         self.tiles
@@ -60,6 +120,7 @@ impl StockMeshCache {
                         (y + MESH_TILE_SIZE).min(field.ny),
                     ],
                     cancelled,
+                    &sweeps,
                 )?;
                 *tile = Some((revision, mesh));
                 Some(())
@@ -211,7 +272,7 @@ impl Heightfield {
             (self.origin[1] + y as f64 * self.res).min(self.max[1]) as f32,
         ]
     }
-    fn contour_corner(&self, x: usize, y: usize, wall_step: f32) -> Corner {
+    fn contour_corner(&self, x: usize, y: usize, wall_step: f32, sweeps: &SweepIndex) -> Corner {
         let mut corner = Corner {
             xy: self.grid_xy(x, y),
             normal: None,
@@ -254,6 +315,21 @@ impl Heightfield {
         }
         if cutters.is_empty() {
             return corner;
+        }
+        // A corner can border several overlapping segments of a rolled tool
+        // path. The winner at a cell center alone does not describe their union.
+        let xy = corner.xy.map(f64::from);
+        for id in sweeps.near(x, y) {
+            let cut = &self.cuts[id as usize];
+            let radius = cut.tool.radius + self.res * 2.;
+            if xy[0] >= cut.a[0].min(cut.b[0]) - radius
+                && xy[0] <= cut.a[0].max(cut.b[0]) + radius
+                && xy[1] >= cut.a[1].min(cut.b[1]) - radius
+                && xy[1] <= cut.a[1].max(cut.b[1]) + radius
+                && !cutters.contains(&id)
+            {
+                cutters.push(id);
+            }
         }
         let implicit = |p: [f64; 2]| {
             cutters
@@ -398,7 +474,8 @@ impl Heightfield {
         floor: f64,
         cancelled: &dyn Fn() -> bool,
     ) -> Option<SurfaceMesh> {
-        self.solid_mesh_region_controlled(floor, [0, 0], [self.nx, self.ny], cancelled)
+        let sweeps = SweepIndex::new(self, cancelled)?;
+        self.solid_mesh_region_controlled(floor, [0, 0], [self.nx, self.ny], cancelled, &sweeps)
     }
 
     fn solid_mesh_region_controlled(
@@ -407,6 +484,7 @@ impl Heightfield {
         [x0, y0]: [usize; 2],
         [x1, y1]: [usize; 2],
         cancelled: &dyn Fn() -> bool,
+        sweeps: &SweepIndex,
     ) -> Option<SurfaceMesh> {
         let width = x1 - x0;
         let height = y1 - y0;
@@ -419,7 +497,7 @@ impl Heightfield {
                 return None;
             }
             for x in x0..=x1 {
-                corners.push(self.contour_corner(x, y, wall_step));
+                corners.push(self.contour_corner(x, y, wall_step, sweeps));
             }
         }
         let mut flat = vec![0u8; width * height];
@@ -631,6 +709,60 @@ impl Heightfield {
 mod tests {
     use super::*;
     use crate::ToolProfile;
+
+    #[test]
+    fn rolled_corner_uses_all_nearby_cutter_sweeps() {
+        let mut field = Heightfield::new([-344.5, -2.5], [-264.5, 20.], 1.1555555555555554, 0.);
+        let corner = [-312.791608967, -0.8];
+        let mut cache = StockMeshCache::default();
+        for r in [4., 3.] {
+            let mut points = vec![[-267.791608967, corner[1] - r], [corner[0], corner[1] - r]];
+            for i in 1..=5 {
+                let angle =
+                    -std::f64::consts::FRAC_PI_2 - i as f64 * std::f64::consts::FRAC_PI_2 / 5.;
+                points.push([corner[0] + r * angle.cos(), corner[1] + r * angle.sin()]);
+            }
+            points.push([corner[0] - r, 10.]);
+            for pair in points.windows(2) {
+                field.cut_segment(
+                    [pair[0][0], pair[0][1], -18.],
+                    [pair[1][0], pair[1][1], -18.],
+                    3.,
+                );
+                let cached = cache.mesh_controlled(&field, -18., &|| false).unwrap();
+                let fresh = StockMeshCache::default()
+                    .mesh_controlled(&field, -18., &|| false)
+                    .unwrap();
+                assert_eq!(cached, fresh, "incremental mesh differs from fresh mesh");
+            }
+        }
+        let mesh = field.to_solid_mesh(-18.);
+        let vertices: Vec<_> = mesh
+            .positions
+            .iter()
+            .zip(&mesh.normals)
+            .filter(|(p, n)| {
+                n[2].abs() < 0.1
+                    && (p[0] as f64 - corner[0]).abs() < 1.
+                    && (p[1] as f64 - corner[1]).abs() < 1.
+            })
+            .map(|(p, _)| *p)
+            .collect();
+        assert!(!vertices.is_empty());
+        for p in vertices {
+            assert!(
+                p[0] as f64 >= corner[0] - 0.08 && p[1] as f64 >= corner[1] - 0.08,
+                "spike at {p:?}"
+            );
+            assert!(
+                (p[0] as f64 - corner[0])
+                    .abs()
+                    .min((p[1] as f64 - corner[1]).abs())
+                    < 0.08,
+                "cut-in at {p:?}"
+            );
+        }
+    }
 
     fn surface_measures(mesh: &SurfaceMesh) -> (f64, f64) {
         let mut area = 0.;

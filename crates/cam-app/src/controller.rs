@@ -97,6 +97,7 @@ pub enum OpKind {
     Carve,
     Adaptive,
     Parallel,
+    Spiral,
 }
 
 /// Whether an operation kind restricts geometry selection to **circular** loops.
@@ -983,7 +984,7 @@ impl AppController {
         entities: &[cam_model::EntityRef],
     ) -> Result<cam_geometry3d::ResolvedInput, String> {
         let geometry = self.setup_geometry_state()?;
-        if matches!(kind, OpKind::Adaptive | OpKind::Parallel) {
+        if matches!(kind, OpKind::Adaptive | OpKind::Parallel | OpKind::Spiral) {
             cam_geometry3d::validate_adaptive_selection(&geometry, entities)?;
         } else {
             crate::cad_operations::validate_selection(&geometry, entities)?;
@@ -1161,6 +1162,7 @@ impl AppController {
                     | OpKind::Thread
                     | OpKind::Adaptive
                     | OpKind::Parallel
+                    | OpKind::Spiral
                     | OpKind::Bore
             ) {
             crate::cad_operations::selection_height_defaults(&preview, &op)
@@ -1185,7 +1187,7 @@ impl AppController {
         let mut doc = self.document().clone();
         if matches!(
             self.operation(id),
-            Some(Operation::Adaptive(_) | Operation::Parallel(_))
+            Some(Operation::Adaptive(_) | Operation::Parallel(_) | Operation::Spiral(_))
         ) {
             cam_geometry3d::validate_adaptive_selection(self.geometry_state(), &entities)?;
         } else {
@@ -1245,31 +1247,49 @@ impl AppController {
         id: u64,
         placement: cam_model::RigidTransform,
     ) -> Result<(), String> {
-        if !placement.is_rigid() {
-            return Err("Placement must be a finite rigid transform".into());
+        self.place_cad_instances(vec![(id, placement)])
+    }
+
+    /// Apply placements as one undoable edit, validating the entire selection first.
+    pub fn place_cad_instances(
+        &mut self,
+        placements: Vec<(u64, cam_model::RigidTransform)>,
+    ) -> Result<(), String> {
+        let mut ids = std::collections::BTreeSet::new();
+        for (id, placement) in &placements {
+            if !placement.is_rigid() {
+                return Err("Placement must be a finite rigid transform".into());
+            }
+            if !ids.insert(*id) || self.geometry_state().instance(*id).is_none() {
+                return Err("Missing or duplicate CAD instance".into());
+            }
         }
-        if self.geometry_state().instance(id).is_none() {
-            return Err("Missing CAD instance".into());
+        if placements.is_empty() {
+            return Err("No CAD bodies selected".into());
         }
         self.edit_document(move |doc| {
-            if let Some(instance) = doc.geometry.instances.iter_mut().find(|i| i.id == id) {
-                instance.placement = placement;
+            for (id, placement) in &placements {
+                if let Some(instance) = doc.geometry.instances.iter_mut().find(|i| i.id == *id) {
+                    instance.placement = *placement;
+                }
             }
             let geometry = doc.geometry.clone();
             for setup in &mut doc.setups {
                 let refs = &setup.frame.references;
-                if refs.model_instance == Some(id)
-                    && refs.x.is_none()
-                    && refs.y.is_none()
-                    && refs.z.is_none()
+                if let Some((id, placement)) = placements
+                    .iter()
+                    .find(|(id, _)| refs.model_instance == Some(*id))
                 {
-                    if let Ok(mut frame) = cam_model::SetupFrame::from_model_instance(&geometry, id)
-                    {
-                        frame.references.origin = refs.origin.clone();
-                        if matches!(refs.origin, cam_model::FrameOrigin::ModelOrigin) {
-                            setup.origin = frame.to_setup_vector(placement.translation);
+                    if refs.x.is_none() && refs.y.is_none() && refs.z.is_none() {
+                        if let Ok(mut frame) =
+                            cam_model::SetupFrame::from_model_instance(&geometry, *id)
+                        {
+                            frame.references.origin = refs.origin.clone();
+                            if matches!(refs.origin, cam_model::FrameOrigin::ModelOrigin) {
+                                setup.origin = frame.to_setup_vector(placement.translation);
+                            }
+                            setup.frame = frame;
                         }
-                        setup.frame = frame;
                     }
                 }
             }
@@ -2298,6 +2318,7 @@ impl AppController {
                     .map(|l| self.loop_contour(*l).cloned())
                     .collect::<Option<Vec<_>>>()?;
                 Operation::Pocket(PocketOp {
+                    maximum_stepover: None,
                     parameter_expressions: Default::default(),
                     wrap: None,
                     additional_regions: Vec::new(),
@@ -2563,6 +2584,17 @@ impl AppController {
                 entry_feeds: Default::default(),
                 work_offset: 1,
                 params: ParallelParams::default(),
+            }),
+            OpKind::Spiral => Operation::Spiral(cam_model::SpiralOp {
+                parameter_expressions: Default::default(),
+                id: 0,
+                tool,
+                spindle_rpm,
+                tool_preset: None,
+                cooling: Default::default(),
+                entry_feeds: Default::default(),
+                work_offset: 1,
+                params: cam_model::SpiralParams::default(),
             }),
         };
         if let Some(cooling) = self
@@ -2888,6 +2920,7 @@ impl AppController {
                         }));
                     } else {
                         operations.push(Operation::Pocket(PocketOp {
+                            maximum_stepover: None,
                             parameter_expressions: Default::default(),
                             wrap: None,
                             additional_regions: Vec::new(),
@@ -3375,6 +3408,7 @@ fn op_kind_of(op: &Operation) -> OpKind {
         Operation::Carve(_) => OpKind::Carve,
         Operation::Adaptive(_) => OpKind::Adaptive,
         Operation::Parallel(_) => OpKind::Parallel,
+        Operation::Spiral(_) => OpKind::Spiral,
     }
 }
 
@@ -3625,7 +3659,7 @@ mod tests {
             Operation::Engrave(o) => o.depth,
             Operation::Carve(o) => o.depth,
             Operation::Adaptive(o) => o.params.stepdown,
-            Operation::Parallel(_) => 1.0,
+            Operation::Parallel(_) | Operation::Spiral(_) => 1.0,
         }
     }
 

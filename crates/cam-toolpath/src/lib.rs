@@ -18,7 +18,7 @@
 
 mod parallel;
 mod rotary;
-pub use parallel::ParallelStrategy;
+pub use parallel::{ParallelStrategy, SpiralStrategy};
 pub use rotary::index_program;
 pub use rotary::wrap_program;
 pub use rotary::ROTARY_WRAP_REVISION;
@@ -54,15 +54,15 @@ use cam_cldata::{Program, SpindleDir};
 use cam_model::{Heights, Tool};
 
 pub use adaptive_strategy::AdaptiveStrategy;
-pub use cache::{CacheStats, OperationCache};
+pub use cache::{concentric_clearing_revision, CacheStats, OperationCache};
 pub use carve::{carve_shape, CarveShape, CarveStrategy};
 pub use chamfer::ChamferStrategy;
 pub use drill::DrillStrategy;
 pub use engrave::EngraveStrategy;
 pub use face::FaceStrategy;
 pub use plan::{
-    build_job, build_job_cached, build_job_cached_with_progress, CalculationProgress,
-    JobCompletion, JobResult, PlanRequest,
+    build_job, build_job_cached, build_job_cached_with_preview, build_job_cached_with_progress,
+    CalculationProgress, JobCompletion, JobResult, PlanRequest,
 };
 mod cache;
 pub use pocket::PocketStrategy;

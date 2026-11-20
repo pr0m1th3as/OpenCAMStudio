@@ -919,7 +919,7 @@ mod tests {
         assert!(
             cam_geometry3d::resolve_selection(
                 &app.controller.setup_geometry_state().unwrap(),
-                &[reference.clone()],
+                std::slice::from_ref(&reference),
                 ExtractionRecipe::ProfileContours,
                 0.
             )

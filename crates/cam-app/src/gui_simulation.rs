@@ -1479,10 +1479,7 @@ mod tests {
                 player.preview.scene.strips.iter().all(|s| s.op == Some(8)),
                 "{mode}"
             );
-            assert!(
-                player.preview.scene.path_cones.iter().all(|c| c.op == 8),
-                "{mode}"
-            );
+            assert!(player.preview.scene.path_cones.is_empty(), "{mode}");
         }
     }
     #[test]
@@ -1493,21 +1490,7 @@ mod tests {
         player.options.show_leads = false;
         player.refresh_display();
         assert_eq!(displayed_bounds(&player, 0), (0., 40.));
-        // Direct cutting entries have main-path markers even without leads.
-        // Hiding leads must not remove markers for the visible cutting moves.
-        assert_eq!(
-            player
-                .preview
-                .scene
-                .path_cones
-                .iter()
-                .map(|cone| (cone.op, cone.at, cone.color))
-                .collect::<Vec<_>>(),
-            vec![
-                (7, [0., 0., 0.], cam_render::PATH_IN),
-                (8, [40., 0., 0.], cam_render::PATH_IN),
-            ]
-        );
+        assert!(player.preview.scene.path_cones.is_empty());
         player.options.show_cutting = false;
         player.refresh_display();
         assert!(player.preview.scene.strips.is_empty());
@@ -1515,7 +1498,7 @@ mod tests {
         player.options.show_leads = true;
         player.refresh_display();
         assert_eq!(displayed_bounds(&player, 2), (-5., 0.));
-        assert!(!player.preview.scene.path_cones.is_empty());
+        assert!(player.preview.scene.path_cones.is_empty());
         let count = player.preview.scene.strips.len();
         player.options.show_points = true;
         player.refresh_display();
@@ -1526,7 +1509,7 @@ mod tests {
         assert!(player.preview.scene.path_cones.is_empty());
     }
     #[test]
-    fn continuous_arc_playback_has_only_actual_entry_and_exit_markers() {
+    fn continuous_arc_playback_draws_motion_without_preview_arrows() {
         let tag = Tag::new(7, MoveKind::Cutting);
         let with_kind = |kind| Tag { kind, ..tag };
         let program = Program {
@@ -1582,12 +1565,11 @@ mod tests {
         player.options.show_leads = true;
         player.options.show_cutting = true;
         player.refresh_display();
-        let cones = &player.preview.scene.path_cones;
-        assert_eq!(
-            cones.len(),
-            2,
-            "continuous path produced spurious arrows: {cones:?}"
-        );
+        assert!(player.preview.scene.path_cones.is_empty());
+        let preview = Scene::from_program(&program);
+        assert_eq!(player.preview.scene.strips.len(), preview.strips.len());
+        let cones = &preview.path_cones;
+        assert_eq!(cones.len(), 2);
         assert_eq!(
             (cones[0].color, cones[1].color),
             (cam_render::PATH_IN, cam_render::PATH_OUT)

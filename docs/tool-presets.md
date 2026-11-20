@@ -30,9 +30,10 @@ imports and exports.
 
 The operation's **Tool** tab lists every preset for that cutter, including presets
 for other materials. Choose another to apply its values, or edit the operation's
-cutting parameters directly. Stepdown and overlap are available on the Passes tab
-where the operation supports them. Presets affect cutting data only; tool geometry
-continues to be defined by the cutter.
+cutting parameters directly. Stepdown is available on the **Passes** tab where
+the operation supports it. Applying an overlap preset to an existing concentric
+Pocket converts the overlap into **Maximum Stepover** using the cutter diameter.
+Presets affect cutting data only, and tool geometry comes from the cutter.
 
 Stepdown maps to axial depth per pass for milling/engraving and peck depth for
 drilling. Drilling uses the plunge feed as its axial feed. Chamfer width increments,

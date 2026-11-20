@@ -1013,7 +1013,7 @@ mod tests {
             }
             let pixels = Headless::screenshot(&mut renderer, size, 1.0, Color::WHITE);
             let mut ppm = format!("P6\n{} {}\n255\n", size.width, size.height).into_bytes();
-            for pixel in pixels.chunks_exact(4) {
+            for pixel in pixels.as_chunks::<4>().0 {
                 ppm.extend_from_slice(&pixel[..3]);
             }
             std::fs::write(format!("/tmp/opencam-cutter-{name}.ppm"), ppm).unwrap();

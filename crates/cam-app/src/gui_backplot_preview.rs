@@ -249,6 +249,14 @@ impl OperationPreview {
         self.jobs.progress()
     }
 
+    pub(super) fn running_preview(&self) -> Option<&crate::RunOutcome> {
+        self.jobs.preview()
+    }
+
+    pub(super) fn preview_revision(&self) -> Option<usize> {
+        self.jobs.preview_revision()
+    }
+
     pub(super) fn needs_poll(&self) -> bool {
         self.jobs.needs_poll()
     }

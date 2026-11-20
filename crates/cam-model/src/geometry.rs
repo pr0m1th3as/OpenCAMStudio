@@ -670,6 +670,7 @@ pub enum ExtractionRecipe {
     /// every included setup body retained as an obstacle.
     AdaptiveClearing,
     ParallelFinishing,
+    SpiralFinishing,
     PocketFloor,
     /// One closed planar loop or connected closed edge chain, at an operator-defined depth.
     PocketBoundary,
@@ -790,7 +791,9 @@ impl GeometryState {
     pub fn binding_fingerprint(&self, binding: &GeometryBinding) -> String {
         if matches!(
             binding.recipe,
-            ExtractionRecipe::AdaptiveClearing | ExtractionRecipe::ParallelFinishing
+            ExtractionRecipe::AdaptiveClearing
+                | ExtractionRecipe::ParallelFinishing
+                | ExtractionRecipe::SpiralFinishing
         ) {
             let mut dependencies: Vec<_> = self
                 .instances

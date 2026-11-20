@@ -255,6 +255,7 @@ fn profile_with(lead: Lead, stepdown: f64, depth: f64) -> Operation {
 
 fn pocket() -> Operation {
     Operation::Pocket(PocketOp {
+        maximum_stepover: None,
         parameter_expressions: Default::default(),
         wrap: None,
         additional_regions: Vec::new(),

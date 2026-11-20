@@ -27,13 +27,14 @@ pub(crate) fn validate_stock_to_leave(
             }
             op.depth
         }
-        Operation::Adaptive(_) | Operation::Parallel(_) => document
+        Operation::Adaptive(_) | Operation::Parallel(_)
+ | Operation::Spiral(_) => document
             .geometry
             .bindings
             .get(&operation.id())
             .map(|binding| binding.effective_heights().depth())
             .ok_or("3D surface operations require linked solid geometry")?,
-        _ => return Err("Stock to Leave is supported for Profile, Pocket, Face, Adaptive Clearing and Parallel.".into()),
+        _ => return Err("Stock to Leave is supported for Profile, Pocket, Face, Adaptive Clearing, Parallel, and Spiral.".into()),
     };
     if stock.axial > 0.0 && stock.axial >= depth {
         return Err(format!("Axial stock to leave ({:.3} mm) must be less than the operation depth ({depth:.3} mm).", stock.axial));
@@ -1048,7 +1049,10 @@ impl AppController {
         let geometry = geometry
             .filter(|_| !matches!(&operation,Operation::Profile(p) if p.selections.is_some()));
         if let Some(selected) = &geometry {
-            if matches!(operation, Operation::Adaptive(_) | Operation::Parallel(_)) {
+            if matches!(
+                operation,
+                Operation::Adaptive(_) | Operation::Parallel(_) | Operation::Spiral(_)
+            ) {
                 cam_geometry3d::validate_adaptive_selection(&document.geometry, selected)?;
             } else {
                 crate::cad_operations::validate_selection(&document.geometry, selected)?;

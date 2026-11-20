@@ -70,12 +70,18 @@ impl App {
                 continue;
             }
             let value = self.fields.get(&field).cloned().unwrap_or_default();
-            fields.push(self.parameter_field_row(
-                field,
-                self.field_label(field),
-                self.field_help(field),
-                &value,
-            ));
+            let (label, help) = match (op, field) {
+                (Operation::Adaptive(_), Field::LeadInSize) => (
+                    "Lead-in arc radius (mm)",
+                    "Radius of the tangent arc into the cut from a cleared link. Zero disables the arc.",
+                ),
+                (Operation::Adaptive(_), Field::LeadOutSize) => (
+                    "Lead-out arc radius (mm)",
+                    "Radius of the tangent arc away from the cut before a cleared link. Zero disables the arc.",
+                ),
+                _ => (self.field_label(field), self.field_help(field)),
+            };
+            fields.push(self.parameter_field_row(field, label, help, &value));
         }
         fields
     }
@@ -302,31 +308,21 @@ impl App {
                     Message::PlungeKindChanged,
                 ));
             }
-            Operation::Parallel(p) if !p.params.scallop => {
-                moves.push(help_wrap(
-                    row![
-                        text("Keep tool down").size(12).width(Length::Fill),
-                        checkbox(p.params.stay_down)
-                            .size(15)
-                            .on_toggle(Message::ParallelStayDownToggled),
-                    ].spacing(8).align_y(Alignment::Center),
-                    "Enable short transitions between neighboring passes when the swept cutter clears the model. At 0 mm Lift height, the tool continues finishing along the surface without an added lift. Gaps and unsafe transitions retract to clearance. Use on pre-roughed stock.",
-                    self.tooltips,
-                ));
+            Operation::Parallel(p) => {
+                moves.push(self.finishing_retraction_control(p.params.retraction_policy()));
+                if !p.params.scallop {
+                    leads.push(profile_picker(
+                        "Transition type",
+                        "No contact retracts between passes. Straight line joins the pass ends at the boundary. Shortest path prefers the shortest checked cutting connection. Smooth rounds beyond the pass ends where the cutter can clear the model.",
+                        self.tooltips,
+                        p.params.transition,
+                        &cam_model::ParallelTransition::ALL[..],
+                        Message::ParallelTransitionChanged,
+                    ));
+                }
             }
-            Operation::Parallel(p) if p.params.scallop => {
-                moves.push(profile_picker(
-                    "Retraction policy",
-                    "Full clearance, a checked raised link, or a checked direct feed link. Links blocked by stock are rerouted during verification.",
-                    self.tooltips,
-                    p.params.scallop_retraction,
-                    &[
-                        cam_model::ScallopRetraction::Full,
-                        cam_model::ScallopRetraction::Minimum,
-                        cam_model::ScallopRetraction::Shortest,
-                    ][..],
-                    Message::ScallopRetractionChanged,
-                ));
+            Operation::Spiral(p) => {
+                moves.push(self.finishing_retraction_control(p.params.retraction));
             }
             Operation::Adaptive(_) => {
                 moves.push(label_help(
@@ -573,6 +569,23 @@ impl App {
                 sections.push(self.operation_section(Section::Positions.id(), positions, None));
         }
         sections.into()
+    }
+    fn finishing_retraction_control(
+        &self,
+        policy: cam_model::ScallopRetraction,
+    ) -> Element<'_, Message> {
+        profile_picker(
+                    "Retraction policy",
+                    "Choose a full retract, a checked raised traverse, or a checked straight feed link between disconnected passes.",
+                    self.tooltips,
+                    policy,
+                    &[
+                        cam_model::ScallopRetraction::Full,
+                        cam_model::ScallopRetraction::Minimum,
+                        cam_model::ScallopRetraction::Shortest,
+                    ][..],
+                    Message::ScallopRetractionChanged,
+                )
     }
 }
 

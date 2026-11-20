@@ -3,10 +3,12 @@
 use std::{ffi::OsString, path::PathBuf};
 
 pub const USAGE: &str = "Usage: opencamstudio [--setup <path.ocam>] [--mcp | --mcp-gui] [--help]
+       opencamstudio --mcp-connect [port]
 
   --setup <path.ocam>  Open a saved setup/project on startup without a file dialog
   --mcp                Serve application commands over MCP stdio without a window
   --mcp-gui            Serve MCP stdio controlling the desktop window (requires gui)
+  --mcp-connect [port] Bridge MCP stdio to a running desktop. An explicit port uses OPENCAMSTUDIO_MCP_TOKEN.
   -h, --help           Show this help
 
 Relative paths are resolved from the current working directory.";
@@ -17,11 +19,17 @@ pub struct Args {
     pub help: bool,
     pub mcp: bool,
     pub mcp_gui: bool,
+    pub mcp_connect: Option<ConnectDesktop>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ConnectDesktop {
+    pub port: Option<u16>,
 }
 
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Args, String> {
     let mut parsed = Args::default();
-    let mut args = args.into_iter();
+    let mut args = args.into_iter().peekable();
     while let Some(arg) = args.next() {
         if arg == "--setup" {
             if parsed.setup.is_some() {
@@ -40,11 +48,28 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Args, String> {
             }
             parsed.mcp = arg == "--mcp";
             parsed.mcp_gui = arg == "--mcp-gui";
+        } else if arg == "--mcp-connect" {
+            if parsed.mcp_connect.is_some() {
+                return Err("--mcp-connect may only be specified once".into());
+            }
+            let port = args
+                .next_if(|arg| !arg.as_encoded_bytes().starts_with(b"-"))
+                .map(|arg| {
+                    arg.to_str()
+                        .and_then(|port| port.parse::<u16>().ok())
+                        .filter(|&port| port != 0)
+                        .ok_or("--mcp-connect accepts a TCP port from 1 to 65535")
+                })
+                .transpose()?;
+            parsed.mcp_connect = Some(ConnectDesktop { port });
         } else if arg == "--help" || arg == "-h" {
             parsed.help = true;
         } else {
             return Err(format!("Unknown argument: {}", arg.to_string_lossy()));
         }
+    }
+    if parsed.mcp_connect.is_some() && (parsed.mcp || parsed.mcp_gui || parsed.setup.is_some()) {
+        return Err("--mcp-connect cannot be combined with --mcp, --mcp-gui or --setup".into());
     }
     Ok(parsed)
 }

@@ -1,7 +1,6 @@
 //! MCP stdio server and the shared, GUI-independent application command catalog.
-//!
-//! No socket is opened. The launching MCP client owns the process and its stdio.
 mod commands;
+pub(crate) mod desktop_link;
 mod protocol;
 mod shop;
 
@@ -9,6 +8,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Map, Value};
 
 pub(crate) use commands::call;
+pub use desktop_link::connect_desktop;
 #[cfg(feature = "gui")]
 pub(crate) use commands::is_read_only;
 pub use protocol::serve;
@@ -229,7 +229,7 @@ pub(crate) fn choice(values: &[&str]) -> Value {
 pub(crate) fn kind() -> Value {
     choice(&[
         "Profile", "Pocket", "Drill", "Face", "Chamfer", "Thread", "Bore", "Engrave", "Carve",
-        "Adaptive", "Parallel",
+        "Adaptive", "Parallel", "Spiral",
     ])
 }
 

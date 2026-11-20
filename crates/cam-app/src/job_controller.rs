@@ -223,7 +223,8 @@ impl AppController {
                 inputs.document.active_setup_id,
                 &inputs.document.rotary_indexes,
                 env!("CARGO_PKG_VERSION"),
-                1u32,
+                // Verified programs and stock must reflect current machining rules.
+                11u32,
             ),
             &inputs.document.excluded_operations,
             &inputs.document.disabled_origins,
@@ -460,6 +461,10 @@ impl AppController {
     pub(crate) fn run_preview(&self) -> Option<&RunOutcome> {
         self.jobs.preview()
     }
+    #[cfg(feature = "gui")]
+    pub(crate) fn run_preview_revision(&self) -> Option<usize> {
+        self.jobs.preview_revision()
+    }
     pub fn run_pending(&self) -> bool {
         self.jobs.pending()
     }
@@ -567,11 +572,9 @@ impl AppController {
                     .iter()
                     .filter(|tool| op.tools().contains(&tool.number))
                     .collect();
-                let binding = document
-                    .geometry
-                    .bindings
-                    .get(&id)
-                    .map(|binding| document.geometry.binding_fingerprint(binding));
+                let geometry_binding = document.geometry.bindings.get(&id);
+                let binding =
+                    geometry_binding.map(|binding| document.geometry.binding_fingerprint(binding));
                 let patterns: Vec<_> = setup
                     .patterns
                     .iter()
@@ -596,6 +599,11 @@ impl AppController {
                         &cam_toolpath::ParallelStrategy::DOMAIN_REVISION.to_le_bytes(),
                     );
                 }
+                if matches!(op, Operation::Spiral(_)) {
+                    bytes.extend_from_slice(
+                        &cam_toolpath::SpiralStrategy::DOMAIN_REVISION.to_le_bytes(),
+                    );
+                }
                 if op.rotary_wrap().is_some() {
                     bytes.extend_from_slice(&cam_toolpath::ROTARY_WRAP_REVISION.to_le_bytes());
                 }
@@ -608,6 +616,14 @@ impl AppController {
                     bytes.extend_from_slice(
                         &cam_toolpath::PocketStrategy::STOCK_CONTOUR_REVISION.to_le_bytes(),
                     );
+                }
+                if geometry_binding
+                    .is_some_and(|b| b.recipe == cam_model::ExtractionRecipe::PocketFloor)
+                {
+                    bytes.extend_from_slice(&cam_geometry3d::POCKET_FLOOR_REVISION.to_le_bytes());
+                }
+                if let Some(revision) = cam_toolpath::concentric_clearing_revision(op) {
+                    bytes.extend_from_slice(&revision.to_le_bytes());
                 }
                 let own = cam_model::GeometryAsset::fingerprint_source(&bytes);
                 previous = cam_model::GeometryAsset::fingerprint_source(

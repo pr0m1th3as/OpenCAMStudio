@@ -183,7 +183,7 @@ fn leads_that_cannot_fit_warn_once_and_preserve_selected_positions() {
 
 #[test]
 fn saved_profiles_with_outdated_finish_revisions_are_recomputed() {
-    for revision in [None, Some(1)] {
+    for revision in [None, Some(1), Some(2)] {
         let op = Operation::Profile(profile());
         let env = JobEnv {
             heights: Heights::new(8., 3., 0.),
@@ -524,6 +524,51 @@ fn open_profiles_require_computed_compensation() {
         "{:?}",
         control.diagnostics
     );
+}
+
+#[test]
+fn open_profile_ignores_retained_closure_overlap() {
+    let mut op = profile();
+    op.closed = false;
+    op.chain = Contour::new(vec![Point::new(0., 0.), Point::new(20., 0.)]);
+    let without_overlap = run(op.clone());
+    op.lead_overlap = 0.6;
+    let with_overlap = run(op);
+    assert!(!with_overlap.has_errors(), "{:?}", with_overlap.diagnostics);
+    assert_eq!(with_overlap.program, without_overlap.program);
+}
+
+#[test]
+fn tangential_extension_applies_to_each_open_pass_and_ignores_closed_contours() {
+    let mut op = profile();
+    op.closed = false;
+    op.side = Side::On;
+    op.chain = Contour::new(vec![Point::new(0., 0.), Point::new(20., 0.)]);
+    op.passes.tangential_extension_distance = 5.;
+    op.passes.finishing = true;
+    op.passes.finish_count = 2;
+    let result = run(op.clone());
+    assert!(!result.has_errors(), "{:?}", result.diagnostics);
+    let starts = plunges(&result);
+    let ends = cuts(&result);
+    assert!(starts.len() >= 4, "{starts:?}");
+    assert!(starts
+        .iter()
+        .all(|p| (p.x + 5.).abs() < 1e-6 || (p.x - 25.).abs() < 1e-6));
+    assert!(
+        ends.iter()
+            .filter(|p| (p.x + 5.).abs() < 1e-6 || (p.x - 25.).abs() < 1e-6)
+            .count()
+            >= 4
+    );
+
+    let mut closed = profile();
+    let baseline = run(closed.clone());
+    closed.passes.tangential_extension_distance = 5.;
+    assert_eq!(run(closed).program, baseline.program);
+
+    op.passes.tangential_extension_distance = -1.;
+    assert!(run(op).has_errors());
 }
 
 #[test]

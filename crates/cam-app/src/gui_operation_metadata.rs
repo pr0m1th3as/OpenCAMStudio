@@ -56,7 +56,7 @@ pub(super) fn operation_fields(op: &Operation) -> Vec<Field> {
                 Field::LiftHeight,
                 Field::Depth,
                 Field::Stepdown,
-                Field::PocketOverlap,
+                Field::PocketStepover,
                 Field::Engagement,
                 Field::SpindleRpm,
                 Field::Feed,
@@ -203,19 +203,44 @@ pub(super) fn operation_fields(op: &Operation) -> Vec<Field> {
             }
             fields
         }
-        Operation::Parallel(o) => {
-            let mut fields = Vec::new();
-            if !o.params.scallop {
-                fields.push(Field::LiftHeight);
+        Operation::Spiral(o) => {
+            let mut fields = vec![
+                Field::AdaptiveOffset,
+                Field::SpiralFromSlope,
+                Field::SpiralToSlope,
+                Field::AdaptiveTolerance,
+                Field::SpiralStepover,
+                Field::SpiralInnerLimit,
+                Field::SpiralOuterLimit,
+                Field::SpindleRpm,
+                Field::Feed,
+                Field::PlungeFeed,
+            ];
+            if o.params.retraction != cam_model::ScallopRetraction::Full {
+                fields.extend([Field::ScallopSafeDistance, Field::SpiralStayDownDistance]);
             }
-            fields.push(Field::ParallelStepover);
+            if o.params.multiple_depths {
+                fields.extend([
+                    Field::SpiralAxialOffset,
+                    Field::Stepdown,
+                    Field::SpiralStepdowns,
+                ]);
+            }
+            if o.params.smoothing {
+                fields.push(Field::ScallopSmoothingTolerance);
+            }
+            fields
+        }
+        Operation::Parallel(o) => {
+            let mut fields = vec![Field::ParallelStepover];
             if !o.params.scallop {
                 fields.push(Field::ParallelAngle);
-            } else {
+            }
+            if o.params.scallop && o.params.scallop_smoothing {
+                fields.push(Field::ScallopSmoothingTolerance);
+            }
+            if o.params.retraction_policy() != cam_model::ScallopRetraction::Full {
                 fields.push(Field::ScallopSafeDistance);
-                if o.params.scallop_smoothing {
-                    fields.push(Field::ScallopSmoothingTolerance);
-                }
             }
             fields.extend([
                 Field::AdaptiveTolerance,
@@ -228,6 +253,8 @@ pub(super) fn operation_fields(op: &Operation) -> Vec<Field> {
         }
         Operation::Adaptive(_) => vec![
             Field::LiftHeight,
+            Field::LeadInSize,
+            Field::LeadOutSize,
             Field::AdaptiveTolerance,
             Field::AdaptiveOptimalLoad,
             Field::Stepdown,
@@ -299,6 +326,7 @@ pub(super) fn operation_fields(op: &Operation) -> Vec<Field> {
         || matches!(
             op,
             Operation::Pocket(_)
+                | Operation::Adaptive(_)
                 | Operation::Chamfer(_)
                 | Operation::Thread(_)
                 | Operation::Bore(_)

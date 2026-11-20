@@ -379,7 +379,10 @@ impl App {
                 Operation::Drill(p) => centers.extend(p.points.iter().copied()),
                 Operation::Bore(p) => centers.extend(p.points.iter().copied()),
                 Operation::Thread(p) => centers.extend(p.points.iter().copied()),
-                Operation::Profile(_) | Operation::Adaptive(_) | Operation::Parallel(_) => {}
+                Operation::Profile(_)
+                | Operation::Adaptive(_)
+                | Operation::Parallel(_)
+                | Operation::Spiral(_) => {}
             }
         }
         if let Some(wrap) = op.rotary_wrap() {
@@ -443,7 +446,12 @@ impl App {
                 );
             }
         }
-        if self.operation_tab == OperationTab::Linking {
+        let position_tab = if matches!(op, Operation::Spiral(_)) {
+            OperationTab::Geometry
+        } else {
+            OperationTab::Linking
+        };
+        if self.operation_tab == position_tab {
             use operation_positions::PositionKind::{Entry, Exit};
             let z = binding.as_ref().map_or(
                 self.controller.inspection_setup().heights.top_of_stock,

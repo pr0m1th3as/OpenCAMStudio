@@ -148,6 +148,7 @@ impl App {
             scene_mesh: None,
             browser_width,
             points: op.chain.points().iter().map(|p| [p.x, p.y]).collect(),
+            closed: op.closed,
             positions: self.profile_tab_locations(),
             z,
             frame: self.controller.inspection_setup().frame.clone(),
@@ -171,6 +172,7 @@ pub(super) struct TabOverlay {
     scene_mesh: Option<SceneMesh>,
     browser_width: f32,
     points: Vec<[f64; 2]>,
+    closed: bool,
     positions: Vec<[f64; 2]>,
     z: f64,
     frame: cam_model::SetupFrame,
@@ -181,6 +183,13 @@ pub(super) struct TabOverlay {
     gizmo_size: Option<f32>,
 }
 impl TabOverlay {
+    fn segments(&self) -> impl Iterator<Item = ([f64; 2], [f64; 2])> + '_ {
+        self.points.windows(2).map(|pair| (pair[0], pair[1])).chain(
+            (self.closed && self.points.len() > 1)
+                .then(|| (*self.points.last().unwrap(), self.points[0])),
+        )
+    }
+
     pub(super) fn with_scene_mesh(
         mut self,
         vertices: Arc<Vec<MeshVertex>>,
@@ -242,8 +251,8 @@ impl TabOverlay {
 
     fn nearest(&self, cursor: iced::Point, bounds: iced::Rectangle) -> Option<[f64; 2]> {
         let mut best = (self.catch_px * self.catch_px, None);
-        for (a, b) in self.points.iter().zip(self.points.iter().cycle().skip(1)) {
-            let (Some(pa), Some(pb)) = (self.project(*a, bounds), self.project(*b, bounds)) else {
+        for (a, b) in self.segments() {
+            let (Some(pa), Some(pb)) = (self.project(a, bounds), self.project(b, bounds)) else {
                 continue;
             };
             let delta = pb - pa;
@@ -357,16 +366,12 @@ impl canvas::Program<Message> for TabOverlay {
                 .with_width(width)
         };
         let mut outline = canvas::path::Builder::new();
-        for (index, point) in self.points.iter().enumerate() {
-            if let Some(point) = self.project(*point, local) {
-                if index == 0 {
-                    outline.move_to(point);
-                } else {
-                    outline.line_to(point);
-                }
+        for (a, b) in self.segments() {
+            if let (Some(a), Some(b)) = (self.project(a, local), self.project(b, local)) {
+                outline.move_to(a);
+                outline.line_to(b);
             }
         }
-        outline.close();
         frame.stroke(
             &outline.build(),
             canvas::Stroke::default()
@@ -1135,7 +1140,7 @@ mod tests {
             app.height_offsets.insert(P::Bottom, "0".into());
             let mut document = app.rotary_draft_document();
             let view = document.indexed_view(id).unwrap().unwrap();
-            let face_z = view.height_selection_bounds(&[face.clone()]).unwrap().1[2];
+            let face_z = view.height_selection_bounds(std::slice::from_ref(&face)).unwrap().1[2];
             let instance = view.geometry.instance(1).unwrap();
             let normal = if face_id == 102 {
                 [0., -1., 0.]
@@ -1541,6 +1546,7 @@ mod tests {
                 catch_px: 12.,
                 gizmo_size: None,
                 points: vec![[0., 0.], [40., 0.], [40., 40.], [0., 40.]],
+                closed: true,
                 positions: vec![],
             };
             let expected = [17., 0.];
@@ -1587,6 +1593,22 @@ mod tests {
                 )
                 .is_none());
         }
+    }
+
+    #[test]
+    fn tab_overlay_respects_open_chain_endpoints() {
+        let (app, _) = selected_cad_profile();
+        let camera = OrbitCamera::framed([-20.; 3], [80.; 3]);
+        let mut overlay = app.profile_tab_overlay(camera, 0.).unwrap();
+        overlay.points = vec![[0., 0.], [40., 0.], [40., 40.], [0., 40.]];
+        overlay.closed = false;
+        assert_eq!(overlay.segments().count(), 3);
+        let bounds = iced::Rectangle::with_size(iced::Size::new(900., 700.));
+        let midpoint = overlay.project([0., 20.], bounds).unwrap();
+        assert!(overlay.nearest(midpoint, bounds).is_none());
+        overlay.closed = true;
+        assert_eq!(overlay.segments().count(), 4);
+        assert!(overlay.nearest(midpoint, bounds).is_some());
     }
 
     #[test]

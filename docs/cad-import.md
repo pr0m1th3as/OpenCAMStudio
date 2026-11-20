@@ -54,6 +54,19 @@ open or closed planar paths; Carve uses a closed region and retains its islands.
 Thread selects cylindrical bores or bosses; review its nominal size and pitch
 using the [thread presets guide](thread-presets.md).
 
+To reposition geometry, right-click a model or body in the Models tree and choose
+**Move model…** or **Move body…**. The inspector provides relative X/Y/Z distances,
+angles and a world-space pivot, initially at the selected geometry's center. Drag
+an arrow to translate along the displayed axis, or drag a colored arc's dot to
+rotate around that axis. The axes follow the part's orientation; for a model with
+multiple bodies, the first body defines the gizmo orientation. Inspector distances
+and angles remain relative to the world axes. Dragged translations snap to 0.5, 1, 5 or 10 mm according to
+zoom; rotations snap to 5 degrees. The small viewport field and the inspector
+accept exact values. The viewport previews the move until **Move** is pressed;
+**Cancel** discards it. Rotations are applied X, then Y, then Z around the pivot,
+followed by translation. A model move affects all its bodies and can be undone in
+one step. Linked toolpaths must be regenerated after a move.
+
 Projects embed imported geometry, so reopening does not require the original
 source file. Model replacement is available from the model context menu.
 Replacement requires reviewing and reselecting linked geometry before generating

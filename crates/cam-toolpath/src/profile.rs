@@ -154,6 +154,14 @@ impl Strategy for ProfileStrategy {
 }
 impl ProfileStrategy {
     fn compute_resolved(&self, env: &JobEnv, cancel: &CancelToken) -> StrategyResult {
+        // Preserve a closed profile's stored overlap when its selection changes
+        // to open paths, but never apply it to those paths. Mixed selections
+        // remain subject to validation because closed paths could use overlap.
+        if self.op.lead_overlap != 0. && self.op.contours().all(|contour| !contour.closed) {
+            let mut op = self.op.clone();
+            op.lead_overlap = 0.;
+            return Self::new(op).compute_resolved(env, cancel);
+        }
         if !self.op.passes.multiple_depths {
             let mut op = self.op.clone();
             op.passes.multiple_depths = true;
@@ -706,6 +714,14 @@ impl ProfileStrategy {
 /// Offset an open centreline to its left, preserving its endpoints and rejecting
 /// collapsed or self-intersecting paths. Shared by profiles and chamfers.
 pub(crate) fn offset_open_chain(source: &[Point], distance: f64) -> Result<Vec<Point>, String> {
+    offset_open_chain_with_join(source, distance, JoinStyle::Miter)
+}
+
+fn offset_open_chain_with_join(
+    source: &[Point],
+    distance: f64,
+    join: JoinStyle,
+) -> Result<Vec<Point>, String> {
     if source.len() < 2
         || source.iter().any(|p| !p.x.is_finite() || !p.y.is_finite())
         || !distance.is_finite()
@@ -722,27 +738,52 @@ pub(crate) fn offset_open_chain(source: &[Point], distance: f64) -> Result<Vec<P
         }
         tangents.push([dx / length, dy / length]);
     }
-    let mut points = Vec::new();
+    // Each vertex contributes either an intersection or the endpoints and
+    // samples of an arc. Keep its first/last point to validate each original
+    // edge separately, even when a corner contributes many arc segments.
+    let mut corners: Vec<Vec<Point>> = Vec::with_capacity(source.len());
     for (i, p) in source.iter().enumerate() {
         let a = tangents[i.saturating_sub(1)];
         let b = tangents[i.min(tangents.len() - 1)];
-        let denominator = 1. + a[0] * b[0] + a[1] * b[1];
+        let dot = a[0] * b[0] + a[1] * b[1];
+        let cross = a[0] * b[1] - a[1] * b[0];
+        let denominator = 1. + dot;
         if denominator < 1e-6 {
             return Err("open chain doubles back; split it at the reversal".into());
         }
-        let dx = -(a[1] + b[1]) * distance / denominator;
-        let dy = (a[0] + b[0]) * distance / denominator;
-        if dx.hypot(dy) > distance.abs().max(1e-9) * 10. {
-            return Err("open chain corner is too sharp for its tool offset".into());
+        if join == JoinStyle::Round && cross * distance < -1e-12 {
+            let angle = cross.atan2(dot);
+            let start = (a[0] * distance).atan2(-a[1] * distance);
+            let segments = (angle.abs() / 0.05).ceil() as usize;
+            let arc = (0..=segments)
+                .map(|step| {
+                    let theta = start + angle * step as f64 / segments as f64;
+                    Point::new(
+                        p.x + distance.abs() * theta.cos(),
+                        p.y + distance.abs() * theta.sin(),
+                    )
+                })
+                .collect();
+            corners.push(arc);
+        } else {
+            let dx = -(a[1] + b[1]) * distance / denominator;
+            let dy = (a[0] + b[0]) * distance / denominator;
+            if dx.hypot(dy) > distance.abs().max(1e-9) * 10. {
+                return Err("open chain corner is too sharp for its tool offset".into());
+            }
+            corners.push(vec![Point::new(p.x + dx, p.y + dy)]);
         }
-        points.push(Point::new(p.x + dx, p.y + dy));
     }
-    // Offsets that cross themselves or reverse an edge cannot be machined as one chain.
-    for (i, pair) in points.windows(2).enumerate() {
-        let t = tangents[i];
-        if (pair[1].x - pair[0].x) * t[0] + (pair[1].y - pair[0].y) * t[1] <= 1e-9 {
+    for (i, t) in tangents.iter().enumerate() {
+        let a = corners[i].last().unwrap();
+        let b = corners[i + 1][0];
+        if (b.x - a.x) * t[0] + (b.y - a.y) * t[1] <= 1e-9 {
             return Err("tool offset collapses an open chain edge; use a smaller cutter".into());
         }
+    }
+    let points: Vec<Point> = corners.into_iter().flatten().collect();
+    // Offsets that cross themselves cannot be machined as one chain.
+    for (i, pair) in points.windows(2).enumerate() {
         for other in points.windows(2).skip(i + 2) {
             let cross = |a: Point, b: Point, c: Point| {
                 (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
@@ -783,10 +824,30 @@ fn open_profile(op: &ProfileOp, radius: f64, env: &JobEnv, cancel: &CancelToken)
         Side::Inside => -1.,
         Side::On => 0.,
     };
-    let mut points = match offset_open_chain(&source, sign * (radius + op.offset)) {
+    let mut points = match offset_open_chain_with_join(
+        &source,
+        sign * (radius + op.offset),
+        op.passes.outer_corner.join(),
+    ) {
         Ok(p) => p,
         Err(e) => return fail(&e),
     };
+    let distance = op.passes.tangential_extension_distance;
+    if distance > 0. {
+        let n = points.len();
+        let a = unit(points[1].x - points[0].x, points[1].y - points[0].y);
+        let b = unit(
+            points[n - 1].x - points[n - 2].x,
+            points[n - 1].y - points[n - 2].y,
+        );
+        let start = Point::new(points[0].x - a.0 * distance, points[0].y - a.1 * distance);
+        let end = Point::new(
+            points[n - 1].x + b.0 * distance,
+            points[n - 1].y + b.1 * distance,
+        );
+        points.insert(0, start);
+        points.push(end);
+    }
     let material_right = op.clearing.climb == (env.spindle == SpindleDir::Cw);
     let reverse = match op.side {
         Side::Outside | Side::On => !material_right,
@@ -3440,6 +3501,84 @@ mod tests {
                 .all(|p| p.z == 5. && (p.y - expected_y).abs() < 1e-9));
             assert_eq!(retracts[0].x, cuts[0].x);
         }
+    }
+
+    #[test]
+    fn open_profile_rolls_around_outer_corners_at_each_depth() {
+        for (side, chain, corner) in [
+            (
+                Side::Outside,
+                vec![
+                    Point::new(10., 10.),
+                    Point::new(30., 10.),
+                    Point::new(30., -10.),
+                ],
+                Point::new(30., 10.),
+            ),
+            (
+                Side::Inside,
+                vec![
+                    Point::new(10., 10.),
+                    Point::new(30., 10.),
+                    Point::new(30., 30.),
+                ],
+                Point::new(30., 10.),
+            ),
+        ] {
+            let mut op = outside_rough_op(0.);
+            op.closed = false;
+            op.chain = Contour::new(chain);
+            op.side = side;
+            op.stepover = 0.;
+            op.depth = 2.;
+            op.stepdown = 1.;
+            op.lead_in = Lead::None;
+            op.lead_out = Lead::None;
+            let round = run_outside_rough(op.clone());
+            assert!(!round.has_errors(), "{:?}", round.diagnostics);
+            let arcs: Vec<_> = round
+                .program
+                .steps
+                .iter()
+                .filter_map(|s| match s {
+                    Step::Arc {
+                        center, end, tag, ..
+                    } if tag.kind == MoveKind::Cutting => Some((center, end)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                arcs.len(),
+                2,
+                "one corner arc at each depth: {:#?}",
+                round.program.steps
+            );
+            for (center, end) in arcs {
+                assert!((center.x - corner.x).abs() < 0.02 && (center.y - corner.y).abs() < 0.02);
+                assert!(((end.x - center.x).hypot(end.y - center.y) - 3.).abs() < 0.02);
+            }
+            op.passes.outer_corner = cam_model::ProfileCorner::Sharp;
+            let sharp = run_outside_rough(op);
+            assert!(!sharp.has_errors(), "{:?}", sharp.diagnostics);
+            assert!(!sharp
+                .program
+                .steps
+                .iter()
+                .any(|s| matches!(s, Step::Arc { tag, .. } if tag.kind == MoveKind::Cutting)));
+        }
+    }
+
+    #[test]
+    fn open_inner_turn_stays_trimmed_with_round_join() {
+        let chain = [
+            Point::new(0., 0.),
+            Point::new(10., 0.),
+            Point::new(10., 10.),
+        ];
+        let points = offset_open_chain_with_join(&chain, 2., JoinStyle::Round).unwrap();
+        assert_eq!(points.len(), 3);
+        assert!((points[1].x - 8.).abs() < 1e-9 && (points[1].y - 2.).abs() < 1e-9);
+        assert!(offset_open_chain_with_join(&chain, 11., JoinStyle::Round).is_err());
     }
 
     #[test]

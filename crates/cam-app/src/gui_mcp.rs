@@ -1,9 +1,13 @@
-//! Stdio runs on a worker; every desktop command executes on the iced event loop.
+//! MCP transports run on workers; desktop commands execute on the iced event loop.
 use super::*;
+use crate::mcp::desktop_link::{authenticate, new_token, Endpoint};
 use crate::mcp::Command;
 use crate::mcp::{self as api, *};
 use serde_json::{json, Value};
+use std::io::{self, BufReader};
+use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::thread::{self, JoinHandle};
 
 pub(super) struct Request {
     name: String,
@@ -11,43 +15,263 @@ pub(super) struct Request {
     reply: SyncSender<CommandResult>,
 }
 
-pub(super) fn start() -> Receiver<Request> {
+pub(super) enum DesktopMcp {
+    Stdio(Receiver<Request>),
+    Local(LocalServer),
+}
+
+pub(super) fn start() -> DesktopMcp {
     let (send, receive) = mpsc::sync_channel(1);
-    let tools = api::tools()
-        .into_iter()
-        .chain(catalog().iter().map(Command::tool))
-        .collect();
-    std::thread::spawn(move || {
-        let result = api::serve(
-            std::io::stdin().lock(),
-            std::io::stdout().lock(),
-            tools,
-            |name, arguments| {
-                let (reply, result) = mpsc::sync_channel(1);
-                send.send(Request {
-                    name: name.into(),
-                    arguments,
-                    reply,
-                })
-                .map_err(|_| "desktop session closed".to_string())?;
-                result
-                    .recv()
-                    .map_err(|_| "desktop session closed".to_string())?
-            },
-        );
+    thread::spawn(move || {
+        let result = serve_desktop(io::stdin().lock(), io::stdout().lock(), &send);
         if let Err(error) = result {
             eprintln!("OpenCAMStudio MCP: {error}");
         }
     });
-    receive
+    DesktopMcp::Stdio(receive)
+}
+
+fn serve_desktop(
+    reader: impl io::BufRead,
+    writer: impl io::Write,
+    send: &SyncSender<Request>,
+) -> io::Result<()> {
+    let tools = api::tools()
+        .into_iter()
+        .chain(catalog().iter().map(Command::tool))
+        .collect();
+    api::serve(reader, writer, tools, |name, arguments| {
+        let (reply, result) = mpsc::sync_channel(1);
+        send.send(Request {
+            name: name.into(),
+            arguments,
+            reply,
+        })
+        .map_err(|_| "desktop session closed".to_string())?;
+        result
+            .recv()
+            .map_err(|_| "desktop session closed".to_string())?
+    })
+}
+
+pub(super) struct LocalServer {
+    listener: TcpListener,
+    port: u16,
+    token: String,
+    send: SyncSender<Request>,
+    receive: Receiver<Request>,
+    connection: Option<(TcpStream, JoinHandle<()>)>,
+    _endpoint_file: tempfile::NamedTempFile,
+}
+
+impl LocalServer {
+    fn start(directory: &Path) -> io::Result<Self> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        listener.set_nonblocking(true)?;
+        let port = listener.local_addr()?.port();
+        let (send, receive) = mpsc::sync_channel(1);
+        let endpoint = Endpoint {
+            port,
+            token: new_token()?,
+        };
+        let endpoint_file = endpoint.publish(directory)?;
+        Ok(Self {
+            listener,
+            port,
+            token: endpoint.token,
+            send,
+            receive,
+            connection: None,
+            _endpoint_file: endpoint_file,
+        })
+    }
+
+    fn accept(&mut self) -> io::Result<()> {
+        if self
+            .connection
+            .as_ref()
+            .is_some_and(|(_, worker)| !worker.is_finished())
+        {
+            return Ok(());
+        }
+        self.connection = None;
+        let stream = match self.listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::Interrupted
+                        | io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                return Ok(())
+            }
+            Err(error) => return Err(error),
+        };
+        stream.set_nonblocking(false)?;
+        let socket = stream.try_clone()?;
+        let send = self.send.clone();
+        let token = self.token.clone();
+        let worker = thread::Builder::new()
+            .name("mcp-desktop".into())
+            .spawn(move || {
+                if authenticate(&stream, &token).is_ok() {
+                    let _ = serve_desktop(BufReader::new(&stream), &stream, &send);
+                }
+                // Wake the client even while the GUI still owns its socket handle.
+                let _ = stream.shutdown(Shutdown::Both);
+            })?;
+        self.connection = Some((socket, worker));
+        Ok(())
+    }
+
+    pub(super) fn port(&self) -> u16 {
+        self.port
+    }
+
+    fn configuration(&self) -> io::Result<String> {
+        let executable = std::env::current_exe()?
+            .with_file_name(format!("opencamstudio-mcp{}", std::env::consts::EXE_SUFFIX));
+        #[cfg(target_os = "linux")]
+        let (executable, environment) = {
+            if let Some(image) = std::env::var_os("APPIMAGE")
+                .map(PathBuf::from)
+                .filter(|path| path.is_file())
+            {
+                // Launch the AppImage itself. Its mount path changes each time.
+                (image, None)
+            } else {
+                let environment = executable
+                    .ancestors()
+                    .nth(3)
+                    .filter(|path| path.join("AppRun").is_file())
+                    .and_then(|path| {
+                        path.join("usr/lib")
+                            .to_str()
+                            .map(|p| json!({"LD_LIBRARY_PATH": p}))
+                    });
+                (executable, environment)
+            }
+        };
+        let command = executable.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the executable path is not UTF-8",
+            )
+        })?;
+        let server = json!({"command": command, "args": ["--mcp-connect"]});
+        #[cfg(target_os = "linux")]
+        let server = {
+            let mut server = server;
+            if let Some(environment) = environment {
+                server["env"] = environment;
+            }
+            server
+        };
+        Ok(serde_json::to_string_pretty(
+            &json!({"mcpServers": {"opencamstudio": server}}),
+        )?)
+    }
+}
+
+impl Drop for LocalServer {
+    fn drop(&mut self) {
+        if let Some((stream, _)) = &self.connection {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
 }
 
 impl App {
+    pub(super) fn restore_local_mcp(&mut self) {
+        if !self.settings.mcp_enabled {
+            return;
+        }
+        match settings_path().and_then(|path| self.restore_local_mcp_from(&path)) {
+            Ok(()) => {}
+            Err(error) => {
+                let message = format!("Could not start MCP: {error}");
+                self.status = message.clone();
+                self.mcp_feedback = Some(message);
+                self.sync_output();
+            }
+        }
+    }
+
+    fn restore_local_mcp_from(&mut self, path: &Path) -> io::Result<()> {
+        if self.settings.mcp_enabled && self.mcp.is_none() {
+            self.mcp = Some(DesktopMcp::Local(LocalServer::start(config_directory(
+                path,
+            )?)?));
+        }
+        Ok(())
+    }
+
+    pub(super) fn save_preferences(&mut self, settings: crate::Settings) -> io::Result<()> {
+        self.save_preferences_to(settings, &settings_path()?)
+    }
+
+    pub(super) fn save_preferences_to(&mut self, settings: crate::Settings, path: &Path) -> io::Result<()> {
+        let directory = config_directory(path)?;
+        std::fs::create_dir_all(directory)?;
+        let pending = tempfile::NamedTempFile::new_in(directory)?;
+        settings.save_to(pending.path())?;
+        let mcp_changed = settings.mcp_enabled != self.settings.mcp_enabled;
+        let server = if mcp_changed && settings.mcp_enabled && self.mcp.is_none() {
+            Some(LocalServer::start(directory)?)
+        } else {
+            None
+        };
+        pending.persist(path)?;
+        self.settings = settings;
+        if mcp_changed {
+            self.mcp_feedback = None;
+            if let Some(server) = server {
+                self.mcp = Some(DesktopMcp::Local(server));
+            } else if !self.settings.mcp_enabled && matches!(self.mcp, Some(DesktopMcp::Local(_))) {
+                self.mcp = None;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn copy_local_mcp_configuration(&mut self) -> iced::Task<Message> {
+        if let Some(DesktopMcp::Local(server)) = &self.mcp {
+            match server.configuration() {
+                Ok(config) => {
+                    self.mcp_feedback = Some("Client configuration copied.".into());
+                    return iced::clipboard::write(config);
+                }
+                Err(error) => {
+                    self.mcp_feedback =
+                        Some(format!("Could not create client configuration: {error}"));
+                }
+            }
+        }
+        iced::Task::none()
+    }
+
     pub(super) fn poll_mcp(&mut self) -> iced::Task<Message> {
-        let request = match self.mcp.as_ref().map(Receiver::try_recv) {
-            Some(Ok(request)) => request,
-            Some(Err(TryRecvError::Disconnected)) => return iced::exit(),
-            _ => return iced::Task::none(),
+        let request = match &mut self.mcp {
+            Some(DesktopMcp::Stdio(receive)) => match receive.try_recv() {
+                Err(TryRecvError::Disconnected) => return iced::exit(),
+                result => result,
+            },
+            Some(DesktopMcp::Local(server)) => {
+                if let Err(error) = server.accept() {
+                    let message = format!("Local MCP stopped: {error}");
+                    self.status = message.clone();
+                    self.mcp_feedback = Some(message);
+                    self.mcp = None;
+                    return iced::Task::none();
+                }
+                server.receive.try_recv()
+            }
+            None => return iced::Task::none(),
+        };
+        let Ok(request) = request else {
+            return iced::Task::none();
         };
         let result = self.mcp_call(&request.name, request.arguments);
         if let Err(error) = &result {
@@ -56,7 +280,7 @@ impl App {
         let _ = request.reply.send(result);
         self.sync_output();
         self.sync_inspector_visibility();
-        iced::Task::none()
+        std::mem::take(&mut self.mcp_task)
     }
 
     fn mcp_call(&mut self, name: &str, args: Value) -> CommandResult {
@@ -177,21 +401,22 @@ impl App {
     }
 
     fn apply_mcp_preferences(&mut self) {
-        self.show_stock = self.settings.view.show_stock;
-        self.show_gizmo = self.settings.view.show_gizmo;
-        self.show_origin = self.settings.view.show_origin;
-        self.show_envelope = self.settings.view.show_envelope;
-        self.tooltips = self.settings.view.tooltips;
-        self.gizmo_size = self.settings.view.gizmo_size;
-        self.snaps = self.settings.snapping.default_snaps.clone();
-        self.project_px = self.settings.panes.project_px;
-        self.inspector_px = self.settings.panes.inspector_px;
-        self.output_px = self.settings.panes.output_px;
+        self.sync_workspace_preferences();
         self.apply_fixed_layout();
         if let Some(player) = &mut self.simulation {
             player.configure(&self.settings.simulation, self.settings.view.stock_color);
         }
     }
+}
+
+fn settings_path() -> io::Result<PathBuf> {
+    crate::settings_path().ok_or_else(|| io::Error::other("settings path unavailable"))
+}
+
+fn config_directory(settings: &Path) -> io::Result<&Path> {
+    settings
+        .parent()
+        .ok_or_else(|| io::Error::other("settings directory unavailable"))
 }
 
 macro_rules! desktop_catalog {
@@ -274,7 +499,7 @@ desktop_catalog! {
             "toggle_transparent_stock"=>Message::ToggleTransparentStock,"toggle_origin"=>Message::ToggleShowOrigin,
             "toggle_envelope"=>Message::ToggleEnvelope,"toggle_gizmo"=>Message::ToggleGizmo,"toggle_tooltips"=>Message::ToggleTooltips,
             "toggle_snapping"=>Message::ToggleSnapping,"toggle_feature_highlights"=>Message::ToggleFeatureHighlights,
-            "show_all_models"=>Message::CadShowAll,"show_preferences"=>Message::ShowPrefs,"close_preferences"=>Message::ClosePrefs,
+            "show_all_models"=>Message::CadShowAll,"show_preferences"=>Message::ShowPrefs,"close_preferences"=>Message::Preferences(preferences::Edit::Cancel),
             "show_license"=>Message::ShowLicense,"close_license"=>Message::CloseLicense,"clear_output"=>Message::OutputClear,
             "apply_editor"=>if c.pattern_draft.is_some(){Message::PatternCommit}else if c.setup_draft.is_some(){Message::SetupCommit}else{Message::Apply},
             "cancel_editor"=>{
@@ -288,7 +513,12 @@ desktop_catalog! {
             },
             _=>return Err("unknown desktop command".into()),
         };
-        let _=c.update(message); Ok(desktop_state(c))
+        let window_command = matches!(message, Message::ShowPrefs | Message::Preferences(_));
+        let task = c.update(message);
+        if window_command {
+            c.mcp_task = task;
+        }
+        Ok(desktop_state(c))
     }
     desktop_simulation [false] "Control stock-removal playback. Open after a completed run; seek uses seconds and speed is 0.25..10." {
         "action":choice(&["open","close","play","pause","start","end","previous_point","next_point","previous_operation","next_operation","seek","speed"]),
@@ -393,7 +623,7 @@ mod tests {
         let (mut app, _) = App::new();
         let (send, receive) = mpsc::sync_channel(1);
         let (reply, result) = mpsc::sync_channel(1);
-        app.mcp = Some(receive);
+        app.mcp = Some(DesktopMcp::Stdio(receive));
         send.send(Request {
             name: "add_setup".into(),
             arguments: json!({}),
@@ -403,6 +633,118 @@ mod tests {
         let _ = app.poll_mcp();
         assert!(result.recv().unwrap().is_ok());
         assert_eq!(app.controller.setups().len(), 1);
+    }
+
+    #[test]
+    fn local_mcp_edits_the_open_project_and_restores_the_saved_preference() {
+        use std::io::{BufRead, Read, Write};
+        use std::time::{Duration, Instant};
+
+        let scratch = crate::config::tests::Scratch::new("mcp-preference");
+        let settings_path = scratch.file("settings.json");
+        let (mut app, _) = App::new();
+        app.controller.add_setup();
+        let original = app.controller.inspection_setup().name.clone();
+        assert!(app.mcp.is_none());
+        app.settings.mcp_enabled = false;
+        let settings = crate::Settings {
+            mcp_enabled: true,
+            ..app.settings.clone()
+        };
+        app.save_preferences_to(settings, &settings_path).unwrap();
+        let Some(DesktopMcp::Local(server)) = &app.mcp else {
+            panic!("could not enable MCP: {:?}", app.mcp_feedback);
+        };
+        let address = (Ipv4Addr::LOCALHOST, server.port());
+        let token = server.token.clone();
+        let client_config = server.configuration().unwrap();
+        let endpoint = Endpoint::discover(&scratch.0).unwrap();
+        assert_eq!(endpoint.port, address.1);
+        assert!(endpoint.token == token);
+        let timeout = Duration::from_secs(5);
+
+        let mut rejected = TcpStream::connect(address).unwrap();
+        rejected.set_read_timeout(Some(timeout)).unwrap();
+        writeln!(rejected, "{}", "x".repeat(token.len())).unwrap();
+        let _ = app.update(Message::PollMcp);
+        assert_eq!(rejected.read(&mut [0]).unwrap(), 0);
+
+        let mut client = TcpStream::connect(address).unwrap();
+        client.set_read_timeout(Some(timeout)).unwrap();
+        writeln!(client, "{token}").unwrap();
+        for message in [
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                "protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{}
+            }}),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                "name":"update_setup","arguments":{"patch":{"name":"Attached client"}}
+            }}),
+        ] {
+            writeln!(client, "{message}").unwrap();
+        }
+        let deadline = Instant::now() + timeout;
+        while app.controller.inspection_setup().name != "Attached client" {
+            assert!(
+                Instant::now() < deadline,
+                "the MCP edit never reached the desktop"
+            );
+            let _ = app.update(Message::PollMcp);
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let mut reader = BufReader::new(&client);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line, "OK\n");
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["id"], 1);
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).unwrap()["result"]["isError"],
+            false
+        );
+
+        app.mcp_call("undo", json!({})).unwrap();
+        assert_eq!(app.controller.inspection_setup().name, original);
+        drop(app);
+        assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+        assert!(TcpStream::connect(address).is_err());
+
+        let (mut app, _) = App::new();
+        (app.settings, _) = crate::load_settings_from(&settings_path);
+        assert!(app.settings.mcp_enabled);
+        app.restore_local_mcp_from(&settings_path).unwrap();
+        let Some(DesktopMcp::Local(server)) = &app.mcp else {
+            panic!("MCP did not start from the saved setting");
+        };
+        assert_eq!(server.configuration().unwrap(), client_config);
+        assert_ne!(server.token, token);
+        let endpoint = Endpoint::discover(&scratch.0).unwrap();
+        let address = (Ipv4Addr::LOCALHOST, endpoint.port);
+        let mut client = TcpStream::connect(address).unwrap();
+        client.set_read_timeout(Some(timeout)).unwrap();
+        writeln!(client, "{}", endpoint.token).unwrap();
+        let _ = app.update(Message::PollMcp);
+        let mut reply = [0; 3];
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"OK\n");
+
+        let settings = crate::Settings {
+            mcp_enabled: false,
+            ..app.settings.clone()
+        };
+        app.save_preferences_to(settings, &settings_path).unwrap();
+        assert!(app.mcp.is_none());
+        assert_eq!(client.read(&mut [0]).unwrap(), 0);
+        assert!(TcpStream::connect(address).is_err());
+        assert!(Endpoint::discover(&scratch.0).is_err());
+        (app.settings, _) = crate::load_settings_from(&settings_path);
+        assert!(!app.settings.mcp_enabled);
+        app.restore_local_mcp_from(&settings_path).unwrap();
+        assert!(app.mcp.is_none());
     }
 
     #[test]

@@ -14,6 +14,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[path = "gui_preferences.rs"]
+mod preferences;
+
 #[path = "gui_mcp.rs"]
 mod mcp;
 
@@ -80,6 +83,8 @@ mod setup_editor_view;
 #[path = "gui_thread_parameters.rs"]
 mod thread_parameters;
 use operation_tabs::OperationTab;
+#[path = "gui_move.rs"]
+mod move_view;
 #[path = "gui_project_tree.rs"]
 mod project_tree_view;
 use project_tree_view::{TreeDrag, TreeMessage, TreeNode};
@@ -227,6 +232,7 @@ enum Icon {
     Carve,
     Adaptive,
     Parallel,
+    Spiral,
     Face,
     NewTool,
     Materials,
@@ -253,7 +259,7 @@ impl Icon {
     /// Every icon, so tests can sweep the whole bundled set. Kept beside the enum:
     /// a variant added without a line here fails `every_icon_is_listed_in_all`.
     #[cfg(test)]
-    const ALL: [Icon; 40] = [
+    const ALL: [Icon; 41] = [
         Icon::New,
         Icon::Open,
         Icon::Save,
@@ -276,6 +282,7 @@ impl Icon {
         Icon::Carve,
         Icon::Adaptive,
         Icon::Parallel,
+        Icon::Spiral,
         Icon::Face,
         Icon::NewTool,
         Icon::Materials,
@@ -320,6 +327,7 @@ impl Icon {
             Icon::Chamfer => include_bytes!("../assets/icons/chamfer.svg"),
             Icon::Engrave => include_bytes!("../assets/icons/engrave.svg"),
             Icon::Carve => include_bytes!("../assets/icons/carve.svg"),
+            Icon::Spiral => include_bytes!("../assets/icons/spiral.svg"),
             Icon::Parallel => include_bytes!("../assets/icons/parallel.svg"),
             Icon::Adaptive => include_bytes!("../assets/icons/adaptive.svg"),
             Icon::Face => include_bytes!("../assets/icons/face.svg"),
@@ -379,6 +387,7 @@ impl Icon {
                             with a V-bit. Unlike engraving, the tool never touches the boundary: its \
                             flanks land on it, and the depth follows from the shape's own width."
             }
+            Icon::Spiral => "Add a 3D Spiral finishing operation for selected CAD bodies or faces.",
             Icon::Parallel => "Add a 3D Parallel or sampled Scallop finishing operation for selected CAD bodies or faces.",
             Icon::Adaptive => "Add a 3D Adaptive Clearing operation for selected CAD bodies or faces.",
             Icon::Face => "Add a Face operation — skim the top of the stock flat.",
@@ -450,15 +459,20 @@ const SAMPLE_DXF: &str = "\
 
 /// Launch the desktop application.
 pub fn run() -> iced::Result {
-    run_app(App::new)
+    run_app(|| {
+        let (mut app, task) = App::new();
+        app.restore_local_mcp();
+        (app, task)
+    })
 }
 
 /// Open a saved setup/project before launching the desktop application.
 /// Load errors are returned before creating a window so automation can detect them.
 pub fn run_with_setup(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let initial = App::new_with_setup(path)
+    let (mut app, task) = App::new_with_setup(path)
         .map_err(|error| format!("Could not load setup {}: {error}", path.display()))?;
-    let initial = std::cell::RefCell::new(Some(initial));
+    app.restore_local_mcp();
+    let initial = std::cell::RefCell::new(Some((app, task)));
     run_app(move || initial.borrow_mut().take().expect("application boots once"))?;
     Ok(())
 }
@@ -476,16 +490,44 @@ pub fn run_with_mcp(path: Option<&Path>) -> Result<(), Box<dyn std::error::Error
 }
 
 fn run_app(boot: impl iced::application::BootFn<App, Message> + 'static) -> iced::Result {
-    iced::application(boot, App::update, App::view)
-        .title(App::window_title)
-        .theme(theme)
-        .subscription(App::subscription)
-        .exit_on_close_request(false)
-        .run()
+    iced::daemon(
+        move || {
+            let (mut app, task) = boot.boot();
+            let (id, open) = iced::window::open(iced::window::Settings {
+                exit_on_close_request: false,
+                ..Default::default()
+            });
+            app.main_window = Some(id);
+            (app, open.discard().chain(task))
+        },
+        App::update,
+        App::window_view,
+    )
+    .title(App::title_for_window)
+    .theme(|app: &App, id| {
+        if app.is_preferences_window(id) {
+            preferences::theme()
+        } else {
+            iced::Theme::Dark
+        }
+    })
+    .subscription(App::subscription)
+    .run()
 }
 
-fn theme(_state: &App) -> iced::Theme {
-    iced::Theme::Dark
+fn window_events(
+    window: iced::window::Id,
+    handle: fn(iced::Event, iced::event::Status) -> Option<Message>,
+) -> iced::Subscription<Message> {
+    iced::event::listen_with(|event, status, id| Some((id, event, status)))
+        .with((window, handle))
+        .filter_map(|((window, handle), (id, event, status))| {
+            if window == id {
+                handle(event, status)
+            } else {
+                None
+            }
+        })
 }
 
 /// Prompt (native dialog) for an existing file matching `exts`, returning its path.
@@ -1280,6 +1322,14 @@ enum Field {
     /// Drill dwell at the hole bottom (seconds); 0 = no dwell.
     Dwell,
     Stepdown,
+    SpiralAxialOffset,
+    SpiralStepdowns,
+    SpiralStepover,
+    SpiralInnerLimit,
+    SpiralOuterLimit,
+    SpiralFromSlope,
+    SpiralToSlope,
+    SpiralStayDownDistance,
     ParallelStepover,
     ParallelAngle,
     ScallopSafeDistance,
@@ -1349,8 +1399,8 @@ enum Field {
     FaceStartOffset,
     /// Face: pass overlap as a percentage of the tool diameter.
     Overlap,
-    /// Absolute overlap between concentric pocket passes.
-    PocketOverlap,
+    /// Maximum horizontal spacing between concentric pocket passes.
+    PocketStepover,
     FaceOverlap,
     /// Face: overshoot past the stock edge before the turnaround (mm).
     FaceOvershoot,
@@ -1469,6 +1519,14 @@ impl Field {
             Field::Profile(n) => n.label(),
             Field::PocketFinish(n) => n.label(),
             Field::Stepdown => "Stepdown (mm)",
+            Field::SpiralAxialOffset => "Axial offset (mm)",
+            Field::SpiralStepdowns => "Number of stepdowns",
+            Field::SpiralStepover => "Stepover (mm)",
+            Field::SpiralInnerLimit => "Inner limit (mm)",
+            Field::SpiralOuterLimit => "Outer limit (mm)",
+            Field::SpiralFromSlope => "From slope (deg)",
+            Field::SpiralToSlope => "To slope (deg)",
+            Field::SpiralStayDownDistance => "Maximum stay-down distance (mm)",
             Field::ParallelStepover => "Stepover (mm)",
             Field::ParallelAngle => "Pass angle (deg)",
             Field::ScallopSafeDistance => "Safe distance (mm)",
@@ -1502,6 +1560,7 @@ impl Field {
             Field::ChamferTipOffset => "Chamfer tip offset (mm)",
             Field::ChamferStep => "Step (mm, 0=one pass)",
             Field::ContourRoughStepover => "Maximum stepover (mm)",
+            Field::PocketStepover => "Maximum Stepover (mm)",
             Field::ContourRoughCount => "Number of stepovers",
             Field::ContourRoughSmoothing => "Smoothing deviation (mm)",
             Field::LeadInSize => "Lead-in size (mm)",
@@ -1509,7 +1568,7 @@ impl Field {
             Field::LeadOverlap => "Lead overlap (mm)",
             Field::FaceStartOffset => "Start offset (mm)",
             Field::Overlap => "Overlap (%)",
-            Field::PocketOverlap | Field::FaceOverlap => "Overlap (mm)",
+            Field::FaceOverlap => "Overlap (mm)",
             Field::FaceOvershoot => "Overshoot (mm)",
             Field::Engagement => "Adaptive stepover (mm, 0=off)",
             Field::RingStep => "Ring step (mm, 0=auto)",
@@ -1552,6 +1611,14 @@ impl Field {
             Field::BoreLeadRadius => "Radius of the horizontal tangent lead. For holes it is limited to half the tool-centre orbit; for bosses the safe distance can increase it.",
 
             Field::OperationTop => "Absolute cutting top in setup Z, in millimetres.",
+            Field::SpiralAxialOffset => "Thickness above the final surface to remove across multiple passes.",
+            Field::SpiralStepdowns => "Enter zero to calculate the pass count from the maximum stepdown.",
+            Field::SpiralStepover => "Horizontal radial spacing between turns or concentric passes.",
+            Field::SpiralInnerLimit => "Minimum radius measured from the spiral center.",
+            Field::SpiralOuterLimit => "Maximum radius measured from the spiral center. Zero uses the machining boundary.",
+            Field::SpiralFromSlope => "Minimum selected surface inclination from horizontal.",
+            Field::SpiralToSlope => "Maximum selected surface inclination from horizontal.",
+            Field::SpiralStayDownDistance => "Maximum horizontal length for a checked low link. Zero uses clearance for separated passes.",
             Field::ParallelStepover => "Target distance between finishing passes, in millimetres. Scallop uses approximate surface distance.",
             Field::ParallelAngle => "Direction of the cutting rows measured counterclockwise from setup X, in degrees.",
             Field::ScallopSafeDistance => "Vertical clearance above the model for minimum retraction. Unsafe links return to full clearance.",
@@ -1815,7 +1882,7 @@ impl Field {
                 "Height of the first facing cut above the drawing reference (mm) — start \
                  above the true top to skim scale, or at 0 to cut to size."
             }
-            Field::PocketOverlap => "Distance shared by neighboring concentric cutting passes, in millimetres.",
+            Field::PocketStepover => "Maximum horizontal distance between adjacent concentric roughing passes. Enter a value up to the tool diameter.",
             Field::FaceOverlap => "Distance shared by neighboring facing passes, in millimetres.",
             Field::Overlap => {
                 "How much each facing pass overlaps the previous, as a percent of tool \
@@ -2188,7 +2255,9 @@ struct App {
     controller: AppController,
     pending_discard: Option<DiscardAction>,
     discarding_confirmed: bool,
-    mcp: Option<std::sync::mpsc::Receiver<mcp::Request>>,
+    mcp: Option<mcp::DesktopMcp>,
+    mcp_feedback: Option<String>,
+    mcp_task: iced::Task<Message>,
     viewport_cache: std::cell::RefCell<Option<(workspace_view::ViewportKey, Viewport)>>,
     profile_contour_cache: std::cell::RefCell<profile_sides::ProfileContourCache>,
     cad_scene_cache: std::cell::RefCell<Option<(workspace_view::CadSceneKey, Arc<CadScene>)>>,
@@ -2199,6 +2268,7 @@ struct App {
     /// Shared transactional editor for setup, stock and postprocess settings. The
     /// draft survives tab changes; only the footer can commit or discard it.
     setup_draft: Option<cam_model::Setup>,
+    move_draft: Option<move_view::MoveDraft>,
     pattern_draft: Option<PatternDraft>,
     pattern_tab: pattern_editor_view::PatternTab,
     setup_model_selection: Option<InstanceId>,
@@ -2283,9 +2353,8 @@ struct App {
     project_px: f32,
     inspector_px: f32,
     output_px: f32,
-    /// The preferences panel is open.
-    show_prefs: bool,
-    show_stock_palette: bool,
+    main_window: Option<iced::window::Id>,
+    preferences: Option<preferences::Preferences>,
     /// Every machine this installation knows about. The **active** one is mirrored into
     /// the controller (which gates exports against it); this is the set to pick from.
     machines: crate::MachineLibrary,
@@ -2746,6 +2815,13 @@ enum BoreOption {
 
 #[derive(Debug, Clone)]
 enum Message {
+    MoveOpen(TreeNode),
+    MoveValue(usize, String),
+    MoveHandleStart(usize, [f64; 9], [f64; 3]),
+    MoveHandleDelta(f64),
+    MoveHandleInput(String),
+    MoveCancel,
+    MoveApply,
     Rotary(rotary_view::Action),
     PollMcp,
     TraverseFocus(bool),
@@ -3073,30 +3149,16 @@ enum Message {
     /// A continuous control has settled (slider released) — write preferences now
     /// rather than on every intermediate value.
     SettingsSettled,
-    SetNumberDecimals(u8),
     /// Make this machine the active one — and adopt its control with it.
     ActiveMachineChanged(String),
     /// Add a machine to the library: a copy of the active one, ready to edit.
     NewMachine,
     /// Remove the active machine (never the last).
     DeleteMachine,
-    /// Open / close the preferences panel.
     ShowPrefs,
-    ClosePrefs,
-    /// Pickbox aperture, logical px. The object-snap catch distance follows it.
-    SetPickbox(f32),
-    /// Snap marker size, as a multiple of the catch aperture.
-    SetMarkerScale(f32),
-    /// The smallest `pane` may be dragged to, logical px.
-    /// Workpiece-origin marker size, as a multiple of the shipped size.
-    SetOriginMarker(f32),
-    /// Stock surface RGB channel, in the range 0–1.
-    ToggleStockPalette,
-    SetStockColor([f32; 3]),
-    SetStockTransparency(f32),
+    Preferences(preferences::Edit),
+    ShortcutKey(Option<char>, iced::keyboard::Modifiers),
     SetSimulationAccuracy(f32),
-    /// Put every preference back to its shipped value.
-    RestoreDefaults,
     PaneResized(pane_grid::ResizeEvent),
     PaneDragged(pane_grid::DragEvent),
     /// The window was resized (tracked for pixel-accurate pane minimums).
@@ -3123,10 +3185,20 @@ enum Message {
     ClearingClimbToggled(bool),
     ParallelBothWaysToggled(bool),
     ParallelScallopToggled(bool),
+    ParallelTransitionChanged(cam_model::ParallelTransition),
     ScallopSmoothingToggled(bool),
     ScallopRetractionChanged(cam_model::ScallopRetraction),
     ScallopOrderChanged(cam_model::ScallopOrder),
-    ParallelStayDownToggled(bool),
+    SpiralModeChanged(cam_model::SpiralMode),
+    SpiralOrderChanged(cam_model::SpiralOrder),
+    SpiralMillingChanged(cam_model::SpiralMilling),
+    SpiralCutDirectionChanged(cam_model::SpiralCutDirection),
+    SpiralBoundaryChanged(cam_model::SpiralBoundary),
+    SpiralContactOnlyToggled(bool),
+    SpiralDepthsToggled(bool),
+    SpiralDepthOrderToggled(bool),
+    SpiralLinkInsideOutToggled(bool),
+    SpiralClockwiseToggled(bool),
     PocketKeepToolDownToggled(bool),
     AdaptiveClimbToggled(bool),
     AdaptiveContainmentChanged(cam_model::AdaptiveContainment),
@@ -3464,27 +3536,6 @@ impl App {
         self.operation_binding_preview = None;
         self.drawing_editing_op = None;
         self.operation_draft = self.controller.operation(id).cloned();
-        if let Some(Operation::Pocket(p)) = &mut self.operation_draft {
-            if p.clear.pocket_overlap.is_none() {
-                if let Some(tool) = self
-                    .controller
-                    .inspection_setup()
-                    .tools
-                    .iter()
-                    .find(|t| t.number == p.tool)
-                {
-                    p.clear.pocket_overlap = Some(tool.diameter * p.clear.overlap);
-                    if p.parameter_expressions
-                        .contains_key(&cam_model::OperationParameter::Overlap)
-                    {
-                        cam_model::OperationParameter::PocketOverlap.set_source(
-                            self.operation_draft.as_mut().unwrap(),
-                            "=overlap * tool_diameter / 100",
-                        );
-                    }
-                }
-            }
-        }
         self.stock_to_leave_draft = Some(self.controller.inspection_setup().stock_to_leave_for(id));
         self.stock_to_leave_initialized = self.stock_to_leave_value().enabled;
         if matches!(self.operation_draft, Some(Operation::Profile(_))) {
@@ -3857,6 +3908,8 @@ impl App {
             pending_discard: None,
             discarding_confirmed: false,
             mcp: None,
+            mcp_feedback: None,
+            mcp_task: iced::Task::none(),
             viewport_cache: Default::default(),
             profile_contour_cache: Default::default(),
             cad_scene_cache: Default::default(),
@@ -3864,6 +3917,7 @@ impl App {
             notice_queue: VecDeque::new(),
             notice_filters: [true; 3],
             status_messages: StatusMessages::default(),
+            move_draft: None,
             setup_draft: None,
             pattern_draft: None,
             pattern_tab: pattern_editor_view::PatternTab::Placement,
@@ -3937,8 +3991,8 @@ impl App {
             inspector_active: false,
             inspector_enabled: true,
             show_license: false,
-            show_prefs: false,
-            show_stock_palette: false,
+            main_window: None,
+            preferences: None,
             window: iced::Size::new(1280.0, 800.0),
             project_px: settings.panes.project_px,
             inspector_px: settings.panes.inspector_px,
@@ -4095,6 +4149,13 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> iced::Task<Message> {
+        match message {
+            Message::Preferences(edit) => return self.edit_preferences(edit),
+            Message::CloseRequested(id) if self.is_preferences_window(id) => {
+                return self.close_preferences();
+            }
+            _ => {}
+        }
         if matches!(message, Message::CadEscape) && self.operation_rename.is_some() {
             self.operation_rename = None;
             return iced::Task::none();
@@ -4124,14 +4185,38 @@ impl App {
         }
         // Handle window-manager close requests even when another editor/dialog is open.
         if let Message::CloseRequested(id) = message {
+            if self.main_window.is_some_and(|main| id != main) {
+                return iced::Task::none();
+            }
             if !self.discarding_confirmed && self.has_changes_to_discard() {
                 self.pending_discard = Some(DiscardAction::Close(id));
                 return iced::Task::none();
             }
-            return iced::window::close(id);
+            return iced::exit();
         }
         if matches!(message, Message::PollMcp) {
             return self.poll_mcp();
+        }
+        if self.move_draft.is_some()
+            && matches!(
+                &message,
+                Message::Select(_)
+                    | Message::SelectSetup(_)
+                    | Message::EditSetup(_)
+                    | Message::ClickOp(_)
+                    | Message::BeginOp(_)
+                    | Message::Undo
+                    | Message::Redo
+                    | Message::RunJob
+                    | Message::ExportNc
+                    | Message::ImportCad
+                    | Message::ReplaceCadAsset(_)
+                    | Message::RemoveCadAsset(_)
+                    | Message::MoveOpen(_)
+            )
+        {
+            self.status = "Apply or cancel the move first.".into();
+            return iced::Task::none();
         }
         if self.pattern_draft.is_some()
             && matches!(
@@ -4256,6 +4341,10 @@ impl App {
         }
         if self.tool_info.is_some() && matches!(message, Message::CadEscape) {
             self.tool_info = None;
+            return iced::Task::none();
+        }
+        if self.move_draft.is_some() && matches!(message, Message::CadEscape) {
+            self.cancel_move();
             return iced::Task::none();
         }
         if self.tool_info.is_some()
@@ -4842,6 +4931,7 @@ impl App {
                 let parsed = self
                     .fields
                     .iter()
+                    .filter(|(&field, _)| field != Field::PocketStepover)
                     .filter_map(|(f, s)| {
                         s.parse::<f64>()
                             .ok()
@@ -4875,6 +4965,7 @@ impl App {
                 let parsed = self
                     .fields
                     .iter()
+                    .filter(|(&field, _)| field != Field::PocketStepover)
                     .filter_map(|(f, s)| {
                         s.parse::<f64>()
                             .ok()
@@ -4896,6 +4987,7 @@ impl App {
                 let parsed = self
                     .fields
                     .iter()
+                    .filter(|(&field, _)| field != Field::PocketStepover)
                     .filter_map(|(f, s)| {
                         s.parse::<f64>()
                             .ok()
@@ -5068,6 +5160,27 @@ impl App {
                 self.drawing_editing_op = None;
                 self.status = "Geometry selection cancelled; other draft edits retained.".into();
             }
+            Message::MoveOpen(node) => self.open_move(node),
+            Message::MoveValue(index, value) => {
+                if let Some(draft) = &mut self.move_draft {
+                    draft.values[index] = value;
+                    draft.clear_handle();
+                }
+            }
+            Message::MoveHandleStart(index, base, direction) => {
+                self.start_move_handle(index, base, direction)
+            }
+            Message::MoveHandleDelta(value) => self.set_move_handle(value, format!("{value:.2}")),
+            Message::MoveHandleInput(value) => {
+                if let Ok(number) = value.trim().parse::<f64>() {
+                    if number.is_finite() {
+                        self.set_move_handle(number, value.clone());
+                    }
+                }
+                self.set_move_handle_text(value);
+            }
+            Message::MoveCancel => self.cancel_move(),
+            Message::MoveApply => self.apply_move(),
             Message::Tree(message) => return self.update_tree(message),
             Message::ShowStatus(target) => {
                 let fingerprints = self.controller.current_toolpath_fingerprints();
@@ -6769,7 +6882,7 @@ impl App {
                 if self.cad_filter != filter
                     && !matches!(
                         self.geometry_operation_kind(),
-                        Some(OpKind::Adaptive | OpKind::Parallel)
+                        Some(OpKind::Adaptive | OpKind::Parallel | OpKind::Spiral)
                     )
                 {
                     self.remove_operation_geometry(None);
@@ -7142,7 +7255,8 @@ impl App {
                             }
                         }
                         cam_model::ExtractionRecipe::AdaptiveClearing
-                        | cam_model::ExtractionRecipe::ParallelFinishing => {
+                        | cam_model::ExtractionRecipe::ParallelFinishing
+                        | cam_model::ExtractionRecipe::SpiralFinishing => {
                             match refs.first().map(|r| r.kind) {
                                 Some(EntityKind::Face) => CadFilter::Face,
                                 _ => CadFilter::Body,
@@ -7406,15 +7520,15 @@ impl App {
                 self.cad_filter_explicit = false;
                 self.operation_tools.clear();
                 self.operation_tab = OperationTab::Tool;
-                if matches!(kind, OpKind::Adaptive | OpKind::Parallel)
-                    && self.controller.geometry_state().instances.is_empty()
-                {
+                let surface = matches!(kind, OpKind::Adaptive | OpKind::Parallel | OpKind::Spiral);
+                if surface && self.controller.geometry_state().instances.is_empty() {
                     self.status =
-                        "Import a solid CAD model before creating 3D Adaptive Clearing.".into();
+                        "Import a solid CAD model before creating a 3D surface operation.".into();
                     return iced::Task::none();
                 }
                 if !self.controller.geometry_state().instances.is_empty()
-                    && (self.controller.regions().is_empty()
+                    && (surface
+                        || self.controller.regions().is_empty()
                         || !self.controller.cad_selection().is_empty())
                 {
                     self.cancel_setup_picks();
@@ -7436,16 +7550,20 @@ impl App {
                     self.cad_tool_pick = tool.map(|tool| tool.number);
                     self.cad_inspecting = false;
                     self.cad_editing_op = None;
-                    self.cad_filter = if matches!(kind, OpKind::Adaptive | OpKind::Parallel) {
-                        match self.controller.cad_selection().first().map(|r| r.kind) {
-                            Some(EntityKind::Face) => CadFilter::Face,
-                            _ => CadFilter::Body,
-                        }
-                    } else if matches!(kind, OpKind::Profile | OpKind::Chamfer | OpKind::Engrave) {
-                        CadFilter::Loop
-                    } else {
-                        CadFilter::Face
-                    };
+                    self.cad_filter =
+                        if matches!(kind, OpKind::Adaptive | OpKind::Parallel | OpKind::Spiral) {
+                            match self.controller.cad_selection().first().map(|r| r.kind) {
+                                Some(EntityKind::Face) => CadFilter::Face,
+                                _ => CadFilter::Body,
+                            }
+                        } else if matches!(
+                            kind,
+                            OpKind::Profile | OpKind::Chamfer | OpKind::Engrave
+                        ) {
+                            CadFilter::Loop
+                        } else {
+                            CadFilter::Face
+                        };
                     self.controller.cancel_operation();
                     self.seed_creation_editor(kind);
                     self.status = "Choose a tool, then select geometry on the Geometry tab.".into();
@@ -8008,12 +8126,6 @@ impl App {
                 // decision. `SettingsSettled` fires on release.
                 self.gizmo_size = v.clamp(GIZMO_SIZE_MIN, GIZMO_SIZE_MAX)
             }
-            Message::SetNumberDecimals(digits) => {
-                self.settings.number_decimals = digits.min(8);
-                self.edited_preset_input = None;
-                self.edited_tool_input = None;
-                self.remember();
-            }
             Message::SettingsSettled => {
                 if self
                     .controller
@@ -8072,23 +8184,22 @@ impl App {
                     self.status = format!("Machine: {}.", self.active_machine);
                 }
             }
-            Message::ShowPrefs => self.show_prefs = true,
-            Message::ClosePrefs => {
-                self.show_prefs = false;
-                self.show_stock_palette = false;
-                self.remember();
-            }
-            Message::SetPickbox(v) => {
-                let (lo, hi) = crate::PICKBOX_RANGE;
-                self.settings.snapping.pickbox_px = v.clamp(lo, hi);
-            }
-            Message::SetMarkerScale(v) => {
-                let (lo, hi) = crate::MARKER_SCALE_RANGE;
-                self.settings.snapping.marker_scale = v.clamp(lo, hi);
-            }
-            Message::SetOriginMarker(v) => {
-                let (lo, hi) = crate::ORIGIN_MARKER_RANGE;
-                self.settings.view.origin_marker_scale = v.clamp(lo, hi);
+            Message::ShowPrefs => return self.open_preferences(),
+            Message::Preferences(_) => unreachable!(),
+            Message::ShortcutKey(key, modifiers) => {
+                if let Some(binding) = shortcut_binding(key, modifiers) {
+                    if let Some(id) = shortcut_for_binding(&self.settings, &binding) {
+                        if let Some(action) = shortcut_action(id) {
+                            if !matches!(action, Message::BeginOp(_))
+                                || (self.controller.has_geometry()
+                                    && !self.controller.setups().is_empty()
+                                    && !self.library.tools.is_empty())
+                            {
+                                return self.update(action);
+                            }
+                        }
+                    }
+                }
             }
             Message::SetSimulationAccuracy(value) => {
                 let (lo, hi) = crate::SIMULATION_ACCURACY_RANGE;
@@ -8096,49 +8207,6 @@ impl App {
                 if let Some(player) = &mut self.simulation {
                     player.options.accuracy = self.settings.simulation.accuracy;
                 }
-            }
-            Message::ToggleStockPalette => self.show_stock_palette = !self.show_stock_palette,
-            Message::SetStockColor(color) => {
-                self.settings.view.stock_color = color;
-                if let Some(player) = &mut self.simulation {
-                    player.configure(&self.settings.simulation, color);
-                }
-                self.show_stock_palette = false;
-                self.remember();
-            }
-            Message::SetStockTransparency(value) => {
-                self.settings.view.stock_transparency = value.clamp(0.0, 1.0);
-            }
-            Message::RestoreDefaults => {
-                // The only escape from a layout the user cannot otherwise undo, so it
-                // resets *everything* — pane sizes and minimums included — and applies
-                // at once rather than behind a confirm they might not be able to reach.
-                self.settings = crate::Settings::default();
-                self.restore_tool_table_preferences();
-                self.edited_preset_input = None;
-                self.edited_tool_input = None;
-                let s = &self.settings;
-                self.show_stock = s.view.show_stock;
-                self.show_gizmo = s.view.show_gizmo;
-                self.show_origin = s.view.show_origin;
-                self.tooltips = s.view.tooltips;
-                self.gizmo_size = s.view.gizmo_size;
-                self.snaps = s.snapping.default_snaps.clone();
-                // origin_marker_scale and the default post are read straight from
-                // `settings` wherever they are used, so resetting the struct is enough.
-                self.project_px = s.panes.project_px;
-                self.inspector_px = s.panes.inspector_px;
-                self.output_px = s.panes.output_px;
-                self.restore_pane_preferences();
-                self.apply_fixed_layout();
-                if self
-                    .controller
-                    .set_simulation_accuracy(self.settings.simulation.accuracy)
-                {
-                    self.rerun();
-                }
-                self.settings.save();
-                self.status = "Preferences restored to defaults.".to_string();
             }
             Message::PaneResized(pane_grid::ResizeEvent { split, ratio }) => {
                 let ratio = self.clamp_resize(split, ratio);
@@ -8396,19 +8464,27 @@ impl App {
                 });
                 self.refresh_operation_fields();
             }
-            Message::ScallopSmoothingToggled(on) => {
+            Message::ParallelTransitionChanged(transition) => {
                 self.edit_operation_draft(|op| {
                     if let Operation::Parallel(p) = op {
-                        p.params.scallop_smoothing = on;
+                        p.params.transition = transition;
                     }
+                });
+            }
+            Message::ScallopSmoothingToggled(on) => {
+                self.edit_operation_draft(|op| match op {
+                    Operation::Parallel(p) => p.params.scallop_smoothing = on,
+                    Operation::Spiral(p) => p.params.smoothing = on,
+                    _ => {}
                 });
                 self.refresh_operation_fields();
             }
             Message::ScallopRetractionChanged(policy) => {
-                self.edit_operation_draft(|op| {
-                    if let Operation::Parallel(p) = op {
-                        p.params.scallop_retraction = policy;
-                    }
+                self.edit_operation_draft(|op| match op {
+                    Operation::Parallel(p) if p.params.scallop => p.params.scallop_retraction = policy,
+                    Operation::Parallel(p) => p.params.retraction = policy,
+                    Operation::Spiral(p) => p.params.retraction = policy,
+                    _ => {}
                 });
                 self.refresh_operation_fields();
             }
@@ -8420,18 +8496,90 @@ impl App {
                 });
                 self.refresh_operation_fields();
             }
-            Message::PocketKeepToolDownToggled(on) => {
+            Message::SpiralModeChanged(value) => {
                 self.edit_operation_draft(|op| {
-                    if let Operation::Pocket(p) = op {
-                        p.clear.keep_tool_down = on;
+                    if let Operation::Spiral(p) = op {
+                        p.params.mode = value;
                     }
                 });
                 self.refresh_operation_fields();
             }
-            Message::ParallelStayDownToggled(on) => {
+            Message::SpiralOrderChanged(value) => {
                 self.edit_operation_draft(|op| {
-                    if let Operation::Parallel(p) = op {
-                        p.params.stay_down = on;
+                    if let Operation::Spiral(p) = op {
+                        p.params.order = value;
+                    }
+                });
+                self.refresh_operation_fields();
+            }
+            Message::SpiralMillingChanged(value) => {
+                self.edit_operation_draft(|op| {
+                    if let Operation::Spiral(p) = op {
+                        p.params.milling = value;
+                    }
+                });
+                self.refresh_operation_fields();
+            }
+            Message::SpiralCutDirectionChanged(value) => {
+                self.edit_operation_draft(|op| {
+                    if let Operation::Spiral(p) = op {
+                        p.params.cut_direction = value;
+                    }
+                });
+                self.refresh_operation_fields();
+            }
+            Message::SpiralBoundaryChanged(value) => {
+                self.edit_operation_draft(|op| {
+                    if let Operation::Spiral(p) = op {
+                        p.params.boundary = value;
+                    }
+                });
+                self.refresh_operation_fields();
+            }
+            Message::SpiralContactOnlyToggled(value) => {
+                self.edit_operation_draft(|op| {
+                    if let Operation::Spiral(p) = op {
+                        p.params.contact_only = value;
+                    }
+                });
+                self.refresh_operation_fields();
+            }
+            Message::SpiralDepthsToggled(value) => {
+                self.edit_operation_draft(|op| {
+                    if let Operation::Spiral(p) = op {
+                        p.params.multiple_depths = value;
+                    }
+                });
+                self.refresh_operation_fields();
+            }
+            Message::SpiralDepthOrderToggled(value) => {
+                self.edit_operation_draft(|op| {
+                    if let Operation::Spiral(p) = op {
+                        p.params.order_by_depth = value;
+                    }
+                });
+                self.refresh_operation_fields();
+            }
+            Message::SpiralLinkInsideOutToggled(value) => {
+                self.edit_operation_draft(|op| {
+                    if let Operation::Spiral(p) = op {
+                        p.params.link_inside_out = value;
+                    }
+                });
+                self.refresh_operation_fields();
+            }
+            Message::SpiralClockwiseToggled(value) => {
+                self.edit_operation_draft(|op| {
+                    if let Operation::Spiral(p) = op {
+                        p.params.clockwise = value;
+                    }
+                });
+                self.refresh_operation_fields();
+            }
+            Message::PocketKeepToolDownToggled(on) => {
+                self.edit_operation_draft(|op| {
+                    if let Operation::Pocket(p) = op {
+                        p.clear.keep_tool_down = on;
                     }
                 });
                 self.refresh_operation_fields();
@@ -8445,13 +8593,11 @@ impl App {
                 self.refresh_operation_fields();
             }
             Message::AdaptiveContainmentChanged(value) => {
-                self.edit_operation_draft(|op| {
-                    if let Operation::Adaptive(adaptive) = op {
-                        adaptive.params.containment = value;
-                    }
-                    if let Operation::Parallel(p) = op {
-                        p.params.containment = value;
-                    }
+                self.edit_operation_draft(|op| match op {
+                    Operation::Adaptive(p) => p.params.containment = value,
+                    Operation::Parallel(p) => p.params.containment = value,
+                    Operation::Spiral(p) => p.params.containment = value,
+                    _ => {}
                 });
                 self.refresh_operation_fields();
             }
@@ -9128,64 +9274,86 @@ impl App {
             } else {
                 iced::Subscription::none()
             },
-            iced::window::resize_events().map(|(_id, size)| Message::WindowResized(size)),
-            iced::event::listen_with(|event, _, _| match event {
-                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
-                    iced::mouse::Button::Left,
-                ))
-                | iced::Event::Keyboard(iced::keyboard::Event::KeyReleased { .. }) => {
-                    Some(Message::CheckHeightFocus)
-                }
-                _ => None,
-            }),
-            iced::event::listen_with(|event, _, _| match event {
-                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
-                    iced::mouse::Button::Left,
-                )) => Some(Message::CheckOperationRenameFocus),
-                _ => None,
-            }),
-            iced::event::listen_with(|event, _, _| match event {
-                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
-                    iced::mouse::Button::Left,
-                )) => Some(Message::ToolColumnRelease),
-                _ => None,
-            }),
-            // Track the window-absolute cursor so overlays (the op context menu)
-            // anchor exactly under the pointer — widget-local positions are offset
-            // by the pane's origin, which is what caused the menu to appear astray.
-            iced::event::listen_with(|event, status, _window| match event {
-                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
-                    iced::mouse::Button::Left,
-                )) => Some(Message::Tree(TreeMessage::Release)),
-                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
-                    Some(Message::WindowCursor(position))
-                }
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
-                    modifiers,
-                    ..
-                }) if status == iced::event::Status::Ignored
-                    && !modifiers.control()
-                    && !modifiers.alt()
-                    && !modifiers.logo() =>
-                {
-                    Some(Message::TraverseFocus(modifiers.shift()))
-                }
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::F8),
-                    ..
-                }) => Some(Message::ToggleStock),
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
-                    ..
-                }) => Some(Message::CadEscape),
-                // Live modifiers, so an op-row click can tell plain from ⌘/Ctrl.
-                iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(m)) => {
-                    Some(Message::ModifiersChanged(m))
-                }
-                _ => None,
-            }),
+            self.preferences
+                .as_ref()
+                .map_or_else(iced::Subscription::none, |prefs| {
+                    window_events(prefs.id, preferences::keyboard_event)
+                }),
+            self.main_window
+                .map_or_else(iced::Subscription::none, |id| {
+                    iced::Subscription::batch([
+                        window_events(id, Self::main_window_event),
+                        window_events(id, |event, _| match event {
+                            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                                iced::mouse::Button::Left,
+                            ))
+                            | iced::Event::Keyboard(iced::keyboard::Event::KeyReleased {
+                                ..
+                            }) => Some(Message::CheckHeightFocus),
+                            _ => None,
+                        }),
+                        window_events(id, |event, _| match event {
+                            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                                iced::mouse::Button::Left,
+                            )) => Some(Message::CheckOperationRenameFocus),
+                            _ => None,
+                        }),
+                        window_events(id, |event, _| match event {
+                            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                                iced::mouse::Button::Left,
+                            )) => Some(Message::ToolColumnRelease),
+                            _ => None,
+                        }),
+                    ])
+                }),
         ])
+    }
+
+    fn main_window_event(event: iced::Event, status: iced::event::Status) -> Option<Message> {
+        match event {
+            iced::Event::Window(iced::window::Event::Resized(size)) => {
+                Some(Message::WindowResized(size))
+            }
+            // Track the window-absolute cursor so overlays anchor under the pointer.
+            iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+                Some(Message::WindowCursor(position))
+            }
+            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => {
+                Some(Message::Tree(TreeMessage::Release))
+            }
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Character(key),
+                modifiers,
+                repeat: false,
+                ..
+            }) if status == iced::event::Status::Ignored => {
+                Some(Message::ShortcutKey(key.chars().next(), modifiers))
+            }
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
+                modifiers,
+                ..
+            }) if status == iced::event::Status::Ignored
+                && !modifiers.control()
+                && !modifiers.alt()
+                && !modifiers.logo() =>
+            {
+                Some(Message::TraverseFocus(modifiers.shift()))
+            }
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::F8),
+                ..
+            }) => Some(Message::ToggleStock),
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                ..
+            }) => Some(Message::CadEscape),
+            // Live modifiers, so an op-row click can tell plain from ⌘/Ctrl.
+            iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(m)) => {
+                Some(Message::ModifiersChanged(m))
+            }
+            _ => None,
+        }
     }
 
     /// Clamp a split's new `ratio` so neither side falls below its panes' pixel
@@ -9229,7 +9397,8 @@ impl App {
     /// Close the pane itself so an idle inspector gives its space to the viewport.
     /// Creation and geometry picking belong to the active operation editor.
     fn sync_inspector_visibility(&mut self) {
-        let editing = self.simulation.is_some()
+        let editing = self.move_draft.is_some()
+            || self.simulation.is_some()
             || self.pattern_draft.is_some()
             || self.library_mode()
             || (self.active_tab == RibbonTab::Machinery
@@ -9759,9 +9928,6 @@ impl App {
         if field == Field::ProfileOffset && self.geometry_operation_kind() == Some(OpKind::Profile)
         {
             return profile_parameters::WALL_ALLOWANCE_HELP;
-        }
-        if field == Field::LiftHeight && self.geometry_operation_kind() == Some(OpKind::Parallel) {
-            return "Lift above neighboring surface passes when Keep tool down is enabled, in millimetres. 0 continues the finishing cut along the surface without an added lift. With Keep tool down disabled, all passes retract to clearance. Gaps and unsafe transitions still use clearance; use on pre-roughed stock.";
         }
         use ToolKind::*;
         match (self.inspected_tool_kind(), field) {
@@ -10929,6 +11095,24 @@ impl App {
         };
     }
 
+    fn title_for_window(&self, id: iced::window::Id) -> String {
+        if self.is_preferences_window(id) {
+            "Preferences".into()
+        } else {
+            self.window_title()
+        }
+    }
+
+    fn window_view(&self, id: iced::window::Id) -> Element<'_, Message> {
+        if let Some(prefs) = self.preferences.as_ref().filter(|prefs| prefs.id == id) {
+            prefs.view(self).map(Message::Preferences)
+        } else if self.main_window == Some(id) {
+            self.view()
+        } else {
+            Space::new().into()
+        }
+    }
+
     fn window_title(&self) -> String {
         let project_name = self
             .controller
@@ -11011,11 +11195,6 @@ impl App {
         }
         if let Some(pickbox) = self.pickbox_overlay() {
             layers = layers.push(pickbox);
-        }
-        if let Some(card) = self.prefs_overlay() {
-            let catcher = mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
-                .on_press(Message::ClosePrefs);
-            layers = layers.push(catcher).push(card);
         }
         if let Some(card) = self.license_overlay() {
             // Same catcher pattern as the menus: a click anywhere off the card closes.
@@ -11123,279 +11302,6 @@ impl App {
                     .align_y(Alignment::Center)
             ]
             .into(),
-        )
-    }
-
-    /// The preferences panel. `None` unless open.
-    ///
-    /// **Only settings with no other control appear here.** The View ribbon already
-    /// toggles stock/cube/origin/tips and sizes the cube, and the snap buttons arm the
-    /// object snaps — duplicating those would create two places to change one thing and
-    /// the inevitable question of which is authoritative. What has no home anywhere
-    /// else includes picking tolerances and stock appearance.
-    ///
-    /// **Live-apply, not Apply-on-dirty.** The two-commit-class convention governs edits
-    /// to the *model* — the thing that becomes G-code. These are not that, and a
-    /// tolerance you cannot see change while dragging is a tolerance you cannot set.
-    fn prefs_overlay(&self) -> Option<Element<'_, Message>> {
-        if !self.show_prefs {
-            return None;
-        }
-        let heading = |t: &'static str| text(t).size(14);
-        let note = |t: String| text(t).size(11);
-
-        // A labelled slider with its value shown, the shape every row here takes.
-        let row_for = |label: &'static str,
-                       range: (f32, f32),
-                       value: f32,
-                       step: f32,
-                       shown: String,
-                       msg: fn(f32) -> Message|
-         -> Element<'_, Message> {
-            row![
-                text(label).size(12).width(Length::Fixed(150.0)),
-                slider(range.0..=range.1, value, msg)
-                    .step(step)
-                    .on_release(Message::SettingsSettled)
-                    .width(Length::Fixed(190.0)),
-                text(shown).size(12).width(Length::Fixed(64.0)),
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center)
-            .into()
-        };
-
-        let snapping = column![
-            heading("Picking and snapping"),
-            row_for(
-                "Pickbox size",
-                crate::PICKBOX_RANGE,
-                self.settings.snapping.pickbox_px,
-                1.0,
-                format!("{:.0} px", self.settings.snapping.pickbox_px),
-                Message::SetPickbox,
-            ),
-            // Shown, not settable. The catch distance is a fixed multiple of the
-            // pickbox on purpose: two absolute knobs would let it be set *smaller*
-            // than the box that feeds it. Showing the derived number keeps the
-            // relationship visible instead of merely documented.
-            note(format!(
-                "Object snaps catch within {:.0} px — {:.1}× the pickbox.",
-                self.settings.snap_catch_px(),
-                crate::SNAP_CATCH_MULTIPLE,
-            )),
-            row_for(
-                "Snap marker size",
-                crate::MARKER_SCALE_RANGE,
-                self.settings.snapping.marker_scale,
-                0.1,
-                format!("{:.1}×", self.settings.snapping.marker_scale),
-                Message::SetMarkerScale,
-            ),
-            row_for(
-                "Origin marker size",
-                crate::ORIGIN_MARKER_RANGE,
-                self.settings.view.origin_marker_scale,
-                0.1,
-                format!("{:.1}×", self.settings.view.origin_marker_scale),
-                Message::SetOriginMarker,
-            ),
-        ]
-        .spacing(6);
-
-        let [r, g, b] = self.settings.view.stock_color;
-        let swatch = button(Space::new().width(42).height(22))
-            .padding(2)
-            .style(move |_, _| iced::widget::button::Style {
-                background: Some(Background::Color(Color::from_rgb(r, g, b))),
-                border: Border {
-                    color: Color::WHITE,
-                    width: 1.0,
-                    radius: 3.0.into(),
-                },
-                ..Default::default()
-            })
-            .on_press(Message::ToggleStockPalette);
-        let mut stock = column![
-            row![
-                heading("Stock color"),
-                swatch,
-                text("Click to choose a color").size(11)
-            ]
-            .spacing(12)
-            .align_y(Alignment::Center),
-            row_for(
-                "Transparency",
-                (0.0, 1.0),
-                self.settings.view.stock_transparency,
-                0.01,
-                format!("{:.0}%", self.settings.view.stock_transparency * 100.0),
-                Message::SetStockTransparency,
-            ),
-            note("Used when transparent stock is enabled.".into()),
-        ]
-        .spacing(6);
-        if self.show_stock_palette {
-            // A grid of hue, saturation and brightness choices, plus neutral grays.
-            for level in 0..6 {
-                let mut colors = row![].spacing(3);
-                for hue in 0..12 {
-                    let h = hue as f32 / 2.0;
-                    let c = if level < 3 {
-                        1.0 - level as f32 * 0.25
-                    } else {
-                        1.0
-                    };
-                    let value = if level < 3 {
-                        1.0
-                    } else {
-                        1.0 - (level - 2) as f32 * 0.22
-                    };
-                    let x = c * (1.0 - ((h % 2.0) - 1.0).abs());
-                    let (rr, gg, bb) = match hue / 2 {
-                        0 => (c, x, 0.0),
-                        1 => (x, c, 0.0),
-                        2 => (0.0, c, x),
-                        3 => (0.0, x, c),
-                        4 => (x, 0.0, c),
-                        _ => (c, 0.0, x),
-                    };
-                    let m = 1.0 - c;
-                    let color = [(rr + m) * value, (gg + m) * value, (bb + m) * value];
-                    colors = colors.push(
-                        button(Space::new().width(26).height(20))
-                            .padding(0)
-                            .style(move |_, _| iced::widget::button::Style {
-                                background: Some(Background::Color(Color::from_rgb(
-                                    color[0], color[1], color[2],
-                                ))),
-                                border: Border {
-                                    color: Color::from_rgb(0.4, 0.4, 0.4),
-                                    width: 1.0,
-                                    radius: 2.0.into(),
-                                },
-                                ..Default::default()
-                            })
-                            .on_press(Message::SetStockColor(color)),
-                    );
-                }
-                stock = stock.push(colors);
-            }
-            let mut grays = row![].spacing(3);
-            for n in 0..12 {
-                let v = n as f32 / 11.0;
-                let color = [v, v, v];
-                grays = grays.push(
-                    button(Space::new().width(26).height(20))
-                        .padding(0)
-                        .style(move |_, _| iced::widget::button::Style {
-                            background: Some(Background::Color(Color::from_rgb(v, v, v))),
-                            border: Border {
-                                color: Color::from_rgb(0.4, 0.4, 0.4),
-                                width: 1.0,
-                                radius: 2.0.into(),
-                            },
-                            ..Default::default()
-                        })
-                        .on_press(Message::SetStockColor(color)),
-                );
-            }
-            stock = stock.push(grays);
-        }
-
-        let simulation = column![
-            heading("Stock cut simulation"),
-            row_for(
-                "Accuracy",
-                crate::SIMULATION_ACCURACY_RANGE,
-                self.settings.simulation.accuracy,
-                0.25,
-                format!("{:.2}×", self.settings.simulation.accuracy),
-                Message::SetSimulationAccuracy,
-            ),
-            note("Higher accuracy resolves finer cuts and uses more time and memory. Rebuilds the simulation when released; also applies to playback.".into()),
-        ].spacing(6);
-
-        let btn = |label: &'static str, msg: Message| {
-            button(
-                text(label)
-                    .size(13)
-                    .line_height(iced::widget::text::LineHeight::Relative(1.0))
-                    .align_y(Alignment::Center),
-            )
-            .padding(Padding::from([5.0, 14.0]))
-            .on_press(msg)
-        };
-
-        let card = container(
-            column![
-                text("Preferences").size(20),
-                note(
-                    "Saved to settings.json in your configuration folder, and applied as \
-                     you change them."
-                        .to_string()
-                ),
-                scrollable(
-                    column![
-                        column![
-                            heading("Number display"),
-                            row![
-                                text("Decimal places").size(12).width(150),
-                                pick_list(
-                                    (0u8..=8).collect::<Vec<_>>(),
-                                    Some(self.settings.number_decimals),
-                                    Message::SetNumberDecimals,
-                                )
-                                .text_size(12)
-                                .padding([7, 9])
-                                .style(inspector_picker)
-                                .width(100),
-                            ]
-                            .spacing(10)
-                            .align_y(Alignment::Center),
-                        ]
-                        .spacing(6),
-                        snapping,
-                        stock,
-                        simulation
-                    ]
-                    .spacing(12)
-                )
-                .height(Length::Shrink),
-                row![
-                    // Left, away from Close: it is destructive, and the two should not
-                    // be adjacent when one of them is the escape from an unusable layout.
-                    btn("Restore defaults", Message::RestoreDefaults),
-                    Space::new().width(Length::Fill),
-                    btn("Close", Message::ClosePrefs),
-                ]
-                .align_y(Alignment::Center),
-            ]
-            .spacing(12)
-            .padding(4),
-        )
-        .width(520)
-        .max_height((self.window.height - 40.0).max(200.0))
-        .padding(16)
-        .style(|theme: &iced::Theme| container::Style {
-            background: Some(Background::Color(
-                theme.extended_palette().background.weak.color,
-            )),
-            border: Border {
-                color: theme.extended_palette().background.strong.color,
-                width: 1.0,
-                radius: 6.0.into(),
-            },
-            ..Default::default()
-        });
-
-        Some(
-            container(card)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .align_x(Alignment::Center)
-                .align_y(Alignment::Center)
-                .into(),
         )
     }
 
@@ -11821,10 +11727,45 @@ impl App {
                 GroupSpec {
                     title: "Project",
                     commands: vec![
-                        cmd(Icon::New, "New", Some(Message::NewProject)),
-                        cmd(Icon::Open, "Open", Some(Message::OpenProject)),
-                        cmd(Icon::Save, "Save", Some(Message::SaveProject)),
-                        cmd(Icon::Save, "Save As", Some(Message::SaveProjectAs)),
+                        cmd_help(
+                            Icon::New,
+                            "New",
+                            Some(Message::NewProject),
+                            format!(
+                                "{} ({})",
+                                Icon::New.help(),
+                                display_shortcut(shortcut_value(&self.settings, "new"))
+                            ),
+                        ),
+                        cmd_help(
+                            Icon::Open,
+                            "Open",
+                            Some(Message::OpenProject),
+                            format!(
+                                "{} ({})",
+                                Icon::Open.help(),
+                                display_shortcut(shortcut_value(&self.settings, "open"))
+                            ),
+                        ),
+                        cmd_help(
+                            Icon::Save,
+                            "Save",
+                            Some(Message::SaveProject),
+                            format!(
+                                "{} ({})",
+                                Icon::Save.help(),
+                                display_shortcut(shortcut_value(&self.settings, "save"))
+                            ),
+                        ),
+                        cmd_help(
+                            Icon::Save,
+                            "Save As",
+                            Some(Message::SaveProjectAs),
+                            format!(
+                                "Save the project under a new name. ({})",
+                                display_shortcut(shortcut_value(&self.settings, "save_as"))
+                            ),
+                        ),
                     ],
                 },
                 GroupSpec {
@@ -11838,8 +11779,26 @@ impl App {
                 GroupSpec {
                     title: "Edit",
                     commands: vec![
-                        cmd(Icon::Undo, "Undo", Some(Message::Undo)),
-                        cmd(Icon::Redo, "Redo", Some(Message::Redo)),
+                        cmd_help(
+                            Icon::Undo,
+                            "Undo",
+                            Some(Message::Undo),
+                            format!(
+                                "{} ({})",
+                                Icon::Undo.help(),
+                                display_shortcut(shortcut_value(&self.settings, "undo"))
+                            ),
+                        ),
+                        cmd_help(
+                            Icon::Redo,
+                            "Redo",
+                            Some(Message::Redo),
+                            format!(
+                                "{} ({})",
+                                Icon::Redo.help(),
+                                display_shortcut(shortcut_value(&self.settings, "redo"))
+                            ),
+                        ),
                         if self.controller.run_pending() {
                             cmd(Icon::Run, "Cancel run", Some(Message::CancelRun))
                         } else {
@@ -11853,24 +11812,125 @@ impl App {
                 // Roughly the order a part is actually made: skim the blank flat,
                 // then cut its shape, then the features, then the decoration.
                 commands: vec![
-                    cmd(Icon::Face, "Face", begin(OpKind::Face)),
-                    cmd(Icon::Profile, "Profile", begin(OpKind::Profile)),
-                    cmd(Icon::Pocket, "Pocket", begin(OpKind::Pocket)),
-                    cmd(Icon::Drill, "Drill", begin(OpKind::Drill)),
-                    cmd(Icon::Thread, "Thread", begin(OpKind::Thread)),
-                    cmd(Icon::Bore, "Bore", begin(OpKind::Bore)),
-                    cmd(Icon::Chamfer, "Chamfer", begin(OpKind::Chamfer)),
-                    cmd(Icon::Engrave, "Engrave", begin(OpKind::Engrave)),
-                    cmd(Icon::Carve, "Carve", begin(OpKind::Carve)),
-                    cmd(
+                    cmd_help(
+                        Icon::Face,
+                        "Face",
+                        begin(OpKind::Face),
+                        format!(
+                            "{} ({})",
+                            Icon::Face.help(),
+                            display_shortcut(shortcut_value(&self.settings, "face"))
+                        ),
+                    ),
+                    cmd_help(
+                        Icon::Profile,
+                        "Profile",
+                        begin(OpKind::Profile),
+                        format!(
+                            "{} ({})",
+                            Icon::Profile.help(),
+                            display_shortcut(shortcut_value(&self.settings, "profile"))
+                        ),
+                    ),
+                    cmd_help(
+                        Icon::Pocket,
+                        "Pocket",
+                        begin(OpKind::Pocket),
+                        format!(
+                            "{} ({})",
+                            Icon::Pocket.help(),
+                            display_shortcut(shortcut_value(&self.settings, "pocket"))
+                        ),
+                    ),
+                    cmd_help(
+                        Icon::Drill,
+                        "Drill",
+                        begin(OpKind::Drill),
+                        format!(
+                            "{} ({})",
+                            Icon::Drill.help(),
+                            display_shortcut(shortcut_value(&self.settings, "drill"))
+                        ),
+                    ),
+                    cmd_help(
+                        Icon::Thread,
+                        "Thread",
+                        begin(OpKind::Thread),
+                        format!(
+                            "{} ({})",
+                            Icon::Thread.help(),
+                            display_shortcut(shortcut_value(&self.settings, "thread"))
+                        ),
+                    ),
+                    cmd_help(
+                        Icon::Bore,
+                        "Bore",
+                        begin(OpKind::Bore),
+                        format!(
+                            "{} ({})",
+                            Icon::Bore.help(),
+                            display_shortcut(shortcut_value(&self.settings, "bore"))
+                        ),
+                    ),
+                    cmd_help(
+                        Icon::Chamfer,
+                        "Chamfer",
+                        begin(OpKind::Chamfer),
+                        format!(
+                            "{} ({})",
+                            Icon::Chamfer.help(),
+                            display_shortcut(shortcut_value(&self.settings, "chamfer"))
+                        ),
+                    ),
+                    cmd_help(
+                        Icon::Engrave,
+                        "Engrave",
+                        begin(OpKind::Engrave),
+                        format!(
+                            "{} ({})",
+                            Icon::Engrave.help(),
+                            display_shortcut(shortcut_value(&self.settings, "engrave"))
+                        ),
+                    ),
+                    cmd_help(
+                        Icon::Carve,
+                        "Carve",
+                        begin(OpKind::Carve),
+                        format!(
+                            "{} ({})",
+                            Icon::Carve.help(),
+                            display_shortcut(shortcut_value(&self.settings, "carve"))
+                        ),
+                    ),
+                    cmd_help(
                         Icon::Adaptive,
                         "3D Adaptive Clearing",
                         begin(OpKind::Adaptive),
+                        format!(
+                            "{} ({})",
+                            Icon::Adaptive.help(),
+                            display_shortcut(shortcut_value(&self.settings, "adaptive"))
+                        ),
                     ),
-                    cmd(
+                    cmd_help(
                         Icon::Parallel,
                         "3D Parallel / Scallop",
                         begin(OpKind::Parallel),
+                        format!(
+                            "{} ({})",
+                            Icon::Parallel.help(),
+                            display_shortcut(shortcut_value(&self.settings, "parallel"))
+                        ),
+                    ),
+                    cmd_help(
+                        Icon::Spiral,
+                        "3D Spiral",
+                        begin(OpKind::Spiral),
+                        format!(
+                            "{} ({})",
+                            Icon::Spiral.help(),
+                            display_shortcut(shortcut_value(&self.settings, "spiral"))
+                        ),
                     ),
                 ],
             }],
@@ -12323,12 +12383,17 @@ impl App {
             || (profile && entity.kind != EntityKind::Silhouette)
             || matches!(
                 self.cad_pending_kind,
-                Some(OpKind::Adaptive | OpKind::Parallel)
+                Some(OpKind::Adaptive | OpKind::Parallel | OpKind::Spiral)
             )
             || self
                 .cad_editing_op
                 .and_then(|id| self.current_operation(id))
-                .is_some_and(|op| matches!(op, Operation::Adaptive(_) | Operation::Parallel(_)))
+                .is_some_and(|op| {
+                    matches!(
+                        op,
+                        Operation::Adaptive(_) | Operation::Parallel(_) | Operation::Spiral(_)
+                    )
+                })
             || matches!(
                 self.cad_pending_kind,
                 Some(
@@ -12359,12 +12424,15 @@ impl App {
         self.geometry_row_selection = None;
         let adaptive = matches!(
             self.cad_pending_kind,
-            Some(OpKind::Adaptive | OpKind::Parallel)
+            Some(OpKind::Adaptive | OpKind::Parallel | OpKind::Spiral)
         ) || self
             .cad_editing_op
             .and_then(|id| self.current_operation(id))
             .is_some_and(|operation| {
-                matches!(operation, Operation::Adaptive(_) | Operation::Parallel(_))
+                matches!(
+                    operation,
+                    Operation::Adaptive(_) | Operation::Parallel(_) | Operation::Spiral(_)
+                )
             });
         let selection_result = if adaptive {
             self.controller
@@ -12468,8 +12536,12 @@ impl App {
             (OpKind::Pocket | OpKind::Engrave, EntityKind::Edge) => CadFilter::Edge,
             (OpKind::Pocket | OpKind::Carve, EntityKind::Face) => CadFilter::Face,
             (OpKind::Thread | OpKind::Drill, EntityKind::Face) => CadFilter::Face,
-            (OpKind::Adaptive | OpKind::Parallel, EntityKind::Face) => CadFilter::Face,
-            (OpKind::Adaptive | OpKind::Parallel, EntityKind::Body) => CadFilter::Body,
+            (OpKind::Adaptive | OpKind::Parallel | OpKind::Spiral, EntityKind::Face) => {
+                CadFilter::Face
+            }
+            (OpKind::Adaptive | OpKind::Parallel | OpKind::Spiral, EntityKind::Body) => {
+                CadFilter::Body
+            }
             (OpKind::Face, EntityKind::Silhouette) => CadFilter::Silhouette,
             _ => self.cad_filter,
         };
@@ -13226,6 +13298,107 @@ fn solve_densities(counts: &[usize], available: f32) -> Vec<Density> {
     densities
 }
 
+// Stored as portable Cmd combinations: Cmd means ⌘ on macOS and Ctrl elsewhere.
+const SHORTCUTS: &[(&str, &str, &str)] = &[
+    ("new", "New project", "Cmd+N"),
+    ("open", "Open project", "Cmd+O"),
+    ("save", "Save project", "Cmd+S"),
+    ("save_as", "Save as", "Cmd+Shift+S"),
+    ("undo", "Undo", "Cmd+Z"),
+    ("redo", "Redo", "Cmd+Shift+Z"),
+    ("face", "Face", "Cmd+Shift+F"),
+    ("profile", "Profile", "Cmd+Shift+P"),
+    ("pocket", "Pocket", "Cmd+Shift+K"),
+    ("drill", "Drill", "Cmd+Shift+D"),
+    ("thread", "Thread", "Cmd+Shift+T"),
+    ("bore", "Bore", "Cmd+Shift+B"),
+    ("chamfer", "Chamfer", "Cmd+Shift+C"),
+    ("engrave", "Engrave", "Cmd+Shift+E"),
+    ("carve", "Carve", "Cmd+Shift+V"),
+    ("adaptive", "3D Adaptive Clearing", "Cmd+Shift+A"),
+    ("parallel", "Parallel", "Cmd+Shift+L"),
+    ("spiral", "3D Spiral", "Cmd+Shift+I"),
+];
+
+fn shortcut_value<'a>(settings: &'a crate::Settings, id: &str) -> &'a str {
+    settings
+        .shortcuts
+        .get(id)
+        .map(String::as_str)
+        .unwrap_or_else(|| {
+            SHORTCUTS
+                .iter()
+                .find(|(name, _, _)| *name == id)
+                .map_or("", |(_, _, default)| *default)
+        })
+}
+
+fn shortcut_binding(key: Option<char>, modifiers: iced::keyboard::Modifiers) -> Option<String> {
+    use iced::keyboard::Modifiers;
+    if modifiers != Modifiers::COMMAND && modifiers != (Modifiers::COMMAND | Modifiers::SHIFT) {
+        return None;
+    }
+    let key = key?.to_ascii_uppercase();
+    if !key.is_ascii_alphanumeric() {
+        return None;
+    }
+    Some(format!(
+        "Cmd+{}{key}",
+        if modifiers.shift() { "Shift+" } else { "" }
+    ))
+}
+
+fn shortcut_for_binding(settings: &crate::Settings, binding: &str) -> Option<&'static str> {
+    SHORTCUTS
+        .iter()
+        .find(|(id, _, _)| shortcut_value(settings, id) == binding)
+        .map(|(id, _, _)| *id)
+        .or_else(|| {
+            (!cfg!(target_os = "macos")
+                && binding == "Cmd+Y"
+                && !settings.shortcuts.contains_key("redo"))
+            .then_some("redo")
+        })
+}
+
+fn shortcut_action(id: &str) -> Option<Message> {
+    Some(match id {
+        "new" => Message::NewProject,
+        "open" => Message::OpenProject,
+        "save" => Message::SaveProject,
+        "save_as" => Message::SaveProjectAs,
+        "undo" => Message::Undo,
+        "redo" => Message::Redo,
+        "face" => Message::BeginOp(OpKind::Face),
+        "profile" => Message::BeginOp(OpKind::Profile),
+        "pocket" => Message::BeginOp(OpKind::Pocket),
+        "drill" => Message::BeginOp(OpKind::Drill),
+        "thread" => Message::BeginOp(OpKind::Thread),
+        "bore" => Message::BeginOp(OpKind::Bore),
+        "chamfer" => Message::BeginOp(OpKind::Chamfer),
+        "engrave" => Message::BeginOp(OpKind::Engrave),
+        "carve" => Message::BeginOp(OpKind::Carve),
+        "adaptive" => Message::BeginOp(OpKind::Adaptive),
+        "parallel" => Message::BeginOp(OpKind::Parallel),
+        "spiral" => Message::BeginOp(OpKind::Spiral),
+        _ => return None,
+    })
+}
+
+fn display_shortcut(binding: &str) -> String {
+    if binding.is_empty() {
+        return "Unassigned".into();
+    }
+    binding.replace(
+        "Cmd",
+        if cfg!(target_os = "macos") {
+            "⌘"
+        } else {
+            "Ctrl"
+        },
+    )
+}
+
 /// One ribbon command in a group's data model — enough to render it at any
 /// density (icon+label, icon-only, or inside a popup).
 struct Command {
@@ -13240,7 +13413,7 @@ struct Command {
     /// Help used to be keyed by icon alone, which is right while an icon means one
     /// thing. The moment one is reused — the tool icon standing in for "add a machine" —
     /// it silently describes the wrong action, which is worse than no tooltip.
-    help: Option<&'static str>,
+    help: Option<String>,
 }
 
 /// A ribbon group's data model.
@@ -13275,10 +13448,10 @@ fn cmd_help(
     icon: Icon,
     label: &'static str,
     action: Option<Message>,
-    help: &'static str,
+    help: impl Into<String>,
 ) -> Command {
     Command {
-        help: Some(help),
+        help: Some(help.into()),
         ..cmd(icon, label, action)
     }
 }
@@ -13331,10 +13504,18 @@ fn render_command(command: &Command, compact: bool, show: bool) -> Element<'stat
     }
     delayed_tooltip(
         btn,
-        container(text(command.help.unwrap_or_else(|| command.icon.help())).size(12))
-            .padding(8)
-            .max_width(300.0)
-            .style(container::rounded_box),
+        container(
+            text(
+                command
+                    .help
+                    .clone()
+                    .unwrap_or_else(|| command.icon.help().to_string()),
+            )
+            .size(12),
+        )
+        .padding(8)
+        .max_width(300.0)
+        .style(container::rounded_box),
         tooltip::Position::Bottom,
     )
     .into()
@@ -13395,6 +13576,7 @@ fn op_kind(op: &Operation) -> &'static str {
         Operation::Adaptive(_) => "3D Adaptive Clearing",
         Operation::Parallel(o) if o.params.scallop => "3D Scallop",
         Operation::Parallel(_) => "3D Parallel",
+        Operation::Spiral(_) => "3D Spiral",
     }
 }
 
@@ -13405,8 +13587,9 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
     }
     match (op, field) {
         (Operation::Pocket(o), Field::LiftHeight) => Some(o.clear.lift_height),
+        (Operation::Adaptive(o), Field::LeadInSize) => Some(o.params.lead_in_radius),
+        (Operation::Adaptive(o), Field::LeadOutSize) => Some(o.params.lead_out_radius),
         (Operation::Adaptive(o), Field::LiftHeight) => Some(o.params.lift_height),
-        (Operation::Parallel(o), Field::LiftHeight) => Some(o.params.lift_height),
         (op, Field::StartX) => operation_tabs::operation_start(op).map(|point| point[0]),
         (op, Field::StartY) => operation_tabs::operation_start(op).map(|point| point[1]),
         (Operation::Engrave(op), Field::OperationTop) => Some(op.top),
@@ -13483,7 +13666,7 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Pocket(o), Field::Depth) => Some(o.depth),
         (Operation::Pocket(o), Field::Stepdown) => Some(o.clear.stepdown),
         (Operation::Pocket(o), Field::Overlap) => Some(o.clear.overlap * 100.0),
-        (Operation::Pocket(o), Field::PocketOverlap) => Some(o.clear.pocket_overlap.unwrap_or(0.0)),
+        (Operation::Pocket(o), Field::PocketStepover) => Some(o.maximum_stepover.unwrap_or(0.0)),
         (Operation::Pocket(o), Field::ProfileOffset) => Some(o.clear.offset),
         (Operation::Pocket(o), Field::LeadInSize) => Some(lead_size(o.clear.lead_in)),
         (Operation::Pocket(o), Field::LeadOutSize) => Some(lead_size(o.clear.lead_out)),
@@ -13545,10 +13728,11 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Thread(o), Field::ThreadBlindAllowance) => Some(o.blind_allowance),
         (Operation::Thread(o), Field::Feed) => Some(o.feed),
         (Operation::Thread(o), Field::PlungeFeed) => Some(o.plunge_feed),
+        (op @ Operation::Spiral(_), field) => parameter_expressions::parameter(field)?.value(op),
         (Operation::Parallel(o), Field::ParallelStepover) => Some(o.params.stepover),
         (Operation::Parallel(o), Field::ParallelAngle) => Some(o.params.angle),
         (Operation::Parallel(o), Field::ScallopSafeDistance) => {
-            Some(o.params.scallop_safe_distance)
+            Some(o.params.safe_distance)
         }
         (Operation::Parallel(o), Field::ScallopSmoothingTolerance) => {
             Some(o.params.scallop_smoothing_tolerance)
@@ -13586,7 +13770,6 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
         match op {
             Operation::Pocket(o) => o.clear.lift_height = value,
             Operation::Adaptive(o) => o.params.lift_height = value,
-            Operation::Parallel(o) => o.params.lift_height = value,
             _ => {}
         }
     }
@@ -13701,8 +13884,8 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
             if let Some(v) = get(Field::Stepdown) {
                 o.clear.stepdown = v;
             }
-            if let Some(v) = get(Field::PocketOverlap) {
-                o.clear.pocket_overlap = Some(v);
+            if let Some(v) = get(Field::PocketStepover) {
+                o.maximum_stepover = Some(v);
             }
             if let Some(v) = get(Field::Engagement) {
                 o.clear.clearing.engagement = v.max(0.0);
@@ -13905,6 +14088,53 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
                 o.plunge_feed = v;
             }
         }
+        Operation::Spiral(o) => {
+            if let Some(v) = get(Field::SpiralAxialOffset) {
+                o.params.axial_offset = v;
+            }
+            if let Some(v) = get(Field::SpiralStepdowns) {
+                o.params.stepdowns = v as u32;
+            }
+            if let Some(v) = get(Field::Stepdown) {
+                o.params.max_stepdown = v;
+            }
+            if let Some(v) = get(Field::SpiralStepover) {
+                o.params.stepover = v;
+            }
+            if let Some(v) = get(Field::SpiralInnerLimit) {
+                o.params.inner_limit = v;
+            }
+            if let Some(v) = get(Field::SpiralOuterLimit) {
+                o.params.outer_limit = v;
+            }
+            if let Some(v) = get(Field::SpiralFromSlope) {
+                o.params.from_slope = v;
+            }
+            if let Some(v) = get(Field::SpiralToSlope) {
+                o.params.to_slope = v;
+            }
+            if let Some(v) = get(Field::SpiralStayDownDistance) {
+                o.params.max_stay_down_distance = v;
+            }
+            if let Some(v) = get(Field::AdaptiveTolerance) {
+                o.params.tolerance = v;
+            }
+            if let Some(v) = get(Field::AdaptiveOffset) {
+                o.params.additional_offset = v;
+            }
+            if let Some(v) = get(Field::Feed) {
+                o.params.feed = v;
+            }
+            if let Some(v) = get(Field::PlungeFeed) {
+                o.params.plunge_feed = v;
+            }
+            if let Some(v) = get(Field::ScallopSafeDistance) {
+                o.params.safe_distance = v;
+            }
+            if let Some(v) = get(Field::ScallopSmoothingTolerance) {
+                o.params.smoothing_tolerance = v;
+            }
+        }
         Operation::Parallel(o) => {
             if let Some(v) = get(Field::ParallelStepover) {
                 o.params.stepover = v;
@@ -13913,7 +14143,7 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
                 o.params.angle = v;
             }
             if let Some(v) = get(Field::ScallopSafeDistance) {
-                o.params.scallop_safe_distance = v;
+                o.params.safe_distance = v;
             }
             if let Some(v) = get(Field::ScallopSmoothingTolerance) {
                 o.params.scallop_smoothing_tolerance = v;
@@ -13932,6 +14162,12 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
             }
         }
         Operation::Adaptive(o) => {
+            if let Some(v) = get(Field::LeadInSize) {
+                o.params.lead_in_radius = v;
+            }
+            if let Some(v) = get(Field::LeadOutSize) {
+                o.params.lead_out_radius = v;
+            }
             if let Some(v) = get(Field::AdaptiveTolerance) {
                 o.params.tolerance = v;
             }
@@ -14477,6 +14713,7 @@ struct Viewport {
     frame_bounds: Option<([f32; 3], [f32; 3])>,
     controls: ViewControls,
     grid_size: [f32; 3],
+    grid_frame: cam_model::RigidTransform,
     show_gizmo: bool,
     /// On-screen cube size, logical px (fixed; independent of window size).
     gizmo_size: f32,
@@ -14529,6 +14766,7 @@ impl Viewport {
         silhouette_bottom: Option<f64>,
         cached_cad_scene: Option<Arc<CadScene>>,
         stock_draft: Option<&cam_model::Setup>,
+        tree_body: Option<InstanceId>,
     ) -> Self {
         let cad_hover = cad_hover.filter(|reference| {
             preview.is_none()
@@ -14577,15 +14815,18 @@ impl Viewport {
                 scene
             }
         };
-        scene.strips.retain(|strip| {
-            preview.is_some()
-                || strip
-                    .op
-                    .is_none_or(|id| focus_ops.contains(&id) && !hidden_ops.contains(&id))
-        });
-        scene.path_cones.retain(|cone| {
-            preview.is_some() || (focus_ops.contains(&cone.op) && !hidden_ops.contains(&cone.op))
-        });
+        let show_run_preview = focus_ops.is_empty()
+            && outcome
+                .zip(controller.run_preview())
+                .is_some_and(|(shown, running)| std::ptr::eq(shown, running));
+        let operation_visible =
+            |id| !hidden_ops.contains(&id) && (focus_ops.contains(&id) || show_run_preview);
+        scene
+            .strips
+            .retain(|strip| preview.is_some() || strip.op.is_none_or(operation_visible));
+        scene
+            .path_cones
+            .retain(|cone| preview.is_some() || operation_visible(cone.op));
         // Drilling annotations from the backplot (peck rings + dwell bars), once a
         // run has produced a program. Anchors only — sized to the screen at draw.
         let drill_marks = outcome
@@ -14632,6 +14873,20 @@ impl Viewport {
             selected.to_vec()
         } else {
             let mut selected = controller.cad_selection().to_vec();
+            if let Some(instance) =
+                tree_body.and_then(|id| controller.geometry_state().instance(id))
+            {
+                if let Some(asset) = controller.geometry_state().asset(instance.asset_id) {
+                    selected.push(EntityRef {
+                        asset_id: asset.id,
+                        revision: asset.revision,
+                        instance_id: instance.id,
+                        body_id: instance.body_id,
+                        kind: EntityKind::Body,
+                        id: instance.body_id,
+                    });
+                }
+            }
             for id in focus_ops {
                 if let Some(binding) = controller.geometry_state().bindings.get(id) {
                     selected.extend(binding.selected.iter().cloned());
@@ -14958,6 +15213,7 @@ impl Viewport {
                 let (x, y, z) = controller.machine().envelope.extent();
                 [x as f32, y as f32, z as f32]
             },
+            grid_frame: Default::default(),
             show_gizmo,
             gizmo_size,
             snap_catch_px: prefs.snapping.pickbox_px * crate::SNAP_CATCH_MULTIPLE,
@@ -15181,12 +15437,14 @@ impl Viewport {
             OpKind::Drill | OpKind::Bore | OpKind::Thread => {
                 self.cad_scene.pick_drill_candidates(ray, aperture, through)
             }
-            OpKind::Adaptive | OpKind::Parallel => self.cad_scene.pick_any_candidates(
-                ray,
-                &[EntityKind::Face, EntityKind::Body],
-                aperture,
-                through,
-            ),
+            OpKind::Adaptive | OpKind::Parallel | OpKind::Spiral => {
+                self.cad_scene.pick_any_candidates(
+                    ray,
+                    &[EntityKind::Face, EntityKind::Body],
+                    aperture,
+                    through,
+                )
+            }
             OpKind::Face => self.cad_scene.pick_any_candidates(
                 ray,
                 &[EntityKind::Face, EntityKind::Silhouette],
@@ -15222,7 +15480,7 @@ impl Viewport {
                             EntityKind::Loop => 1,
                             _ => 2,
                         },
-                        OpKind::Adaptive | OpKind::Parallel => match entity.kind {
+                        OpKind::Adaptive | OpKind::Parallel | OpKind::Spiral => match entity.kind {
                             EntityKind::Face => 0,
                             EntityKind::Body => 1,
                             _ => 2,
@@ -15673,7 +15931,13 @@ impl shader::Program<Message> for Viewport {
             cone_vertices: Arc::new(cone_vertices),
             cone_indices: Arc::new(cone_indices),
             grid_vertices: Arc::new(
-                grid_view::GridLayout::new(self.camera(), bounds.size(), self.grid_size).vertices(),
+                grid_view::GridLayout::new(
+                    self.camera(),
+                    bounds.size(),
+                    self.grid_size,
+                    self.grid_frame,
+                )
+                .vertices(),
             ),
             vertices: self.vertices.clone(),
             overlay_vertices: Arc::new(overlays),
@@ -16036,6 +16300,43 @@ impl shader::Primitive for ScenePrimitive {
         gizmo_pass.set_viewport(gx as f32, gy as f32, size as f32, size as f32, 0.0, 1.0);
         gizmo_pass.set_scissor_rect(gx, gy, size, size);
         pipeline.gizmo.draw(&mut gizmo_pass);
+    }
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    use super::*;
+    use iced::keyboard::Modifiers;
+
+    #[test]
+    fn defaults_are_unique_and_cover_all_actions() {
+        let settings = crate::Settings::default();
+        let mut bindings = BTreeSet::new();
+        for &(id, _, binding) in SHORTCUTS {
+            assert!(bindings.insert(binding), "duplicate binding: {binding}");
+            assert!(shortcut_action(id).is_some(), "missing action: {id}");
+            assert_eq!(shortcut_for_binding(&settings, binding), Some(id));
+        }
+        assert_eq!(
+            shortcut_binding(Some('p'), Modifiers::COMMAND | Modifiers::SHIFT).as_deref(),
+            Some("Cmd+Shift+P")
+        );
+        assert!(shortcut_binding(Some('p'), Modifiers::COMMAND | Modifiers::ALT).is_none());
+        assert!(shortcut_binding(Some('p'), Modifiers::NONE).is_none());
+    }
+
+    #[test]
+    fn overrides_and_unassigned_bindings_survive_settings_round_trip() {
+        let mut settings = crate::Settings::default();
+        settings.shortcuts.insert("profile".into(), "Cmd+9".into());
+        settings.shortcuts.insert("save".into(), String::new());
+        let loaded: crate::Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(shortcut_for_binding(&loaded, "Cmd+9"), Some("profile"));
+        assert_eq!(shortcut_for_binding(&loaded, "Cmd+Shift+P"), None);
+        assert_eq!(shortcut_value(&loaded, "save"), "");
+        assert_eq!(shortcut_for_binding(&loaded, "Cmd+S"), None);
+        assert_eq!(shortcut_value(&loaded, "open"), "Cmd+O");
     }
 }
 
@@ -16580,6 +16881,100 @@ mod multi_setup_draft_tests {
     }
 
     #[test]
+    fn spiral_editor_picks_center_and_applies_or_cancels_pass_settings() {
+        use cam_model::{ScallopRetraction, SpiralMode, SpiralOrder};
+        let mut app = blank_app();
+        let operation = app.controller.operation_template(OpKind::Spiral, 1);
+        let id = operation.id();
+        assert_eq!(
+            families_for(OpKind::Spiral),
+            &[crate::ToolKindPick::BallMill]
+        );
+        assert_eq!(
+            operation_tabs::field_tab(Field::SpiralInnerLimit),
+            OperationTab::Passes
+        );
+        assert_eq!(
+            operation_tabs::field_tab(Field::SpiralFromSlope),
+            OperationTab::Geometry
+        );
+        assert_eq!(
+            operation_tabs::field_tab(Field::SpiralStayDownDistance),
+            OperationTab::Linking
+        );
+        app.controller.add_operation(operation);
+        app.begin_operation_draft(id);
+        send(
+            &mut app,
+            Message::OperationPositionPick(operation_positions::PositionKind::Entry),
+        );
+        send(&mut app, Message::OperationPositionPicked([6., 7., 2.]));
+        send(
+            &mut app,
+            Message::SpiralModeChanged(SpiralMode::SpiralWithCircles),
+        );
+        send(
+            &mut app,
+            Message::SpiralOrderChanged(SpiralOrder::OutsideIn),
+        );
+        send(&mut app, Message::SpiralClockwiseToggled(true));
+        send(
+            &mut app,
+            Message::ScallopRetractionChanged(ScallopRetraction::Shortest),
+        );
+        send(
+            &mut app,
+            Message::FieldChanged(Field::SpiralInnerLimit, "1.5".into()),
+        );
+        send(
+            &mut app,
+            Message::FieldChanged(Field::SpiralOuterLimit, "8".into()),
+        );
+        send(&mut app, Message::Apply);
+        let Some(Operation::Spiral(saved)) = app.controller.operation(id) else {
+            panic!("Spiral operation is missing");
+        };
+        assert_eq!(saved.params.center, Some([6., 7.]));
+        assert_eq!(saved.params.mode, SpiralMode::SpiralWithCircles);
+        assert_eq!(saved.params.order, SpiralOrder::OutsideIn);
+        assert_eq!(saved.params.retraction, ScallopRetraction::Shortest);
+        assert_eq!(
+            [saved.params.inner_limit, saved.params.outer_limit],
+            [1.5, 8.]
+        );
+        assert!(saved.params.clockwise);
+        for tab in [
+            OperationTab::Tool,
+            OperationTab::Geometry,
+            OperationTab::Heights,
+            OperationTab::Passes,
+            OperationTab::Linking,
+        ] {
+            app.operation_tab = tab;
+            let _view = app.operation_inspector(id);
+        }
+        app.begin_operation_draft(id);
+        send(
+            &mut app,
+            Message::OperationPositionClear(operation_positions::PositionKind::Entry),
+        );
+        send(&mut app, Message::CancelOperationDraft);
+        assert_eq!(
+            app.controller
+                .operation(id)
+                .and_then(operation_tabs::operation_start),
+            Some([6., 7.])
+        );
+        assert!(app.controller.undo());
+        assert_eq!(
+            app.controller
+                .operation(id)
+                .and_then(operation_tabs::operation_start),
+            None
+        );
+    }
+
+    #[test]
     fn scallop_mode_is_a_saved_and_cancelable_finishing_choice() {
         let mut app = blank_app();
         let operation = app.controller.operation_template(OpKind::Parallel, 1);
@@ -16636,7 +17031,7 @@ mod multi_setup_draft_tests {
         assert!(
             matches!(app.controller.operation(id), Some(Operation::Parallel(p))
             if p.params.scallop_smoothing && p.params.scallop_smoothing_tolerance == 0.07
-                && p.params.scallop_safe_distance == 0.8 && p.params.scallop_start == Some([3., 4.])
+                && p.params.safe_distance == 0.8 && p.params.scallop_start == Some([3., 4.])
                 && p.params.scallop_order == cam_model::ScallopOrder::InsideOut
                 && p.params.scallop_retraction == cam_model::ScallopRetraction::Shortest),
             "{}",
@@ -16652,51 +17047,86 @@ mod multi_setup_draft_tests {
     }
 
     #[test]
-    fn parallel_keep_tool_down_checkbox_supports_zero_lift_apply_cancel_and_undo() {
+    fn parallel_transition_type_applies_cancels_and_undoes() {
+        use cam_model::ParallelTransition;
         let mut app = blank_app();
         let operation = app.controller.operation_template(OpKind::Parallel, 1);
         let id = operation.id();
         app.controller.add_operation(operation);
-        let checked = |op: &Operation| matches!(op, Operation::Parallel(p) if p.params.stay_down);
+        let mode = |op: &Operation| match op {
+            Operation::Parallel(p) => p.params.transition,
+            _ => unreachable!(),
+        };
         app.begin_operation_draft(id);
-        send(&mut app, Message::ParallelStayDownToggled(true));
-        assert!(checked(app.current_operation(id).unwrap()));
-        assert!(!checked(app.controller.operation(id).unwrap()));
-        assert_eq!(
-            op_field(app.current_operation(id).unwrap(), Field::LiftHeight),
-            Some(0.)
-        );
+        app.operation_tab = OperationTab::Linking;
+        let _ = app.operation_inspector(id);
+        send(&mut app, Message::ParallelTransitionChanged(ParallelTransition::NoContact));
+        assert_eq!(mode(app.current_operation(id).unwrap()), ParallelTransition::NoContact);
         send(&mut app, Message::CancelOperationDraft);
-        assert!(!checked(app.controller.operation(id).unwrap()));
+        assert_eq!(mode(app.controller.operation(id).unwrap()), ParallelTransition::StraightLine);
         app.begin_operation_draft(id);
-        send(&mut app, Message::ParallelStayDownToggled(true));
+        send(&mut app, Message::ParallelTransitionChanged(ParallelTransition::Smooth));
         send(&mut app, Message::Apply);
-        assert!(
-            checked(app.controller.operation(id).unwrap()),
-            "{}",
-            app.status
-        );
+        assert_eq!(mode(app.controller.operation(id).unwrap()), ParallelTransition::Smooth);
         assert!(app.controller.undo());
-        assert!(!checked(app.controller.operation(id).unwrap()));
-        assert!(app.controller.redo());
-        assert!(checked(app.controller.operation(id).unwrap()));
+        assert_eq!(mode(app.controller.operation(id).unwrap()), ParallelTransition::StraightLine);
+    }
+
+    #[test]
+    fn parallel_retraction_policy_supports_apply_cancel_and_undo() {
+        use cam_model::ScallopRetraction;
+        let mut app = blank_app();
+        let operation = app.controller.operation_template(OpKind::Parallel, 1);
+        let id = operation.id();
+        assert!(!operation_fields(&operation).contains(&Field::LiftHeight));
+        app.controller.add_operation(operation);
+        let minimum = |op: &Operation| {
+            matches!(op, Operation::Parallel(p) if p.params.retraction == ScallopRetraction::Minimum)
+        };
         app.begin_operation_draft(id);
-        send(
-            &mut app,
-            Message::FieldChanged(Field::LiftHeight, "2".into()),
-        );
-        send(&mut app, Message::ParallelStayDownToggled(false));
+        send(&mut app, Message::ScallopRetractionChanged(ScallopRetraction::Minimum));
+        assert!(minimum(app.current_operation(id).unwrap()));
+        assert!(operation_fields(app.current_operation(id).unwrap()).contains(&Field::ScallopSafeDistance));
+        send(&mut app, Message::CancelOperationDraft);
+        assert!(!minimum(app.controller.operation(id).unwrap()));
+        app.begin_operation_draft(id);
+        send(&mut app, Message::ScallopRetractionChanged(ScallopRetraction::Minimum));
         send(&mut app, Message::Apply);
-        assert!(!checked(app.controller.operation(id).unwrap()));
-        assert_eq!(
-            op_field(app.controller.operation(id).unwrap(), Field::LiftHeight),
-            Some(2.)
-        );
+        assert!(minimum(app.controller.operation(id).unwrap()), "{}", app.status);
+        assert!(app.controller.undo());
+        assert!(!minimum(app.controller.operation(id).unwrap()));
+    }
+
+    #[test]
+    fn adaptive_arc_sizes_are_linking_fields_and_can_be_edited_independently() {
+        let mut app = blank_app();
+        let mut operation = app.controller.operation_template(OpKind::Adaptive, 1);
+        let Operation::Adaptive(op) = &mut operation else {
+            unreachable!()
+        };
+        op.params.feed = 300.;
+        op.params.plunge_feed = 100.;
+        let id = operation.id();
+        for field in [Field::LeadInSize, Field::LeadOutSize] {
+            assert!(operation_fields(&operation).contains(&field));
+            assert_eq!(operation_tabs::field_tab(field), OperationTab::Linking);
+            assert_eq!(op_field(&operation, field), Some(0.6));
+            assert!(!operation_tabs::operation_field_invalid(&operation, field, 0.));
+            assert!(operation_tabs::operation_field_invalid(&operation, field, -1.));
+        }
+        app.controller.add_operation(operation);
+        app.begin_operation_draft(id);
+        send(&mut app, Message::FieldChanged(Field::LeadInSize, "0.9".into()));
+        send(&mut app, Message::FieldChanged(Field::LeadOutSize, "0".into()));
+        send(&mut app, Message::Apply);
+        let applied = app.controller.operation(id).unwrap();
+        assert_eq!(op_field(applied, Field::LeadInSize), Some(0.9));
+        assert_eq!(op_field(applied, Field::LeadOutSize), Some(0.));
     }
 
     #[test]
     fn lift_height_editor_supports_validation_apply_cancel_and_undo() {
-        for kind in [OpKind::Pocket, OpKind::Adaptive, OpKind::Parallel] {
+        for kind in [OpKind::Pocket, OpKind::Adaptive] {
             let mut app = blank_app();
             let mut operation = app.controller.operation_template(kind, 1);
             if let Operation::Adaptive(op) = &mut operation {
@@ -16705,7 +17135,7 @@ mod multi_setup_draft_tests {
             }
             let id = operation.id();
             let field = Field::LiftHeight;
-            let initial = if kind == OpKind::Pocket { 0.2 } else { 0.0 };
+            let initial = 0.2;
             assert!(operation_fields(&operation).contains(&field));
             assert_eq!(operation_tabs::field_tab(field), OperationTab::Linking);
             assert_eq!(op_field(&operation, field), Some(initial));
@@ -16731,7 +17161,7 @@ mod multi_setup_draft_tests {
             app.begin_operation_draft(id);
             assert_eq!(
                 app.fields.get(&field).map(String::as_str),
-                Some(if kind == OpKind::Pocket { "0.2" } else { "0" })
+                Some("0.2")
             );
             send(&mut app, Message::FieldChanged(field, "2".into()));
             send(&mut app, Message::Apply);
