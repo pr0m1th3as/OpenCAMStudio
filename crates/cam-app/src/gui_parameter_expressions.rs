@@ -1475,7 +1475,7 @@ mod tests {
             let pixels =
                 Headless::screenshot(&mut renderer, iced::Size::new(380, 440), 1., Color::WHITE);
             let mut ppm = b"P6\n380 440\n255\n".to_vec();
-            for pixel in pixels.chunks_exact(4) {
+            for pixel in pixels.as_chunks::<4>().0 {
                 ppm.extend_from_slice(&pixel[..3]);
             }
             std::fs::write(

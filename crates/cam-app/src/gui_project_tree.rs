@@ -1958,14 +1958,14 @@ mod tests {
             &mut app,
             Message::Tree(TreeMessage::View(TreeNode::Setup(setup))),
         );
-        let before = iced::advanced::widget::Tree::new(&app.workspace_main());
+        let before = iced::advanced::widget::Tree::new(app.workspace_main());
         let browser_index = before.children[0].children.len() - 1;
         send(
             &mut app,
             Message::Tree(TreeMessage::Press(TreeNode::Operation(ids[0]))),
         );
         send(&mut app, Message::Tree(TreeMessage::Release));
-        let after = iced::advanced::widget::Tree::new(&app.workspace_main());
+        let after = iced::advanced::widget::Tree::new(app.workspace_main());
         assert_eq!(
             after.children[0].children.len() - 1,
             browser_index,
@@ -2071,9 +2071,9 @@ mod tests {
                 } else {
                     TreeNode::Operation(ids[0])
                 };
-                send(&mut app, Message::Tree(TreeMessage::Open(node.clone())));
+                send(&mut app, Message::Tree(TreeMessage::Open(node)));
                 send(&mut app, Message::Tree(TreeMessage::ShowPatternMenu));
-                assert_eq!(app.tree_menu, Some(node.clone()));
+                assert_eq!(app.tree_menu, Some(node));
                 assert!(app.pattern_menu_y.is_some());
                 assert!(
                     app.pattern_draft.is_none(),

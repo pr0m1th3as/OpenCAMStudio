@@ -1159,7 +1159,7 @@ mod tests {
         let _ = app.update(Message::OperationGeometry(GeometryMessage::Edit));
         assert!(app.wrapped_pocket_geometry_editor());
         assert!(app.operation_geometry_preview().strips.is_empty());
-        assert_eq!(app.controller.cad_selection(), &[face.clone()]);
+        assert_eq!(app.controller.cad_selection(), std::slice::from_ref(&face));
         let _ = app.operation_geometry_settings();
         let larger_face = EntityRef {
             id: 2,
@@ -1180,7 +1180,7 @@ mod tests {
         assert_eq!(viewport.cad_filter, EntityKind::Loop);
         assert_eq!(viewport.cad_operation_kind, Some(OpKind::Engrave));
         let _ = app.update(Message::CadSelect(boundary.clone()));
-        assert_eq!(app.controller.cad_selection(), &[boundary.clone()]);
+        assert_eq!(app.controller.cad_selection(), std::slice::from_ref(&boundary));
         assert_eq!(app.editor_selected_geometry(), vec![boundary.clone()]);
         assert!(
             app.geometry_settings_valid().is_ok(),

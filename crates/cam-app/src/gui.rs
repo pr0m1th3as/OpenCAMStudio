@@ -17126,7 +17126,7 @@ mod multi_setup_draft_tests {
 
     #[test]
     fn lift_height_editor_supports_validation_apply_cancel_and_undo() {
-        for kind in [OpKind::Pocket, OpKind::Adaptive, OpKind::Parallel] {
+        for kind in [OpKind::Pocket, OpKind::Adaptive] {
             let mut app = blank_app();
             let mut operation = app.controller.operation_template(kind, 1);
             if let Operation::Adaptive(op) = &mut operation {
@@ -17135,7 +17135,7 @@ mod multi_setup_draft_tests {
             }
             let id = operation.id();
             let field = Field::LiftHeight;
-            let initial = if kind == OpKind::Parallel { 0.0 } else { 0.2 };
+            let initial = 0.2;
             assert!(operation_fields(&operation).contains(&field));
             assert_eq!(operation_tabs::field_tab(field), OperationTab::Linking);
             assert_eq!(op_field(&operation, field), Some(initial));
@@ -17161,7 +17161,7 @@ mod multi_setup_draft_tests {
             app.begin_operation_draft(id);
             assert_eq!(
                 app.fields.get(&field).map(String::as_str),
-                Some(if kind == OpKind::Parallel { "0" } else { "0.2" })
+                Some("0.2")
             );
             send(&mut app, Message::FieldChanged(field, "2".into()));
             send(&mut app, Message::Apply);

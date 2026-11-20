@@ -256,12 +256,12 @@ impl JobInputs {
         }) {
             let scene = self.program_scene(&job.program, cancel);
             if !cancel.is_cancelled() {
-                publish(PreviewUpdate::Replace(RunOutcome {
+                publish(PreviewUpdate::Replace(Box::new(RunOutcome {
                     completion: JobCompletion::Incomplete,
                     program: job.program.clone(),
                     scene,
                     ..Default::default()
-                }));
+                })));
             }
         }
         let mut stock = if !self.toolpath_preview
@@ -400,11 +400,11 @@ struct Running {
 }
 enum JobEvent {
     Preview(JobStamp, PreviewUpdate),
-    Finished(JobOutput),
+    Finished(Box<JobOutput>),
 }
 enum PreviewUpdate {
     Append(Scene),
-    Replace(RunOutcome),
+    Replace(Box<RunOutcome>),
 }
 pub(crate) struct JobOutput {
     pub stamp: JobStamp,
@@ -497,14 +497,14 @@ impl JobService {
                     ..Default::default()
                 });
                 outcome.stamp = Some(request.stamp.clone());
-                let _ = sender.send(JobEvent::Finished(JobOutput {
+                let _ = sender.send(JobEvent::Finished(Box::new(JobOutput {
                     stamp: request.stamp,
                     outcome,
                     cache,
-                }));
+                })));
             });
         if let Err(error) = spawned {
-            let _ = failure_sender.send(JobEvent::Finished(JobOutput {
+            let _ = failure_sender.send(JobEvent::Finished(Box::new(JobOutput {
                 stamp: stamp.clone(),
                 cache: OperationCache::default(),
                 outcome: RunOutcome {
@@ -517,7 +517,7 @@ impl JobService {
                     .for_setup(setup_id)],
                     ..Default::default()
                 },
-            }));
+            })));
         }
         self.running = Some(Running {
             stamp,
@@ -572,12 +572,12 @@ impl JobService {
                         }
                         PreviewUpdate::Replace(mut preview) => {
                             preview.stamp = Some(stamp);
-                            self.preview = Some(preview);
+                            self.preview = Some(*preview);
                         }
                     }
                     self.preview_revision = self.preview_revision.wrapping_add(1);
                 }
-                Ok(JobEvent::Finished(result)) => break Some(result),
+                Ok(JobEvent::Finished(result)) => break Some(*result),
                 Err(mpsc::TryRecvError::Empty) => return None,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     break Some(JobOutput {
@@ -679,10 +679,10 @@ mod tests {
         sender
             .send(JobEvent::Preview(
                 stamp.clone(),
-                PreviewUpdate::Replace(RunOutcome {
+                PreviewUpdate::Replace(Box::new(RunOutcome {
                     completion: JobCompletion::Incomplete,
                     ..Default::default()
-                }),
+                })),
             ))
             .unwrap();
         assert!(jobs.poll(7).is_none());
@@ -716,14 +716,14 @@ mod tests {
             }
             let (sender, receiver) = mpsc::channel();
             sender
-                .send(JobEvent::Finished(JobOutput {
+                .send(JobEvent::Finished(Box::new(JobOutput {
                     stamp: wrong,
                     outcome: RunOutcome {
                         completion: JobCompletion::Complete,
                         ..Default::default()
                     },
                     cache: Default::default(),
-                }))
+                })))
                 .unwrap();
             let mut jobs = JobService::default();
             jobs.serial = 3;

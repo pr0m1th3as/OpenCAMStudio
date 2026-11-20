@@ -2655,13 +2655,13 @@ mod tests {
                 .filter(|vertex| vertex.color == kind.color())
                 .collect();
             assert_eq!(cross.len(), 4, "show a live point cross at the snap");
-            for axis in 0..3 {
+            for (axis, target_coordinate) in target.iter().enumerate() {
                 let center = cross
                     .iter()
                     .map(|vertex| vertex.position[axis] as f64)
                     .sum::<f64>()
                     / cross.len() as f64;
-                assert!((center - target[axis]).abs() < 1e-5);
+                assert!((center - target_coordinate).abs() < 1e-5);
             }
             let _ = app.update(Message::SetupHover(position, hover));
             let action = viewport
