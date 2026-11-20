@@ -183,13 +183,13 @@ pub(super) enum Pick {
     IndexLoop,
     IndexEdge,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) enum IndexMode {
     Manual,
     Face,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MachiningType {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(super) enum MachiningType {
     ThreeAxis,
     Indexed,
     Wrap,
@@ -458,6 +458,7 @@ impl App {
     }
     pub(super) fn rotary_controls(&self, op: &Operation) -> Element<'_, Message> {
         use iced::widget::column;
+        use parameter_options::{MACHINING_TYPE, ROTARY_ANGLE_MODE, ROTARY_AXIS, ROTARY_FLIP, ROTARY_UNWRAP};
         let enabled = op.rotary_wrap().is_some();
         let indexed = self.rotary_index_draft.is_some();
         let selected_mode = if enabled {
@@ -471,52 +472,55 @@ impl App {
         if op.supports_rotary_wrap() {
             machining_types.push(MachiningType::Wrap);
         }
+        let machining_type_picker = container(icon_picker::picker(
+            iced::advanced::widget::Id::from("machining-type-menu"),
+            machining_types.clone(),
+            selected_mode,
+            |mode| {
+                row![mode.icon(), text(mode.to_string()).size(12).width(Length::Fill)]
+                    .spacing(8)
+                    .align_y(Alignment::Center)
+                    .into()
+            },
+            |_| 0,
+            MACHINING_TYPE.on_change(),
+        ))
+        .width(Length::Fixed(INSPECTOR_PICKER_W));
         let mut form = column![row![
             text("Machining Type").size(12).width(Length::Fill),
-            container(icon_picker::picker(
-                iced::advanced::widget::Id::from("machining-type-menu"),
-                machining_types,
-                selected_mode,
-                |mode| row![
-                    mode.icon(),
-                    text(mode.to_string()).size(12).width(Length::Fill)
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center)
-                .into(),
-                |_| 0,
-                |mode| Message::Rotary(match mode {
-                    MachiningType::ThreeAxis => Action::Enable(false),
-                    MachiningType::Indexed => Action::Indexed(true),
-                    MachiningType::Wrap => Action::Enable(true),
-                }),
-            ))
-            .width(Length::Fixed(INSPECTOR_PICKER_W))
+            MACHINING_TYPE.menu(
+                &selected_mode,
+                selected_mode.to_string(),
+                &machining_types,
+                machining_type_picker,
+            ),
         ]
         .spacing(8)
         .align_y(Alignment::Center)]
         .spacing(12);
         if let Some(index) = &self.rotary_index_draft {
+            use cam_model::RotaryAxis;
+
+            let axes = [RotaryAxis::A, RotaryAxis::B];
+            let label = match index.axis {
+                RotaryAxis::A => "A (X)",
+                RotaryAxis::B => "B (Y)",
+            };
+            let axis_picker = pick_list(["A (X)", "B (Y)"], Some(label), |axis| {
+                ROTARY_AXIS.on_change()(if axis == "A (X)" {
+                    RotaryAxis::A
+                } else {
+                    RotaryAxis::B
+                })
+            })
+            .text_size(12)
+            .padding([7, 9])
+            .style(inspector_picker)
+            .width(Length::Fixed(INSPECTOR_INPUT_W));
             form = form.push(
                 row![
                     text("Rotary axis").size(12).width(Length::Fill),
-                    pick_list(
-                        ["A (X)", "B (Y)"],
-                        Some(if index.axis == cam_model::RotaryAxis::A {
-                            "A (X)"
-                        } else {
-                            "B (Y)"
-                        }),
-                        |axis| Message::Rotary(Action::IndexAxis(if axis == "A (X)" {
-                            cam_model::RotaryAxis::A
-                        } else {
-                            cam_model::RotaryAxis::B
-                        },)),
-                    )
-                    .text_size(12)
-                    .padding([7, 9])
-                    .style(inspector_picker)
-                    .width(Length::Fixed(INSPECTOR_INPUT_W))
+                    ROTARY_AXIS.menu(&index.axis, label.into(), &axes, axis_picker),
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),
@@ -524,15 +528,11 @@ impl App {
             form = form.push(
                 row![
                     text("Angle mode").size(12).width(Length::Fill),
-                    pick_list(
-                        [IndexMode::Manual, IndexMode::Face],
-                        Some(self.rotary_index_mode),
-                        |v| Message::Rotary(Action::IndexMode(v))
-                    )
-                    .text_size(12)
-                    .padding([7, 9])
-                    .style(inspector_picker)
-                    .width(Length::Fixed(INSPECTOR_INPUT_W))
+                    ROTARY_ANGLE_MODE.picker(
+                        self.rotary_index_mode,
+                        &[IndexMode::Manual, IndexMode::Face],
+                        Length::Fixed(INSPECTOR_INPUT_W),
+                    ),
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),
@@ -583,9 +583,7 @@ impl App {
                             "Flip adds 180° to the index angle, turning the selected face away from the tool. Select geometry accessible from the resulting direction. Orange marks the orientation face and tool approach; blue marks cutting geometry.",
                             self.tooltips,
                         ),
-                        checkbox(index.flip)
-                            .on_toggle(|v| Message::Rotary(Action::IndexFlip(v)))
-                            .width(Length::Fixed(INSPECTOR_INPUT_W)),
+                        ROTARY_FLIP.checkbox(index.flip, 15),
                     ]
                     .spacing(8)
                     .align_y(Alignment::Center),
@@ -638,9 +636,7 @@ impl App {
         form = form.push(
             row![
                 text("Unwrap Geometry").size(12).width(Length::Fill),
-                checkbox(wrap.unwrap_geometry)
-                    .on_toggle(|v| Message::Rotary(Action::Unwrap(v)))
-                    .width(Length::Fixed(INSPECTOR_INPUT_W))
+                ROTARY_UNWRAP.checkbox(wrap.unwrap_geometry, 15)
             ]
             .spacing(8)
             .align_y(Alignment::Center),
@@ -714,6 +710,7 @@ impl App {
         match action {
             Action::Indexed(enabled) => {
                 if enabled {
+                    let initializing = self.rotary_index_draft.is_none();
                     let mut index = self.rotary_index_draft.clone().unwrap_or_default();
                     if let Some(wrap) = self
                         .operation_draft
@@ -726,6 +723,9 @@ impl App {
                     self.rotary_index_draft = Some(index);
                     self.edit_operation_draft(|op| op.set_rotary_wrap(None));
                     self.seed_rotary_index_values();
+                    if initializing {
+                        self.seed_user_rotary_index_options();
+                    }
                 } else {
                     self.rotary_index_draft = None;
                 }
@@ -813,6 +813,9 @@ impl App {
                 });
                 self.rotary_pick = None;
                 self.refresh_operation_fields();
+                if enabled && !restoring {
+                    self.seed_user_rotary_wrap_options();
+                }
             }
             Action::Unwrap(value) => self.edit_operation_draft(|op| {
                 if let Some(mut w) = op.rotary_wrap().cloned() {

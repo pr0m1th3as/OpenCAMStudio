@@ -1,6 +1,9 @@
 //! Shared DXF/STEP operation creation controls.
 use super::*;
 use iced::widget::column;
+
+pub(super) const DEFAULT_POCKET_ENGAGEMENT: &str = "=tool_diameter * 0.4";
+
 impl App {
     pub(super) fn creating_operation(&self) -> bool {
         self.cad_pending_kind.is_some()
@@ -55,10 +58,11 @@ impl App {
     pub(super) fn wizard_cutting(&self) -> Option<CuttingData> {
         let seeded = self.wizard_seeded_cutting()?;
         let parse = |field, fallback| {
-            self.fields
-                .get(&field)
-                .map_or(Some(fallback), |text| text.parse::<f64>().ok())
-                .filter(|value| value.is_finite())
+            if self.fields.contains_key(&field) {
+                self.parsed_field_value(field).ok()
+            } else {
+                Some(fallback)
+            }
         };
         let cutting = CuttingData {
             rpm: parse(Field::SpindleRpm, seeded.rpm)?,
@@ -89,51 +93,9 @@ impl App {
         self.inspector_active = true;
         self.operation_binding_preview = None;
         self.operation_geometry = None;
-        self.operation_draft = Some(self.controller.operation_template(kind, 0));
-        if let Some(op) = &mut self.operation_draft {
-            if let Operation::Pocket(pocket) = op {
-                pocket.clear.adaptive_enabled = Some(false);
-                cam_model::OperationParameter::Engagement.set_source(op, "=tool_diameter * 0.4");
-                cam_model::OperationParameter::PocketFinishFeed.set_source(op, "=feed");
-                cam_model::OperationParameter::Stepdown
-                    .set_source(op, pocket_parameters::DEFAULT_STEPDOWN);
-                let stepover = cam_model::OperationParameter::MaximumStepover;
-                stepover.set_source(op, stepover.default_expression());
-            }
-            if let Operation::Profile(_) = op {
-                cam_model::OperationParameter::Stepdown
-                    .set_source(op, pocket_parameters::DEFAULT_STEPDOWN);
-            }
-            if let Operation::Face(_) = op {
-                cam_model::OperationParameter::Stepdown
-                    .set_source(op, pocket_parameters::DEFAULT_STEPDOWN);
-                cam_model::OperationParameter::FaceOverlap.set_source(op, "=tool_diameter * 0.5");
-                cam_model::OperationParameter::FaceOvershoot
-                    .set_source(op, "=tool_diameter / 2 + 0.1");
-            }
-            let fields = operation_fields(op);
-            for (field, parameter, source) in [
-                (
-                    Field::RampFeed,
-                    cam_model::OperationParameter::RampFeed,
-                    "=plungeFeed",
-                ),
-                (
-                    Field::LeadInFeed,
-                    cam_model::OperationParameter::LeadInFeed,
-                    "=feed",
-                ),
-                (
-                    Field::LeadOutFeed,
-                    cam_model::OperationParameter::LeadOutFeed,
-                    "=feed",
-                ),
-            ] {
-                if fields.contains(&field) {
-                    parameter.set_source(op, source);
-                }
-            }
-        }
+        let mut operation = self.controller.operation_template(kind, 0);
+        Self::seed_programmed_parameter_defaults(&mut operation);
+        self.operation_draft = Some(operation);
         self.stock_to_leave_draft = Some(
             self.controller
                 .pending_op()
@@ -156,7 +118,39 @@ impl App {
         self.refresh_fields();
         self.seed_wizard_cutting();
         self.auto_operation_preset();
+        self.seed_user_option_defaults();
+        self.seed_user_parameter_defaults(|_| true);
         self.sync_creation_geometry_heights();
+    }
+
+    pub(super) fn seed_programmed_parameter_defaults(op: &mut Operation) {
+        use cam_model::OperationParameter as Parameter;
+
+        let kind = AppController::operation_kind(op);
+        if let Operation::Pocket(pocket) = op {
+            pocket.clear.adaptive_enabled = Some(false);
+            Parameter::Engagement.set_source(op, DEFAULT_POCKET_ENGAGEMENT);
+            Parameter::PocketFinishFeed.set_source(op, "=feed");
+            let stepover = Parameter::MaximumStepover;
+            stepover.set_source(op, stepover.default_expression());
+        }
+        if matches!(kind, OpKind::Profile | OpKind::Pocket | OpKind::Face) {
+            Parameter::Stepdown.set_source(op, pocket_parameters::DEFAULT_STEPDOWN);
+        }
+        if kind == OpKind::Face {
+            Parameter::FaceOverlap.set_source(op, "=tool_diameter * 0.5");
+            Parameter::FaceOvershoot.set_source(op, "=tool_diameter / 2 + 0.1");
+        }
+        let fields = operation_fields(op);
+        for (field, parameter, source) in [
+            (Field::RampFeed, Parameter::RampFeed, "=plungeFeed"),
+            (Field::LeadInFeed, Parameter::LeadInFeed, "=feed"),
+            (Field::LeadOutFeed, Parameter::LeadOutFeed, "=feed"),
+        ] {
+            if fields.contains(&field) {
+                parameter.set_source(op, source);
+            }
+        }
     }
 
     /// Follow the selected surface while retaining every height definition the
@@ -225,12 +219,16 @@ impl App {
 
     pub(super) fn sync_creation_tool(&mut self) {
         if let Some(tool) = self.wizard_tool() {
+            let cooling = self.creation_cooling_override();
             let number = self.stage_operation_tool(tool);
             self.edit_operation_draft(|op| {
                 op.set_tool(number);
                 op.clear_tool_preset();
             });
             self.auto_operation_preset();
+            if let Some(cooling) = cooling {
+                self.edit_operation_draft(|op| op.set_cooling(cooling));
+            }
         }
         self.sync_creation_geometry_heights();
     }

@@ -132,11 +132,10 @@ pub(super) fn inspector_section_label(label: &str) -> iced::widget::Text<'static
         .color(INSPECTOR_TEXT)
 }
 
-/// The checkbox label is clickable too. Only render the section body when enabled.
-pub(super) fn inspector_section_toggle(
+/// The checkbox label is clickable too.
+pub(super) fn inspector_section_checkbox(
     label: &str,
     enabled: bool,
-    on_toggle: Option<impl Fn(bool) -> Message + 'static>,
 ) -> iced::widget::Checkbox<'static, Message> {
     checkbox(enabled)
         .label(label.to_owned())
@@ -144,7 +143,6 @@ pub(super) fn inspector_section_toggle(
         .spacing(8)
         .text_size(INSPECTOR_TEXT_SIZE)
         .font(INSPECTOR_SECTION_FONT)
-        .on_toggle_maybe(on_toggle)
 }
 
 fn inspector_section_frame<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {

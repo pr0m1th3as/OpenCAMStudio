@@ -111,6 +111,18 @@ impl Widget<Message, iced::Theme, iced::Renderer> for FormulaInput<'_> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        if matches!(
+            event,
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right))
+        ) && layout
+            .bounds()
+            .intersection(viewport)
+            .is_some_and(|bounds| cursor.is_over(bounds))
+        {
+            shell.publish(Message::OpenParameterMenu(self.field));
+            shell.capture_event();
+            return;
+        }
         let state = tree.state.downcast_mut::<InputState>();
         if state.is_focused() {
             if let Event::Keyboard(iced::keyboard::Event::KeyPressed {
@@ -356,5 +368,16 @@ mod tests {
         assert!(messages
             .iter()
             .any(|m| matches!(m, Message::ParameterInputState(FIELD, true, 8))));
+        let messages = dispatch(
+            &mut input,
+            &mut tree,
+            &renderer,
+            &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)),
+            mouse::Cursor::Available(iced::Point::new(20., 12.)),
+        );
+        assert!(matches!(
+            messages.as_slice(),
+            [Message::OpenParameterMenu(FIELD)]
+        ));
     }
 }

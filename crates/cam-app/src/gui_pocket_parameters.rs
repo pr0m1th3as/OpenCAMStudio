@@ -1,5 +1,6 @@
 //! Pocket finishing controls; all cutter compensation is computed by the strategy.
 use super::*;
+use parameter_options::{depth_toggle, pocket_toggle, MULTIPLE_DEPTHS, POCKET_FINISHING};
 use cam_model::PocketFinishing;
 
 pub(super) const DEFAULT_STEPDOWN: &str = "=min(tool_fluteLength * 0.75; tool_diameter * 2.5)";
@@ -102,7 +103,7 @@ impl App {
             .optional_section(
                 "Multiple Depths",
                 d.enabled,
-                Some(|v| Message::PocketDepthToggle(DepthToggle::Enabled, v)),
+                Some(MULTIPLE_DEPTHS),
             );
         if !d.enabled {
             return list;
@@ -145,9 +146,7 @@ impl App {
             list = list.push(
                 row![
                     label_help(label, help, self.tooltips),
-                    checkbox(value)
-                        .size(15)
-                        .on_toggle(move |v| Message::PocketDepthToggle(toggle, v))
+                    depth_toggle(toggle).checkbox(value, 15)
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),
@@ -163,7 +162,7 @@ impl App {
             .optional_section(
                 "Finishing passes",
                 p.enabled,
-                Some(|value| Message::PocketFinishToggle(Toggle::Enabled, value)),
+                Some(POCKET_FINISHING),
             );
         if !p.enabled {
             return list;
@@ -180,9 +179,7 @@ impl App {
         let toggle = |label, help, value, t| -> Element<'_, Message> {
             row![
                 label_help(label, help, self.tooltips),
-                checkbox(value)
-                    .size(15)
-                    .on_toggle(move |value| Message::PocketFinishToggle(t, value))
+                pocket_toggle(t).checkbox(value, 15)
             ]
             .spacing(8)
             .align_y(Alignment::Center)

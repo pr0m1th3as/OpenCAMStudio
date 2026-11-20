@@ -1181,15 +1181,7 @@ impl App {
                 .style(inspector_picker)
                 .width(Length::Fill),
             text("Cooling").size(12),
-            pick_list(
-                &cam_model::Cooling::ALL[..],
-                Some(op.cooling()),
-                Message::OperationCoolingChanged
-            )
-            .text_size(12)
-            .padding([7, 9])
-            .style(inspector_picker)
-            .width(Length::Fill),
+            parameter_options::COOLING.picker(op.cooling(), &cam_model::Cooling::ALL, Length::Fill),
         ]
         .spacing(6);
         if let Some(preset) = op.tool_preset() {

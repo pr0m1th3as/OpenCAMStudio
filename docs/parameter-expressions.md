@@ -23,6 +23,18 @@ or unrounded numeric value. Enter does not apply the whole operation. Replace a 
 plain number to override it. Apply, Cancel, save/reopen and Undo/Redo retain the
 bindings and overrides.
 
+Right-click a parameter or open its **⋮** menu to see its current value.
+The menu is available on individual numeric fields, checkboxes within sections,
+and reusable dropdown choices. **Save as User Default** stores the formula,
+number, or choice for that parameter and operation type. New operations of that
+type use the saved default. **Reset to User Default** becomes available after
+you save one.
+**Reset to System Default** restores the programmed setting. The saved user
+default stays available after a system reset. Use **Apply** to commit either
+reset to an existing operation.
+**Copy Parameter Name** copies the parameter's name. Numeric parameter names
+can be used in formulas.
+
 Typing letters in a formula shows the available matching variable names. Suggestions
 are filtered at the caret, including inside function arguments. Click a suggestion,
 or select it with ↑/↓ and insert it with Tab. Tab otherwise advances focus normally.

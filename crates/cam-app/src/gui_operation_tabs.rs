@@ -1,5 +1,6 @@
 //! Backend-driven operation tabs. Tab changes only change the view of one draft.
 use super::*;
+use parameter_options::*;
 use cam_model::Comp;
 use iced::widget::column;
 use iced::widget::svg;
@@ -291,9 +292,7 @@ fn profile_climb_control(climb: bool, show_help: bool) -> Element<'static, Messa
             .size(12)
             .width(Length::Fill)
             .color(INSPECTOR_TEXT),
-        checkbox(climb)
-            .size(15)
-            .on_toggle(Message::ClearingClimbToggled),
+        CLEARING_CLIMB.checkbox(climb, 15),
     ]
     .spacing(8)
     .align_y(Alignment::Center);
@@ -353,14 +352,14 @@ fn stock_offset_fields(operation: &Operation) -> Vec<Field> {
     fields
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Compensation {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(super) enum Compensation {
     Computed,
     Control,
 }
 impl Compensation {
     const ALL: [Self; 2] = [Self::Computed, Self::Control];
-    fn of(comp: Comp) -> Self {
+    pub(super) fn of(comp: Comp) -> Self {
         match comp {
             Comp::Computed => Self::Computed,
             Comp::Control => Self::Control,
@@ -373,7 +372,7 @@ impl Compensation {
             &Self::ALL[..1]
         }
     }
-    fn value(self) -> Comp {
+    pub(super) fn value(self) -> Comp {
         match self {
             Self::Computed => Comp::Computed,
             Self::Control => Comp::Control,
@@ -507,7 +506,7 @@ impl App {
                 list = list.optional_section(
                     "Stock contours",
                     pocket.stock_contours.enabled,
-                    Some(|value| Message::OperationGeometry(GeometryMessage::StockContours(value))),
+                    Some(STOCK_CONTOURS),
                 );
                 if pocket.stock_contours.enabled {
                     list = list.push(
@@ -538,20 +537,11 @@ impl App {
                     .section("Geometry")
                     .push(text("Tool containment").size(12));
                 list = list.push(
-                    pick_list(
-                        [
+                    CONTAINMENT.picker(adaptive.params.containment, &[
                             cam_model::AdaptiveContainment::Inside,
                             cam_model::AdaptiveContainment::Center,
                             cam_model::AdaptiveContainment::Outside,
-                        ],
-                        Some(adaptive.params.containment),
-                        Message::AdaptiveContainmentChanged,
-                    )
-                    .placeholder("Choose containment")
-                    .text_size(12)
-                    .padding([7, 9])
-                    .style(inspector_picker)
-                    .width(Length::Fill),
+                        ], Length::Fill),
                 );
             }
         }
@@ -748,7 +738,7 @@ impl App {
                 list = list.optional_section(
                     "Roughing passes",
                     rough.enabled,
-                    Some(Message::ContourRoughingToggled),
+                    Some(CONTOUR_ROUGHING),
                 );
                 if rough.enabled {
                     for field in [
@@ -780,13 +770,13 @@ impl App {
                 if tab == OperationTab::Geometry && linked.is_none() {
                     list = list.section("Geometry");
                     let comp = p.comp;
-                    list = list.push(profile_picker(
+                    list = list.push(operation_picker(
                         "Compensation",
                         "Computed offsets the geometry; Control uses the machine's G41/G42 cutter compensation. Climb in Passes also determines the compensation side.",
                         self.tooltips,
                         Compensation::of(comp),
                         Compensation::available(self.controller.post_kind()),
-                        |value| Message::ProfileCompChanged(value.value()),
+                        COMPENSATION,
                     ));
                 }
                 if tab == OperationTab::Geometry {
@@ -799,7 +789,7 @@ impl App {
                                 self.controller.post_kind().supports_cutter_comp(),
                             )
                             .tabs)
-                            .then_some(Message::ProfileTabsEnabled),
+                            .then_some(HOLDING_TABS),
                     );
                     if !p.closed || !p.additional_chains.is_empty() {
                         list = list.push(
@@ -823,7 +813,7 @@ impl App {
                         list = list.push(text("Open chains support leads, ramps and tangent extensions with computed compensation. Ramps retrace their entry at depth; short chains need a smaller stepdown.").size(11).color(INSPECTOR_MUTED));
                     }
                     if p.tabs.enabled {
-                        list = list.push(profile_picker("Tab shape","Rectangular tabs keep a flat top; triangular tabs rise and fall gradually.",self.tooltips,p.tabs.shape,&cam_model::TabShape::ALL[..],Message::ProfileTabShape));
+                        list = list.push(operation_picker("Tab shape","Rectangular tabs keep a flat top; triangular tabs rise and fall gradually.",self.tooltips,p.tabs.shape,&cam_model::TabShape::ALL[..],TAB_SHAPE));
                         for field in [Field::TabWidth, Field::TabHeight] {
                             let value = self.fields.get(&field).cloned().unwrap_or_default();
                             list = list.push(self.parameter_field_row(
@@ -833,10 +823,10 @@ impl App {
                                 &value,
                             ));
                         }
-                        list = list.push(profile_picker(
+                        list = list.push(operation_picker(
                             "Tab positioning", "Place tabs automatically by contour distance, or select locations on the contour.", self.tooltips,
                             if p.tabs.manual { profile_tabs::Positioning::Manual } else if p.tabs.count.is_some() { profile_tabs::Positioning::ByCount } else { profile_tabs::Positioning::ByDistance },
-                            &profile_tabs::Positioning::ALL[..], Message::ProfileTabPositioning,
+                            &profile_tabs::Positioning::ALL[..], TAB_POSITIONING,
                         ));
                         if !p.tabs.manual {
                             let field = if p.tabs.count.is_some() {
@@ -876,7 +866,7 @@ impl App {
                     let adaptive = p.clear.pocket_adaptive_enabled();
                     list = list.push(row![
                         label_help("Adaptive clearing", "Use adaptive clearing to limit radial engagement; otherwise use concentric clearing.", self.tooltips),
-                        checkbox(adaptive).size(15).on_toggle(Message::PocketAdaptiveToggled)
+                        ADAPTIVE_POCKET.checkbox(adaptive, 15)
                     ].spacing(8).align_y(Alignment::Center));
                     if !adaptive {
                         let value = self
@@ -907,9 +897,7 @@ impl App {
                     list = list.push(
                         row![
                             label_help("Climb", help::CLIMB, self.tooltips),
-                            checkbox(p.clear.clearing.climb)
-                                .size(15)
-                                .on_toggle(Message::ClearingClimbToggled)
+                            CLEARING_CLIMB.checkbox(p.clear.clearing.climb, 15)
                         ]
                         .spacing(8),
                     );
@@ -918,13 +906,13 @@ impl App {
             Operation::Face(f) if tab == OperationTab::Passes => {
                 list =
                     list.extend(self.multiple_depth_controls(f.multiple_depths, f.stepdown, true));
-                list = list.section("Passes").push(profile_picker(
+                list = list.section("Passes").push(operation_picker(
                     "Direction",
                     help::FACE_DIRECTION,
                     self.tooltips,
                     f.direction,
                     &Axis::ALL[..],
-                    Message::FaceDirectionChanged,
+                    FACE_DIRECTION,
                 ))
             }
             Operation::Chamfer(c) if !c.faces.is_empty() || self.chamfer_faces_active() => {
@@ -942,13 +930,13 @@ impl App {
             }
             Operation::Chamfer(c) => {
                 if tab == OperationTab::Geometry {
-                    list = list.section("Geometry").push(profile_picker(
+                    list = list.section("Geometry").push(operation_picker(
                         "Side",
                         help::SIDE,
                         self.tooltips,
                         c.side,
                         &Side::ALL[..],
-                        Message::SideChanged,
+                        CHAMFER_SIDE,
                     ));
                 }
                 if tab == OperationTab::Passes {
@@ -987,21 +975,17 @@ impl App {
                     list = list.push(
                         row![
                             label_help("Gradual", help::CHAMFER_GRADUAL, self.tooltips),
-                            checkbox(c.gradual)
-                                .size(15)
-                                .on_toggle(Message::ChamferGradualToggled)
+                            CHAMFER_GRADUAL.checkbox(c.gradual, 15)
                         ]
                         .spacing(8),
                     );
                 }
             }
             Operation::Bore(b) => {
-                let toggle = |label: &'static str, value, option: fn(bool) -> BoreOption| {
+                let toggle = |label: &'static str, value, setting: Setting<bool>| {
                     row![
                         text(label).size(12),
-                        checkbox(value)
-                            .size(15)
-                            .on_toggle(move |v| Message::BoreOption(option(v)))
+                        setting.checkbox(value, 15)
                     ]
                     .spacing(8)
                 };
@@ -1017,75 +1001,69 @@ impl App {
                             .size(12),
                         );
                     } else {
-                        list = list.push(toggle("Internal hole", b.internal, BoreOption::Internal));
+                        list = list.push(toggle("Internal hole", b.internal, BORE_INTERNAL));
                     }
-                    list = list.push(pick_list(
-                        &cam_model::BoreOrder::ALL[..],
-                        Some(b.order),
-                        |v| Message::BoreOption(BoreOption::Order(v)),
-                    ));
+                    list = list.push(BORE_ORDER.picker(b.order, &cam_model::BoreOrder::ALL, Length::Fill));
                     list = list.push(toggle(
                         "Reverse order",
                         b.reverse_order,
-                        BoreOption::Reverse,
+                        BORE_REVERSE,
                     ));
                 }
                 if tab == OperationTab::Passes {
                     list = list.section("Passes").push(toggle(
                         "Use ramp angle",
                         b.ramp_angle.is_some(),
-                        BoreOption::Angle,
+                        BORE_ANGLE,
                     ));
                     list = list.section("Passes").push(toggle(
                         "Climb milling",
                         b.climb,
-                        BoreOption::Climb,
+                        BORE_CLIMB,
                     ));
                     list = list.section("Passes").push(toggle(
                         "Repeat final pass",
                         b.repeat_pass,
-                        BoreOption::Repeat,
+                        BORE_REPEAT,
                     ));
                     list = list.push(text("Tool compensation is computed in CAM.").size(12));
                 }
             }
             Operation::Thread(t) => {
                 if tab == OperationTab::Geometry {
-                    list = list.section("Geometry").push(profile_picker(
+                    list = list.section("Geometry").push(operation_picker(
                         "Bore",
                         help::BORE,
                         self.tooltips,
                         Bore::of(t.internal),
                         &Bore::ALL[..],
-                        |b| Message::ThreadInternalChanged(b == Bore::Internal),
+                        THREAD_BORE,
                     ));
                     list = list
                         .section("Geometry")
                         .push(self.thread_geometry_controls(t));
                 }
                 if tab == OperationTab::Passes {
-                    list = list.section("Passes").push(profile_picker(
+                    list = list.section("Passes").push(operation_picker(
                         "Hand",
                         help::HAND,
                         self.tooltips,
                         t.hand,
                         &Hand::ALL[..],
-                        Message::ThreadHandChanged,
+                        THREAD_HAND,
                     ));
-                    list = list.push(profile_picker(
+                    list = list.push(operation_picker(
                         "Cut",
                         help::THREAD_CUT,
                         self.tooltips,
                         CutStyle::of(t.climb),
                         &CutStyle::ALL[..],
-                        |c| Message::ThreadClimbChanged(c == CutStyle::Climb),
+                        THREAD_CUT,
                     ));
                     list = list.push(
                         row![
                             label_help("Gradual", help::THREAD_GRADUAL, self.tooltips),
-                            checkbox(t.gradual)
-                                .size(15)
-                                .on_toggle(Message::ThreadGradualToggled)
+                            THREAD_GRADUAL.checkbox(t.gradual, 15)
                         ]
                         .spacing(8),
                     );
@@ -1095,37 +1073,35 @@ impl App {
                 use cam_model::{SpiralCutDirection, SpiralMilling, SpiralMode, SpiralOrder};
                 let p = spiral.params;
                 list = list.section("Passes")
-                    .push(profile_picker(
+                    .push(operation_picker(
                         "Spiral mode",
                         "Choose a continuous spiral, a spiral with circular limit passes, or separate concentric circles.",
                         self.tooltips,
                         p.mode,
                         &[SpiralMode::Spiral, SpiralMode::SpiralWithCircles, SpiralMode::ConcentricCircles][..],
-                        Message::SpiralModeChanged,
+                        SPIRAL_MODE,
                     ))
-                    .push(profile_picker(
+                    .push(operation_picker(
                         "Inside/Outside direction",
                         "Order passes from the center or from the outside. Shortest machining distance reduces repositioning between separate passes.",
                         self.tooltips,
                         p.order,
                         &[SpiralOrder::InsideOut, SpiralOrder::OutsideIn, SpiralOrder::Shortest][..],
-                        Message::SpiralOrderChanged,
+                        SPIRAL_ORDER,
                     ))
-                    .push(profile_picker(
+                    .push(operation_picker(
                         "Direction",
                         "Climb or conventional uses the spindle and uncut side of the spiral. Both ways uses the Clockwise setting.",
                         self.tooltips,
                         p.cut_direction,
                         &[SpiralCutDirection::Climb, SpiralCutDirection::Conventional, SpiralCutDirection::BothWays][..],
-                        Message::SpiralCutDirectionChanged,
+                        SPIRAL_CUT,
                     ));
                 if p.order == SpiralOrder::Shortest {
                     list = list.push(
                         row![
                             text("Link from inside to outside").size(12),
-                            checkbox(p.link_inside_out)
-                                .size(15)
-                                .on_toggle(Message::SpiralLinkInsideOutToggled)
+                            SPIRAL_LINK_ORDER.checkbox(p.link_inside_out, 15)
                         ]
                         .spacing(8),
                     );
@@ -1134,25 +1110,23 @@ impl App {
                     list = list.push(
                         row![
                             text("Clockwise").size(12),
-                            checkbox(p.clockwise)
-                                .size(15)
-                                .on_toggle(Message::SpiralClockwiseToggled)
+                            SPIRAL_CLOCKWISE.checkbox(p.clockwise, 15)
                         ]
                         .spacing(8),
                     );
                 }
-                list = list.push(profile_picker(
+                list = list.push(operation_picker(
                     "Up/Down milling",
                     "Split passes at changes in elevation and orient each piece to cut uphill or downhill.",
                     self.tooltips,
                     p.milling,
                     &[SpiralMilling::Both, SpiralMilling::Up, SpiralMilling::Down][..],
-                    Message::SpiralMillingChanged,
+                    SPIRAL_MILLING,
                 ));
                 list = list.optional_section(
                     "Multiple Depths",
                     p.multiple_depths,
-                    Some(Message::SpiralDepthsToggled),
+                    Some(SPIRAL_DEPTHS),
                 );
                 if p.multiple_depths {
                     for (field, label) in [
@@ -1171,9 +1145,7 @@ impl App {
                     list = list.push(
                         row![
                             text("Order by depth").size(12),
-                            checkbox(p.order_by_depth)
-                                .size(15)
-                                .on_toggle(Message::SpiralDepthOrderToggled)
+                            SPIRAL_DEPTH_ORDER.checkbox(p.order_by_depth, 15)
                         ]
                         .spacing(8),
                     );
@@ -1181,7 +1153,7 @@ impl App {
                 list = list.optional_section(
                     "Smoothing",
                     p.smoothing,
-                    Some(Message::ScallopSmoothingToggled),
+                    Some(SMOOTHING),
                 );
                 if p.smoothing {
                     let field = Field::ScallopSmoothingTolerance;
@@ -1196,14 +1168,14 @@ impl App {
             }
             Operation::Spiral(spiral) if tab == OperationTab::Geometry => {
                 use cam_model::SpiralBoundary;
-                list = list.section("Geometry").push(profile_picker(
+                list = list.section("Geometry").push(operation_picker(
                     "Machining boundary",
                     "Use the selected geometry bounding box, its projected silhouette, or the setup stock bounding box.",
                     self.tooltips,
                     spiral.params.boundary,
                     &[SpiralBoundary::BoundingBox, SpiralBoundary::Silhouette, SpiralBoundary::StockBox][..],
-                    Message::SpiralBoundaryChanged,
-                )).push(profile_picker(
+                    SPIRAL_BOUNDARY,
+                )).push(operation_picker(
                     "Tool containment",
                     "Position of the cutter relative to the machining boundary.",
                     self.tooltips,
@@ -1213,12 +1185,12 @@ impl App {
                         cam_model::AdaptiveContainment::Center,
                         cam_model::AdaptiveContainment::Outside,
                     ][..],
-                    Message::AdaptiveContainmentChanged,
+                    CONTAINMENT,
                 ));
                 list = list.push(help_wrap(
                     row![
                         text("Contact only").size(12),
-                        checkbox(spiral.params.contact_only).size(15).on_toggle(Message::SpiralContactOnlyToggled)
+                        SPIRAL_CONTACT.checkbox(spiral.params.contact_only, 15)
                     ].spacing(8),
                     "Trim cutting to selected surface footprints. Clear to extend to the machining boundary where the cutter can safely follow the model or bottom height.",
                     self.tooltips,
@@ -1243,9 +1215,7 @@ impl App {
                 list = list.section("Passes").push(
                     row![
                         text("Scallop (surface offsets)").size(12),
-                        checkbox(p.params.scallop)
-                            .size(15)
-                            .on_toggle(Message::ParallelScallopToggled)
+                        PARALLEL_SCALLOP.checkbox(p.params.scallop, 15)
                     ]
                     .spacing(8),
                 );
@@ -1253,15 +1223,13 @@ impl App {
                     list = list.push(
                         row![
                             text("Both ways (zigzag)").size(12),
-                            checkbox(p.params.both_ways)
-                                .size(15)
-                                .on_toggle(Message::ParallelBothWaysToggled)
+                            PARALLEL_BOTH_WAYS.checkbox(p.params.both_ways, 15)
                         ]
                         .spacing(8),
                     );
                 } else {
                     list = list.push(text("Sampled surface offsets; vertical walls and narrow features may remain unfinished. Inspect the simulation.").size(11).color(palette::GROUP_LABEL));
-                    list = list.push(profile_picker(
+                    list = list.push(operation_picker(
                         "Inside/Outside direction",
                         "Advance from the outer boundary inward or in reverse. Shortest keeps the outside-in stepover sequence and reduces travel within each level.",
                         self.tooltips,
@@ -1271,21 +1239,19 @@ impl App {
                             cam_model::ScallopOrder::InsideOut,
                             cam_model::ScallopOrder::Shortest,
                         ][..],
-                        Message::ScallopOrderChanged,
+                        SCALLOP_ORDER,
                     ));
                     list = list.push(
                         row![
                             text("Smoothing").size(12),
-                            checkbox(p.params.scallop_smoothing)
-                                .size(15)
-                                .on_toggle(Message::ScallopSmoothingToggled)
+                            SMOOTHING.checkbox(p.params.scallop_smoothing, 15)
                         ]
                         .spacing(8),
                     );
                 }
             }
             Operation::Parallel(p) if tab == OperationTab::Geometry => {
-                list = list.push(profile_picker(
+                list = list.push(operation_picker(
                     "Tool containment",
                     "Position of the cutter relative to the selected machining area. Tool center on boundary clips the scan rows to the selected face footprint, including around openings. Smooth turns can extend beyond the ends.",
                     self.tooltips,
@@ -1295,16 +1261,14 @@ impl App {
                         cam_model::AdaptiveContainment::Center,
                         cam_model::AdaptiveContainment::Outside,
                     ][..],
-                    Message::AdaptiveContainmentChanged,
+                    CONTAINMENT,
                 ));
             }
             Operation::Adaptive(adaptive) if tab == OperationTab::Passes => {
                 list = list.section("Passes").push(
                     row![
                         label_help("Cut direction", help::CLIMB, self.tooltips),
-                        checkbox(adaptive.params.climb)
-                            .size(15)
-                            .on_toggle(Message::AdaptiveClimbToggled)
+                        ADAPTIVE_CLIMB.checkbox(adaptive.params.climb, 15)
                     ]
                     .spacing(8),
                 );
@@ -1315,9 +1279,7 @@ impl App {
                     list = list.push(
                         row![
                             text("Closed chain").size(12),
-                            checkbox(o.closed)
-                                .size(15)
-                                .on_toggle(Message::EngraveClosedChanged)
+                            ENGRAVE_CLOSED.checkbox(o.closed, 15)
                         ]
                         .spacing(8),
                     );
@@ -1354,7 +1316,7 @@ impl App {
                     list = list.optional_section(
                         "Clearing pass (end mill)",
                         c.clear.is_some(),
-                        Some(Message::CarveClearToggled),
+                        Some(CARVE_CLEAR),
                     );
                     if tab == OperationTab::Tool {
                         if let Some(cl) = &c.clear {
@@ -1420,9 +1382,7 @@ impl App {
                             list = list.push(
                                 row![
                                     label_help("Clearing climb", help::CLIMB, self.tooltips),
-                                    checkbox(cl.params.clearing.climb)
-                                        .size(15)
-                                        .on_toggle(Message::CarveClearClimbToggled)
+                                    CARVE_CLEAR_CLIMB.checkbox(cl.params.clearing.climb, 15)
                                 ]
                                 .spacing(8),
                             );
@@ -1438,7 +1398,7 @@ impl App {
             list = list.optional_section(
                 "Stock to Leave",
                 enabled,
-                Some(Message::StockToLeaveToggled),
+                Some(STOCK_LEAVE),
             );
             if enabled {
                 for field in stock_offset_fields(op) {

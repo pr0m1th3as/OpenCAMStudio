@@ -10,12 +10,10 @@
 //! # What is a preference
 //!
 //! Something about **how you work**, or about **your hardware**. Never about *this
-//! part*. Three exclusions follow from that and are settled (Andreas, 2026-08-01):
+//! part*. The tool library supplies the initial cutting data for each cutter.
+//! Explicit parameter defaults saved from the inspector can override those
+//! starting values for an operation kind.
 //!
-//! - **No cutting parameters** — stepover, feeds, plunge style are a tool-library
-//!   matter. Per-tool nominal cutting data already seeds a new operation; a second
-//!   default here would be a competing source of truth, and the two would drift with
-//!   no way for the operator to tell which produced the number in front of them.
 //! - **No default machine** — only the post ([`NewProjectPrefs`]). The machine
 //!   *gates* an export (envelope, feed/spindle ceilings) and is saved per project at
 //!   schema v11 precisely so reopening a job cannot silently retarget it.
@@ -101,6 +99,10 @@ pub struct Settings {
     pub tool_table: ToolTablePrefs,
     /// Shortcut overrides; an empty value disables a command.
     pub shortcuts: std::collections::BTreeMap<String, String>,
+    /// Numeric sources and option selections saved per operation kind and parameter name.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub parameter_defaults:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     /// Keys this build does not know about, carried through a save untouched.
     ///
     /// So that running an older build after a newer one does not quietly delete the
@@ -459,6 +461,7 @@ impl Default for Settings {
             session: SessionState::default(),
             tool_table: ToolTablePrefs::default(),
             shortcuts: Default::default(),
+            parameter_defaults: Default::default(),
             extra: Default::default(),
         }
     }
