@@ -2212,12 +2212,43 @@ impl AppController {
         }
         let (points, closed) = self.loop_points(boundary)?;
         let chain = Contour::new(points);
-        self.build_op_shape(kind, chain, closed, islands, tool, start, cutting)
+        self.build_op_shape(
+            kind,
+            chain,
+            closed,
+            islands,
+            tool,
+            start,
+            cutting,
+            self.defaults,
+        )
     }
 
     /// An uncommitted parameter template; its placeholder contour is always
     /// replaced by validated user geometry before publishing an operation.
     pub fn operation_template(&self, kind: OpKind, tool: u32) -> Operation {
+        self.operation_template_with_defaults(kind, tool, self.defaults, None)
+    }
+
+    /// The programmed operation template before project and cutter overrides.
+    #[cfg(feature = "gui")]
+    pub(crate) fn system_operation_template(&self, kind: OpKind) -> Operation {
+        let defaults = JobParams::default();
+        let cutting = CuttingData {
+            rpm: defaults.spindle_rpm,
+            feed: defaults.feed,
+            plunge_feed: defaults.plunge_feed,
+        };
+        self.operation_template_with_defaults(kind, 0, defaults, Some(cutting))
+    }
+
+    fn operation_template_with_defaults(
+        &self,
+        kind: OpKind,
+        tool: u32,
+        defaults: JobParams,
+        cutting: Option<CuttingData>,
+    ) -> Operation {
         let chain = Contour::new(vec![
             Point::new(0., 0.),
             Point::new(10., 0.),
@@ -2236,7 +2267,7 @@ impl AppController {
         } else {
             chain
         };
-        self.build_op_shape(kind, chain, true, &[], tool, None, None)
+        self.build_op_shape(kind, chain, true, &[], tool, None, cutting, defaults)
             .unwrap()
     }
 
@@ -2250,8 +2281,8 @@ impl AppController {
         tool: u32,
         start: Option<[f64; 2]>,
         cutting: Option<CuttingData>,
+        defaults: JobParams,
     ) -> Option<Operation> {
-        let p = self.defaults;
         // Cutting data: the values chosen in the wizard if given, else the tool's
         // seeded nominals. A `spindle_rpm` of 0 falls back to the job default at plan
         // time; the inspector can override any of these per operation afterwards.
@@ -2295,8 +2326,8 @@ impl AppController {
                 side: Side::Outside,
                 comp: Comp::Computed,
                 offset: 0.0,
-                depth: p.depth,
-                stepdown: p.stepdown,
+                depth: defaults.depth,
+                stepdown: defaults.stepdown,
                 stepover: 0.0,
                 spindle_rpm,
                 tool_preset: None,
@@ -2328,7 +2359,7 @@ impl AppController {
                     tool,
                     boundary: chain,
                     islands: island_contours,
-                    depth: p.depth,
+                    depth: defaults.depth,
                     spindle_rpm,
                     tool_preset: None,
                     cooling: Default::default(),
@@ -2343,7 +2374,7 @@ impl AppController {
                         keep_tool_down: false,
                         lift_height: 0.2,
                         clearing: cam_model::Clearing::default(),
-                        stepdown: p.stepdown,
+                        stepdown: defaults.stepdown,
                         overlap: 0.5,
                         offset: 0.0,
                         feed,
@@ -2360,7 +2391,7 @@ impl AppController {
                 id: 0,
                 tool,
                 points: vec![centroid(&chain)],
-                depth: p.depth,
+                depth: defaults.depth,
                 start_offset: 0.0,
                 peck: None,
                 dwell: None,
@@ -2390,7 +2421,7 @@ impl AppController {
                     // then tunes (start_offset raises it to level proud stock).
                     start_offset: 0.0,
                     depth: 1.0,
-                    stepdown: p.stepdown,
+                    stepdown: defaults.stepdown,
                     overlap: 0.5,
                     // `overshoot` is the cutter-edge clearance past the stock edge; the
                     // strategy handles the radius and stock geometry, so this is just a
@@ -2421,7 +2452,7 @@ impl AppController {
                 chain,
                 side: Side::Outside,
                 width: 1.0,
-                top: p.top_of_stock,
+                top: defaults.top_of_stock,
                 // 0 depth ⇒ use the tool tip at the bevel bottom; 0 step ⇒ one pass.
                 depth: 0.0,
                 step: 0.0,
@@ -2445,8 +2476,8 @@ impl AppController {
                     tool,
                     points: vec![center],
                     diameter: 2. * radius,
-                    z_top: p.top_of_stock,
-                    z_bottom: p.top_of_stock - p.depth,
+                    z_top: defaults.top_of_stock,
+                    z_bottom: defaults.top_of_stock - defaults.depth,
                     spindle_rpm,
                     feed,
                     plunge_feed,
@@ -2482,8 +2513,8 @@ impl AppController {
                     pitch: 1.0,
                     // Thread span is absolute Z; `depth` is now a positive magnitude
                     // below the top, so the bottom sits that far under it.
-                    z_top: p.top_of_stock,
-                    z_bottom: p.top_of_stock - p.depth,
+                    z_top: defaults.top_of_stock,
+                    z_bottom: defaults.top_of_stock - defaults.depth,
                     climb: true,
                     passes: 1,
                     spring_passes: 0,
@@ -2516,7 +2547,7 @@ impl AppController {
                     clear: None,
                     boundary: chain,
                     islands: island_contours,
-                    top: p.top_of_stock,
+                    top: defaults.top_of_stock,
                     // A cap, not a command: the shape decides the actual depth. Deeper
                     // than an engraving default, since a carve is meant to be seen.
                     depth: 1.0,
@@ -2548,7 +2579,7 @@ impl AppController {
                 chain,
                 // Closed for a picked region loop; open for an imported stroke.
                 closed,
-                top: p.top_of_stock,
+                top: defaults.top_of_stock,
                 // A shallow default: engraving is a surface mark, not a cut. One
                 // pass (stepdown 0) — normal at this depth.
                 depth: 0.3,
@@ -3473,6 +3504,29 @@ fn default_setup(p: &JobParams) -> Setup {
 mod tests {
     use super::*;
     use cam_model::{Envelope, Point3};
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn system_operation_template_uses_programmed_depth_and_cutting_data() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "part.dxf").unwrap();
+        app.defaults.depth = 6.;
+        let tool = app.setup().tools[0].number;
+        app.edit_tool(0, |tool| {
+            tool.nominal_feed = 575.;
+            tool.presets.clear();
+        });
+        let Operation::Profile(project) = app.operation_template(OpKind::Profile, tool) else {
+            panic!("profile template");
+        };
+        let Operation::Profile(system) = app.system_operation_template(OpKind::Profile) else {
+            panic!("profile template");
+        };
+        assert_eq!((project.depth, project.feed), (6., 575.));
+        let defaults = JobParams::default();
+        assert_eq!((system.depth, system.feed), (defaults.depth, defaults.feed));
+        assert_eq!(system.spindle_rpm, defaults.spindle_rpm);
+    }
 
     #[test]
     fn unsaved_changes_follow_successful_save_open_undo_and_redo() {

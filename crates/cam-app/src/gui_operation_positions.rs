@@ -197,6 +197,10 @@ impl App {
             PositionKind::Exit => set_end(op, Some(point)),
         });
         if kind == PositionKind::Entry {
+            if self.creating_operation() {
+                self.creation_edited_fields
+                    .extend([Field::StartX, Field::StartY]);
+            }
             self.fields.remove(&Field::StartX);
             self.fields.remove(&Field::StartY);
         }

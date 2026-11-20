@@ -225,7 +225,7 @@ impl App {
             self.finish_parameter_edit(field);
         }
     }
-    fn finish_parameter_edit(&mut self, field: Field) {
+    pub(super) fn finish_parameter_edit(&mut self, field: Field) {
         if let Some(mut operation) = self.parameter_operation().cloned() {
             // Invalid text stays visible and editable; the last numeric snapshot
             // remains intact until a valid edit is completed.
@@ -356,7 +356,7 @@ impl App {
             })
             .collect()
     }
-    fn parameter_operation(&self) -> Option<&Operation> {
+    pub(super) fn parameter_operation(&self) -> Option<&Operation> {
         if self.library_mode() {
             return None;
         }
@@ -578,7 +578,7 @@ impl App {
                 _ => false,
             })
     }
-    fn parameter_display_result(&self, field: Field) -> Result<f64, String> {
+    pub(super) fn parameter_display_result(&self, field: Field) -> Result<f64, String> {
         // Other fields keep their resolved values until this edit is finished.
         if self
             .parameter_editor
@@ -674,9 +674,11 @@ impl App {
         } else {
             Length::Fill
         });
-        let mut form =
-            iced::widget::column![row![label, control].spacing(8).align_y(Alignment::Center)]
-                .spacing(3);
+        let menu = parameter_defaults::menu_button(Message::OpenParameterMenu(field));
+        let mut form = iced::widget::column![row![label, control, menu]
+            .spacing(4)
+            .align_y(Alignment::Center)]
+        .spacing(3);
         if !suggestions.is_empty() {
             let mut choices = iced::widget::Column::new().spacing(1);
             for (index, name) in suggestions.into_iter().enumerate() {

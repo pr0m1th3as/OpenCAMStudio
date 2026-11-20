@@ -61,11 +61,15 @@ impl<'a> Form<'a> {
         self,
         label: &'static str,
         enabled: bool,
-        on_toggle: Option<impl Fn(bool) -> Message + 'static>,
+        setting: Option<parameter_options::Setting<bool>>,
     ) -> Self {
         let mut form = self.section(label);
-        form.groups[form.current].toggle =
-            Some(checkbox(enabled).size(14).on_toggle_maybe(on_toggle).into());
+        form.groups[form.current].toggle = Some(
+            checkbox(enabled)
+                .size(14)
+                .on_toggle_maybe(setting.map(|setting| setting.on_change()))
+                .into(),
+        );
         form
     }
 

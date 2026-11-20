@@ -276,11 +276,10 @@ impl App {
             let enabled = d.reference != Reference::Disabled;
             let collapsed = !enabled || self.collapsed_heights.contains(&plane);
             let toggle = (plane == Plane::Feed).then(|| {
-                Element::from(
-                    checkbox(enabled)
-                        .size(14)
-                        .on_toggle(Message::HeightFeedEnabled),
-                )
+                checkbox(enabled)
+                    .size(14)
+                    .on_toggle(Message::HeightFeedEnabled)
+                    .into()
             });
             let heading = inspector_disclosure_heading(
                 &plane.to_string(),

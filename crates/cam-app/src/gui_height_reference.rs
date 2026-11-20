@@ -61,14 +61,17 @@ fn label<M: 'static>(reference: Reference) -> Element<'static, M> {
 }
 
 pub(super) fn picker(plane: Plane, selected: Reference) -> Element<'static, Message> {
-    icon_picker::picker(
+    let options = Reference::options(plane);
+    let setting = parameter_options::height_reference_setting(plane);
+    let widget = icon_picker::picker(
         menu_id(plane),
-        Reference::options(plane),
+        options.clone(),
         selected,
         label,
         group,
-        move |reference| Message::HeightReferenceChanged(plane, reference),
-    )
+        setting.on_change(),
+    );
+    setting.menu(&selected, selected.to_string(), &options, widget)
 }
 
 #[cfg(test)]

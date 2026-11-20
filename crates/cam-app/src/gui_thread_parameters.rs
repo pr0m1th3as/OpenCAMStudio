@@ -1,11 +1,12 @@
 //! Transactional thread-size presets and geometry-driven suggestions.
 use super::*;
+use parameter_options::{operation_picker, THREAD_HAND, THREAD_SERIES, THREAD_SIZING};
 use cam_model::{
     matching_thread_standards, thread_standards, ThreadDiameterBasis, ThreadSeries, ThreadStandard,
 };
 use iced::widget::column;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) enum ThreadMatchMode {
     #[default]
     Manual,
@@ -32,7 +33,7 @@ impl std::fmt::Display for ThreadMatchMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) enum ThreadFamily {
     #[default]
     All,
@@ -280,21 +281,11 @@ impl App {
         let options: Vec<_> = std::iter::once(ThreadChoice(None))
             .chain(standards.into_iter().map(|s| ThreadChoice(Some(s))))
             .collect();
-        let picker = |options, selected, change: fn(ThreadFamily) -> ThreadMessage| {
-            pick_list(options, Some(selected), move |v| {
-                Message::ThreadParameters(change(v))
-            })
-            .text_size(12)
-            .padding([7, 9])
-            .style(inspector_picker)
-            .width(Length::Fill)
-        };
         let mut body = column![
             label_help("Sizing", "Prepared-bore matching uses the basic minor diameter or approximate cut-thread drill size. Nominal matching uses the major diameter. Nearby sizes are suggestions; review the intended specification.", self.tooltips),
-            pick_list(ThreadMatchMode::ALL,Some(state.mode),|v| Message::ThreadParameters(ThreadMessage::Mode(v)))
-                .text_size(12).padding([7,9]).style(inspector_picker).width(Length::Fill),
+            THREAD_SIZING.picker(state.mode, &ThreadMatchMode::ALL, Length::Fill),
             text("Thread series").size(12),
-            picker(ThreadFamily::ALL,state.family,ThreadMessage::Family),
+            THREAD_SERIES.picker(state.family, &ThreadFamily::ALL, Length::Fill),
             label_help("Standard size", "Applies the standard nominal major diameter and pitch. Metric coarse/fine and Unified UNC/UNF are cylindrical 60-degree threads. Hand, cutting data and heights remain as configured. Nearby diameter matches appear first; diameter alone cannot identify a unique thread or certify its tolerance class.",self.tooltips),
             pick_list(options,Some(selected),|v| Message::ThreadParameters(ThreadMessage::Preset(v)))
                 .text_size(12).padding([7,9]).style(inspector_picker).width(Length::Fill),
@@ -314,13 +305,13 @@ impl App {
         for (field, value) in [(Field::MajorDia, major_value), (Field::Pitch, pitch_value)] {
             body = body.push(self.parameter_field_row(field, field.label(), field.help(), &value));
         }
-        body.push(profile_picker(
+        body.push(operation_picker(
             "Hand",
             help::HAND,
             self.tooltips,
             thread.hand,
             &Hand::ALL,
-            Message::ThreadHandChanged,
+            THREAD_HAND,
         ))
         .into()
     }

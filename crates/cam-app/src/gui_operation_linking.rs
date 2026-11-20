@@ -1,5 +1,6 @@
 //! One owner for linking controls, grouped in machining order.
 use super::*;
+use parameter_options::*;
 use cam_model::Comp;
 use iced::widget::{column, Column};
 
@@ -127,11 +128,11 @@ impl App {
                 moves.push(help_wrap(
                     row![
                         text("Keep tool down").size(12).width(Length::Fill),
-                        checkbox(p.passes.keep_tool_down).size(15).on_toggle_maybe(
-                            keep_down_supported.then_some(|v| {
-                                Message::ProfilePassToggle(profile_parameters::Toggle::KeepToolDown, v)
-                            }),
-                        ),
+                        if keep_down_supported {
+                            PROFILE_KEEP_DOWN.checkbox(p.passes.keep_tool_down, 15)
+                        } else {
+                            checkbox(p.passes.keep_tool_down).size(15).into()
+                        },
                     ]
                     .spacing(8)
                     .align_y(Alignment::Center),
@@ -145,9 +146,7 @@ impl App {
                         text("Retract at lead-out feed")
                             .size(12)
                             .width(Length::Fill),
-                        checkbox(p.passes.feed_retract).size(15).on_toggle(|v| {
-                            Message::ProfilePassToggle(profile_parameters::Toggle::FeedRetract, v)
-                        }),
+                        PROFILE_FEED_RETRACT.checkbox(p.passes.feed_retract, 15),
                     ]
                     .spacing(8)
                     .align_y(Alignment::Center),
@@ -158,12 +157,7 @@ impl App {
                 leads.push(
                     row![
                         label_help("Lead-In (Entry)", help::LEAD_IN, self.tooltips),
-                        checkbox(entry_enabled)
-                            .size(15)
-                            .on_toggle(|v| Message::ProfilePassToggle(
-                                profile_parameters::Toggle::LeadInEnabled,
-                                v
-                            ))
+                        PROFILE_ENTRY.checkbox(entry_enabled, 15)
                     ]
                     .spacing(8)
                     .align_y(Alignment::Center)
@@ -171,7 +165,7 @@ impl App {
                 );
                 if entry_enabled {
                     {
-                        leads.push(profile_picker(
+                        leads.push(operation_picker(
                             "Entry lead type",
                             help::LEAD_IN,
                             self.tooltips,
@@ -181,7 +175,7 @@ impl App {
                             } else {
                                 &LeadKind::ALL[1..]
                             },
-                            Message::LeadInKindChanged,
+                            LEAD_IN,
                         ));
                     }
                     leads.push(field(Field::LeadInSize));
@@ -199,12 +193,7 @@ impl App {
                             profile_parameters::Toggle::LeadOutEnabled.help(),
                             self.tooltips
                         ),
-                        checkbox(exit_enabled)
-                            .size(15)
-                            .on_toggle(|v| Message::ProfilePassToggle(
-                                profile_parameters::Toggle::LeadOutEnabled,
-                                v
-                            ))
+                        PROFILE_EXIT.checkbox(exit_enabled, 15)
                     ]
                     .spacing(8)
                     .align_y(Alignment::Center)
@@ -218,12 +207,7 @@ impl App {
                                 profile_parameters::Toggle::SameLeadOut.help(),
                                 self.tooltips
                             ),
-                            checkbox(p.passes.same_lead_out).size(15).on_toggle(|v| {
-                                Message::ProfilePassToggle(
-                                    profile_parameters::Toggle::SameLeadOut,
-                                    v,
-                                )
-                            })
+                            PROFILE_SAME_OUT.checkbox(p.passes.same_lead_out, 15)
                         ]
                         .spacing(8)
                         .align_y(Alignment::Center)
@@ -232,7 +216,7 @@ impl App {
                 }
                 if exit_enabled && (!p.passes.same_lead_out || !entry_enabled) {
                     {
-                        leads.push(profile_picker(
+                        leads.push(operation_picker(
                             "Exit lead type",
                             help::LEAD_OUT,
                             self.tooltips,
@@ -242,7 +226,7 @@ impl App {
                             } else {
                                 &LeadKind::ALL[1..]
                             },
-                            Message::LeadOutKindChanged,
+                            LEAD_OUT,
                         ));
                     }
                     if p.lead_out != Lead::None {
@@ -255,7 +239,7 @@ impl App {
                 if p.contours().all(|contour| contour.closed) {
                     moves.push(field(Field::LeadOverlap));
                 }
-                ramping.push(profile_picker(
+                ramping.push(operation_picker(
                     "Plunge",
                     help::PLUNGE,
                     self.tooltips,
@@ -267,57 +251,55 @@ impl App {
                     } else {
                         &PlungeKind::ALL[..1]
                     },
-                    Message::PlungeKindChanged,
+                    PLUNGE,
                 ));
             }
             Operation::Pocket(p) => {
                 moves.push(help_wrap(
                     row![
                         text("Keep tool down").size(12).width(Length::Fill),
-                        checkbox(p.clear.keep_tool_down)
-                            .size(15)
-                            .on_toggle(Message::PocketKeepToolDownToggled),
+                        POCKET_STAY_DOWN.checkbox(p.clear.keep_tool_down, 15),
                     ]
                     .spacing(8)
                     .align_y(Alignment::Center),
                     KEEP_TOOL_DOWN_HELP,
                     self.tooltips,
                 ));
-                leads.push(profile_picker(
+                leads.push(operation_picker(
                     "Wall lead-in",
                     help::LEAD_IN,
                     self.tooltips,
                     LeadKind::of(p.clear.lead_in),
                     &LeadKind::ALL[..],
-                    Message::LeadInKindChanged,
+                    LEAD_IN,
                 ));
-                leads.push(profile_picker(
+                leads.push(operation_picker(
                     "Wall lead-out",
                     help::LEAD_OUT,
                     self.tooltips,
                     LeadKind::of(p.clear.lead_out),
                     &LeadKind::ALL[..],
-                    Message::LeadOutKindChanged,
+                    LEAD_OUT,
                 ));
-                ramping.push(profile_picker(
+                ramping.push(operation_picker(
                     "Plunge",
                     help::PLUNGE,
                     self.tooltips,
                     PlungeKind::of(p.clear.plunge),
                     &PlungeKind::ALL[..],
-                    Message::PlungeKindChanged,
+                    PLUNGE,
                 ));
             }
             Operation::Parallel(p) => {
                 moves.push(self.finishing_retraction_control(p.params.retraction_policy()));
                 if !p.params.scallop {
-                    leads.push(profile_picker(
+                    leads.push(operation_picker(
                         "Transition type",
                         "No contact retracts between passes. Straight line joins the pass ends at the boundary. Shortest path prefers the shortest checked cutting connection. Smooth rounds beyond the pass ends where the cutter can clear the model.",
                         self.tooltips,
                         p.params.transition,
                         &cam_model::ParallelTransition::ALL[..],
-                        Message::ParallelTransitionChanged,
+                        PARALLEL_TRANSITION,
                     ));
                 }
             }
@@ -386,9 +368,7 @@ impl App {
                 leads.push(
                     row![
                         label_help("Lead-In (Entry)", help::LEAD_IN, self.tooltips),
-                        checkbox(entry_enabled)
-                            .size(15)
-                            .on_toggle(Message::ChamferEntryEnabled)
+                        CHAMFER_ENTRY.checkbox(entry_enabled, 15)
                     ]
                     .spacing(8)
                     .align_y(Alignment::Center)
@@ -396,13 +376,13 @@ impl App {
                 );
                 if entry_enabled {
                     {
-                        leads.push(profile_picker(
+                        leads.push(operation_picker(
                             "Entry lead type",
                             help::LEAD_IN,
                             self.tooltips,
                             LeadKind::of(c.lead_in),
                             &LeadKind::ALL[1..],
-                            Message::LeadInKindChanged,
+                            LEAD_IN,
                         ));
                     }
                     leads.push(field(Field::LeadInSize));
@@ -417,9 +397,7 @@ impl App {
                 leads.push(
                     row![
                         text("Lead-Out (Exit)").size(12).width(Length::Fill),
-                        checkbox(exit_enabled)
-                            .size(15)
-                            .on_toggle(Message::ChamferExitEnabled)
+                        CHAMFER_EXIT.checkbox(exit_enabled, 15)
                     ]
                     .spacing(8)
                     .align_y(Alignment::Center)
@@ -429,9 +407,7 @@ impl App {
                     leads.push(
                         row![
                             text("Same as Lead-In").size(12).width(Length::Fill),
-                            checkbox(c.same_lead_out)
-                                .size(15)
-                                .on_toggle(Message::ChamferSameLeadOut)
+                            CHAMFER_SAME_LEAD.checkbox(c.same_lead_out, 15)
                         ]
                         .spacing(8)
                         .align_y(Alignment::Center)
@@ -440,13 +416,13 @@ impl App {
                 }
                 if exit_enabled && (!c.same_lead_out || !entry_enabled) {
                     {
-                        leads.push(profile_picker(
+                        leads.push(operation_picker(
                             "Exit lead type",
                             help::LEAD_OUT,
                             self.tooltips,
                             LeadKind::of(c.lead_out),
                             &LeadKind::ALL[1..],
-                            Message::LeadOutKindChanged,
+                            LEAD_OUT,
                         ));
                     }
                     if c.lead_out != Lead::None {
@@ -464,9 +440,7 @@ impl App {
                     leads.push(help_wrap(
                         row![
                             text("Lead to centre").size(12).width(Length::Fill),
-                            checkbox(b.lead_to_center)
-                                .size(15)
-                                .on_toggle(|v| Message::BoreOption(BoreOption::Center(v))),
+                            BORE_CENTER.checkbox(b.lead_to_center, 15),
                         ]
                         .spacing(8),
                         BORE_CENTER_HELP,
@@ -478,54 +452,49 @@ impl App {
                 moves.push(
                     (row![
                         label_help("Stay down", help::CARVE_STAY_DOWN, self.tooltips),
-                        checkbox(c.stay_down)
-                            .size(15)
-                            .on_toggle(Message::CarveStayDownToggled),
+                        CARVE_STAY_DOWN.checkbox(c.stay_down, 15),
                     ]
                     .spacing(8))
                     .into(),
                 );
                 moves.push(help_wrap(
-                    inspector_section_toggle(
-                        "Clearing pass (end mill)",
-                        c.clear.is_some(),
-                        Some(Message::CarveClearToggled),
-                    ),
+                    inspector_section_checkbox("Clearing pass (end mill)", c.clear.is_some())
+                        .on_toggle(Message::CarveClearToggled),
                     help::CARVE_CLEAR,
                     self.tooltips,
                 ));
-                ramping.push(profile_picker(
+                ramping.push(operation_picker(
                     "Plunge",
                     help::CARVE_PLUNGE,
                     self.tooltips,
                     PlungeKind::of(c.plunge),
                     &PlungeKind::ALL[..],
-                    Message::PlungeKindChanged,
+                    PLUNGE,
                 ));
                 if let Some(cl) = &c.clear {
-                    leads.push(profile_picker(
+                    leads.push(operation_picker(
                         "Clearing lead-in",
                         help::LEAD_IN,
                         self.tooltips,
                         LeadKind::of(cl.params.lead_in),
                         &LeadKind::ALL[..],
-                        Message::CarveClearLeadInChanged,
+                        CARVE_CLEAR_LEAD_IN,
                     ));
-                    leads.push(profile_picker(
+                    leads.push(operation_picker(
                         "Clearing lead-out",
                         help::LEAD_OUT,
                         self.tooltips,
                         LeadKind::of(cl.params.lead_out),
                         &LeadKind::ALL[..],
-                        Message::CarveClearLeadOutChanged,
+                        CARVE_CLEAR_LEAD_OUT,
                     ));
-                    ramping.push(profile_picker(
+                    ramping.push(operation_picker(
                         "Clearing plunge",
                         help::CARVE_CLEAR_PLUNGE,
                         self.tooltips,
                         PlungeKind::of(cl.params.plunge),
                         &PlungeKind::ALL[..],
-                        Message::CarveClearPlungeChanged,
+                        CARVE_CLEAR_PLUNGE,
                     ));
                 }
             }
@@ -574,7 +543,7 @@ impl App {
         &self,
         policy: cam_model::ScallopRetraction,
     ) -> Element<'_, Message> {
-        profile_picker(
+        operation_picker(
                     "Retraction policy",
                     "Choose a full retract, a checked raised traverse, or a checked straight feed link between disconnected passes.",
                     self.tooltips,
@@ -584,7 +553,7 @@ impl App {
                         cam_model::ScallopRetraction::Minimum,
                         cam_model::ScallopRetraction::Shortest,
                     ][..],
-                    Message::ScallopRetractionChanged,
+                    RETRACTION,
                 )
     }
 }

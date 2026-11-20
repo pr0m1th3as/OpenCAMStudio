@@ -122,8 +122,12 @@ mod illustrated_help;
 mod operation_positions;
 #[path = "gui_operation_preview.rs"]
 mod operation_preview;
+#[path = "gui_parameter_defaults.rs"]
+mod parameter_defaults;
 #[path = "gui_parameter_expressions.rs"]
 mod parameter_expressions;
+#[path = "gui_parameter_options.rs"]
+mod parameter_options;
 #[path = "gui_picking.rs"]
 mod picking_view;
 #[path = "gui_pocket_parameters.rs"]
@@ -884,7 +888,7 @@ impl RibbonTab {
 }
 
 /// The kind of a [`Lead`], for the inspector picker (params come from fields).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum LeadKind {
     None,
     Linear,
@@ -938,7 +942,7 @@ impl std::fmt::Display for LeadKind {
 }
 
 /// The kind of a [`Plunge`], for the inspector picker.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum PlungeKind {
     Straight,
     Ramp,
@@ -993,7 +997,7 @@ impl std::fmt::Display for PlungeKind {
 
 /// Whether a thread is cut into a bore or onto a boss, for the inspector picker
 /// (a friendlier face on `ThreadOp::internal`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Bore {
     Internal,
     External,
@@ -1022,7 +1026,7 @@ impl std::fmt::Display for Bore {
 
 /// Climb vs. conventional milling, for the inspector picker (a friendlier face on
 /// `ThreadOp::climb`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum CutStyle {
     Climb,
     Conventional,
@@ -2305,6 +2309,7 @@ struct App {
     collapsed_operation_sections: BTreeSet<operation_sections::Section>,
     focused_height: Option<String>,
     parameter_editor: parameter_expressions::Editor,
+    parameter_menu: Option<(parameter_defaults::Target, iced::Point)>,
     height_draft_id: Option<u32>,
     height_draft: Option<cam_model::OperationHeightSettings>,
     height_disabled_feed_reference: Option<cam_model::HeightReference>,
@@ -2932,6 +2937,10 @@ enum Message {
     SetOperationVisible(u32, bool),
     FieldChanged(Field, String),
     ParameterInputState(Field, bool, usize),
+    OpenParameterMenu(Field),
+    OpenParameterOptionMenu(parameter_options::OptionMenu),
+    CloseParameterMenu,
+    ParameterMenuAction(parameter_defaults::Action),
     ParameterComplete(Field, &'static str, usize),
     ParameterSuggestionMove(Field, i32),
     HeightReferenceChanged(cam_model::HeightPlaneKind, cam_model::HeightReference),
@@ -3668,7 +3677,7 @@ impl App {
     }
 
     fn refresh_operation_fields(&mut self) {
-        let previous = self.fields.clone();
+        let previous = std::mem::take(&mut self.fields);
         let overrides = (
             self.cad_override_top.clone(),
             self.cad_override_bottom.clone(),
@@ -3676,7 +3685,7 @@ impl App {
         self.refresh_fields();
         (self.cad_override_top, self.cad_override_bottom) = overrides;
         let supported = self.inspector_fields();
-        for (field, value) in previous {
+        for (&field, value) in &previous {
             if supported.contains(&field)
                 || (value.trim().parse::<f64>().is_err()
                     && parameter_expressions::parameter(field).is_some_and(|p| {
@@ -3685,9 +3694,10 @@ impl App {
                             .is_some_and(|op| p.value(op).is_some())
                     }))
             {
-                self.fields.insert(field, value);
+                self.fields.insert(field, value.clone());
             }
         }
+        self.seed_user_parameter_defaults(|field| !previous.contains_key(&field));
     }
 
     fn set_round_stock_axis(&mut self, entity: EntityRef) -> bool {
@@ -3955,6 +3965,7 @@ impl App {
             collapsed_operation_sections: BTreeSet::new(),
             focused_height: None,
             parameter_editor: Default::default(),
+            parameter_menu: None,
             height_draft_id: None,
             height_draft: None,
             height_disabled_feed_reference: None,
@@ -4317,6 +4328,9 @@ impl App {
     }
 
     fn update_message(&mut self, message: Message) -> iced::Task<Message> {
+        if matches!(message, Message::CadEscape) && self.parameter_menu.take().is_some() {
+            return iced::Task::none();
+        }
         if matches!(message, Message::CadEscape) && self.library_context_menu.is_some() {
             self.library_context_menu = None;
             return iced::Task::none();
@@ -4952,13 +4966,15 @@ impl App {
                     }
                     if seed {
                         cam_model::OperationParameter::Engagement
-                            .set_source(op, "=tool_diameter * 0.4");
+                            .set_source(op, creation::DEFAULT_POCKET_ENGAGEMENT);
                     }
                 });
                 self.refresh_operation_fields();
                 if seed {
-                    self.fields
-                        .insert(Field::Engagement, "=tool_diameter * 0.4".into());
+                    self.fields.insert(
+                        Field::Engagement,
+                        creation::DEFAULT_POCKET_ENGAGEMENT.into(),
+                    );
                 }
             }
             Message::PocketDepthToggle(toggle, value) => {
@@ -6367,6 +6383,12 @@ impl App {
             Message::ParameterInputState(field, focused, cursor) => {
                 self.parameter_input_state(field, focused, cursor);
             }
+            Message::OpenParameterMenu(field) => return self.open_parameter_menu(field),
+            Message::OpenParameterOptionMenu(option) => {
+                return self.open_parameter_option_menu(option);
+            }
+            Message::CloseParameterMenu => self.parameter_menu = None,
+            Message::ParameterMenuAction(action) => return self.parameter_menu_action(action),
             Message::ParameterComplete(field, name, cursor) => {
                 return self.complete_parameter(field, name, cursor);
             }
@@ -7630,6 +7652,7 @@ impl App {
                     }
                     self.sync_creation_tool();
                     self.refresh_operation_fields();
+                    self.seed_user_parameter_defaults(|_| true);
                 }
             }
             Message::CancelOp => {
@@ -8727,6 +8750,9 @@ impl App {
                 // The visible field set can change with this choice, so reseed the
                 // buffers -- a newly revealed field would otherwise render blank.
                 self.refresh_operation_fields();
+                if on {
+                    self.seed_user_clearing_options();
+                }
             }
             Message::CarveClearToolChanged(index) => {
                 let Some(tool) = self.library.tools.get(index).cloned() else {
@@ -9677,6 +9703,7 @@ impl App {
     /// selection.
     fn refresh_fields(&mut self) {
         self.parameter_editor = Default::default();
+        self.parameter_menu = None;
         self.edited_tool_input = None;
         if self.creating_operation() {
             self.focused_height = None;
@@ -11181,6 +11208,13 @@ impl App {
         if let Some(menu) = self.lib_menu_overlay() {
             let catcher = mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
                 .on_press(Message::CloseLibMenu);
+            layers = layers.push(catcher).push(menu);
+        }
+        if let Some(menu) = self.parameter_menu_overlay() {
+            let catcher = mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
+                .on_press(Message::CloseParameterMenu)
+                .on_right_press(Message::CloseParameterMenu)
+                .on_scroll(|_| Message::CloseParameterMenu);
             layers = layers.push(catcher).push(menu);
         }
         if let Some(dialog) = self.operation_tool_selector_overlay() {
@@ -14490,6 +14524,20 @@ fn profile_picker_w<T>(
 where
     T: ToString + PartialEq + Clone + 'static,
 {
+    let control = pick_list(options, Some(selected), on_select)
+        .text_size(12)
+        .padding([7, 9])
+        .style(inspector_picker)
+        .width(Length::Fixed(width));
+    profile_picker_row(label, help, show, control)
+}
+
+fn profile_picker_row(
+    label: &str,
+    help: &'static str,
+    show: bool,
+    control: impl Into<Element<'static, Message>>,
+) -> Element<'static, Message> {
     let whole_row_help = [
         help::LEAD_IN,
         help::LEAD_OUT,
@@ -14499,11 +14547,7 @@ where
     .contains(&help);
     let row = row![
         label_help(label.to_string(), help, show && !whole_row_help),
-        pick_list(options, Some(selected), on_select)
-            .text_size(12)
-            .padding([7, 9])
-            .style(inspector_picker)
-            .width(Length::Fixed(width)),
+        control.into(),
     ]
     .spacing(8)
     .align_y(Alignment::Center);

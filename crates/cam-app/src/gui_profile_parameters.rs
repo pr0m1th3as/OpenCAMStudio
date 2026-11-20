@@ -1,5 +1,6 @@
 //! Inspector adapters for the shared profile pass model.
 use super::*;
+use parameter_options::{operation_picker, profile_toggle, CORNER, PROFILE_FINISH, PROFILE_MULTIPLE};
 pub(super) const CUT_ORDER_HELP: &str = "By contour completes each contour before the next. By depth visits contours at each depth before going deeper. By radial pass completes each radial stage across contours and depths before the next. Outside stock clearing runs first when enabled.";
 pub(super) const CORNER_HELP: &str = "Roll around corner uses a rounded offset at outside corners. Keep sharp corner extends the offset edges to their intersection; very acute corners are bevelled to limit the extension.";
 pub(super) const WALL_ALLOWANCE_HELP: &str = "Signed offset of the final profile wall from the selected contour. Positive leaves material on the part; negative cuts past the nominal wall. This allowance remains after the finishing passes.";
@@ -534,7 +535,7 @@ impl Toggle {
             Self::RoughFinal => "Use smaller bottom increments on every radial/roughing stage. When disabled, intermediate stages keep the regular maximum stepdown; the final wall and its spring passes retain the smaller increments.",
         }
     }
-    fn get(self, p: &ProfileOp) -> bool {
+    pub(super) fn get(self, p: &ProfileOp) -> bool {
         if matches!(self, Self::LeadInEnabled) {
             return p.passes.lead_in_enabled.unwrap_or(p.lead_in != Lead::None);
         }
@@ -781,9 +782,7 @@ impl App {
         let toggle = |t: Toggle| -> Element<'_, Message> {
             row![
                 label_help(t.label(), t.help(), self.tooltips),
-                checkbox(t.get(p))
-                    .size(15)
-                    .on_toggle(move |v| Message::ProfilePassToggle(t, v))
+                profile_toggle(t).checkbox(t.get(p), 15)
             ]
             .spacing(8)
             .align_y(Alignment::Center)
@@ -815,7 +814,7 @@ impl App {
             list = list.optional_section(
                 "Multiple Depths",
                 p.passes.multiple_depths,
-                Some(|v| Message::ProfilePassToggle(Toggle::MultipleDepths, v)),
+                Some(PROFILE_MULTIPLE),
             );
             if p.passes.multiple_depths {
                 let field = Field::Stepdown;
@@ -849,7 +848,7 @@ impl App {
             list = list.optional_section(
                 "Finishing passes",
                 p.passes.finishing,
-                Some(|v| Message::ProfilePassToggle(Toggle::Finishing, v)),
+                Some(PROFILE_FINISH),
             );
             if p.passes.finishing {
                 for n in [
@@ -863,13 +862,13 @@ impl App {
                 list = list.push(toggle(Toggle::FinishOnlyFinal));
             }
             list = list.section("Passes").push(number(Number::Tolerance));
-            list = list.push(profile_picker(
+            list = list.push(operation_picker(
                 "Outer corners",
                 CORNER_HELP,
                 self.tooltips,
                 p.passes.outer_corner,
                 &cam_model::ProfileCorner::ALL[..],
-                Message::ProfileCorner,
+                CORNER,
             ));
             if (!linked && !p.tabs.enabled) || p.passes.taper_angle != 0. {
                 list = list.push(number(Number::Taper));

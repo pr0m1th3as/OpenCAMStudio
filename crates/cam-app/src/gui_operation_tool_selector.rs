@@ -149,6 +149,7 @@ impl App {
             }
             self.sync_creation_tool();
             self.refresh_operation_fields();
+            self.seed_user_parameter_defaults(|_| true);
         } else {
             let number = self.stage_operation_tool(tool);
             self.edit_operation_draft(|op| {
