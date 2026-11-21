@@ -297,6 +297,7 @@ impl App {
             } else if outcome.collisions.is_empty() {
                 lines.push("Simulation: no collisions.".into());
             }
+            let severity = self.controller.verification_collision_severity();
             lines.extend(outcome.collisions.iter().map(|c| {
                 let owner = match (c.pattern_id, c.instance_index) {
                     (Some(pattern), Some(instance)) => format!(
@@ -307,7 +308,10 @@ impl App {
                         .op_id
                         .map_or(String::new(), |op| format!(" (operation #{op})")),
                 };
-                format!("Verification {:?}{}: {}", c.kind, owner, c.message)
+                format!(
+                    "Verification {severity:?} ({:?}){owner}: {}",
+                    c.kind, c.message
+                )
             }));
         }
         let output = lines.join("\n");

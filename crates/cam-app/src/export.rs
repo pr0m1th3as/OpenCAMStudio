@@ -1,6 +1,22 @@
 //! Headless controller service.
 use super::*;
 impl AppController {
+    /// Choose whether detected collisions block posting a completed toolpath.
+    pub fn set_block_export_on_verification_errors(&mut self, block: bool) {
+        if self.block_export_on_verification_errors != block {
+            self.block_export_on_verification_errors = block;
+            self.nc = None;
+        }
+    }
+
+    pub(crate) fn verification_collision_severity(&self) -> Severity {
+        if self.block_export_on_verification_errors {
+            Severity::Error
+        } else {
+            Severity::Warning
+        }
+    }
+
     /// Post the most recent complete run to the selected controller, caching and
     /// returning it. Cancelled, incomplete or failed runs cannot be exported.
     pub fn export_nc(&mut self) -> Result<&str, ExportError> {
@@ -14,30 +30,28 @@ impl AppController {
         if outcome.has_errors() {
             return Err(ExportError::HasErrors);
         }
-        // A rapid plowing through stock would crash the machine — block by default.
-        let rapids = outcome
-            .collisions
-            .iter()
-            .filter(|c| c.kind == CollisionKind::RapidThroughStock)
-            .count();
-        if rapids > 0 {
-            return Err(ExportError::RapidThroughStock(rapids));
-        }
-        let noncutting = outcome
-            .collisions
-            .iter()
-            .filter(|c| c.kind == CollisionKind::NonCuttingThroughStock)
-            .count();
-        if noncutting > 0 {
-            return Err(ExportError::NonCuttingThroughStock(noncutting));
-        }
-        let fixtures = outcome
-            .collisions
-            .iter()
-            .filter(|c| c.kind == CollisionKind::Fixture)
-            .count();
-        if fixtures > 0 {
-            return Err(ExportError::FixtureCollision(fixtures));
+        if self.block_export_on_verification_errors {
+            let collision_errors: [(CollisionKind, fn(usize) -> ExportError); 3] = [
+                (
+                    CollisionKind::RapidThroughStock,
+                    ExportError::RapidThroughStock,
+                ),
+                (
+                    CollisionKind::NonCuttingThroughStock,
+                    ExportError::NonCuttingThroughStock,
+                ),
+                (CollisionKind::Fixture, ExportError::FixtureCollision),
+            ];
+            for (kind, error) in collision_errors {
+                let count = outcome
+                    .collisions
+                    .iter()
+                    .filter(|hit| hit.kind == kind)
+                    .count();
+                if count > 0 {
+                    return Err(error(count));
+                }
+            }
         }
         let mut options = self.post_options();
         if self.post_kind == PostKind::Estlcam {
@@ -59,7 +73,7 @@ impl AppController {
     }
 
     /// Export the current toolpath as G-code to `path`. Runs the same gating as
-    /// [`AppController::export_nc`] (non-cutting stock collisions block the write).
+    /// [`AppController::export_nc`].
     pub fn export_nc_to(&mut self, path: impl AsRef<Path>) -> Result<(), ExportToError> {
         let nc = self.export_nc().map_err(ExportToError::Export)?.to_string();
         std::fs::write(path.as_ref(), nc).map_err(|e| ExportToError::Io(e.to_string()))?;

@@ -805,7 +805,9 @@ mod tests {
     }
 
     #[test]
-    fn restored_collision_still_blocks_export() {
+    fn restored_collision_uses_current_export_preference() {
+        use serde_json::json;
+
         let mut app = app();
         app.run(&CancelToken::new());
         app.outcome
@@ -838,6 +840,43 @@ mod tests {
             reopened.export_nc(),
             Err(ExportError::RapidThroughStock(_))
         ));
+        let revision = reopened.revision();
+        let mut session = crate::mcp::Session {
+            controller: reopened,
+            ..Default::default()
+        };
+        assert_eq!(
+            session.call("get_run_status", json!({})).unwrap()["outcome"]["collisions"][0]
+                ["severity"],
+            "Error"
+        );
+        session
+            .call(
+                "update_preferences",
+                json!({"patch":{"block_export_on_verification_errors":false}}),
+            )
+            .unwrap();
+        assert_eq!(session.controller.revision(), revision);
+        assert_eq!(
+            session.call("get_run_status", json!({})).unwrap()["outcome"]["collisions"][0]
+                ["severity"],
+            "Warning"
+        );
+        let nc = session.call("export_nc", json!({})).unwrap();
+        let nc_path = path.with_extension("nc");
+        session.call("export_nc", json!({"path":nc_path})).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&nc_path).unwrap(),
+            nc.as_str().unwrap()
+        );
+
+        session.call("restore_preferences", json!({})).unwrap();
+        assert!(session.controller.exported_nc().is_none());
+        assert!(matches!(
+            session.controller.export_nc(),
+            Err(ExportError::RapidThroughStock(1))
+        ));
+        std::fs::remove_file(nc_path).unwrap();
         std::fs::remove_file(path).unwrap();
     }
 

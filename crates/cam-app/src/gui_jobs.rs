@@ -278,10 +278,12 @@ impl App {
             .iter()
             .filter(|d| d.severity == Severity::Error)
             .count();
+        let has_collisions = !outcome.collisions.is_empty();
+        let collision_severity = self.controller.verification_collision_severity();
         self.status = match outcome.completion {
-            JobCompletion::Complete if outcome.has_errors() || !outcome.collisions.is_empty() =>
+            JobCompletion::Complete if errors > 0 || (has_collisions && collision_severity == Severity::Error) =>
                 "Toolpath verification errors — click a setup or operation status indicator for details.".into(),
-            JobCompletion::Complete if outcome.diagnostics.iter().any(|d| d.severity == Severity::Warning) =>
+            JobCompletion::Complete if has_collisions || outcome.diagnostics.iter().any(|d| d.severity == Severity::Warning) =>
                 "Toolpath ready with warnings — click a setup or operation status indicator for details.".into(),
             JobCompletion::Complete => "Toolpath ready. Export when you like.".to_string(),
             JobCompletion::Failed => format!("{errors} error(s) — click a setup or operation status indicator for details."),

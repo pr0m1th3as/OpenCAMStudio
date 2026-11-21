@@ -596,6 +596,19 @@ async fn confirm_export_duplicates(detail: String) -> bool {
         == rfd::MessageDialogResult::Yes
 }
 
+async fn report_export_verification_warnings(count: usize) {
+    let detail = format!(
+        "Verification detected collisions with stock or fixtures ({count} total). Review the setup or operation status indicators for details."
+    );
+    rfd::AsyncMessageDialog::new()
+        .set_level(rfd::MessageLevel::Warning)
+        .set_title("G-code export has verification warnings")
+        .set_description(detail)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show()
+        .await;
+}
+
 /// Native error dialog for an export that cannot happen.
 ///
 /// A dialog rather than the status line, because the status line lives in the **Output**
@@ -3051,9 +3064,8 @@ enum Message {
     CadToImport(Option<PathBuf>),
     /// Prompt for a `.nc` export location.
     ExportNc,
-    /// Answer to the "export exact-duplicate operations anyway?" confirm dialog:
-    /// `true` proceeds to the save prompt, `false` aborts the export.
-    ExportDupConfirmed(String, bool),
+    /// The operator declined to export exact duplicate operations.
+    ExportDuplicatesDeclined,
     /// The chosen `.nc` path (`None` = cancelled).
     NcToExport(String, Option<PathBuf>),
     // --- Operation-creation wizard ---
@@ -4150,6 +4162,9 @@ impl App {
         }
         app.controller
             .set_simulation_accuracy(app.settings.simulation.accuracy);
+        app.controller.set_block_export_on_verification_errors(
+            app.settings.block_export_on_verification_errors,
+        );
         app.controller.select(Selection::Setup);
         app.restore_pane_preferences();
         // Always open on Home, regardless of the workspace last used.
@@ -6800,6 +6815,7 @@ impl App {
                                 severity: Severity::Error,
                                 message: error.clone(),
                                 source: None,
+                                verification_collision: false,
                             }],
                             detail: error,
                             error: true,
@@ -7353,26 +7369,31 @@ impl App {
                     })
                     .filter(|group| group.len() > 1)
                     .collect();
-                if groups.is_empty() {
-                    let kind = self.controller.post_kind();
-                    return iced::Task::perform(
-                        pick_save("G-code", kind.default_file_name(), kind.file_extensions()),
-                        move |path| Message::NcToExport(nc.clone(), path),
-                    );
-                }
-                return iced::Task::perform(
-                    confirm_export_duplicates(describe_duplicates(&groups)),
-                    move |confirmed| Message::ExportDupConfirmed(nc.clone(), confirmed),
-                );
-            }
-            Message::ExportDupConfirmed(nc, true) => {
+                let duplicates = (!groups.is_empty()).then(|| describe_duplicates(&groups));
+                let verification_warnings = self
+                    .controller
+                    .outcome()
+                    .map_or(0, |outcome| outcome.collisions.len());
                 let kind = self.controller.post_kind();
                 return iced::Task::perform(
-                    pick_save("G-code", kind.default_file_name(), kind.file_extensions()),
-                    move |path| Message::NcToExport(nc.clone(), path),
+                    async move {
+                        if let Some(detail) = duplicates {
+                            if !confirm_export_duplicates(detail).await {
+                                return Message::ExportDuplicatesDeclined;
+                            }
+                        }
+                        if verification_warnings > 0 {
+                            report_export_verification_warnings(verification_warnings).await;
+                        }
+                        let path =
+                            pick_save("G-code", kind.default_file_name(), kind.file_extensions())
+                                .await;
+                        Message::NcToExport(nc, path)
+                    },
+                    std::convert::identity,
                 );
             }
-            Message::ExportDupConfirmed(_, false) => {
+            Message::ExportDuplicatesDeclined => {
                 self.status =
                     "Export cancelled — exclude or edit the duplicate operation(s).".to_string();
             }

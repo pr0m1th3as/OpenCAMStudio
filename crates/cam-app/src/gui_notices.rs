@@ -14,6 +14,7 @@ pub(super) struct NoticeEntry {
     pub severity: Severity,
     pub message: String,
     pub source: Option<String>,
+    pub verification_collision: bool,
 }
 
 impl Notice {
@@ -24,6 +25,7 @@ impl Notice {
                 severity: Severity::Error,
                 message: detail.clone(),
                 source: None,
+                verification_collision: false,
             }],
             detail,
             error: true,
@@ -49,31 +51,30 @@ pub(super) fn job_notice_with_info(outcome: &crate::RunOutcome) -> Option<Notice
             severity: diagnostic.severity,
             message: diagnostic.message.clone(),
             source: None,
+            verification_collision: false,
         })
         .collect();
-    entries.extend(outcome.collisions.iter().map(|collision| NoticeEntry {
-        severity: Severity::Error,
-        message: format!("Verification: {}", collision.message),
-        source: None,
-    }));
-    let error = entries
-        .iter()
-        .any(|entry| entry.severity == Severity::Error)
-        || matches!(
-            outcome.completion,
-            JobCompletion::Failed | JobCompletion::Incomplete
-        );
-    if error
-        && !entries
-            .iter()
-            .any(|entry| entry.severity == Severity::Error)
+    if matches!(
+        outcome.completion,
+        JobCompletion::Failed | JobCompletion::Incomplete
+    ) && !outcome.has_errors()
     {
         entries.push(NoticeEntry {
             severity: Severity::Error,
             message: "The toolpath or verification did not complete. Export is unavailable.".into(),
             source: None,
+            verification_collision: false,
         });
     }
+    entries.extend(outcome.collisions.iter().map(|collision| NoticeEntry {
+        severity: Severity::Error,
+        message: format!("Verification: {}", collision.message),
+        source: None,
+        verification_collision: true,
+    }));
+    let error = entries
+        .iter()
+        .any(|entry| entry.severity == Severity::Error);
     (!entries.is_empty()).then(|| Notice {
         title: if error {
             "Toolpath / verification errors"
@@ -295,6 +296,7 @@ impl App {
                                 severity: Severity::Warning,
                                 message,
                                 source: None,
+                                verification_collision: false,
                             })
                             .collect(),
                         error: false,
@@ -506,6 +508,7 @@ mod tests {
                 severity: Severity::Warning,
                 message: "Test warning".into(),
                 source: None,
+                verification_collision: false,
             }],
             error: false,
         });

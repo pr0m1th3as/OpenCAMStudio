@@ -385,6 +385,9 @@ a different machine legitimately changes the height of its lifts.
 **Preferences** sits beside **About**, right of the ribbon tabs. It opens a separate
 window with General, Snapping, Stock, Simulation, Shortcuts, and MCP tabs.
 
+- **Block G-code export on verification errors** is enabled by default under **General**.
+  Turn it off to allow export of completed toolpaths with stock or fixture collisions.
+  The app marks the collisions as warnings and shows a warning before the save dialog.
 - **Pickbox size** — the aperture of the square that follows the cursor during a pick.
   Its half-size is also the vertex-snap tolerance. The object-snap catch distance is
   shown beneath it but is **not separately settable**: it stays a fixed 1.5× the
@@ -479,7 +482,7 @@ on a carve means hundreds of times.
 
 **A blocked export never opens a file dialog.** The G-code is posted the moment you
 click Export, so if the job cannot be exported — a toolpath larger than the machine's
-travel, operations still marked ⚠, a rapid that would plow through uncut stock — you get
+travel, a failed toolpath run, a stock collision with blocking enabled — you get
 an error dialog *then*, and no file chooser appears. Picking a folder and a filename only
 to be refused afterwards reads as "saved", and sends you looking for a file that was
 never written. The dialog is used rather than the status line because the **Output** pane
@@ -516,8 +519,8 @@ can be hidden, and a refusal is the one message that must not be missable.
   sub-millimetre engraved groove is actually visible rather than falling between
   cells; it is capped so refining cannot turn a preview into a hang.
 - **Home → Export** posts the toolpath to the selected controller dialect. It is
-  blocked if the run had errors **or** the simulation found a rapid through stock;
-  the status line says why. Otherwise it reports the line count. Program comments are
+  blocked if the run failed, the post rejects the program, or verification finds a
+  collision with blocking enabled. The status line reports the export result. Program comments are
   reduced to printable ASCII (`°` becomes `deg`, `⌀` becomes `dia`) — grbl tolerates
   UTF-8, Fanuc/Haas controls and 7-bit DNC links often do not.
 - **Undo / Redo** step through document edits.

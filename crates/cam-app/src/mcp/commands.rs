@@ -64,6 +64,7 @@ fn report(c: &AppController) -> Value {
     });
     let outcome = c.outcome().map(|o| json!({"completion":format!("{:?}",o.completion), "diagnostics":o.diagnostics,
         "collisions":o.collisions.iter().map(|hit| json!({"kind":format!("{:?}",hit.kind),
+            "severity":c.verification_collision_severity(),
             "at":hit.at,"message":hit.message,"operation":hit.op_id,"pattern":hit.pattern_id,
             "instance_index":hit.instance_index,"step_index":hit.step_index,"fraction":hit.fraction})).collect::<Vec<_>>(),
         "stock_vertices":o.stock_vertices.len(), "stock_triangles":o.stock_indices.len()/3}));
@@ -409,7 +410,7 @@ catalog! {
             "tool_changes":time.tool_changes,"tool_change_seconds":time.tool_change_seconds}))
     }
     get_cache_stats [true] "Inspect toolpath fragment cache reuse/computation counts." {} |c,_a| {let s=c.cache_stats(); Ok(json!({"reused":s.reused,"computed":s.computed}))}
-    export_nc [false] "Post verified toolpaths to G-code. Optional path writes a file; otherwise returns text. Exact duplicate operations require allow_duplicates. All normal completion, diagnostic, collision and machine-limit checks apply." {"path":optional(text()),"allow_duplicates":optional(boolean())} |c,a| {
+    export_nc [false] "Post completed toolpaths to G-code. Optional path writes a file; otherwise returns text. Exact duplicate operations require allow_duplicates. Detected collisions block export according to preferences. Check get_run_status for verification warnings." {"path":optional(text()),"allow_duplicates":optional(boolean())} |c,a| {
         c.poll_run();
         let duplicates=c.duplicate_operation_groups();
         if !duplicates.is_empty() && !a.flag("allow_duplicates")? {

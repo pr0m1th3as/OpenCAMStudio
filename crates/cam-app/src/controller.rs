@@ -179,9 +179,7 @@ pub enum ExportError {
     Incomplete,
     /// The last run produced errors, so its G-code is unsafe to emit.
     HasErrors,
-    /// The simulation found `n` rapid(s) plowing through remaining stock — a
-    /// machine-crash hazard, blocked by default. (A future preference could let
-    /// the user downgrade this to a warning.)
+    /// The simulation found `n` rapid moves through remaining stock.
     RapidThroughStock(usize),
     /// Non-cutting feeds or cutter tips contact remaining stock.
     NonCuttingThroughStock(usize),
@@ -278,6 +276,7 @@ pub struct AppController {
     saved_verification: BTreeMap<u64, crate::project::StoredVerification>,
     automatic_toolpath_run: bool,
     simulation_accuracy: f32,
+    block_export_on_verification_errors: bool,
     operation_id_floor: u32,
     setup_id_floor: u64,
     asset_id_floor: u64,
@@ -592,6 +591,7 @@ impl AppController {
             saved_verification: Default::default(),
             automatic_toolpath_run: false,
             simulation_accuracy: 1.0,
+            block_export_on_verification_errors: true,
             operation_id_floor: 0,
             setup_id_floor: 1,
             asset_id_floor: 1,
@@ -4867,6 +4867,7 @@ mod tests {
     #[test]
     fn non_complete_previews_cannot_export_even_without_error_diagnostics() {
         let mut app = AppController::new(machine());
+        app.set_block_export_on_verification_errors(false);
         app.open_dxf(PART_DXF, "part.dxf").unwrap();
         let complete = app.run(&CancelToken::new()).clone();
         assert!(!complete.has_errors());

@@ -128,7 +128,8 @@ sections and the protected material that needs another setup. A fully blocked
 profile instance fails. Other operations and unsupported profile configurations
 retain collision rejection. Every generated escape and re-entry is verified,
 including overhead-fixture conflicts. Playback checks the same envelopes
-and stops at contact. Fixture collisions block NC export. Holder and machine
+and stops at contact. Fixture collisions block NC export by default. **Preferences →
+General** can treat them as export warnings. Holder and machine
 geometry are not included. Fixtures remain visible when simulation hides the model.
 Changing fixtures, clearances, source revisions or placements invalidates generated
 results. Missing fixture geometry must be removed or reselected before generation.

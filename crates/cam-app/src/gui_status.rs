@@ -58,13 +58,7 @@ impl StatusMessages {
                     .cloned()
                     .collect(),
                 // A failed run without any diagnostic still needs a setup error.
-                completion: if operation.is_none()
-                    && !outcome
-                        .diagnostics
-                        .iter()
-                        .any(|d| d.severity == Severity::Error)
-                    && outcome.collisions.is_empty()
-                {
+                completion: if operation.is_none() && !outcome.has_errors() {
                     outcome.completion
                 } else {
                     JobCompletion::Complete
@@ -158,8 +152,8 @@ impl App {
             }
         }
         let mut lines = Vec::new();
-        let mut error = false;
         let mut entries = Vec::new();
+        let collision_severity = self.controller.verification_collision_severity();
         for source in targets {
             let Some(recorded) = self.status_messages.0.get(&source) else {
                 continue;
@@ -175,13 +169,15 @@ impl App {
             {
                 continue;
             }
-            error |= recorded.notice.error;
             let label = match source {
                 StatusTarget::Setup(_) => setup.name.clone(),
                 StatusTarget::Operation(id) => format!("Operation #{id}"),
             };
             lines.push(format!("{label}\n{}", recorded.notice.detail));
             entries.extend(recorded.notice.entries.iter().cloned().map(|mut entry| {
+                if entry.verification_collision {
+                    entry.severity = collision_severity;
+                }
                 entry.source = Some(label.clone());
                 entry
             }));
@@ -196,6 +192,9 @@ impl App {
                 op_kind(setup.operations.iter().find(|op| op.id() == id)?)
             ),
         };
+        let error = entries
+            .iter()
+            .any(|entry| entry.severity == Severity::Error);
         Some(Notice {
             title,
             detail: lines.join("\n\n"),
@@ -558,6 +557,12 @@ mod tests {
         );
         assert!(notice(&app, StatusTarget::Operation(id))
             .is_some_and(|n| n.error && n.detail.contains("rapid through stock")));
+        app.controller
+            .set_block_export_on_verification_errors(false);
+        let warning = notice(&app, StatusTarget::Operation(id)).unwrap();
+        assert!(!warning.error);
+        assert_eq!(warning.entries[0].severity, Severity::Warning);
+        assert!(warning.detail.contains("rapid through stock"));
         let setup_id = app.controller.active_setup_id();
         record(
             &mut app,

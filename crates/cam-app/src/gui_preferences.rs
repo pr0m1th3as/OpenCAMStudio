@@ -51,6 +51,7 @@ impl Tab {
 pub(super) enum Edit {
     SelectTab(Tab),
     NumberDecimals(u8),
+    BlockExportOnVerificationErrors(bool),
     Pickbox(f32),
     MarkerScale(f32),
     OriginMarker(f32),
@@ -105,6 +106,9 @@ impl Preferences {
                 self.show_stock_palette = false;
             }
             Edit::NumberDecimals(digits) => self.draft.number_decimals = digits.min(8),
+            Edit::BlockExportOnVerificationErrors(block) => {
+                self.draft.block_export_on_verification_errors = block;
+            }
             Edit::Pickbox(value) => {
                 let (lo, hi) = crate::PICKBOX_RANGE;
                 self.draft.snapping.pickbox_px = value.clamp(lo, hi);
@@ -196,6 +200,7 @@ impl Preferences {
             };
         }
         merge!(number_decimals);
+        merge!(block_export_on_verification_errors);
         merge!(snapping.pickbox_px);
         merge!(snapping.marker_scale);
         merge!(view.origin_marker_scale);
@@ -267,20 +272,32 @@ impl Preferences {
     }
 
     fn general(&self) -> Element<'_, Edit> {
-        row![
-            text("Decimal places").size(INSPECTOR_TEXT_SIZE).width(150),
-            pick_list(
-                (0u8..=8).collect::<Vec<_>>(),
-                Some(self.draft.number_decimals),
-                Edit::NumberDecimals,
-            )
-            .text_size(INSPECTOR_TEXT_SIZE)
-            .padding([7, 9])
-            .style(inspector_picker)
-            .width(100),
+        column![
+            row![
+                text("Decimal places").size(INSPECTOR_TEXT_SIZE).width(150),
+                pick_list(
+                    (0u8..=8).collect::<Vec<_>>(),
+                    Some(self.draft.number_decimals),
+                    Edit::NumberDecimals,
+                )
+                .text_size(INSPECTOR_TEXT_SIZE)
+                .padding([7, 9])
+                .style(inspector_picker)
+                .width(100),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+            column![
+                checkbox(self.draft.block_export_on_verification_errors)
+                    .label("Block G-code export on verification errors")
+                    .size(16)
+                    .text_size(INSPECTOR_TEXT_SIZE)
+                    .on_toggle(Edit::BlockExportOnVerificationErrors),
+                note("Turn off to export with warnings for stock and fixture collisions.".into()),
+            ]
+            .spacing(6),
         ]
-        .spacing(10)
-        .align_y(Alignment::Center)
+        .spacing(14)
         .into()
     }
 
@@ -581,6 +598,8 @@ impl App {
         let reset = prefs.reset;
         let decimals_changed = settings.number_decimals != self.settings.number_decimals;
         let accuracy_changed = settings.simulation.accuracy != self.settings.simulation.accuracy;
+        let verification_policy_changed = settings.block_export_on_verification_errors
+            != self.settings.block_export_on_verification_errors;
         let simulation_changed = settings.simulation != self.settings.simulation
             || settings.view.stock_color != self.settings.view.stock_color;
         if settings != self.settings {
@@ -616,6 +635,18 @@ impl App {
         if reset {
             self.status = "Preferences restored to defaults.".into();
         }
+        if verification_policy_changed {
+            if !reset
+                && !self.controller.run_pending()
+                && self
+                    .controller
+                    .outcome()
+                    .is_some_and(|outcome| !outcome.collisions.is_empty())
+            {
+                self.report_run();
+            }
+            self.sync_output();
+        }
         self.close_preferences()
     }
 
@@ -638,6 +669,7 @@ impl App {
 mod tests {
     use super::*;
     use crate::config::tests::Scratch;
+    use cam_toolpath::Severity;
 
     #[test]
     fn cancel_and_window_close_discard_the_draft() {
@@ -646,11 +678,18 @@ mod tests {
         let _ = app.update(Message::ShowPrefs);
         let id = app.preferences.as_ref().unwrap().id;
         let _ = app.update(Message::Preferences(Edit::NumberDecimals(8)));
+        let _ = app.update(Message::Preferences(Edit::BlockExportOnVerificationErrors(
+            !original.block_export_on_verification_errors,
+        )));
         let _ = app.update(Message::Preferences(Edit::SelectTab(Tab::Stock)));
         let _ = app.update(Message::ShowPrefs);
         let prefs = app.preferences.as_ref().unwrap();
         assert_eq!(prefs.id, id);
         assert_eq!(prefs.draft.number_decimals, 8);
+        assert_ne!(
+            prefs.draft.block_export_on_verification_errors,
+            original.block_export_on_verification_errors
+        );
         assert_eq!(prefs.tab, Tab::Stock);
         assert_eq!(app.settings, original);
         let _ = app.update(Message::Preferences(Edit::Cancel));
@@ -670,8 +709,12 @@ mod tests {
         let (mut app, _) = App::new();
         let scratch = Scratch::new("accept-preferences");
         let path = scratch.file("settings.json");
+        app.settings.block_export_on_verification_errors = true;
         let _ = app.update(Message::ShowPrefs);
         let _ = app.update(Message::Preferences(Edit::NumberDecimals(6)));
+        let _ = app.update(Message::Preferences(Edit::BlockExportOnVerificationErrors(
+            false,
+        )));
         let _ = app.update(Message::Preferences(Edit::SelectTab(Tab::Snapping)));
         let _ = app.update(Message::Preferences(Edit::Pickbox(18.0)));
         let _ = app.update(Message::Preferences(Edit::SelectTab(Tab::Shortcuts)));
@@ -684,6 +727,11 @@ mod tests {
         assert_eq!(outcome, crate::settings::LoadOutcome::Loaded);
         assert_eq!(saved, app.settings);
         assert_eq!(saved.number_decimals, 6);
+        assert!(!saved.block_export_on_verification_errors);
+        assert_eq!(
+            app.controller.verification_collision_severity(),
+            Severity::Warning
+        );
         assert_eq!(saved.snapping.pickbox_px, 18.0);
         assert_eq!(saved.shortcuts[SHORTCUTS[0].0], "");
         assert!(!saved.view.tooltips);
@@ -695,6 +743,9 @@ mod tests {
         let (mut app, _) = App::new();
         let scratch = Scratch::new("reset-preferences");
         app.settings.number_decimals = 6;
+        app.settings.block_export_on_verification_errors = false;
+        app.controller
+            .set_block_export_on_verification_errors(false);
         let _ = app.update(Message::ShowPrefs);
         let _ = app.update(Message::Preferences(Edit::RestoreDefaults));
         assert_eq!(app.settings.number_decimals, 6);
@@ -709,6 +760,10 @@ mod tests {
         let path = scratch.file("settings.json");
         let _ = app.accept_preferences(|app, settings| app.save_preferences_to(settings, &path));
         assert_eq!(app.settings, Settings::default());
+        assert_eq!(
+            app.controller.verification_collision_severity(),
+            Severity::Error
+        );
         assert!(app.preferences.is_none());
     }
 }

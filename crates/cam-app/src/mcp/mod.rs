@@ -55,6 +55,8 @@ impl Session {
         controller.set_post_kind(active.post);
         controller.set_estlcam_options(active.estlcam);
         controller.set_simulation_accuracy(settings.simulation.accuracy);
+        controller
+            .set_block_export_on_verification_errors(settings.block_export_on_verification_errors);
         Self {
             controller,
             library,
