@@ -2446,7 +2446,10 @@ pub(crate) fn depth_levels(top: f64, depth: f64, stepdown: f64) -> Vec<f64> {
     {
         return Vec::new();
     }
-    let epsilon = 1e-12 * (1. + top.abs().max(depth.abs()));
+    // CAD-derived heights can differ from an exact stepdown multiple by tiny
+    // modelling tolerances. Finish at the requested depth instead of emitting
+    // another full contour for a remainder of at most 0.001 mm.
+    let epsilon = 0.001_f64.min(stepdown * 0.5);
     let mut levels = Vec::with_capacity(count as usize);
     for i in 1..=count as usize {
         let next = (top - i as f64 * stepdown).max(depth);
@@ -2532,6 +2535,18 @@ mod tests {
         assert_eq!(depth_levels(0.0, -1.0, 1.5), vec![-1.0]);
         assert_eq!(depth_levels(0.0, -5.0, 2.0), vec![-2.0, -4.0, -5.0]);
         assert!(depth_levels(0.0, 1.0, 1.0).is_empty());
+    }
+
+    #[test]
+    fn levels_absorb_cad_height_noise_without_dropping_real_remainders() {
+        let bottom = -12.00000010000008;
+        assert_eq!(depth_levels(0.0, bottom, 6.0), vec![-6.0, bottom]);
+        assert_eq!(depth_levels(0.0, -12.0005, 6.0), vec![-6.0, -12.0005]);
+        assert_eq!(depth_levels(0.0, -12.002, 6.0), vec![-6.0, -12.0, -12.002]);
+        assert_eq!(
+            depth_levels(0.0, -0.0000021, 0.000001),
+            vec![-0.000001, -0.0000021]
+        );
     }
 
     fn step_end_z(s: &Step) -> f64 {
