@@ -1346,10 +1346,8 @@ impl AppController {
                     "Choose positive stock dimensions and model positions within the stock".into(),
                 )
             }
-            Stock::RelativeBox { offsets }
-                if offsets.iter().flatten().any(|v| !v.is_finite() || *v < 0.) =>
-            {
-                return Err("Stock allowances must be finite and non-negative".into())
+            Stock::RelativeBox { offsets } if offsets.iter().flatten().any(|v| !v.is_finite()) => {
+                return Err("Stock offsets must be finite".into());
             }
             Stock::FixedRound {
                 diameter,
@@ -1416,8 +1414,11 @@ impl AppController {
         }) {
             return Err("Stock must have finite, positive dimensions on all axes".into());
         }
-        if setup.stock != Stock::PreviousSetup
-            && !self.geometry_state().instances.is_empty()
+        // A negative relative offset deliberately puts a stock face inside the model bounds.
+        if !matches!(
+            setup.stock,
+            Stock::RelativeBox { .. } | Stock::PreviousSetup
+        ) && !self.geometry_state().instances.is_empty()
             && (0..3).any(|i| stock_min[i] > min[i] + 1e-6 || stock_max[i] < max[i] - 1e-6)
         {
             return Err("Stock does not contain the selected machining model".into());

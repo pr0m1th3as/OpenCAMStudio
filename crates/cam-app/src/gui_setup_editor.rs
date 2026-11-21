@@ -381,7 +381,7 @@ impl App {
                         }
                     }
                     cam_model::Stock::RelativeBox { offsets } => {
-                        list = list.push(inspector_section("Stock allowance"));
+                        list = list.push(inspector_section("Stock offsets"));
                         for (side, side_offsets) in offsets.iter().enumerate() {
                             for (axis, offset) in side_offsets.iter().enumerate() {
                                 let i = side * 3 + axis;
@@ -492,11 +492,16 @@ impl App {
                         stock_min[i] > model_min[i] + 1e-6 || stock_max[i] < model_max[i] - 1e-6
                     })
                 {
-                    list = list.push(
-                        text("Stock does not contain the selected machining model.")
-                            .size(11)
-                            .color(palette::ERROR),
-                    );
+                    let (message, color) = match draft.stock {
+                        cam_model::Stock::RelativeBox { .. } => {
+                            ("Part of the model lies outside the stock.", INSPECTOR_MUTED)
+                        }
+                        _ => (
+                            "Stock does not contain the selected machining model.",
+                            palette::ERROR,
+                        ),
+                    };
+                    list = list.push(text(message).size(11).color(color));
                 }
             }
             SetupEditorTab::Postprocess => {

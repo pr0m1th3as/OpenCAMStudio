@@ -17556,6 +17556,45 @@ mod multi_setup_draft_tests {
     }
 
     #[test]
+    fn negative_relative_box_offsets_apply_the_previewed_stock() {
+        let mut app = model_list_app();
+        let before = app.controller.document().clone();
+        send(&mut app, Message::SetupModelToggled(1, true));
+        send(
+            &mut app,
+            Message::SetupStockKindChanged(StockEditorKind::RelativeBox),
+        );
+        send(&mut app, Message::SetupStockNumberChanged(5, "-11".into()));
+        send(&mut app, Message::SetupCommit);
+        assert!(app.status.contains("positive dimensions"), "{}", app.status);
+        assert!(app.setup_draft.is_some());
+        assert_eq!(app.controller.document(), &before);
+
+        send(&mut app, Message::SetupStockNumberChanged(0, "-2".into()));
+        send(&mut app, Message::SetupStockNumberChanged(5, "-6".into()));
+        let draft = app.setup_draft.as_ref().unwrap();
+        let expected_stock = draft.stock;
+        let bounds = ([2., -1., -1.], [11., 11., 4.]);
+        assert_eq!(app.controller.pending_setup_stock_bounds(draft), bounds);
+        let (vertices, _) = workspace_view::uncut_stock_mesh_for_setup(&app.controller, draft);
+        assert!(vertices.iter().any(|vertex| vertex.position[2] == 4.));
+        assert!(vertices.iter().all(|vertex| vertex.position[2] <= 4.));
+
+        send(&mut app, Message::SetupCommit);
+        assert!(app.setup_draft.is_none(), "{}", app.status);
+        assert_eq!(app.controller.inspection_setup().stock, expected_stock);
+        assert_eq!(app.controller.stock_box(), bounds);
+
+        let scratch = crate::config::tests::Scratch::new("relative-box-offsets");
+        let path = scratch.file("stock.ocam");
+        app.controller.save_project(&path).unwrap();
+        let mut reopened = AppController::new(crate::default_machine());
+        reopened.open_project(&path).unwrap();
+        assert_eq!(reopened.inspection_setup().stock, expected_stock);
+        assert_eq!(reopened.stock_box(), bounds);
+    }
+
+    #[test]
     fn setup_geometry_clear_removes_only_the_chosen_role_in_the_draft() {
         let mut app = model_list_app();
         send(&mut app, Message::SetupModelToggled(1, true));

@@ -58,8 +58,10 @@ uses the active work origin and the setup axes; it updates with the WCS preview.
 The model browser view uses the world grid.
 
 Stock supports a fixed-size box, positioned against the model along each axis,
-or a box with independent allowances on all six sides. Material is separate from
-stock shape. After the first setup, **From previous setup** uses the remaining
+or a relative-size box with independent offsets on all six sides. Negative offsets
+move a stock face inward. The resulting box must have positive dimensions.
+Material is separate from stock shape.
+After the first setup, **From previous setup** uses the remaining
 material after the immediately preceding setup's included operations. Generating
 or simulating recalculates the required earlier setups automatically, including
 chains of inherited stock. Reordering setups changes the source. Upstream edits,

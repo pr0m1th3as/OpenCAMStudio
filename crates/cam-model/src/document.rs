@@ -567,7 +567,8 @@ pub enum Stock {
         size: [f64; 3],
         model_position: [f64; 3],
     },
-    /// A box grown independently on the negative and positive side of each axis.
+    /// A box with independent offsets from each model face. Negative offsets move the
+    /// corresponding stock face inward.
     RelativeBox { offsets: [[f64; 3]; 2] },
     /// Round stock parallel to the selected edge or along an origin axis.
     /// When unset, the direction is setup Z.
