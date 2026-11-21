@@ -148,7 +148,7 @@ impl OperationCache {
             // Recompute persisted profiles generated before automatic lead placement.
             profile_lead_revision: u32::from(matches!(op, Operation::Profile(_))),
             // Recompute profiles created before the roughing allowance and open-corner fixes.
-            profile_finish_revision: 3 * u32::from(matches!(op, Operation::Profile(_))),
+            profile_finish_revision: 4 * u32::from(matches!(op, Operation::Profile(_))),
             // Old keep-down bridges were tagged as non-cutting and failed verification.
             keep_down_revision: match op {
                 Operation::Profile(p) if p.passes.keep_tool_down => 1,

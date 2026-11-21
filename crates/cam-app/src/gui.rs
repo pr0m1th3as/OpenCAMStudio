@@ -118,6 +118,8 @@ use tool_presets::{MaterialChoice, PresetChoice, PresetField};
 mod grid_view;
 #[path = "gui_help.rs"]
 mod illustrated_help;
+#[path = "gui_operation_hints.rs"]
+mod operation_hints;
 #[path = "gui_operation_positions.rs"]
 mod operation_positions;
 #[path = "gui_operation_preview.rs"]
@@ -176,7 +178,11 @@ mod palette {
     pub const ACCENT_BLUE: Color = rgb(0.20, 0.55, 0.90);
     /// Normal control text.
     pub const LABEL_COLOR: Color = rgb(0.82, 0.82, 0.82);
-    /// Group caption text (and disabled controls).
+    /// Ribbon text and group captions on the dark ribbon background.
+    pub const RIBBON_TEXT: Color = rgb(0.92, 0.92, 0.92);
+    pub const RIBBON_CAPTION: Color = rgb(0.75, 0.75, 0.75);
+    pub const RIBBON_DISABLED: Color = rgb(0.65, 0.65, 0.65);
+    /// Muted labels and disabled controls elsewhere.
     pub const GROUP_LABEL: Color = rgb(0.50, 0.50, 0.50);
     /// Hover fill for tabs.
     pub const TOOL_HOVER: Color = rgb(0.32, 0.32, 0.32);
@@ -11755,7 +11761,13 @@ impl App {
         // library must have at least one tool (it seeds defaults, so it always does).
         let can_create =
             has_geo && !self.controller.setups().is_empty() && !self.library.tools.is_empty();
-        let begin = |kind: OpKind| can_create.then_some(Message::BeginOp(kind));
+        let operation = |icon, label, kind, shortcut| Command {
+            operation_hint: Some((
+                kind,
+                display_shortcut(shortcut_value(&self.settings, shortcut)),
+            )),
+            ..cmd(icon, label, can_create.then_some(Message::BeginOp(kind)))
+        };
         match self.active_tab {
             RibbonTab::Home => vec![
                 GroupSpec {
@@ -11841,133 +11853,33 @@ impl App {
                     ],
                 },
             ],
-            RibbonTab::Machining => vec![GroupSpec {
-                title: "Create",
-                // Roughly the order a part is actually made: skim the blank flat,
-                // then cut its shape, then the features, then the decoration.
-                commands: vec![
-                    cmd_help(
-                        Icon::Face,
-                        "Face",
-                        begin(OpKind::Face),
-                        format!(
-                            "{} ({})",
-                            Icon::Face.help(),
-                            display_shortcut(shortcut_value(&self.settings, "face"))
-                        ),
-                    ),
-                    cmd_help(
-                        Icon::Profile,
-                        "Profile",
-                        begin(OpKind::Profile),
-                        format!(
-                            "{} ({})",
-                            Icon::Profile.help(),
-                            display_shortcut(shortcut_value(&self.settings, "profile"))
-                        ),
-                    ),
-                    cmd_help(
-                        Icon::Pocket,
-                        "Pocket",
-                        begin(OpKind::Pocket),
-                        format!(
-                            "{} ({})",
-                            Icon::Pocket.help(),
-                            display_shortcut(shortcut_value(&self.settings, "pocket"))
-                        ),
-                    ),
-                    cmd_help(
-                        Icon::Drill,
-                        "Drill",
-                        begin(OpKind::Drill),
-                        format!(
-                            "{} ({})",
-                            Icon::Drill.help(),
-                            display_shortcut(shortcut_value(&self.settings, "drill"))
-                        ),
-                    ),
-                    cmd_help(
-                        Icon::Thread,
-                        "Thread",
-                        begin(OpKind::Thread),
-                        format!(
-                            "{} ({})",
-                            Icon::Thread.help(),
-                            display_shortcut(shortcut_value(&self.settings, "thread"))
-                        ),
-                    ),
-                    cmd_help(
-                        Icon::Bore,
-                        "Bore",
-                        begin(OpKind::Bore),
-                        format!(
-                            "{} ({})",
-                            Icon::Bore.help(),
-                            display_shortcut(shortcut_value(&self.settings, "bore"))
-                        ),
-                    ),
-                    cmd_help(
-                        Icon::Chamfer,
-                        "Chamfer",
-                        begin(OpKind::Chamfer),
-                        format!(
-                            "{} ({})",
-                            Icon::Chamfer.help(),
-                            display_shortcut(shortcut_value(&self.settings, "chamfer"))
-                        ),
-                    ),
-                    cmd_help(
-                        Icon::Engrave,
-                        "Engrave",
-                        begin(OpKind::Engrave),
-                        format!(
-                            "{} ({})",
-                            Icon::Engrave.help(),
-                            display_shortcut(shortcut_value(&self.settings, "engrave"))
-                        ),
-                    ),
-                    cmd_help(
-                        Icon::Carve,
-                        "Carve",
-                        begin(OpKind::Carve),
-                        format!(
-                            "{} ({})",
-                            Icon::Carve.help(),
-                            display_shortcut(shortcut_value(&self.settings, "carve"))
-                        ),
-                    ),
-                    cmd_help(
-                        Icon::Adaptive,
-                        "3D Adaptive Clearing",
-                        begin(OpKind::Adaptive),
-                        format!(
-                            "{} ({})",
-                            Icon::Adaptive.help(),
-                            display_shortcut(shortcut_value(&self.settings, "adaptive"))
-                        ),
-                    ),
-                    cmd_help(
-                        Icon::Parallel,
-                        "3D Parallel / Scallop",
-                        begin(OpKind::Parallel),
-                        format!(
-                            "{} ({})",
-                            Icon::Parallel.help(),
-                            display_shortcut(shortcut_value(&self.settings, "parallel"))
-                        ),
-                    ),
-                    cmd_help(
-                        Icon::Spiral,
-                        "3D Spiral",
-                        begin(OpKind::Spiral),
-                        format!(
-                            "{} ({})",
-                            Icon::Spiral.help(),
-                            display_shortcut(shortcut_value(&self.settings, "spiral"))
-                        ),
-                    ),
-                ],
-            }],
+            RibbonTab::Machining => vec![
+                GroupSpec {
+                    title: "2D",
+                    commands: vec![
+                        operation(Icon::Face, "Face", OpKind::Face, "face"),
+                        operation(Icon::Profile, "Profile", OpKind::Profile, "profile"),
+                        operation(Icon::Pocket, "Pocket", OpKind::Pocket, "pocket"),
+                        operation(Icon::Thread, "Thread", OpKind::Thread, "thread"),
+                        operation(Icon::Bore, "Bore", OpKind::Bore, "bore"),
+                        operation(Icon::Chamfer, "Chamfer", OpKind::Chamfer, "chamfer"),
+                        operation(Icon::Engrave, "Engrave", OpKind::Engrave, "engrave"),
+                        operation(Icon::Carve, "Carve", OpKind::Carve, "carve"),
+                    ],
+                },
+                GroupSpec {
+                    title: "3D",
+                    commands: vec![
+                        operation(Icon::Adaptive, "3D Adaptive", OpKind::Adaptive, "adaptive"),
+                        operation(Icon::Parallel, "3D Parallel", OpKind::Parallel, "parallel"),
+                        operation(Icon::Spiral, "3D Spiral", OpKind::Spiral, "spiral"),
+                    ],
+                },
+                GroupSpec {
+                    title: "Drilling",
+                    commands: vec![operation(Icon::Drill, "Drill", OpKind::Drill, "drill")],
+                },
+            ],
             RibbonTab::Machinery => vec![GroupSpec {
                 title: "Machines",
                 commands: vec![
@@ -12040,8 +11952,11 @@ impl App {
     fn ribbon_body(&self) -> Element<'_, Message> {
         let specs = self.ribbon_specs();
         let densities = self.ribbon_densities(&specs);
-        let mut band = row![].spacing(GROUP_GAP).align_y(Alignment::Start);
+        let mut band = row![].align_y(Alignment::Start);
         for (i, (spec, &density)) in specs.iter().zip(&densities).enumerate() {
+            if i > 0 {
+                band = band.push(ribbon_separator());
+            }
             band = band.push(render_group(spec, density, i, self.tooltips));
         }
         // The View tab gets a live orientation-cube size control (a slider has no
@@ -12049,8 +11964,8 @@ impl App {
         // The View tab gets the cube-size slider, then the pane-visibility toggles —
         // both sit outside the density solver, which sizes icon-command groups only.
         if self.active_tab == RibbonTab::View {
-            band = band.push(self.cube_size_group());
-            band = band.push(self.panes_group());
+            band = band.push(ribbon_separator()).push(self.cube_size_group());
+            band = band.push(ribbon_separator()).push(self.panes_group());
         }
         band.into()
     }
@@ -12079,7 +11994,7 @@ impl App {
         };
         let value = text(format!("{} px", self.gizmo_size as i32))
             .size(11)
-            .color(palette::GROUP_LABEL);
+            .color(palette::RIBBON_CAPTION);
         ribbon_group(
             "Cube size",
             column![control, value]
@@ -13124,14 +13039,31 @@ fn subtree_min(
     }
 }
 
+/// A divider occupying the existing gap between ribbon groups.
+fn ribbon_separator() -> Element<'static, Message> {
+    container(
+        container(Space::new().width(1).height(58)).style(|_theme| container::Style {
+            background: Some(Background::Color(palette::SEPARATOR)),
+            ..container::Style::default()
+        }),
+    )
+    .width(Length::Fixed(GROUP_GAP))
+    .center_x(Length::Fixed(GROUP_GAP))
+    .into()
+}
+
 /// A labelled ribbon group: its command widgets stacked over a small caption in
 /// muted grey (OpenCADStudio places the group label at the bottom).
 fn ribbon_group<'a>(
     title: &'a str,
     content: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    let caption = text(title).size(10).color(palette::GROUP_LABEL);
-    container(column![content.into(), caption].spacing(4))
+    let caption = text(title).size(10).color(palette::RIBBON_CAPTION);
+    container(
+        column![content.into(), caption]
+            .spacing(4)
+            .align_x(Alignment::Center),
+    )
         .padding(Padding::from([3.0, 4.0]))
         .into()
 }
@@ -13154,7 +13086,7 @@ fn tab_button_style(active: bool, status: button::Status) -> button::Style {
         text_color: if active {
             Color::WHITE
         } else {
-            palette::LABEL_COLOR
+            palette::RIBBON_TEXT
         },
         border: Border {
             radius: 3.0.into(),
@@ -13179,7 +13111,7 @@ fn snap_toggle_style(on: bool, status: button::Status) -> button::Style {
         text_color: if on {
             Color::WHITE
         } else {
-            palette::LABEL_COLOR
+            palette::RIBBON_TEXT
         },
         border: Border {
             color: palette::SEPARATOR,
@@ -13200,9 +13132,9 @@ fn command_button_style(status: button::Status) -> button::Style {
         _ => None,
     };
     let text_color = if matches!(status, button::Status::Disabled) {
-        palette::GROUP_LABEL
+        palette::RIBBON_DISABLED
     } else {
-        palette::LABEL_COLOR
+        palette::RIBBON_TEXT
     };
     button::Style {
         background,
@@ -13230,7 +13162,7 @@ fn command_toggle_style(on: bool, status: button::Status) -> button::Style {
     };
     button::Style {
         background: Some(Background::Color(accent)),
-        text_color: palette::LABEL_COLOR,
+        text_color: palette::RIBBON_TEXT,
         border: Border {
             radius: 3.0.into(),
             ..Border::default()
@@ -13448,6 +13380,8 @@ struct Command {
     /// thing. The moment one is reused — the tool icon standing in for "add a machine" —
     /// it silently describes the wrong action, which is worse than no tooltip.
     help: Option<String>,
+    /// Kept separately from the action so disabled operations still explain themselves.
+    operation_hint: Option<(OpKind, String)>,
 }
 
 /// A ribbon group's data model.
@@ -13470,6 +13404,7 @@ fn cmd(icon: Icon, label: &'static str, action: Option<Message>) -> Command {
         action,
         toggle: None,
         help: None,
+        operation_hint: None,
     }
 }
 
@@ -13496,6 +13431,7 @@ fn toggle_cmd(icon: Icon, label: &'static str, on: bool, msg: Message) -> Comman
         label,
         action: Some(msg),
         help: None,
+        operation_hint: None,
         toggle: Some(on),
     }
 }
@@ -13520,7 +13456,7 @@ fn render_command(command: &Command, compact: bool, show: bool) -> Element<'stat
         .align_x(Alignment::Center)
         .into()
     };
-    let base = button(content)
+    let base = button(container(content).center_x(Length::Fill))
         .width(Length::Fixed(width))
         .padding(Padding::from([4.0, 2.0]));
     let btn: Element<'static, Message> = match command.toggle {
@@ -13535,6 +13471,16 @@ fn render_command(command: &Command, compact: bool, show: bool) -> Element<'stat
     };
     if !show {
         return btn;
+    }
+    if let Some((kind, shortcut)) = &command.operation_hint {
+        return delayed_tooltip(
+            btn,
+            operation_hints::content(*kind, shortcut),
+            tooltip::Position::Bottom,
+        )
+        .padding(0)
+        .gap(5)
+        .into();
     }
     delayed_tooltip(
         btn,
@@ -13580,7 +13526,7 @@ fn render_group(
         } else {
             icon_svg(spec.rep_icon(), icon_px)
         };
-        return button(content)
+        return button(container(content).center_x(Length::Fill))
             .width(Length::Fixed(width))
             .padding(Padding::from([4.0, 2.0]))
             .on_press(Message::ToggleRibbonGroup(index))
