@@ -1,12 +1,13 @@
 //! The native Preferences window and its uncommitted settings.
 use super::{
-    display_shortcut, inspector_button, inspector_footer, inspector_picker, inspector_primary,
-    inspector_secondary, inspector_tab, mcp, palette, shortcut_binding, shortcut_value, App,
-    Message, INSPECTOR_MUTED, INSPECTOR_TEXT, INSPECTOR_TEXT_SIZE, SHORTCUTS,
+    delayed_tooltip, display_shortcut, inspector_button, inspector_footer, inspector_picker,
+    inspector_primary, inspector_secondary, inspector_tab, mcp, palette, popup_surface,
+    shortcut_binding, shortcut_value, App, Message, INSPECTOR_MUTED, INSPECTOR_TEXT,
+    INSPECTOR_TEXT_SIZE, SHORTCUTS,
 };
 use crate::Settings;
 use iced::widget::{
-    button, checkbox, column, container, pick_list, row, scrollable, slider, text, Space,
+    button, checkbox, column, container, pick_list, row, scrollable, slider, text, tooltip, Space,
 };
 use iced::{Alignment, Background, Color, Element, Length, Theme};
 use std::sync::LazyLock;
@@ -287,15 +288,20 @@ impl Preferences {
             ]
             .spacing(10)
             .align_y(Alignment::Center),
-            column![
+            delayed_tooltip(
                 checkbox(self.draft.block_export_on_verification_errors)
                     .label("Block G-code export on verification errors")
                     .size(16)
                     .text_size(INSPECTOR_TEXT_SIZE)
                     .on_toggle(Edit::BlockExportOnVerificationErrors),
-                note("Turn off to export with warnings for stock and fixture collisions.".into()),
-            ]
-            .spacing(6),
+                container(
+                    text("Turn off to export with warnings for stock and fixture collisions.")
+                        .size(INSPECTOR_TEXT_SIZE),
+                )
+                .padding(8)
+                .style(popup_surface),
+                tooltip::Position::Bottom,
+            ),
         ]
         .spacing(14)
         .into()

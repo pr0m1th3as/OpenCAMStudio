@@ -1995,11 +1995,11 @@ impl Field {
 }
 
 /// Require a deliberate hover before showing help on any control.
-fn delayed_tooltip<'a>(
-    content: impl Into<Element<'a, Message>>,
-    help: impl Into<Element<'a, Message>>,
+fn delayed_tooltip<'a, M: 'a>(
+    content: impl Into<Element<'a, M>>,
+    help: impl Into<Element<'a, M>>,
     position: tooltip::Position,
-) -> tooltip::Tooltip<'a, Message> {
+) -> tooltip::Tooltip<'a, M> {
     tooltip(content, help, position).delay(std::time::Duration::from_millis(600))
 }
 
