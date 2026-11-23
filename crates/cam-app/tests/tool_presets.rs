@@ -227,6 +227,8 @@ fn catalog_details_round_trip_and_old_tools_load_without_them() {
         manufacturer: "Example Tools".into(),
         product_id: "EM-6".into(),
         product_link: "https://example.com/EM-6".into(),
+        cutter_material: "Carbide".into(),
+        coating: "TiAlN".into(),
         ..cutter()
     };
     let library = ToolLibrary {
@@ -237,7 +239,7 @@ fn catalog_details_round_trip_and_old_tools_load_without_them() {
     let loaded: ToolLibrary = serde_json::from_str(&encoded).unwrap();
     assert_eq!(loaded.tools[0], tool);
     let mut legacy = serde_json::to_value(&tool).unwrap();
-    for field in ["description", "manufacturer", "product_id", "product_link"] {
+    for field in ["description", "manufacturer", "product_id", "product_link", "cutter_material", "coating"] {
         legacy.as_object_mut().unwrap().remove(field);
     }
     let loaded: Tool = serde_json::from_value(legacy).unwrap();
@@ -245,6 +247,8 @@ fn catalog_details_round_trip_and_old_tools_load_without_them() {
     assert!(loaded.manufacturer.is_empty());
     assert!(loaded.product_id.is_empty());
     assert!(loaded.product_link.is_empty());
+    assert!(loaded.cutter_material.is_empty());
+    assert!(loaded.coating.is_empty());
     assert_eq!(loaded.presets, tool.presets);
     assert_eq!(loaded.identity(), tool.identity());
 }

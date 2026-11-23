@@ -252,7 +252,14 @@ impl canvas::Program<Message> for ToolCanvas {
                         let mut seg: Vec<P> = Vec::new();
                         for i in 0..=steps {
                             let z = flute_len * (i as f64) / (steps as f64);
-                            let psi = psi0 + s * TAU * (z / pitch);
+                            // Compression changes helix direction at mid-length. Its
+                            // actual transition height is not specified by the tool data.
+                            let advance = if self.cutting_direction == CutDir::Compression {
+                                if z <= flute_len * 0.5 { -z } else { z - flute_len }
+                            } else {
+                                s * z
+                            };
+                            let psi = psi0 + TAU * advance / pitch;
                             if psi.cos() > 0.0 {
                                 seg.push(map(radius_at(z) * psi.sin(), z, 1.0));
                             } else if seg.len() >= 2 {
@@ -302,6 +309,7 @@ pub(super) fn is_parameter(field: Field) -> bool {
         Field::ToolDiameter
             | Field::ToolLength
             | Field::FluteLength
+            | Field::FaceBodyHeight
             | Field::ShankDiameter
             | Field::ShankLength
             | Field::NeckLength
@@ -389,14 +397,10 @@ fn dimensions(tool: &cam_model::Tool) -> Vec<Dimension> {
             lane: 0.0,
         },
     );
-    if !conical {
+    if !matches!(tool.kind, ToolKind::VBit { .. }) {
         add(
             FluteLength,
-            if matches!(tool.kind, ToolKind::FaceMill) {
-                "Body"
-            } else {
-                "Lc"
-            },
+            "Lc",
             flute,
             Vertical {
                 radius: r,
@@ -406,6 +410,13 @@ fn dimensions(tool: &cam_model::Tool) -> Vec<Dimension> {
                 lane: 0.0,
             },
         );
+    }
+    if matches!(tool.kind, ToolKind::FaceMill) {
+        add(FaceBodyHeight, "Body", tool.face_body_height(), Vertical {
+            radius: r, from: 0.0, to: tool.face_body_height(), left: false, lane: 1.0,
+        });
+    }
+    if !conical {
         add(
             ShankDiameter,
             if matches!(tool.kind, ToolKind::FaceMill) {
@@ -693,7 +704,6 @@ impl ToolCanvas {
                         "Shank diameter (mm)"
                     }
                     (ToolKind::FaceMill, Field::ToolDiameter) => "Cutting diameter (mm)",
-                    (ToolKind::FaceMill, Field::FluteLength) => "Body height (mm)",
                     (ToolKind::FaceMill, Field::ShankDiameter) => "Arbor diameter (mm)",
                     (ToolKind::ThreadMill { pitch: None }, Field::FluteLength) => {
                         "Length of cut (mm)"

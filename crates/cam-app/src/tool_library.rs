@@ -749,8 +749,7 @@ impl ToolKindPick {
                 corner_radius: 1.0,
                 tip_length: 0.0,
             },
-            // A chamfer mill is always ground with a flat tip; 0 would make it a
-            // V-bit. 0.2 mm is a typical small flat.
+            // Start with a small flat; pointed chamfer mills can use zero.
             ToolKindPick::ChamferMill => ToolKind::ChamferMill {
                 included_angle_deg: 90.0,
                 tip_diameter: 0.2,

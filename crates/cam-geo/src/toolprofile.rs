@@ -173,7 +173,14 @@ pub fn generatrix(spec: &GeneratrixSpec) -> Profile2D {
             } else {
                 0.0
             };
-            segs.push(line(Point::new(r, z_apex), true));
+            if spec.flute_length > EPS && spec.flute_length < z_apex - EPS {
+                let z = spec.flute_length;
+                let radius = rf + (r - rf) * z / z_apex;
+                segs.push(line(Point::new(radius, z), true));
+                segs.push(line(Point::new(r, z_apex), false));
+            } else {
+                segs.push(line(Point::new(r, z_apex), true));
+            }
             z_apex
         }
         BottomShape::VTip {

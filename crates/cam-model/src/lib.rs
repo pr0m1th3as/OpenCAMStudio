@@ -328,6 +328,8 @@ pub enum CutDir {
     Up,
     /// Straight (axial) flutes — no helix. Only meaningful for a square end mill.
     Straight,
+    /// Up-cut near the tip and down-cut above it, directing chips inward.
+    Compression,
 }
 
 impl std::fmt::Display for CutDir {
@@ -336,6 +338,7 @@ impl std::fmt::Display for CutDir {
             CutDir::Down => "Down-cut",
             CutDir::Up => "Up-cut",
             CutDir::Straight => "Straight flute",
+            CutDir::Compression => "Compression",
         })
     }
 }
@@ -359,17 +362,26 @@ pub struct Tool {
     pub product_id: String,
     #[serde(default)]
     pub product_link: String,
+    /// Cutter substrate, such as carbide or high-speed steel.
+    #[serde(default)]
+    pub cutter_material: String,
+    /// Cutter coating, such as TiAlN; empty when unspecified.
+    #[serde(default)]
+    pub coating: String,
     /// Tool number (emitted as `Tn`).
     pub number: u32,
     /// Cutting diameter, mm.
     pub diameter: f64,
     /// Overall tool length — the stickout below the holder, mm.
     pub length: f64,
-    /// Length of the cutting edge (length of cut) from the tip, mm. `0.0` = unspecified
-    /// → treated as fully fluted (equals `length`); see [`Tool::flute_len`]. Drives the
+    /// Length of the cutting edge (length of cut) from the tip, mm. `0.0` = unspecified;
+    /// see [`Tool::flute_len`] for the fallback. Drives the
     /// cutting/non-cutting split of a generated generatrix.
     #[serde(default)]
     pub flute_length: f64,
+    /// Face mill body height; zero means the legacy flute length.
+    #[serde(default)]
+    pub face_body_height: f64,
     /// Shank diameter, mm. `0.0` = unspecified → equals the cutting `diameter` (no
     /// distinct shank); see [`Tool::shank_dia`].
     #[serde(default)]
@@ -422,10 +434,13 @@ impl Default for Tool {
             manufacturer: String::new(),
             product_id: String::new(),
             product_link: String::new(),
+            cutter_material: String::new(),
+            coating: String::new(),
             number: 0,
             diameter: 0.0,
             length: 0.0,
             flute_length: 0.0,
+            face_body_height: 0.0,
             shank_diameter: 0.0,
             neck_length: 0.0,
             neck_diameter: 0.0,
@@ -449,10 +464,22 @@ impl Tool {
     }
 
     /// Effective length of cut: the explicit [`flute_length`](Self::flute_length), or
-    /// the overall [`length`](Self::length) when unspecified (`0.0` ⇒ fully fluted).
+    /// the overall length when unspecified. For a chamfer mill the unspecified
+    /// length is the cone height, preserving its original cutting profile.
     pub fn flute_len(&self) -> f64 {
         if self.flute_length > 0.0 {
             self.flute_length
+        } else if let ToolKind::ChamferMill {
+            included_angle_deg,
+            tip_diameter,
+        } = self.kind
+        {
+            let tangent = (included_angle_deg * 0.5).to_radians().tan();
+            if tangent > 0.0 {
+                ((self.diameter - tip_diameter).max(0.0) * 0.5 / tangent).min(self.length)
+            } else {
+                self.length
+            }
         } else {
             self.length
         }
@@ -466,6 +493,11 @@ impl Tool {
         } else {
             self.diameter
         }
+    }
+
+    /// Face mill body height, with a fallback for older saved tools.
+    pub fn face_body_height(&self) -> f64 {
+        if self.face_body_height > 0.0 { self.face_body_height } else { self.flute_len() }
     }
 
     /// Effective neck diameter: the explicit [`neck_diameter`](Self::neck_diameter),
@@ -485,6 +517,21 @@ impl Tool {
     /// repeated full-form teeth, with the non-cutting tip, neck and shank tagged.
     pub fn profile(&self) -> cam_geo::Profile2D {
         use cam_geo::BottomShape;
+        if matches!(self.kind, ToolKind::FaceMill) {
+            use cam_geo::{Point, Profile2D, ProfileSeg, SegShape};
+            let r = self.radius().max(0.0);
+            let body = self.face_body_height().max(0.0);
+            let flute = self.flute_len().clamp(0.0, body);
+            let length = self.length.max(body);
+            let shank = self.shank_dia().max(0.0) * 0.5;
+            let line = |r, z, cutting| ProfileSeg { shape: SegShape::Line, end: Point::new(r, z), cutting };
+            let mut segs = vec![line(r, 0.0, true), line(r, flute, true)];
+            if body > flute { segs.push(line(r, body, false)); }
+            if (shank - r).abs() > 1e-9 { segs.push(line(shank, body, false)); }
+            if length > body { segs.push(line(shank, length, false)); }
+            if shank > 1e-9 { segs.push(line(0.0, length, false)); }
+            return Profile2D { start: Point::new(0.0, 0.0), segs };
+        }
         // Single-profile (single-point) thread mill: one 60° tooth at the tip, a sharply
         // reduced neck over the length of cut (its reach), then the shank. The neck ⌀ sets
         // the max thread depth = (min cutting ⌀ − neck ⌀)/2. Built directly, since the
@@ -587,9 +634,7 @@ impl Tool {
             } => {
                 // Like a V-bit but with a flat, **non-cutting** tip instead of a rounded
                 // one: the cone flank is the only cutting surface, flaring exactly to the
-                // shaft. Single diameter (= shaft); flute_length 0 leaves the shaft
-                // non-cutting.
-                flute_length = 0.0;
+                // shaft. The flute length controls where the cutting edge ends.
                 shank_radius = self.radius();
                 BottomShape::Cone {
                     half_angle_rad: (included_angle_deg * 0.5).to_radians(),
@@ -787,6 +832,15 @@ mod tests {
     }
 
     #[test]
+    fn compression_direction_round_trips_and_has_distinct_identity() {
+        let down = Tool { kind: ToolKind::EndMill, ..Default::default() };
+        let compression = Tool { cutting_direction: CutDir::Compression, ..down.clone() };
+        let loaded: Tool = serde_json::from_str(&serde_json::to_string(&compression).unwrap()).unwrap();
+        assert_eq!(loaded.cutting_direction, CutDir::Compression);
+        assert_ne!(compression.identity(), down.identity());
+    }
+
+    #[test]
     fn radius_mill_profile_and_identity_round_trip() {
         use cam_geo::{Point, SegShape};
         let tool = Tool {
@@ -859,12 +913,36 @@ mod tests {
             .iter()
             .filter(|s| s.cutting)
             .all(|s| s.end.x <= 4.0 + 1e-9));
+        let mut short = mk(ToolKind::ChamferMill {
+            included_angle_deg: 90.0,
+            tip_diameter: 0.0,
+        });
+        short.flute_length = 2.0;
+        let profile = short.profile();
+        assert!(profile.segs.iter().any(|s| s.cutting && (s.end.y - 2.0).abs() < 1e-9));
+        assert!(profile.segs.iter().filter(|s| s.cutting).all(|s| s.end.y <= 2.0 + 1e-9));
+        assert!(profile.segs.iter().any(|s| !s.cutting && (s.end.y - 4.0).abs() < 1e-9));
+        short.flute_length = 0.0;
+        assert!((short.flute_len() - 4.0).abs() < 1e-9);
         // Flute split honoured: nothing above z=20 cuts.
         assert!(em
             .segs
             .iter()
             .filter(|s| s.cutting)
             .all(|s| s.end.y <= 20.0 + 1e-9));
+    }
+
+    #[test]
+    fn face_mill_body_and_cutting_length_are_distinct() {
+        let mut tool = Tool { diameter: 50.0, length: 60.0, flute_length: 25.0, shank_diameter: 16.0, kind: ToolKind::FaceMill, ..Default::default() };
+        assert_eq!(tool.face_body_height(), 25.0);
+        tool.face_body_height = 25.0;
+        tool.flute_length = 5.0;
+        let profile = tool.profile();
+        assert!(profile.segs.iter().any(|s| s.cutting && s.end.y == 5.0));
+        assert!(profile.segs.iter().any(|s| !s.cutting && s.end.x == 25.0 && s.end.y == 25.0));
+        let json = serde_json::to_string(&tool).unwrap();
+        assert_eq!(serde_json::from_str::<Tool>(&json).unwrap(), tool);
     }
 
     #[test]

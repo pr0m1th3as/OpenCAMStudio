@@ -202,16 +202,7 @@ mod palette {
     pub const ERROR: Color = rgb(0.92, 0.30, 0.28);
 }
 
-/// The smallest tip **radius** a ground pointed tool can physically have, in mm.
-///
-/// Neither a chamfer mill nor a V-bit has a true `r = 0` point — it cannot be ground
-/// and would not survive contact. 50 µm is the practical floor for a ground tip; below
-/// it the number is fiction and the geometry degenerates (a V-bit's tip arc collapses,
-/// and a chamfer mill's non-cutting flat — the very thing that distinguishes it from a
-/// V-bit — disappears).
-///
-/// Applied as a **radius** to both, so the two are held to the same physical size: a
-/// V-bit's tip radius directly, a chamfer mill's tip *diameter* at twice this.
+/// Minimum V-bit tip radius, in mm.
 pub const MIN_TIP_RADIUS_MM: f64 = 0.05;
 
 /// Ribbon command icons. Each variant is a small embedded SVG (see
@@ -1173,6 +1164,14 @@ fn apply_tool_dims(t: &mut cam_model::Tool, parsed: &BTreeMap<Field, f64>) {
         t.nominal_plunge_feed = v.max(0.0);
     }
 
+    // A face mill's cutting length, body height and overall length are independent.
+    if matches!(t.kind, ToolKind::FaceMill) {
+        let body = t.face_body_height();
+        t.face_body_height = parsed.get(&Field::FaceBodyHeight).copied().unwrap_or(body);
+        if let Some(&flute) = parsed.get(&Field::FluteLength) { t.flute_length = flute; }
+        if let Some(&length) = parsed.get(&Field::ToolLength) { t.length = length; }
+        return;
+    }
     // overall = flute + shank. Snapshot the effective flute/shank *before* the edit.
     let old_flute = t.flute_len();
     let old_shank = (t.length - old_flute).max(0.0);
@@ -1290,9 +1289,9 @@ enum Field {
     OriginIndex,
     ToolDiameter,
     ToolLength,
-    /// Length of cut (flute length) from the tip, mm. Also reused, kind-aware, as a face
-    /// mill's body height and a thread mill's thread length.
+    /// Length of cut (flute length) from the tip, mm.
     FluteLength,
+    FaceBodyHeight,
     /// Shank diameter, mm (a face mill's arbor diameter, kind-aware).
     ShankDiameter,
     /// Shank length, mm — a *derived* field: overall = flute + shank (editing it moves
@@ -1503,6 +1502,7 @@ impl Field {
             Field::ToolDiameter => "Flute diameter (mm)",
             Field::ToolLength => "Overall length (mm)",
             Field::FluteLength => "Flute length (mm)",
+            Field::FaceBodyHeight => "Body height (mm)",
             Field::ShankDiameter => "Shank diameter (mm)",
             Field::ShankLength => "Shank length (mm)",
             Field::NeckLength => "Neck length (mm, 0=none)",
@@ -1720,6 +1720,7 @@ impl Field {
                  rest of the tool, up to the overall length, is the non-cutting shank; \
                  the split is used for gouge/collision checks."
             }
+            Field::FaceBodyHeight => "Axial height of the face mill body, including its non-cutting portion.",
             Field::ShankDiameter => {
                 "Diameter of the non-cutting shank above the cutting portion (typically \
                  equal to the cutting diameter)."
@@ -1764,10 +1765,8 @@ impl Field {
                  90° for a 45° chamfer). Sets how cut depth maps to chamfer width."
             }
             Field::TipDiameter => {
-                "Diameter of the flat, non-cutting tip of a chamfer mill (min 0.10 mm — \
-                 a chamfer mill is always ground with a flat, and one cannot be ground \
-                 sharper). Only the angled flank cuts, which is why a chamfer mill \
-                 cannot engrave: use a V-bit."
+                "Diameter of the flat, non-cutting tip of a chamfer mill. Set to 0 \
+                 for a pointed tip. Only the angled flank cuts."
             }
             Field::TipRadius => {
                 "Rounded-tip radius of a carving V-bit (min 0.05 mm — a point is always \
@@ -8306,6 +8305,8 @@ impl App {
                                 manufacturer: t.manufacturer.clone(),
                                 product_id: t.product_id.clone(),
                                 product_link: t.product_link.clone(),
+                                cutter_material: t.cutter_material.clone(),
+                                coating: t.coating.clone(),
                                 ..crate::tool_library::default_tool(t.number, kind)
                             };
                         }
@@ -8882,6 +8883,8 @@ impl App {
                         tool_presets::ToolDetail::Manufacturer => tool.manufacturer = value,
                         tool_presets::ToolDetail::ProductId => tool.product_id = value,
                         tool_presets::ToolDetail::ProductLink => tool.product_link = value,
+                        tool_presets::ToolDetail::CutterMaterial => tool.cutter_material = value,
+                        tool_presets::ToolDetail::Coating => tool.coating = value,
                     }
                 }
             }
@@ -9948,7 +9951,6 @@ impl App {
             // Face mill: cutting-⌀ disc, and the flute/shank fields describe the shell-mill
             // body and its arbor.
             (Some(ToolKind::FaceMill), Field::ToolDiameter) => "Cutting diameter (mm)",
-            (Some(ToolKind::FaceMill), Field::FluteLength) => "Body height (mm)",
             (Some(ToolKind::FaceMill), Field::ShankDiameter) => "Arbor diameter (mm)",
             // Thread mill: a single-point mill's ⌀ is the *minimum* cutting ⌀ (smallest
             // hole); FluteLength is its length of cut (reach) and it exposes the reduced
@@ -10021,10 +10023,7 @@ impl App {
                 "Flute length — the fluted (cutting) portion from the tip; the plain shank \
                  continues above it. Must be at least the drill-point cone height."
             }
-            (Some(FaceMill), Field::FluteLength) => {
-                "Body height — the axial length of the wide cutting body; the narrower \
-                 arbor continues above it up to the overall length."
-            }
+            (Some(FaceMill), Field::FluteLength) => "Axial cutting length from the tool tip; it cannot exceed the body height.",
             (Some(ThreadMill { pitch: None }), Field::FluteLength) => {
                 "Length of cut — how far down from the tip the single tooth can thread \
                  (the reduced-neck reach); it sets the maximum threaded depth."
@@ -10142,14 +10141,9 @@ impl App {
                 !(0.0 < a && a < 180.0)
             }
             Field::TipDiameter => {
-                // Physically a chamfer mill always has a *flat* at its point — it is
-                // ground that way, and that flat is precisely why it does not cut at
-                // its centre (and so cannot engrave). A zero flat would make it a
-                // V-bit, not a chamfer mill, so it must be positive; and it must stay
-                // narrower than the shaft ⌀, else there is no cone at all.
+                // A zero tip is allowed; the tip must be narrower than the shaft.
                 match (buf(Field::TipDiameter), buf(Field::ToolDiameter)) {
-                    // Held to the same physical radius as a V-bit's tip, hence 2×.
-                    (Some(tip), _) if tip < 2.0 * MIN_TIP_RADIUS_MM - 1e-9 => true,
+                    (Some(tip), _) if tip < 0.0 => true,
                     (Some(tip), Some(d)) => tip >= d - 1e-9,
                     _ => false,
                 }
@@ -10182,6 +10176,7 @@ impl App {
                     return true; // flute length cannot be 0 (anywhere)
                 }
                 match self.inspected_tool_kind() {
+                    Some(ToolKind::FaceMill) => matches!(buf(Field::FaceBodyHeight), Some(body) if fl > body + 1e-9),
                     Some(ToolKind::RadiusMill { .. }) => {
                         matches!((buf(Field::CornerRadius), buf(Field::TipLength)), (Some(cr), Some(tip)) if fl < cr + tip - 1e-9)
                     }
@@ -10200,6 +10195,7 @@ impl App {
                     _ => false,
                 }
             }
+            Field::FaceBodyHeight => value <= 0.0 || matches!(buf(Field::ToolLength), Some(length) if value > length + 1e-9),
             _ => false,
         }
     }
@@ -10465,20 +10461,22 @@ impl App {
                     Field::TipRadius,
                 ],
                 // Chamfer mill: like a V-bit but its tip is a flat (non-cutting) instead of a
-                // rounded one — a single shaft ⌀, overall length, point angle, and a flat tip
+                // rounded one — a single shaft ⌀, flute and overall lengths, point angle, and a flat tip
                 // ⌀ in place of the V-bit's tip radius.
                 Some(ToolKind::ChamferMill { .. }) => vec![
                     Field::ToolDiameter,
+                    Field::FluteLength,
                     Field::ToolLength,
                     Field::ChamferAngle,
                     Field::TipDiameter,
                 ],
-                // Face mill (shell mill): a wide cutting body on a narrower arbor. FluteLength
-                // is relabelled "Body height" and ShankDiameter "Arbor diameter" (see
+                // Face mill (shell mill): a wide cutting body on a narrower arbor.
+                // ShankDiameter is relabelled "Arbor diameter" (see
                 // `field_label`). No shank-length / neck — the arbor length is overall − body.
                 Some(ToolKind::FaceMill) => vec![
                     Field::ToolDiameter,
                     Field::FluteLength,
+                    Field::FaceBodyHeight,
                     Field::ShankDiameter,
                     Field::ToolLength,
                     Field::Flutes,
@@ -10664,6 +10662,7 @@ impl App {
                 Field::ToolLength => Some(t.length),
                 // Effective flute (resolves the 0-sentinel), so shank = overall − flute.
                 Field::FluteLength => Some(t.flute_len()),
+                Field::FaceBodyHeight => Some(t.face_body_height()),
                 Field::ShankDiameter => Some(t.shank_dia()),
                 Field::ShankLength => Some((t.length - t.flute_len()).max(0.0)),
                 Field::NeckLength => Some(t.neck_length),
@@ -10755,6 +10754,10 @@ impl App {
             },
             Field::FluteLength => match self.controller.selection() {
                 Selection::Tool(i) => setup.tools.get(i).map(|t| t.flute_len()),
+                _ => None,
+            },
+            Field::FaceBodyHeight => match self.controller.selection() {
+                Selection::Tool(i) => setup.tools.get(i).map(|t| t.face_body_height()),
                 _ => None,
             },
             Field::ShankDiameter => match self.controller.selection() {
@@ -12703,6 +12706,12 @@ impl App {
                     tool_presets::ToolDetail::ProductLink,
                     &tool.product_link,
                 ),
+                (
+                    "Cutter material",
+                    tool_presets::ToolDetail::CutterMaterial,
+                    &tool.cutter_material,
+                ),
+                ("Coating", tool_presets::ToolDetail::Coating, &tool.coating),
             ] {
                 list = list.push(
                     row![
@@ -12766,17 +12775,16 @@ impl App {
             );
             if is_end_mill {
                 let dir_opts = if matches!(t.kind, ToolKind::EndMill | ToolKind::RoughingMill) {
-                    vec![CutDir::Down, CutDir::Up, CutDir::Straight]
+                    vec![CutDir::Down, CutDir::Up, CutDir::Straight, CutDir::Compression]
                 } else {
-                    vec![CutDir::Down, CutDir::Up]
+                    vec![CutDir::Down, CutDir::Up, CutDir::Compression]
                 };
                 list = list.push(
                     row![
                         help_wrap(
                             text("Cutting direction").width(Length::Fill).size(13),
-                            "Down-cut vs up-cut (helix direction); a physical property of the \
-                             tool, like the flute count. Flat end mills also allow a straight \
-                             (axial) flute.",
+                            "Flute direction: up-cut, down-cut, or compression (up-cut at \
+                             the tip and down-cut above). Flat end mills also allow straight flutes.",
                             self.tooltips,
                         ),
                         pick_list(
@@ -14319,6 +14327,7 @@ fn library_extra(t: &cam_model::Tool) -> Option<String> {
         CutDir::Down => "D",
         CutDir::Up => "U",
         CutDir::Straight => "S",
+        CutDir::Compression => "C",
     };
     match t.kind {
         ToolKind::EndMill | ToolKind::RoughingMill | ToolKind::BallMill => Some(format!(
@@ -18032,11 +18041,49 @@ mod inspector_field_tests {
     use cam_model::{DrillOp, Tool};
 
     #[test]
+    fn face_mill_flute_and_body_are_independent() {
+        let (mut app, _) = App::new();
+        app.workspace = Workspace::Tools;
+        app.tool_edit = Some(Tool { diameter: 50.0, length: 60.0, flute_length: 25.0, shank_diameter: 16.0, kind: ToolKind::FaceMill, ..Default::default() });
+        assert!(app.inspector_fields().contains(&Field::FluteLength));
+        assert!(app.inspector_fields().contains(&Field::FaceBodyHeight));
+        app.fields.insert(Field::FaceBodyHeight, "25".into());
+        app.fields.insert(Field::ToolLength, "60".into());
+        app.fields.insert(Field::FluteLength, "5".into());
+        app.live_edit(Field::FluteLength);
+        let tool = app.tool_edit.as_ref().unwrap();
+        assert_eq!((tool.flute_len(), tool.face_body_height(), tool.length), (5.0, 25.0, 60.0));
+        assert!(!app.field_invalid(Field::FluteLength));
+        app.fields.insert(Field::FluteLength, "26".into());
+        assert!(app.field_invalid(Field::FluteLength));
+    }
+
+    #[test]
+    fn chamfer_flute_and_zero_tip_are_editable() {
+        let (mut app, _) = App::new();
+        app.workspace = Workspace::Tools;
+        app.tool_edit = Some(Tool {
+            diameter: 6.0,
+            length: 40.0,
+            kind: ToolKindPick::ChamferMill.to_kind(),
+            ..Default::default()
+        });
+        assert!(app.inspector_fields().contains(&Field::FluteLength));
+        app.fields.insert(Field::ToolDiameter, "6".into());
+        app.fields.insert(Field::TipDiameter, "0".into());
+        assert!(!app.field_invalid(Field::TipDiameter));
+        app.fields.insert(Field::TipDiameter, "-0.01".into());
+        assert!(app.field_invalid(Field::TipDiameter));
+        app.fields.insert(Field::TipDiameter, "6".into());
+        assert!(app.field_invalid(Field::TipDiameter));
+        app.fields.insert(Field::FluteLength, "2".into());
+        app.live_edit(Field::FluteLength);
+        assert_eq!(app.tool_edit.as_ref().unwrap().flute_length, 2.0);
+    }
+
+    #[test]
     fn new_pointed_tools_seed_a_physically_real_tip() {
-        // Ground truth: neither tool has a true r=0 point — one cannot be ground and
-        // would not survive contact. The kinds differ by what the tip *is*: a chamfer
-        // mill's flat does not cut (so it cannot engrave), a V-bit's rounded tip does.
-        // A zero on either would collapse them into the same geometry.
+        // Default tools retain a small flat or rounded tip respectively.
         match ToolKindPick::ChamferMill.to_kind() {
             ToolKind::ChamferMill { tip_diameter, .. } => {
                 assert!(

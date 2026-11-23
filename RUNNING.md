@@ -358,22 +358,22 @@ a different machine legitimately changes the height of its lifts.
   cutting** shank/neck/tip — never colour alone). Every field or picker change
   updates the preview immediately; **Apply** commits it to the library on disk and
   is greyed until there is an unsaved change.
+- Every tool can record its cutter material and coating as optional text. These are
+  separate from the workpiece material used by cutting-data presets.
 - **Tool kinds**, each with its own fields, validation, and silhouette:
   - **End mills** — Square, Ball-nose, Rounded-edge (bull-nose; adds a corner
     radius). Flute ⌀ / flute length / shank ⌀ / shank length / overall / flutes,
     plus a **cutting direction** (Down / Up, and Straight for square) shown as the
-    flute-helix lean.
+    flute-helix lean, including compression (up-cut at the tip and down-cut above).
   - **Drill bit** — adds a point angle (bounded 90–135°); the helix reads as a
     right-hand twist.
   - **V-bit** — a single shaft ⌀ + point angle + **rounded** tip radius (the cone
     flares exactly to the shaft). The rounded tip *cuts*, which is what lets a V-bit
     engrave.
-  - **Chamfer mill** — a cone with a flat, **non-cutting** tip (only the angled
-    flank cuts). This is exactly what separates it from a V-bit, and why it cannot
-    engrave. Both tips have a physical **minimum size** — no cutter is ground to a
-    true zero point — so a V-bit's tip radius must be ≥ 0.05 mm and a chamfer mill's
-    tip ⌀ ≥ 0.10 mm; below that the field is flagged and **Apply** stays disabled.
-  - **Face mill** — a shell mill: cutting ⌀, body height, arbor ⌀, overall, and an
+  - **Chamfer mill** — a cone with a tip diameter that may be zero, and an editable
+    flute length. A flat tip is non-cutting; the angled flank cuts up to the flute
+    length. A V-bit's tip radius must be ≥ 0.05 mm.
+  - **Face mill** — a shell mill: cutting ⌀, flute length, body height, arbor ⌀, overall, and an
     insert count drawn as a row of 90° inserts on the body.
   - **Thread mill** — a **Single-point / Full-form** toggle. Single-point (single
     profile) has a min cutting ⌀, a reduced neck (which sets the max thread depth),
