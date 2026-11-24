@@ -2180,11 +2180,18 @@ impl AppController {
             if doc.cad_linked_operations.contains(&sel) {
                 doc.cad_linked_operations.insert(new_id);
             }
-            let stock = doc.setup().stock_to_leave_for(sel);
-            if stock.enabled {
-                doc.setup_mut().stock_to_leave.insert(new_id, stock);
+            let setup = doc.setup_mut();
+            if let Some(heights) = setup.height_settings.get(&sel).cloned() {
+                setup.height_settings.insert(new_id, heights);
             }
-            doc.setup_mut().operations.insert(insert_after, copy);
+            if let Some(heights) = setup.operation_heights.get(&sel).copied() {
+                setup.operation_heights.insert(new_id, heights);
+            }
+            let stock = setup.stock_to_leave_for(sel);
+            if stock.enabled {
+                setup.stock_to_leave.insert(new_id, stock);
+            }
+            setup.operations.insert(insert_after, copy);
         });
         self.selection = Selection::Operation(new_id);
         self.invalidate();
@@ -4296,9 +4303,24 @@ mod tests {
 
     #[test]
     fn duplicate_delete_and_reorder_operations() {
+        use cam_model::{
+            HeightDefinition, HeightPlaneKind, HeightReference, OperationHeightSettings,
+        };
+
         let mut app = AppController::new(machine());
         app.open_dxf(PART_DXF, "part.dxf").unwrap();
         assert_eq!(op_ids(&app), vec![0, 1]);
+        let mut heights = OperationHeightSettings::default();
+        *heights.definition_mut(HeightPlaneKind::Bottom) =
+            HeightDefinition::new(HeightReference::SelectedContours, -2.0);
+        app.apply_operation_height_settings(
+            app.operation(0).unwrap().clone(),
+            None,
+            vec![],
+            None,
+            heights.clone(),
+        )
+        .unwrap();
 
         // Duplicate op 0: the copy gets a fresh id, is inserted right after it,
         // and becomes the selection.
@@ -4306,6 +4328,7 @@ mod tests {
         app.duplicate_selected_operation();
         assert_eq!(op_ids(&app), vec![0, 2, 1]);
         assert_eq!(app.selection(), Selection::Operation(2));
+        assert_eq!(app.setup().height_settings.get(&2), Some(&heights));
 
         // Move the copy down past op 1, then back up.
         app.move_selected_operation(false);
@@ -4326,6 +4349,7 @@ mod tests {
         // All of it is undoable, one step at a time.
         assert!(app.undo()); // undo delete
         assert_eq!(op_ids(&app), vec![0, 2, 1]);
+        assert_eq!(app.setup().height_settings.get(&2), Some(&heights));
     }
 
     #[test]

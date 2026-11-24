@@ -1577,6 +1577,13 @@ mod tests {
             Some(heights),
         )
         .unwrap();
+        app.select(Selection::Operation(id));
+        app.duplicate_selected_operation();
+        let operation_copy = app.selected_operation().unwrap().id();
+        assert_eq!(app.setup().heights_for(operation_copy), heights);
+        assert!(!app.setup().height_settings.contains_key(&operation_copy));
+        assert!(app.undo());
+
         let duplicated = app.duplicate_setup(first).unwrap();
         let copy_id = app.setup().operations[0].id();
         assert_ne!(copy_id, id);
