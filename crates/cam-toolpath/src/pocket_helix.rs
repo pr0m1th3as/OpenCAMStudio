@@ -7,6 +7,53 @@ use cam_model::{Heights, Plunge, MAX_PROFILE_MOVES};
 use crate::profile::{loop_perimeter, rotate_to_start, unit, walk_loop};
 use crate::rings::RingsError;
 
+const MAX_RADIUS_DECIMALS: u8 = 8;
+const RADIUS_UNITS_PER_MM: u64 = 10u64.pow(MAX_RADIUS_DECIMALS as u32);
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PocketHelixFit {
+    radius: f64,
+    target: Point,
+    fixed: bool,
+    maximum_radius_units: u64,
+}
+
+impl PocketHelixFit {
+    pub(crate) fn message(
+        &self,
+        decimals: Option<u8>,
+        format_number: impl Fn(f64) -> String,
+    ) -> String {
+        let location = if self.fixed {
+            "at the selected pocket entry"
+        } else {
+            "in the pocket area needed for this entry"
+        };
+        // Round down the maximum so the displayed setting can actually fit.
+        let requested = if decimals.is_some() {
+            format_number(self.radius)
+        } else {
+            self.radius.to_string()
+        };
+        let decimals = decimals.unwrap_or(3).min(MAX_RADIUS_DECIMALS);
+        let divisor = 10u64.pow(u32::from(MAX_RADIUS_DECIMALS - decimals));
+        let maximum =
+            (self.maximum_radius_units / divisor) as f64 / 10u64.pow(u32::from(decimals)) as f64;
+        format!(
+            "Helix with radius {requested} mm does not fit {location} (X {}, Y {}). The maximum fitting helix radius is {} mm.",
+            format_number(self.target.x),
+            format_number(self.target.y),
+            format_number(maximum),
+        )
+    }
+}
+
+impl std::fmt::Display for PocketHelixFit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message(None, |value| format!("{value:.3}")))
+    }
+}
+
 pub(crate) struct PocketHelix<'a> {
     guard: &'a [Polygon],
     centres: Vec<Vec<Polygon>>,
@@ -30,6 +77,10 @@ impl<'a> PocketHelix<'a> {
                 "Helix radius and pitch must be finite and positive".into(),
             ));
         }
+        Self::with_radius(guard, radius, pitch).map(Some)
+    }
+
+    fn with_radius(guard: &'a [Polygon], radius: f64, pitch: f64) -> Result<Self, RingsError> {
         // Keep a thin centre region when the requested circle is tangent to
         // opposite walls. Every candidate is checked against the original guard.
         let inset = (radius - GRID_MM).max(0.0);
@@ -38,12 +89,12 @@ impl<'a> PocketHelix<'a> {
             .map(|region| offset(std::slice::from_ref(region), -inset, JoinStyle::Round))
             .collect::<Result<_, _>>()
             .map_err(|error| RingsError::Offset(error.to_string()))?;
-        Ok(Some(Self {
+        Ok(Self {
             guard,
             centres,
             radius,
             pitch,
-        }))
+        })
     }
 
     pub(crate) fn place(
@@ -52,6 +103,38 @@ impl<'a> PocketHelix<'a> {
         normal: (f64, f64),
         fixed: bool,
     ) -> Result<Placement, RingsError> {
+        if let Some(placement) = self.try_place(target, normal, fixed) {
+            return Ok(placement);
+        }
+        Err(RingsError::PocketHelixFit(PocketHelixFit {
+            radius: self.radius,
+            target,
+            fixed,
+            maximum_radius_units: self.maximum_fitting_radius_units(target, normal, fixed),
+        }))
+    }
+
+    fn maximum_fitting_radius_units(&self, target: Point, normal: (f64, f64), fixed: bool) -> u64 {
+        // Store the fit at the finest display precision. Smaller circles can
+        // nest inside larger ones, even with a fixed point on the circumference.
+        let scale = RADIUS_UNITS_PER_MM as f64;
+        let mut lower = 0;
+        let mut upper = (self.radius * scale).floor() as u64;
+        while lower < upper {
+            let middle = lower + (upper - lower).div_ceil(2);
+            let radius = middle as f64 / scale;
+            if Self::with_radius(self.guard, radius, self.pitch)
+                .is_ok_and(|helix| helix.try_place(target, normal, fixed).is_some())
+            {
+                lower = middle;
+            } else {
+                upper = middle - 1;
+            }
+        }
+        lower
+    }
+
+    fn try_place(&self, target: Point, normal: (f64, f64), fixed: bool) -> Option<Placement> {
         let radius = self.radius;
         let fits = |region: &Polygon, centre: Point| {
             region.contains(centre)
@@ -63,14 +146,14 @@ impl<'a> PocketHelix<'a> {
                 continue;
             }
             if normal.0.hypot(normal.1) > 0.0 && fits(region, original) {
-                return Ok(Placement {
+                return Some(Placement {
                     start: target,
                     normal,
                     transfer: Vec::new(),
                 });
             }
             if let Some(normal) = fixed_normal(region, target, radius, |p| fits(region, p)) {
-                return Ok(Placement {
+                return Some(Placement {
                     start: target,
                     normal,
                     transfer: Vec::new(),
@@ -130,22 +213,14 @@ impl<'a> PocketHelix<'a> {
                     (dx, dy)
                 };
                 let start = Point::new(centre.x + dx * radius, centre.y + dy * radius);
-                return Ok(Placement {
+                return Some(Placement {
                     start,
                     normal: (-dx, -dy),
                     transfer: route,
                 });
             }
         }
-        let location = if fixed {
-            "at the selected pocket entry"
-        } else {
-            "in the pocket area needed for this entry"
-        };
-        Err(RingsError::Limit(format!(
-            "Helix with radius {radius} mm does not fit {location} (X {:.3}, Y {:.3})",
-            target.x, target.y
-        )))
+        None
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -409,7 +484,12 @@ mod tests {
         let automatic = helix.place(target, (-1.0, 0.0), false).unwrap();
         assert!(automatic.start.x < 21.0);
         assert_eq!(automatic.transfer.last(), Some(&target));
-        assert!(helix.place(target, (-1.0, 0.0), true).is_err());
+        let Err(RingsError::PocketHelixFit(fit)) = helix.place(target, (-1.0, 0.0), true) else {
+            panic!("expected an error at the selected entry");
+        };
+        let message = fit.to_string();
+        assert!(message.contains("at the selected pocket entry"));
+        assert!(message.contains("The maximum fitting helix radius is 1.000 mm."));
     }
 
     #[test]
@@ -430,6 +510,43 @@ mod tests {
         assert_eq!(placement.start, target);
         assert!(placement.transfer.is_empty());
         assert!((target.x + placement.normal.0 * 2.5 - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pocket_helix_reports_a_radius_that_fits_at_display_precision() {
+        let guard = [Polygon::new(contour(&[
+            (0.0, 0.0),
+            (5.0012, 0.0),
+            (5.0012, 30.0),
+            (0.0, 30.0),
+        ]))
+        .unwrap()];
+        let target = Point::new(0.0, 12.34567);
+        let helix = PocketHelix::with_radius(&guard, 3.0046, 1.0).unwrap();
+        let Err(RingsError::PocketHelixFit(fit)) = helix.place(target, (1.0, 0.0), false) else {
+            panic!("expected an error for the oversized helix");
+        };
+        let diagnostic = crate::Diagnostic::pocket_helix_fit(42, fit);
+        let diagnostic: crate::Diagnostic =
+            serde_json::from_str(&serde_json::to_string(&diagnostic).unwrap()).unwrap();
+        // The geometric limit is 2.5006 mm, so ordinary rounding would suggest
+        // an unusable setting at three decimal places.
+        assert!(diagnostic
+            .message
+            .contains("The maximum fitting helix radius is 2.500 mm."));
+        let coarse = diagnostic.display_message(0, |value| format!("{value:.0}"));
+        assert!(coarse.contains("radius is 2 mm."), "{coarse}");
+        let preferred = diagnostic.display_message(2, |value| format!("{value:.2}"));
+        assert!(preferred.contains("operation 42:"));
+        assert!(preferred.contains("radius 3.00 mm"));
+        assert!(preferred.contains("(X 0.00, Y 12.35)"));
+        assert!(preferred.contains("radius is 2.50 mm."));
+        let fine = diagnostic.display_message(4, |value| format!("{value:.4}"));
+        assert!(fine.contains("radius 3.0046 mm"));
+        assert!(fine.contains("(X 0.0000, Y 12.3457)"));
+        assert!(fine.contains("radius is 2.5006 mm."), "{fine}");
+        let fitting = PocketHelix::with_radius(&guard, 2.5, 1.0).unwrap();
+        assert!(fitting.place(target, (1.0, 0.0), false).is_ok());
     }
 
     #[test]

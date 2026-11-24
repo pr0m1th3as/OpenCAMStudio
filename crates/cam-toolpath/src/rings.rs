@@ -7,7 +7,7 @@ use cam_cldata::{MoveKind, Point3, Program, Step, Tag};
 use cam_geo::{offset, JoinStyle, Point, Polygon};
 use cam_model::{Heights, Lead, Plunge};
 
-use crate::pocket_helix::PocketHelix;
+use crate::pocket_helix::{PocketHelix, PocketHelixFit};
 use crate::CancelToken;
 
 /// Safety cap on the number of concentric rings (guards the offset loop).
@@ -31,6 +31,17 @@ pub(crate) enum RingsError {
     /// A geometry offset failed.
     Offset(String),
     Limit(String),
+    PocketHelixFit(PocketHelixFit),
+}
+
+impl std::fmt::Display for RingsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str("Clearing was cancelled"),
+            Self::Offset(message) | Self::Limit(message) => f.write_str(message),
+            Self::PocketHelixFit(fit) => fit.fmt(f),
+        }
+    }
 }
 
 /// Concentric offset rings clearing a region: offset it inward from the wall by

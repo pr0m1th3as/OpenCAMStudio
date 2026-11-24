@@ -133,6 +133,8 @@ pub struct Diagnostic {
     /// planner is what knows the ownership. Lets the UI mark *which* operation failed
     /// instead of only reporting a count.
     pub op: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pocket_helix_fit: Option<pocket_helix::PocketHelixFit>,
 }
 
 impl Diagnostic {
@@ -144,6 +146,30 @@ impl Diagnostic {
             source: SourceRef::default(),
             message: message.into(),
             op: None,
+            pocket_helix_fit: None,
+        }
+    }
+
+    pub(crate) fn pocket_helix_fit(id: u32, fit: pocket_helix::PocketHelixFit) -> Self {
+        let mut diagnostic =
+            Self::error(format!("operation {id}: pocket toolpath failed: {fit}")).for_op(id);
+        diagnostic.pocket_helix_fit = Some(fit);
+        diagnostic
+    }
+
+    /// Format numerical details at the caller's display precision.
+    pub fn display_message(
+        &self,
+        decimals: u8,
+        format_number: impl Fn(f64) -> String,
+    ) -> std::borrow::Cow<'_, str> {
+        match (&self.pocket_helix_fit, self.op) {
+            (Some(fit), Some(id)) => format!(
+                "operation {id}: pocket toolpath failed: {}",
+                fit.message(Some(decimals), format_number)
+            )
+            .into(),
+            _ => self.message.as_str().into(),
         }
     }
 
@@ -182,6 +208,7 @@ impl Diagnostic {
             source: SourceRef::default(),
             message: message.into(),
             op: None,
+            pocket_helix_fit: None,
         }
     }
 
@@ -193,6 +220,7 @@ impl Diagnostic {
             source: SourceRef::default(),
             message: message.into(),
             op: None,
+            pocket_helix_fit: None,
         }
     }
 }

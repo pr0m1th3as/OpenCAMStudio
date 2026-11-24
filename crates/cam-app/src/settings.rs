@@ -508,6 +508,14 @@ impl Settings {
         }
     }
 
+    #[cfg(feature = "gui")]
+    pub(crate) fn format_diagnostic<'a>(
+        &self,
+        diagnostic: &'a cam_toolpath::Diagnostic,
+    ) -> std::borrow::Cow<'a, str> {
+        diagnostic.display_message(self.number_decimals, |value| self.format_number(value))
+    }
+
     /// Keep in-progress text intact; format only inactive numeric inputs.
     pub fn format_numeric_input(&self, value: &str, editing: bool) -> String {
         if !editing {

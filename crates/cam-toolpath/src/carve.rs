@@ -481,10 +481,7 @@ impl CarveStrategy {
                                     ..Default::default()
                                 };
                             }
-                            Err(
-                                crate::rings::RingsError::Offset(e)
-                                | crate::rings::RingsError::Limit(e),
-                            ) => {
+                            Err(e) => {
                                 fail!("operation {}: clearing offset failed: {e}", op.id)
                             }
                         }

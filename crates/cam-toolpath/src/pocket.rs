@@ -366,12 +366,9 @@ impl PocketStrategy {
             offset(std::slice::from_ref(&region), -first, JoinStyle::Round).unwrap_or_default();
         let helix = match PocketHelix::new(&guard, op.clear.plunge) {
             Ok(helix) => helix,
-            Err(
-                crate::rings::RingsError::Offset(reason) | crate::rings::RingsError::Limit(reason),
-            ) => {
+            Err(reason) => {
                 fail!("operation {}: pocket toolpath failed: {reason}", op.id)
             }
-            Err(crate::rings::RingsError::Cancelled) => unreachable!(),
         };
 
         let levels = pocket_levels(op, env.heights.top_of_stock, floor);
@@ -444,7 +441,14 @@ impl PocketStrategy {
                     ..Default::default()
                 };
             }
-            Err(crate::rings::RingsError::Offset(e) | crate::rings::RingsError::Limit(e)) => {
+            Err(crate::rings::RingsError::PocketHelixFit(fit)) => {
+                diagnostics.push(Diagnostic::pocket_helix_fit(op.id, fit));
+                return StrategyResult {
+                    diagnostics,
+                    ..Default::default()
+                };
+            }
+            Err(e) => {
                 fail!("operation {}: pocket toolpath failed: {e}", op.id)
             }
         }
@@ -1397,6 +1401,9 @@ mod tests {
                     diagnostic
                         .message
                         .contains("Helix with radius 2.51 mm does not fit")
+                        && diagnostic
+                            .message
+                            .contains("The maximum fitting helix radius is 2.500 mm.")
                 }),
                 "{:?}",
                 result.diagnostics

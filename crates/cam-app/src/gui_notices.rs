@@ -1,5 +1,6 @@
 //! Import completion and explicitly opened warning/error dialogs.
 use super::*;
+use crate::Settings;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Notice {
@@ -35,7 +36,7 @@ impl Notice {
 
 #[cfg(test)]
 pub(super) fn job_notice(outcome: &crate::RunOutcome) -> Option<Notice> {
-    let notice = job_notice_with_info(outcome)?;
+    let notice = job_notice_with_info(outcome, &Settings::default())?;
     notice
         .entries
         .iter()
@@ -43,13 +44,16 @@ pub(super) fn job_notice(outcome: &crate::RunOutcome) -> Option<Notice> {
         .then_some(notice)
 }
 
-pub(super) fn job_notice_with_info(outcome: &crate::RunOutcome) -> Option<Notice> {
+pub(super) fn job_notice_with_info(
+    outcome: &crate::RunOutcome,
+    settings: &Settings,
+) -> Option<Notice> {
     let mut entries: Vec<_> = outcome
         .diagnostics
         .iter()
         .map(|diagnostic| NoticeEntry {
             severity: diagnostic.severity,
-            message: diagnostic.message.clone(),
+            message: settings.format_diagnostic(diagnostic).into_owned(),
             source: None,
             verification_collision: false,
         })

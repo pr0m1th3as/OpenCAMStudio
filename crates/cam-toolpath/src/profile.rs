@@ -505,7 +505,7 @@ impl ProfileStrategy {
                             ..Default::default()
                         };
                     }
-                    Err(crate::rings::RingsError::Offset(e) | crate::rings::RingsError::Limit(e)) => {
+                    Err(e) => {
                         diagnostics.push(Diagnostic::error(format!(
                             "operation {}: offset failed: {e}",
                             op.id

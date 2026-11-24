@@ -10,7 +10,7 @@ pub(super) enum StatusTarget {
 
 struct RecordedStatus {
     dependencies: BTreeMap<u32, String>,
-    notice: Notice,
+    outcome: crate::RunOutcome,
     machine: cam_model::Machine,
     accuracy: f32,
 }
@@ -66,7 +66,13 @@ impl StatusMessages {
                 ..Default::default()
             };
             self.0.remove(&target);
-            if let Some(notice) = notices::job_notice_with_info(&scoped) {
+            if !scoped.diagnostics.is_empty()
+                || !scoped.collisions.is_empty()
+                || matches!(
+                    scoped.completion,
+                    JobCompletion::Failed | JobCompletion::Incomplete
+                )
+            {
                 let dependencies = fingerprints
                     .iter()
                     .filter(|(id, _)| {
@@ -81,7 +87,7 @@ impl StatusMessages {
                     target,
                     RecordedStatus {
                         dependencies,
-                        notice,
+                        outcome: scoped,
                         machine: machine.clone(),
                         accuracy,
                     },
@@ -173,8 +179,12 @@ impl App {
                 StatusTarget::Setup(_) => setup.name.clone(),
                 StatusTarget::Operation(id) => format!("Operation #{id}"),
             };
-            lines.push(format!("{label}\n{}", recorded.notice.detail));
-            entries.extend(recorded.notice.entries.iter().cloned().map(|mut entry| {
+            let Some(notice) = notices::job_notice_with_info(&recorded.outcome, &self.settings)
+            else {
+                continue;
+            };
+            lines.push(format!("{label}\n{}", notice.detail));
+            entries.extend(notice.entries.into_iter().map(|mut entry| {
                 if entry.verification_collision {
                     entry.severity = collision_severity;
                 }

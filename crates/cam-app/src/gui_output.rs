@@ -257,7 +257,7 @@ impl App {
             } else {
                 format!(" | {}", context.join(" | "))
             },
-            diagnostic.message
+            self.settings.format_diagnostic(diagnostic)
         )
     }
 
@@ -360,6 +360,50 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helix_output_and_status_follow_number_precision_without_regenerating() {
+        let (mut app, _) = App::new();
+        app.controller = AppController::new(crate::default_machine());
+        let Operation::Pocket(mut pocket) = app.controller.operation_template(OpKind::Pocket, 1)
+        else {
+            unreachable!();
+        };
+        pocket.clear.plunge = cam_model::Plunge::Helix {
+            radius: 3.4567,
+            pitch: 3.0,
+        };
+        let id = pocket.id;
+        app.controller.edit_setup(|setup| {
+            setup.tools = vec![cam_model::Tool {
+                number: 1,
+                diameter: 6.0,
+                length: 30.0,
+                kind: cam_model::ToolKind::EndMill,
+                ..Default::default()
+            }];
+            setup.operations = vec![Operation::Pocket(pocket)];
+        });
+        app.controller.run(&cam_toolpath::CancelToken::new());
+        app.record_status_messages();
+
+        for (decimals, requested, maximum) in [(2, "3.46", "2.00"), (4, "3.4567", "2.0000")] {
+            app.settings.number_decimals = decimals;
+            app.sync_output();
+            let requested = format!("Helix with radius {requested} mm");
+            let maximum = format!("The maximum fitting helix radius is {maximum} mm.");
+            let output = app.output_content.text();
+            assert!(
+                output.contains(&requested) && output.contains(&maximum),
+                "{output}"
+            );
+            let target = StatusTarget::Operation(id);
+            let notice = app
+                .status_notice(target, &app.controller.current_toolpath_fingerprints())
+                .unwrap();
+            assert!(notice.detail.contains(&requested) && notice.detail.contains(&maximum));
+        }
+    }
 
     #[test]
     fn incremental_output_handles_appends_replacements_unicode_and_history_trimming() {
