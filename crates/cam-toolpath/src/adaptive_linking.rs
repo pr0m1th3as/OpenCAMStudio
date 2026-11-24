@@ -511,30 +511,48 @@ impl PreparedPath {
         job: &ClearJob,
         heights: &Heights,
         levels: &[f64],
-    ) {
+    ) -> Result<(), crate::rings::RingsError> {
         let link = Tag::new(job.id, MoveKind::Link);
         let plunge = Tag::new(job.id, MoveKind::Plunge);
+        let entry = self.entry.off;
+        let placement = job
+            .helix
+            .map(|helix| helix.place(entry, self.entry.normal, job.start.is_some()))
+            .transpose()?;
         let mut from_z = heights.retract.max(heights.top_of_stock);
         for &z in levels {
-            let entry = self.entry.off;
-            program.push(Step::Rapid {
-                to: Point3::new(entry.x, entry.y, heights.clearance),
-                tag: link,
-            });
-            crate::emit::descend_to(program, entry, from_z, heights, job.feed, job.id);
-            let tan = tangent(&self.sections[0], true);
-            crate::profile::emit_plunge(
-                program,
-                entry,
-                tan,
-                self.entry.normal,
-                from_z,
-                z,
-                leads::guard_plunge(job.guard, entry, self.entry.normal, job.plunge),
-                job.plunge_feed,
-                job.entry_feeds.ramp(job.feed),
-                plunge,
-            );
+            if let Some((helix, placement)) = job.helix.zip(placement.as_ref()) {
+                helix.emit(
+                    program,
+                    placement,
+                    from_z,
+                    z,
+                    heights,
+                    job.feed,
+                    job.entry_feeds.ramp(job.feed),
+                    job.id,
+                    None,
+                )?;
+            } else {
+                program.push(Step::Rapid {
+                    to: Point3::new(entry.x, entry.y, heights.clearance),
+                    tag: link,
+                });
+                crate::emit::descend_to(program, entry, from_z, heights, job.feed, job.id);
+                let tan = tangent(&self.sections[0], true);
+                crate::profile::emit_plunge(
+                    program,
+                    entry,
+                    tan,
+                    self.entry.normal,
+                    from_z,
+                    z,
+                    leads::guard_plunge(job.guard, entry, self.entry.normal, job.plunge),
+                    job.plunge_feed,
+                    job.entry_feeds.ramp(job.feed),
+                    plunge,
+                );
+            }
             self.entry
                 .emit(program, true, z, job.entry_feeds.lead_in(job.feed), job.id);
             for i in 0..self.sections.len() {
@@ -614,6 +632,7 @@ impl PreparedPath {
             });
             from_z = z;
         }
+        Ok(())
     }
 }
 
@@ -801,6 +820,7 @@ mod tests {
             start: None,
             end: None,
             guard: &[],
+            helix: None,
         }
     }
 
@@ -908,7 +928,9 @@ mod tests {
             assert_eq!(prepared.links[0].departing.on, seam);
             assert_eq!(prepared.links[0].arriving.on, seam);
             let mut program = Program::new();
-            prepared.emit(&mut program, &job, &Heights::new(5., 2., 0.), &[-2., -4.]);
+            prepared
+                .emit(&mut program, &job, &Heights::new(5., 2., 0.), &[-2., -4.])
+                .unwrap();
             program.validate().unwrap();
             let mut last_cut = None;
             let mut reentries = 0;

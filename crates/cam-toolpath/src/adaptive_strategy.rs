@@ -559,6 +559,7 @@ impl AdaptiveStrategy {
             start: op.params.start,
             end: op.params.end,
             guard: &guard,
+            helix: None,
         };
         crate::clearing::clear_validated(
             program,

@@ -7,6 +7,7 @@ use cam_cldata::{MoveKind, Point3, Program, Step, Tag};
 use cam_geo::{offset, JoinStyle, Point, Polygon};
 use cam_model::{Heights, Lead, Plunge};
 
+use crate::pocket_helix::PocketHelix;
 use crate::CancelToken;
 
 /// Safety cap on the number of concentric rings (guards the offset loop).
@@ -185,7 +186,24 @@ fn enter_with_plunge(
     lead_path: Vec<Point>,
     guard: &[Polygon],
     local_from: Option<Point>,
-) -> Option<f64> {
+    helix: Option<&PocketHelix<'_>>,
+    fixed_entry: bool,
+) -> Result<Option<f64>, RingsError> {
+    if let Some(helix) = helix {
+        let placement = helix.place(p, out, fixed_entry)?;
+        helix.emit(
+            prog,
+            &placement,
+            from_z,
+            z,
+            h,
+            feed,
+            entry_feeds.ramp(feed),
+            id,
+            local_from,
+        )?;
+        return Ok(None);
+    }
     // The ramp never travels through air to reach the material: its height is measured
     // from the top of stock, or from the floor the previous level left.
     let ramp_top = from_z.min(h.top_of_stock);
@@ -238,7 +256,7 @@ fn enter_with_plunge(
             entry_feeds.ramp(feed),
             Tag::new(id, MoveKind::Plunge),
         );
-        return Some(*on_ring);
+        return Ok(Some(*on_ring));
     }
     crate::profile::emit_plunge(
         prog,
@@ -252,7 +270,7 @@ fn enter_with_plunge(
         entry_feeds.ramp(feed),
         Tag::new(id, MoveKind::Plunge),
     );
-    None
+    Ok(None)
 }
 
 /// The normal toward the **cleared** side of a wall loop — where the tool has been,
@@ -295,7 +313,9 @@ fn approach(
     ring: &[Point],
     lead_path: Vec<Point>,
     guard: &[Polygon],
-) -> Option<f64> {
+    helix: Option<&PocketHelix<'_>>,
+    fixed_entry: bool,
+) -> Result<Option<f64>, RingsError> {
     let hop = (p.x - prev_end.x).hypot(p.y - prev_end.y);
     let local = hop <= link_threshold
         && (guard.is_empty() || hop <= 1e-9 || crate::linking::contained(guard, prev_end, p));
@@ -305,12 +325,18 @@ fn approach(
             feed,
             tag: Tag::new(id, MoveKind::Cutting),
         });
-        return None;
+        return Ok(None);
     }
     // A lead can start beyond the cleared area even when the ring-to-ring hop
     // is short. Retract before moving to that entry; a local lifted traverse
     // cannot establish clearance for the whole lead-in path.
-    if local && lead_path.is_empty() && !guard.is_empty() {
+    // Retain the short lifted link when the helix keeps its usual footprint.
+    // A relocated entry gets approached from clearance.
+    if local
+        && lead_path.is_empty()
+        && !guard.is_empty()
+        && (helix.is_none() || crate::leads::guard_plunge(guard, p, out, plunge) == plunge)
+    {
         return enter_with_plunge(
             prog,
             p,
@@ -328,6 +354,8 @@ fn approach(
             lead_path,
             guard,
             Some(prev_end),
+            helix,
+            fixed_entry,
         );
     }
     prog.push(Step::Rapid {
@@ -351,6 +379,8 @@ fn approach(
         lead_path,
         guard,
         None,
+        helix,
+        fixed_entry,
     )
 }
 
@@ -395,7 +425,9 @@ pub(crate) fn emit_wall_ring(
     link_threshold: f64,
     lift_height: f64,
     end: Option<[f64; 2]>,
-) -> Point {
+    helix: Option<&PocketHelix<'_>>,
+    fixed_entry: bool,
+) -> Result<Point, RingsError> {
     let ri = crate::profile::rotate_to_start(pts, Some([prev_end.x, prev_end.y]));
     let start = ri[0];
     let tan_in = crate::profile::start_tangent(&ri);
@@ -433,8 +465,10 @@ pub(crate) fn emit_wall_ring(
         &ri,
         crate::profile::lead_in_path(start, entry, cin, eff_in),
         guard,
-    );
-    match ramped {
+        helix,
+        fixed_entry,
+    )?;
+    Ok(match ramped {
         // It ramped: the lead was flown on the way down, and the cut must begin where
         // the ramp ended and travel a full perimeter, so the sloped stretch is
         // re-machined at depth.
@@ -492,7 +526,7 @@ pub(crate) fn emit_wall_ring(
             );
             exit
         }
-    }
+    })
 }
 
 /// Emit a **stay-down, inside-out** pocket path. Per depth level: enter once at the
@@ -531,9 +565,10 @@ pub(crate) fn emit_stay_down(
     levels: &[f64],
     link_threshold: f64,
     cancel: &CancelToken,
-) {
+    helix: Option<&PocketHelix<'_>>,
+) -> Result<(), RingsError> {
     if rings.is_empty() {
-        return;
+        return Ok(());
     }
     // The level entry's own Link rapid now belongs to `enter_with_plunge`, which is
     // the only thing that knows where the tool must come down.
@@ -544,7 +579,7 @@ pub(crate) fn emit_stay_down(
     let mut from_z = h.retract.max(h.top_of_stock);
     for &z in levels {
         if cancel.is_cancelled() {
-            return;
+            return Err(RingsError::Cancelled);
         }
         // Enter at the innermost ring (a boundary loop, so the plunge strategy's
         // helix/ramp is placed on the inward, cleared side), per the operator's
@@ -585,7 +620,9 @@ pub(crate) fn emit_stay_down(
                 -1.,
                 lift_height,
                 end.filter(|_| rings.len() == 1),
-            )
+                helix,
+                start.is_some(),
+            )?
         } else {
             let on_ring = enter_with_plunge(
                 prog,
@@ -617,7 +654,9 @@ pub(crate) fn emit_stay_down(
                 },
                 guard,
                 None,
-            );
+                helix,
+                start.is_some(),
+            )?;
             // A ramped entry begins its cut where the ramp ended, and goes a full perimeter
             // from there so the sloped stretch is re-machined at depth.
             match on_ring {
@@ -647,7 +686,7 @@ pub(crate) fn emit_stay_down(
 
         for (index, ring) in rings[1..].iter().enumerate() {
             if cancel.is_cancelled() {
-                return;
+                return Err(RingsError::Cancelled);
             }
             let exit_preference = end.filter(|_| index + 2 == rings.len());
             if ring.is_wall && leaded {
@@ -671,7 +710,9 @@ pub(crate) fn emit_stay_down(
                     link_threshold,
                     lift_height,
                     exit_preference,
-                );
+                    helix,
+                    false,
+                )?;
                 continue;
             }
             // Begin this ring at the point nearest where the last one ended, so the
@@ -704,7 +745,9 @@ pub(crate) fn emit_stay_down(
                 // An interior clearing ring has no lead of its own.
                 Vec::new(),
                 guard,
-            );
+                helix,
+                false,
+            )?;
             // As at the level entry: a ramped approach starts its cut where the ramp
             // ended and travels a full perimeter, so it re-machines what it sloped. A
             // short hop cuts across at depth and needs none of that.
@@ -735,4 +778,5 @@ pub(crate) fn emit_stay_down(
         });
         from_z = z;
     }
+    Ok(())
 }

@@ -41,6 +41,7 @@ mod leads;
 mod linking;
 mod plan;
 mod pocket;
+mod pocket_helix;
 mod profile;
 mod raster;
 mod rings;

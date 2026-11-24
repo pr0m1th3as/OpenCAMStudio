@@ -478,6 +478,7 @@ impl ProfileStrategy {
                     start: op.start,
                     end: None,
                     guard: &[],
+                    helix: None,
                     spindle: env.spindle,
                 };
                 match crate::clearing::clear(

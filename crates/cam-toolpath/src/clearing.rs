@@ -19,6 +19,7 @@ use cam_cldata::{MoveKind, Point3, Program, SpindleDir, Step, Tag};
 use cam_geo::{Point, Polygon};
 use cam_model::{Clearing, Heights, Lead, Plunge, Tool, ToolKind};
 
+use crate::pocket_helix::PocketHelix;
 use crate::rings::{concentric_rings, emit_stay_down, Ring, RingsError};
 use crate::CancelToken;
 
@@ -62,6 +63,8 @@ pub(crate) struct ClearJob<'a> {
     /// Cutter-centre region that bounds wall leads and entry helices
     /// (empty ⇒ no containment guard).
     pub guard: &'a [Polygon],
+    /// Placement across the pocket, with a hard error for an unplaceable helix.
+    pub helix: Option<&'a PocketHelix<'a>>,
 }
 
 impl ClearJob<'_> {
@@ -230,7 +233,7 @@ pub(crate) fn clear_validated(
             cancel,
         ) {
             let mut candidate = Program::new();
-            if prefer_stay_down {
+            let emitted = if prefer_stay_down {
                 let path = crate::frontadvance::LinkedFrontier {
                     feed_links: vec![false; moves.len()],
                     moves,
@@ -245,11 +248,11 @@ pub(crate) fn clear_validated(
                     job,
                     heights,
                     levels,
-                );
+                )
             } else {
-                emit_adaptive_moves(&mut candidate, &moves, &air, job, heights, levels);
-            }
-            if accept(&candidate) {
+                emit_adaptive_moves(&mut candidate, &moves, &air, job, heights, levels)
+            };
+            if emitted.is_ok() && accept(&candidate) {
                 if !prefer_stay_down || clearance_lifts(&candidate, heights) <= levels.len() {
                     prog.extend(candidate);
                     return Ok(ClearResult {
@@ -294,8 +297,9 @@ pub(crate) fn clear_validated(
             if let Some(ends) = ends.as_ref().filter(|path| path.air.iter().any(|&air| air)) {
                 let mut candidate = Program::new();
                 let arcs = crate::adaptive_linking::floor_links(ends, job, true, cancel);
-                emit_3d_adaptive(&mut candidate, ends, &arcs, job, heights, levels);
-                if accept(&candidate) {
+                if emit_3d_adaptive(&mut candidate, ends, &arcs, job, heights, levels).is_ok()
+                    && accept(&candidate)
+                {
                     prog.extend(candidate);
                     return Ok(ClearResult {
                         paths: 1,
@@ -309,7 +313,7 @@ pub(crate) fn clear_validated(
                 .chain(std::iter::once(moves.as_slice()))
             {
                 let mut candidate = Program::new();
-                if let Some(linked) = crate::frontadvance::link_cleared_travel(
+                let emitted = if let Some(linked) = crate::frontadvance::link_cleared_travel(
                     moves,
                     region,
                     job.radius,
@@ -329,13 +333,13 @@ pub(crate) fn clear_validated(
                             job,
                             heights,
                             levels,
-                        );
+                        )
                     } else {
                         match crate::adaptive_linking::prepare(&linked, region, job) {
                             Ok(Some(prepared)) => {
                                 prepared.emit(&mut candidate, job, heights, levels)
                             }
-                            Err(_) if configured_leads => {} // The leaded concentric fallback remains available.
+                            Err(_) if configured_leads => Ok(()), // The leaded concentric fallback remains available.
                             _ => emit_adaptive_moves_with_travel(
                                 &mut candidate,
                                 &linked.moves,
@@ -353,9 +357,11 @@ pub(crate) fn clear_validated(
                         }
                     }
                 } else if !cancel.is_cancelled() && (prefer_stay_down || !configured_leads) {
-                    emit_adaptive_moves(&mut candidate, moves, &[], job, heights, levels);
-                }
-                if !candidate.steps().is_empty() && accept(&candidate) {
+                    emit_adaptive_moves(&mut candidate, moves, &[], job, heights, levels)
+                } else {
+                    Ok(())
+                };
+                if emitted.is_ok() && !candidate.steps().is_empty() && accept(&candidate) {
                     if !prefer_stay_down || clearance_lifts(&candidate, heights) <= levels.len() {
                         prog.extend(candidate);
                         return Ok(ClearResult {
@@ -523,12 +529,13 @@ fn clear_concentric(
             levels,
             1.5 * spacing,
             cancel,
-        );
+            job.helix,
+        )
     };
     if adaptive_3d && job.start.is_none() && job.end.is_none() {
         if let Some(joined) = join_small_entry_rings(&rings, spacing, job.guard) {
             let mut candidate = Program::new();
-            emit(&mut candidate, &joined);
+            emit(&mut candidate, &joined)?;
             if cancel.is_cancelled() {
                 return Err(RingsError::Cancelled);
             }
@@ -538,7 +545,7 @@ fn clear_concentric(
             }
         }
     }
-    emit(prog, &rings);
+    emit(prog, &rings)?;
     if cancel.is_cancelled() {
         return Err(RingsError::Cancelled);
     }
@@ -609,7 +616,7 @@ fn emit_adaptive_moves(
     job: &ClearJob,
     h: &Heights,
     levels: &[f64],
-) {
+) -> Result<(), RingsError> {
     emit_adaptive_moves_with_travel(
         prog,
         moves,
@@ -623,7 +630,7 @@ fn emit_adaptive_moves(
         job,
         h,
         levels,
-    );
+    )
 }
 
 fn emit_3d_adaptive(
@@ -633,7 +640,7 @@ fn emit_3d_adaptive(
     job: &ClearJob,
     heights: &Heights,
     levels: &[f64],
-) {
+) -> Result<(), RingsError> {
     emit_adaptive_moves_with_travel(
         program,
         &path.moves,
@@ -647,7 +654,7 @@ fn emit_3d_adaptive(
         job,
         heights,
         levels,
-    );
+    )
 }
 
 struct AdaptiveTravel<'a> {
@@ -666,9 +673,9 @@ fn emit_adaptive_moves_with_travel(
     job: &ClearJob,
     h: &Heights,
     levels: &[f64],
-) {
+) -> Result<(), RingsError> {
     if moves.len() < 2 {
-        return;
+        return Ok(());
     }
     let link = Tag::new(job.id, MoveKind::Link);
     let cut = Tag::new(job.id, MoveKind::Cutting);
@@ -687,46 +694,64 @@ fn emit_adaptive_moves_with_travel(
         (1.0, 0.0)
     };
 
+    let start = moves[0].0;
+    let tan = tan_at(0);
+    let out = (-tan.1, tan.0);
+    let placement = job
+        .helix
+        .map(|helix| helix.place(start, out, job.start.is_some()))
+        .transpose()?;
     let mut from_z = h.retract.max(h.top_of_stock);
     for &z in levels {
-        let start = moves[0].0;
-        let tan = tan_at(0);
-        let out = (-tan.1, tan.0);
-        prog.push(Step::Rapid {
-            to: Point3::new(start.x, start.y, h.clearance),
-            tag: link,
-        });
-        crate::emit::descend_to(prog, start, from_z, h, job.feed, job.id);
-        // A steered clearing path is **open**: it never returns to its entry, so a
-        // one-way contour ramp would strand the wedge it leaves. Here the ramp runs
-        // forward along the path and retraces it at depth — still along the toolpath,
-        // but ending where it began, which is the contract the rest of this loop
-        // assumes. A closed loop (profile, carve rings) needs no such return.
-        match crate::profile::contour_ramp_len(job.plunge, from_z - z) {
-            Some(len) => {
-                let path: Vec<_> = moves.iter().map(|&(p, _)| p).collect();
-                let ramp = crate::profile::advance_along_path(&path, len);
-                crate::profile::emit_open_ramp(
-                    prog,
-                    &ramp,
-                    from_z,
-                    z,
-                    job.entry_feeds.ramp(job.feed),
-                    plunge_tag,
-                );
-            }
-            None => crate::profile::emit_plunge(
+        if let Some((helix, placement)) = job.helix.zip(placement.as_ref()) {
+            helix.emit(
                 prog,
-                start,
-                tan,
-                out,
+                placement,
                 from_z,
                 z,
-                crate::leads::guard_plunge(job.guard, start, out, job.plunge),
-                job.plunge_feed,
+                h,
+                job.feed,
                 job.entry_feeds.ramp(job.feed),
-                plunge_tag,
-            ),
+                job.id,
+                None,
+            )?;
+        } else {
+            prog.push(Step::Rapid {
+                to: Point3::new(start.x, start.y, h.clearance),
+                tag: link,
+            });
+            crate::emit::descend_to(prog, start, from_z, h, job.feed, job.id);
+            // A steered clearing path is **open**: it never returns to its entry, so a
+            // one-way contour ramp would strand the wedge it leaves. Here the ramp runs
+            // forward along the path and retraces it at depth — still along the toolpath,
+            // but ending where it began, which is the contract the rest of this loop
+            // assumes. A closed loop (profile, carve rings) needs no such return.
+            match crate::profile::contour_ramp_len(job.plunge, from_z - z) {
+                Some(len) => {
+                    let path: Vec<_> = moves.iter().map(|&(p, _)| p).collect();
+                    let ramp = crate::profile::advance_along_path(&path, len);
+                    crate::profile::emit_open_ramp(
+                        prog,
+                        &ramp,
+                        from_z,
+                        z,
+                        job.entry_feeds.ramp(job.feed),
+                        plunge_tag,
+                    );
+                }
+                None => crate::profile::emit_plunge(
+                    prog,
+                    start,
+                    tan,
+                    out,
+                    from_z,
+                    z,
+                    crate::leads::guard_plunge(job.guard, start, out, job.plunge),
+                    job.plunge_feed,
+                    job.entry_feeds.ramp(job.feed),
+                    plunge_tag,
+                ),
+            }
         }
 
         let lift_height = job.lift_height.max(travel.minimum_lift);
@@ -923,6 +948,7 @@ fn emit_adaptive_moves_with_travel(
         });
         from_z = z;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -982,6 +1008,7 @@ mod tests {
             start: None,
             end: None,
             guard: &[],
+            helix: None,
             spindle: cam_cldata::SpindleDir::Cw,
         }
     }
@@ -1027,7 +1054,7 @@ mod tests {
             let mut job = frame_clearjob(frame_job());
             job.lift_height = lift;
             let mut program = Program::new();
-            emit_adaptive_moves(&mut program, &moves, &air, &job, &h, &[-3., -6.]);
+            emit_adaptive_moves(&mut program, &moves, &air, &job, &h, &[-3., -6.]).unwrap();
             for z in [-3., -6.] {
                 let raised = (z + lift).min(h.clearance);
                 for x in [11., 12.] {
@@ -1079,7 +1106,7 @@ mod tests {
         )
         .unwrap();
         let mut cutting_links = Program::new();
-        emit_adaptive_moves(&mut cutting_links, &moves, &[], &job, &heights, &[-6.]);
+        emit_adaptive_moves(&mut cutting_links, &moves, &[], &job, &heights, &[-6.]).unwrap();
         let mut rapid_links = Program::new();
         clear(
             &mut rapid_links,
@@ -1134,7 +1161,8 @@ mod tests {
                 &job,
                 &h,
                 &[-3.],
-            );
+            )
+            .unwrap();
             let raised = (-3. + requested.max(0.2)).min(5.);
             assert!(program
                 .steps()
@@ -1185,7 +1213,8 @@ mod tests {
             &job,
             &h,
             &[-3.],
-        );
+        )
+        .unwrap();
         assert!(!program.steps().iter().any(|s| matches!(s,
             Step::Linear { to, .. } if *to == Point3::new(11., 10., -3.))));
         assert!(program.steps().iter().any(|s| matches!(s,
@@ -1354,7 +1383,8 @@ mod tests {
             &job,
             &Heights::new(5., 2., 0.),
             &[-1.],
-        );
+        )
+        .unwrap();
         assert!(program.validate().is_ok());
         let exits: Vec<_> = program
             .steps()

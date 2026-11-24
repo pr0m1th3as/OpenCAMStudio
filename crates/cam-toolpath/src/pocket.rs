@@ -10,6 +10,7 @@ use cam_cldata::Program;
 use cam_geo::{offset, Contour, JoinStyle, Point, Polygon};
 use cam_model::PocketOp;
 
+use crate::pocket_helix::PocketHelix;
 use crate::profile::depth_levels;
 use crate::{CancelToken, Diagnostic, JobEnv, Strategy, StrategyResult};
 
@@ -363,6 +364,15 @@ impl PocketStrategy {
         // pocket narrower than the lead) is dropped to a plain wall pass.
         let guard =
             offset(std::slice::from_ref(&region), -first, JoinStyle::Round).unwrap_or_default();
+        let helix = match PocketHelix::new(&guard, op.clear.plunge) {
+            Ok(helix) => helix,
+            Err(
+                crate::rings::RingsError::Offset(reason) | crate::rings::RingsError::Limit(reason),
+            ) => {
+                fail!("operation {}: pocket toolpath failed: {reason}", op.id)
+            }
+            Err(crate::rings::RingsError::Cancelled) => unreachable!(),
+        };
 
         let levels = pocket_levels(op, env.heights.top_of_stock, floor);
         if levels.is_empty() {
@@ -402,6 +412,7 @@ impl PocketStrategy {
             start: op.start,
             end: op.end,
             guard: &guard,
+            helix: helix.as_ref(),
             spindle: env.spindle,
         };
         let emit = |program: &mut Program,
@@ -819,6 +830,10 @@ fn emit_with_finishing(
             .map_err(|e| RingsError::Offset(e.to_string()))?;
         paths.push((rings, guard));
     }
+    let helices: Vec<_> = paths
+        .iter()
+        .map(|(_, guard)| PocketHelix::new(guard, op.clear.plunge))
+        .collect::<Result<_, _>>()?;
     let mut from_z = env.heights.top_of_stock;
     for (level, &z) in levels.iter().enumerate() {
         if cancel.is_cancelled() {
@@ -830,7 +845,7 @@ fn emit_with_finishing(
             // Keep entry at the stock top rather than the previous roughing depth.
             continue;
         }
-        for (stage, (rings, guard)) in paths.iter().enumerate() {
+        for (stage, ((rings, guard), helix)) in paths.iter().zip(&helices).enumerate() {
             for ring in rings {
                 if cancel.is_cancelled() {
                     return Err(RingsError::Cancelled);
@@ -870,7 +885,9 @@ fn emit_with_finishing(
                     -1.,
                     op.clear.lift_height,
                     if last { op.end } else { None },
-                );
+                    helix.as_ref(),
+                    false,
+                )?;
                 program.push(Step::Rapid {
                     to: Point3::new(exit.x, exit.y, env.heights.clearance),
                     tag: Tag::new(op.id, MoveKind::Retract),
@@ -1285,6 +1302,106 @@ mod tests {
         assert!(!plunge_arcs.is_empty(), "expected helix plunge arcs");
         // The helix descends: at least one arc ends below the stock top.
         assert!(plunge_arcs.iter().any(|&z| z < 0.0), "helix must descend");
+    }
+
+    fn narrow_helix_pocket(radius: f64, adaptive: bool) -> StrategyResult {
+        let mut operation = leaded_op(Vec::new());
+        operation.boundary = Contour::new(vec![
+            Point::new(0.0, 0.0),
+            Point::new(13.0, 0.0),
+            Point::new(13.0, 47.0),
+            Point::new(0.0, 47.0),
+        ]);
+        operation.depth = 7.8;
+        operation.maximum_stepover = Some(2.4);
+        operation.clear.multiple_depths.enabled = false;
+        operation.clear.adaptive_enabled = Some(adaptive);
+        operation.clear.clearing.engagement = if adaptive { 2.4 } else { 0.0 };
+        operation.clear.plunge = Plunge::Helix { radius, pitch: 3.0 };
+        operation.clear.lead_in = Lead::Arc { radius: 0.6 };
+        operation.clear.lead_out = Lead::Arc { radius: 0.6 };
+        operation.finishing = cam_model::PocketFinishing {
+            enabled: true,
+            count: 1,
+            stepover: 1.0,
+            ..Default::default()
+        };
+        PocketStrategy::new(operation).compute(
+            &JobEnv {
+                heights: Heights::new(15.0, 5.0, 0.0),
+                tools: &tools(6.0),
+                stock: None,
+                spindle: cam_cldata::SpindleDir::Cw,
+            },
+            &CancelToken::new(),
+        )
+    }
+
+    #[test]
+    fn pocket_helix_uses_full_roughing_width_before_any_cut() {
+        for adaptive in [false, true] {
+            // 13 mm slot minus the 6 mm cutter and two 1 mm finishing allowances.
+            // The 5 mm orbit fits exactly across the usable roughing width.
+            let result = narrow_helix_pocket(2.5, adaptive);
+            assert!(!result.has_errors(), "{:?}", result.diagnostics);
+            result.program.validate().unwrap();
+            let moves = result.program.steps();
+            let first_cut = moves
+                .iter()
+                .position(|step| {
+                    matches!(step, Step::Arc { tag, .. } | Step::Linear { tag, .. }
+                    if matches!(tag.kind, MoveKind::Plunge | MoveKind::Cutting))
+                })
+                .unwrap();
+            let Step::Arc {
+                center, end, tag, ..
+            } = moves[first_cut]
+            else {
+                panic!("expected the helix before cutting or feeding into stock");
+            };
+            assert_eq!(tag.kind, MoveKind::Plunge);
+            let Step::Rapid { to: start, .. } = moves[first_cut - 1] else {
+                panic!("expected the approach to the stock surface");
+            };
+            assert_eq!(start.z, 0.0);
+            assert!((center.x - 6.5).abs() < 1e-8);
+            assert!(((start.x - center.x).hypot(start.y - center.y) - 2.5).abs() < 1e-8);
+            assert!(
+                (end.z + 1.3).abs() < 1e-8,
+                "the configured pitch limits Z per turn"
+            );
+            assert_eq!(plunges(&result), 0);
+            assert!(cutting_moves(&result) > 0);
+            let sim = cam_sim::simulate(
+                &result.program,
+                [-1.0, -1.0, -9.0],
+                [14.0, 48.0, 0.0],
+                &cam_sim::SimOptions {
+                    resolution: 0.2,
+                    tool_radius: 3.0,
+                },
+                &[],
+            );
+            assert!(sim.is_clean(), "{:?}", sim.collisions);
+        }
+    }
+
+    #[test]
+    fn pocket_helix_that_exceeds_roughing_width_reports_an_error() {
+        for adaptive in [false, true] {
+            let result = narrow_helix_pocket(2.51, adaptive);
+            assert!(result.has_errors());
+            assert!(result.program.steps().is_empty());
+            assert!(
+                result.diagnostics.iter().any(|diagnostic| {
+                    diagnostic
+                        .message
+                        .contains("Helix with radius 2.51 mm does not fit")
+                }),
+                "{:?}",
+                result.diagnostics
+            );
+        }
     }
 
     #[test]

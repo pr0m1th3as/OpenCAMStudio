@@ -224,7 +224,7 @@ impl AppController {
                 &inputs.document.rotary_indexes,
                 env!("CARGO_PKG_VERSION"),
                 // Verified programs and stock must reflect current machining rules.
-                11u32,
+                12u32,
             ),
             &inputs.document.excluded_operations,
             &inputs.document.disabled_origins,

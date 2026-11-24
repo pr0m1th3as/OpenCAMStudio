@@ -457,6 +457,7 @@ impl CarveStrategy {
                             start: op.start,
                             end: op.end,
                             guard: &guards,
+                            helix: None,
                             spindle: env.spindle,
                         };
                         match crate::clearing::clear(
