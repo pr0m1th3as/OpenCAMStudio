@@ -535,6 +535,7 @@ impl AdaptiveStrategy {
         };
         let job = crate::clearing::ClearJob {
             lift_height: op.params.lift_height,
+            keep_tool_down: false,
             id: op.id,
             simplification_tolerance: op.params.simplification_tolerance(),
             radius,

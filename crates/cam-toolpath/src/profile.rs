@@ -459,6 +459,7 @@ impl ProfileStrategy {
                 // ring sits at the tool radius.
                 let job = crate::clearing::ClearJob {
                     lift_height: 0.0,
+                    keep_tool_down: false,
                     id: op.id,
                     simplification_tolerance: crate::frontadvance::SIMPLIFY_EPS,
                     radius,

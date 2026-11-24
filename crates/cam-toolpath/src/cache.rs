@@ -72,8 +72,10 @@ pub(crate) struct CacheExtras {
 /// Revision for operations that can emit concentric clearing passes.
 pub fn concentric_clearing_revision(operation: &Operation) -> Option<u32> {
     let can_clear = match operation {
-        // Discard saved pockets that could substitute a straight plunge.
-        Operation::Pocket(p) if matches!(p.clear.plunge, Plunge::Helix { .. }) => return Some(3),
+        Operation::Pocket(p) if matches!(p.clear.plunge, Plunge::Helix { .. }) => {
+            // Recompute saved helices when stay-down linking can replace them.
+            return Some(if p.clear.keep_tool_down { 4 } else { 3 });
+        }
         Operation::Pocket(_) | Operation::Adaptive(_) => true,
         Operation::Profile(p) => {
             p.stepover > 0.

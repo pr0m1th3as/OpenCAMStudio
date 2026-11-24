@@ -406,6 +406,30 @@ pub(crate) fn automatic_wall_start(pts: &[Point]) -> Point {
     Point::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5)
 }
 
+pub(crate) enum WallApproach {
+    Clearance,
+    FromRing { max_distance: f64, lift_height: f64 },
+    AfterRetract { max_distance: f64, move_seam: bool },
+}
+
+/// The point immediately before a vertical retract from this pass's depth.
+fn retracted_at_depth(program: &Program, id: u32, z: f64) -> Option<Point> {
+    let [.., previous, Step::Rapid { to, tag }] = program.steps() else {
+        return None;
+    };
+    if tag.kind != MoveKind::Retract || tag.op_id != id || to.z <= z {
+        return None;
+    }
+    let (from, previous_tag) = match previous {
+        Step::Linear { to, tag, .. } | Step::Arc { end: to, tag, .. } => (to, tag),
+        _ => return None,
+    };
+    (previous_tag.op_id == id
+        && (from.z - z).abs() <= 1e-9
+        && (from.x - to.x).hypot(from.y - to.y) <= 1e-9)
+        .then(|| Point::new(from.x, from.y))
+}
+
 /// Cut a finished-wall ring with a lead-in/out eased from the cleared side, and
 /// return the exit point. Handles boundary (lead inward) and island (lead outward)
 /// walls uniformly via the loop winding.
@@ -419,7 +443,7 @@ pub(crate) fn automatic_wall_start(pts: &[Point]) -> Point {
 pub(crate) fn emit_wall_ring(
     prog: &mut Program,
     pts: &[Point],
-    prev_end: Point,
+    seed: Point,
     from_z: f64,
     z: f64,
     id: u32,
@@ -433,13 +457,46 @@ pub(crate) fn emit_wall_ring(
     reversed: bool,
     h: &Heights,
     plunge: Plunge,
-    link_threshold: f64,
-    lift_height: f64,
+    approach_mode: WallApproach,
     end: Option<[f64; 2]>,
     helix: Option<&PocketHelix<'_>>,
     fixed_entry: bool,
 ) -> Result<Point, RingsError> {
-    let ri = crate::profile::rotate_to_start(pts, Some([prev_end.x, prev_end.y]));
+    let rotate = |p: Point| crate::profile::rotate_to_start(pts, Some([p.x, p.y]));
+    let entry_at = |ring: &[Point]| {
+        let tan = crate::profile::start_tangent(ring);
+        let normal = cleared_normal(tan, reversed);
+        let lead = crate::leads::guard_lead(guard, ring[0], tan, normal, lead_in, true);
+        let point = crate::leads::lead_start_point(ring[0], tan, normal, lead);
+        (lead, point)
+    };
+    let mut ri = rotate(seed);
+    let (mut eff_in, mut entry) = entry_at(&ri);
+    let mut at_depth = None;
+    if let WallApproach::AfterRetract {
+        max_distance,
+        move_seam,
+    } = approach_mode
+    {
+        if let Some(from) = retracted_at_depth(prog, id, z) {
+            let reachable = |point: Point| {
+                point.distance_sq(from) <= max_distance.powi(2)
+                    && crate::linking::contained(guard, from, point)
+            };
+            if reachable(entry) {
+                at_depth = Some(from);
+            } else if move_seam {
+                let nearby = rotate(from);
+                let (nearby_lead, nearby_entry) = entry_at(&nearby);
+                if (eff_in == Lead::None || nearby_lead != Lead::None) && reachable(nearby_entry) {
+                    ri = nearby;
+                    eff_in = nearby_lead;
+                    entry = nearby_entry;
+                    at_depth = Some(from);
+                }
+            }
+        }
+    }
     let start = ri[0];
     let tan_in = crate::profile::start_tangent(&ri);
     let cin = cleared_normal(tan_in, reversed);
@@ -447,9 +504,7 @@ pub(crate) fn emit_wall_ring(
     let cout = cleared_normal(tan_out, reversed);
 
     // Drop any lead that would swing past the far wall down to a plain pass.
-    let eff_in = crate::leads::guard_lead(guard, start, tan_in, cin, lead_in, true);
     let eff_out = crate::leads::guard_lead(guard, exit_on, tan_out, cout, lead_out, false);
-    let entry = crate::leads::lead_start_point(start, tan_in, cin, eff_in);
     let exit = crate::leads::lead_end_point(exit_on, tan_out, cout, eff_out);
 
     let lead = Tag::new(id, MoveKind::LeadIn);
@@ -457,28 +512,48 @@ pub(crate) fn emit_wall_ring(
     // The ramp descends *along the lead* — through air, meeting the wall at `start` —
     // and then along the ring. So the lead is handed to the entry rather than emitted
     // after it.
-    let ramped = approach(
-        prog,
-        prev_end,
-        entry,
-        tan_in,
-        cin,
-        from_z,
-        z,
-        h,
-        plunge,
-        feed,
-        plunge_feed,
-        entry_feeds,
-        id,
-        link_threshold,
-        lift_height,
-        &ri,
-        crate::profile::lead_in_path(start, entry, cin, eff_in),
-        guard,
-        helix,
-        fixed_entry,
-    )?;
+    let ramped = if let Some(from) = at_depth {
+        prog.steps.pop();
+        if from.distance_sq(entry) > 1e-18 {
+            // The link can cut the reserved wall stock, so feed it as a cut.
+            prog.push(Step::Linear {
+                to: Point3::new(entry.x, entry.y, z),
+                feed,
+                tag: cut,
+            });
+        }
+        None
+    } else {
+        let (link_threshold, lift_height) = match approach_mode {
+            WallApproach::FromRing {
+                max_distance,
+                lift_height,
+            } => (max_distance, lift_height),
+            _ => (-1., 0.),
+        };
+        approach(
+            prog,
+            seed,
+            entry,
+            tan_in,
+            cin,
+            from_z,
+            z,
+            h,
+            plunge,
+            feed,
+            plunge_feed,
+            entry_feeds,
+            id,
+            link_threshold,
+            lift_height,
+            &ri,
+            crate::profile::lead_in_path(start, entry, cin, eff_in),
+            guard,
+            helix,
+            fixed_entry,
+        )?
+    };
     Ok(match ramped {
         // It ramped: the lead was flown on the way down, and the cut must begin where
         // the ramp ended and travel a full perimeter, so the sloped stretch is
@@ -628,8 +703,7 @@ pub(crate) fn emit_stay_down(
                 reversed,
                 h,
                 plunge,
-                -1.,
-                lift_height,
+                WallApproach::Clearance,
                 end.filter(|_| rings.len() == 1),
                 helix,
                 start.is_some(),
@@ -718,8 +792,10 @@ pub(crate) fn emit_stay_down(
                     reversed,
                     h,
                     plunge,
-                    link_threshold,
-                    lift_height,
+                    WallApproach::FromRing {
+                        max_distance: link_threshold,
+                        lift_height,
+                    },
                     exit_preference,
                     helix,
                     false,

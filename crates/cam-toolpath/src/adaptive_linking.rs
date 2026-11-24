@@ -795,6 +795,7 @@ mod tests {
     fn job(lead_in: Lead, lead_out: Lead, overlap: f64) -> ClearJob<'static> {
         ClearJob {
             lift_height: 0.2,
+            keep_tool_down: false,
             id: 7,
             simplification_tolerance: 0.02,
             radius: 3.,

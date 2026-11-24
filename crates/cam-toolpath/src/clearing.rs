@@ -27,6 +27,8 @@ use crate::CancelToken;
 pub(crate) struct ClearJob<'a> {
     /// Lift above each cutting level for local links, limited to clearance.
     pub lift_height: f64,
+    /// With helical pocket entry, feed short, contained links at depth.
+    pub keep_tool_down: bool,
     /// Operation id, stamped onto emitted tags.
     pub id: u32,
     /// Frontier and corner-detection simplification tolerance, mm; 0 disables it.
@@ -464,7 +466,12 @@ fn clear_concentric(
     let (lift_height, lead_in, lead_out) = if adaptive_3d {
         (0.0, Lead::None, Lead::None)
     } else {
-        (job.lift_height, job.lead_in, job.lead_out)
+        let lift = if job.keep_tool_down && !job.guard.is_empty() {
+            0.0
+        } else {
+            job.lift_height
+        };
+        (lift, job.lead_in, job.lead_out)
     };
     let n = rings.len();
     let vertices: usize = rings.iter().map(|r| r.pts.len()).sum();
@@ -991,6 +998,7 @@ mod tests {
     fn frame_clearjob(clearing: Clearing) -> ClearJob<'static> {
         ClearJob {
             lift_height: 0.0,
+            keep_tool_down: false,
             id: 7,
             simplification_tolerance: crate::frontadvance::SIMPLIFY_EPS,
             radius: 3.0,

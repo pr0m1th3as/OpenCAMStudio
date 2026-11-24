@@ -440,6 +440,7 @@ impl CarveStrategy {
                             .unwrap_or_default();
                         let job = crate::clearing::ClearJob {
                             lift_height: cp.lift_height,
+                            keep_tool_down: false,
                             id: op.id,
                             simplification_tolerance: crate::frontadvance::SIMPLIFY_EPS,
                             radius: r,

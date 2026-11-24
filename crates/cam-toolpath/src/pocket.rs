@@ -384,6 +384,7 @@ impl PocketStrategy {
         // adaptive departures and re-entries still use the configured leads.
         let job = crate::clearing::ClearJob {
             lift_height: op.clear.lift_height,
+            keep_tool_down: op.clear.keep_tool_down && helix.is_some(),
             id: op.id,
             simplification_tolerance: crate::frontadvance::SIMPLIFY_EPS,
             radius: r,
@@ -777,8 +778,8 @@ fn pocket_levels(op: &PocketOp, top: f64, floor: f64) -> Vec<f64> {
     depth_levels(top, floor, step)
 }
 
-/// Finish each cleared depth, or only the final depth when selected. Each disconnected loop
-/// approaches from clearance, so links cannot cut through an island or another lobe.
+/// Finish each cleared depth, or only the final depth when selected. Loops that cannot
+/// be reached by a short, contained link approach from clearance.
 #[allow(clippy::too_many_arguments)]
 fn emit_with_finishing(
     program: &mut Program,
@@ -790,7 +791,7 @@ fn emit_with_finishing(
     cancel: &CancelToken,
     rough: impl Fn(&mut Program, &[f64]) -> Result<(), crate::rings::RingsError>,
 ) -> Result<(), crate::rings::RingsError> {
-    use crate::rings::{concentric_rings, RingsError};
+    use crate::rings::{concentric_rings, RingsError, WallApproach};
     use cam_cldata::{MoveKind, Point3, SpindleDir, Step, Tag};
     let finish = op.finishing;
     let stages = finish.count + u32::from(finish.repeat_pass);
@@ -886,8 +887,14 @@ fn emit_with_finishing(
                     reversed,
                     &env.heights,
                     op.clear.plunge,
-                    -1.,
-                    op.clear.lift_height,
+                    if op.clear.keep_tool_down && helix.is_some() {
+                        WallApproach::AfterRetract {
+                            max_distance: 4. * radius,
+                            move_seam: op.start.is_none(),
+                        }
+                    } else {
+                        WallApproach::Clearance
+                    },
                     if last { op.end } else { None },
                     helix.as_ref(),
                     false,
@@ -1308,7 +1315,7 @@ mod tests {
         assert!(plunge_arcs.iter().any(|&z| z < 0.0), "helix must descend");
     }
 
-    fn narrow_helix_pocket(radius: f64, adaptive: bool) -> StrategyResult {
+    fn narrow_helix_operation(radius: f64, adaptive: bool) -> PocketOp {
         let mut operation = leaded_op(Vec::new());
         operation.boundary = Contour::new(vec![
             Point::new(0.0, 0.0),
@@ -1330,7 +1337,11 @@ mod tests {
             stepover: 1.0,
             ..Default::default()
         };
-        PocketStrategy::new(operation).compute(
+        operation
+    }
+
+    fn narrow_helix_pocket(radius: f64, adaptive: bool) -> StrategyResult {
+        PocketStrategy::new(narrow_helix_operation(radius, adaptive)).compute(
             &JobEnv {
                 heights: Heights::new(15.0, 5.0, 0.0),
                 tools: &tools(6.0),
@@ -1339,6 +1350,50 @@ mod tests {
             },
             &CancelToken::new(),
         )
+    }
+
+    #[test]
+    fn keep_tool_down_uses_one_helix_for_roughing_and_finishing_at_a_depth() {
+        let mut op = narrow_helix_operation(1.2, true);
+        op.clear.lift_height = 0.2;
+        op.finishing.feed = 200.;
+        let ts = tools(6.);
+        let env = JobEnv {
+            heights: Heights::new(15., 5., 0.),
+            tools: &ts,
+            stock: None,
+            spindle: cam_cldata::SpindleDir::Cw,
+        };
+        let cancel = CancelToken::new();
+        let helix_entries = |result: &StrategyResult| {
+            let mut in_helix = false;
+            result
+                .program
+                .steps()
+                .iter()
+                .filter(|step| {
+                    let helix =
+                        matches!(step, Step::Arc { tag, .. } if tag.kind == MoveKind::Plunge);
+                    let first_arc = helix && !in_helix;
+                    in_helix = helix;
+                    first_arc
+                })
+                .count()
+        };
+
+        let lifted = PocketStrategy::new(op.clone()).compute(&env, &cancel);
+        assert!(!lifted.has_errors(), "{:?}", lifted.diagnostics);
+        assert!(helix_entries(&lifted) > 1);
+
+        op.clear.keep_tool_down = true;
+        let linked = PocketStrategy::new(op).compute(&env, &cancel);
+        assert!(!linked.has_errors(), "{:?}", linked.diagnostics);
+        linked.program.validate().unwrap();
+        assert_eq!(helix_entries(&linked), 1);
+        assert_eq!(plunges(&linked), 0);
+        assert_eq!(retracts(&linked), 1);
+        assert_eq!(leadin_arcs(&linked).len(), leadin_arcs(&lifted).len());
+        assert!(finish_length(&linked) >= finish_length(&lifted));
     }
 
     #[test]
