@@ -10,6 +10,15 @@ pub fn verify_profile_entry(state: &GeometryState, entry: &ProfileGeometryEntry)
     if selected.is_empty() {
         return None;
     }
+    match split_profile_chain_entry(state, entry) {
+        Ok(Some(entries)) => {
+            return entries
+                .iter()
+                .find_map(|entry| verify_profile_entry(state, entry));
+        }
+        Err(error) => return Some(error),
+        Ok(None) => {}
+    }
     let result = if entry.kind == ProfileGeometryKind::Silhouette {
         selected.iter().try_for_each(|reference| {
             let body = EntityRef {

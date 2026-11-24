@@ -88,7 +88,10 @@ impl App {
                 .map(|b| b.selected.clone())
                 .unwrap_or_default()
         };
-        let mut entries = crate::cad_operations::profile_entries_from_selection(&refs);
+        let mut entries = crate::cad_operations::profile_entries_from_selection(
+            self.controller.geometry_state(),
+            &refs,
+        );
         for entry in &mut entries {
             // Preserve the older envelope-only recipe when opening its settings.
             if entry.kind == ProfileGeometryKind::Silhouette
@@ -330,34 +333,48 @@ impl App {
                     editor.draft.name =
                         format!("{} {}", kind_name(editor.draft.kind), editor.index + 1);
                 }
-                let result = self.indexed_draft_geometry().and_then(|g| {
-                    cam_geometry3d::profile_entry_contours(&g, &editor.draft).map(|_| ())
+                let result = self.indexed_draft_geometry().and_then(|geometry| {
+                    let split =
+                        cam_geometry3d::split_profile_chain_entry(&geometry, &editor.draft)?;
+                    let entries = split
+                        .as_deref()
+                        .unwrap_or(std::slice::from_ref(&editor.draft));
+                    for entry in entries {
+                        cam_geometry3d::profile_entry_contours(&geometry, entry)?;
+                    }
+                    Ok(split)
                 });
-                if let Err(error) = result {
-                    self.report_error(format!(
-                        "Profile geometry entry '{}' rejected: {error}",
-                        editor.draft.name
-                    ));
-                    editor.error = Some(error);
-                    self.profile_entry_editor = Some(editor);
-                    return;
-                }
+                let split = match result {
+                    Ok(split) => split,
+                    Err(error) => {
+                        self.report_error(format!(
+                            "Profile geometry entry '{}' rejected: {error}",
+                            editor.draft.name
+                        ));
+                        editor.error = Some(error);
+                        self.profile_entry_editor = Some(editor);
+                        return;
+                    }
+                };
                 let before = self.operation_draft.clone();
-                let changed = self
-                    .profile_entries()
-                    .get(editor.index)
-                    .is_none_or(|entry| entry.source != editor.draft.source);
+                let changed = split.is_some()
+                    || self
+                        .profile_entries()
+                        .get(editor.index)
+                        .is_none_or(|entry| entry.source != editor.draft.source);
+                let replacement = split.unwrap_or_else(|| vec![editor.draft]);
                 self.edit_operation_draft(|op| {
                     if let Operation::Profile(p) = op {
-                        if let Some(entry) = p
+                        if let Some(entries) = p
                             .selections
                             .as_mut()
-                            .and_then(|entries| entries.get_mut(editor.index))
+                            .filter(|entries| editor.index < entries.len())
                         {
-                            *entry = editor.draft;
+                            entries.splice(editor.index..=editor.index, replacement);
                         }
                     }
                 });
+                self.geometry_row_selection = Some(editor.index);
                 self.cad_filter_explicit = editor.previous_filter_explicit;
                 self.geometry_additive = false;
                 self.profile_side_overrides.clear();
@@ -704,7 +721,7 @@ impl App {
                 .align_y(Alignment::Center);
             for (mode, name, label) in [
                 (ProfileChainMode::Closed, "closed", "Closed chain: use a closed planar boundary. Along rounded walls, the operation's Top and Bottom heights define the cut depth."),
-                (ProfileChainMode::Open, "open", "Open chain: follow planar edges at the operation's Top and Bottom heights, including edges beside rounded surfaces. The cut extends the selected curve vertically."),
+                (ProfileChainMode::Open, "open", "Open chain: follow planar edges at the operation's Top and Bottom heights, including edges beside rounded surfaces. Each disconnected path becomes a separate entry."),
             ] {
                 let active = entry.chain_mode == mode
                     || (entry.chain_mode == ProfileChainMode::Auto
@@ -1095,6 +1112,63 @@ mod tests {
             })
             .collect();
         select_closed_edges(app, references);
+    }
+
+    #[test]
+    fn confirming_disconnected_open_edges_creates_individually_editable_entries() {
+        if !crate::test_fixture::available("chamfer_test.ocam") {
+            return;
+        }
+        let (mut app, reference) = cad_loop_app("chamfer_test.ocam", 50);
+        let picks = [12, 19].map(|id| EntityRef {
+            kind: EntityKind::Edge,
+            id,
+            ..reference.clone()
+        });
+        let direct = app
+            .controller
+            .preview_cad_operation(OpKind::Profile, &picks)
+            .unwrap();
+        assert_eq!(direct.profiles.len(), 2);
+
+        let _ = app.update(Message::BeginOp(OpKind::Profile));
+        for message in [
+            EntryMessage::Add(ProfileGeometryKind::Chain),
+            EntryMessage::ChainMode(ProfileChainMode::Open),
+            EntryMessage::Name("Open rims".into()),
+            EntryMessage::Reverse(true),
+        ] {
+            let _ = app.update(Message::ProfileEntry(message));
+        }
+        for reference in &picks {
+            let _ = app.update(Message::CadSelect(reference.clone()));
+        }
+        let (preview, _) = app.profile_selection_geometry().unwrap();
+        assert_eq!(preview.contours().count(), 2);
+        app.set_profile_entry_contour_side(1, Side::On);
+        let _ = app.update(Message::ProfileEntry(EntryMessage::Confirm));
+        assert!(app.profile_entry_editor.is_none(), "{}", app.status);
+        assert!(app.output_last_geometry_error.is_none());
+        let entries = app.profile_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "Open rims");
+        assert_eq!(entries[1].name, "Open rims (2)");
+        for (entry, reference) in entries.iter().zip(picks) {
+            assert_eq!(entry.source, ProfileGeometrySource::Cad(vec![reference]));
+            assert!(entry.reversed);
+        }
+        assert_eq!(entries[1].side_overrides.get(&0), Some(&Side::On));
+
+        let _ = app.update(Message::ConfirmOp);
+        assert!(!app.creating_operation(), "{}", app.status);
+        let Selection::Operation(id) = app.controller.selection() else {
+            panic!("operation");
+        };
+        let Some(Operation::Profile(saved)) = app.controller.operation(id) else {
+            panic!("profile");
+        };
+        assert_eq!(saved.selections.as_ref(), Some(&entries));
+        assert!(saved.contours().all(|contour| !contour.closed));
     }
 
 

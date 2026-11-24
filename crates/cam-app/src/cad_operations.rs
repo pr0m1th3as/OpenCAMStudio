@@ -212,21 +212,23 @@ pub(crate) fn recipe(
         OpKind::Profile if selected.len() == 1 && selected[0].kind == EntityKind::Silhouette => {
             ExtractionRecipe::ProfileSilhouette
         }
-        OpKind::Profile
-            if selected.first().is_some_and(|first| {
+        OpKind::Profile => {
+            let mixed = selected.first().is_some_and(|first| {
                 selected.iter().any(|reference| {
                     reference.kind != first.kind
                         || reference.instance_id != first.instance_id
                         || reference.asset_id != first.asset_id
                         || reference.body_id != first.body_id
                 })
-            }) =>
-        {
-            ExtractionRecipe::ProfileEntries {
-                entries: profile_entries_from_selection(selected),
+            });
+            if mixed || selected.len() > 1 && selected[0].kind == EntityKind::Edge {
+                let entries = profile_entries_from_selection(geometry, selected);
+                if mixed || entries.len() > 1 {
+                    return Ok(ExtractionRecipe::ProfileEntries { entries });
+                }
             }
+            ExtractionRecipe::ProfileContours
         }
-        OpKind::Profile => ExtractionRecipe::ProfileContours,
         OpKind::Face => ExtractionRecipe::FaceRegion,
         OpKind::Parallel => ExtractionRecipe::ParallelFinishing,
         OpKind::Spiral => ExtractionRecipe::SpiralFinishing,
@@ -234,7 +236,10 @@ pub(crate) fn recipe(
     })
 }
 
-pub(crate) fn profile_entries_from_selection(selected: &[EntityRef]) -> Vec<ProfileGeometryEntry> {
+pub(crate) fn profile_entries_from_selection(
+    geometry: &GeometryState,
+    selected: &[EntityRef],
+) -> Vec<ProfileGeometryEntry> {
     let mut entries: Vec<ProfileGeometryEntry> = Vec::new();
     for reference in selected {
         if matches!(reference.kind, EntityKind::Edge | EntityKind::Face) {
@@ -263,6 +268,14 @@ pub(crate) fn profile_entries_from_selection(selected: &[EntityRef]) -> Vec<Prof
         entries.push(entry);
     }
     entries
+        .into_iter()
+        .flat_map(|entry| {
+            cam_geometry3d::split_profile_chain_entry(geometry, &entry)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| vec![entry])
+        })
+        .collect()
 }
 
 /// Source topology stays immutable. Only instance placements are rotated into

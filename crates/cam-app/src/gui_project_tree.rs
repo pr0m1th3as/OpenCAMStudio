@@ -1,6 +1,8 @@
 //! Overlay browser, context commands and stable-ID drag/drop routing.
 use super::*;
+use iced::advanced::{layout, mouse, overlay, renderer, widget, Clipboard, Layout, Shell, Widget};
 use iced::widget::column;
+use iced::{Event, Point, Rectangle, Size, Vector};
 
 const TREE_ROW_H: f32 = 30.0;
 const TREE_TEXT_SIZE: u32 = 12;
@@ -1287,28 +1289,13 @@ impl App {
                     ));
             }
         }
+        const MENU_WIDTH: f32 = 244.0;
+        const SUBMENU_WIDTH: f32 = 180.0;
+
         let menu = container(scrollable(items.padding(4)).height(Length::Shrink))
-            .width(244)
-            .max_height((self.window.height - self.op_menu_pos.y - 12.0).max(100.0))
+            .width(MENU_WIDTH)
             .style(popup_surface);
-        let position = iced::Point::new(
-            self.op_menu_pos.x.min((self.window.width - 250.0).max(0.0)),
-            self.op_menu_pos
-                .y
-                .min((self.window.height - 110.0).max(0.0)),
-        );
-        let main_menu: Element<'_, Message> = container(menu)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .align_x(iced::alignment::Horizontal::Left)
-            .align_y(iced::alignment::Vertical::Top)
-            .padding(Padding {
-                top: position.y,
-                left: position.x,
-                right: 0.0,
-                bottom: 0.0,
-            })
-            .into();
+        let main_menu = fit_tree_menu(menu.into(), self.op_menu_pos);
         let Some(y) = self.pattern_menu_y else {
             return Some(main_menu);
         };
@@ -1320,25 +1307,155 @@ impl App {
             .spacing(2)
             .padding(4),
         )
-        .width(180)
+        .width(SUBMENU_WIDTH)
         .style(popup_surface);
-        let left = if position.x + 244.0 + 180.0 <= self.window.width {
-            position.x + 244.0
+        let menu_left = self
+            .op_menu_pos
+            .x
+            .clamp(0.0, (self.window.width - MENU_WIDTH).max(0.0));
+        let left = if menu_left + MENU_WIDTH + SUBMENU_WIDTH <= self.window.width {
+            menu_left + MENU_WIDTH
         } else {
-            (position.x - 180.0).max(0.0)
+            (menu_left - SUBMENU_WIDTH).max(0.0)
         };
-        let submenu = container(submenu)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .align_x(iced::alignment::Horizontal::Left)
-            .align_y(iced::alignment::Vertical::Top)
-            .padding(Padding {
-                top: y.clamp(0.0, (self.window.height - 80.0).max(0.0)),
-                left,
-                right: 0.0,
-                bottom: 0.0,
-            });
-        Some(iced::widget::stack![main_menu, submenu].into())
+        let submenu = fit_tree_menu(submenu.into(), iced::Point::new(left, y));
+        Some(
+            iced::widget::stack![main_menu, submenu]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+        )
+    }
+}
+
+fn fit_tree_menu(menu: Element<'_, Message>, anchor: iced::Point) -> Element<'_, Message> {
+    Element::new(PositionedTreeMenu { menu, anchor })
+}
+
+struct PositionedTreeMenu<'a> {
+    menu: Element<'a, Message>,
+    anchor: Point,
+}
+
+impl Widget<Message, iced::Theme, iced::Renderer> for PositionedTreeMenu<'_> {
+    fn size(&self) -> Size<Length> {
+        self.menu.as_widget().size()
+    }
+
+    fn children(&self) -> Vec<widget::Tree> {
+        vec![widget::Tree::new(&self.menu)]
+    }
+
+    fn diff(&self, tree: &mut widget::Tree) {
+        tree.children[0].diff(&self.menu);
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut widget::Tree,
+        renderer: &iced::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        // Measure against the full window, then move the menu far enough to fit.
+        let node = self
+            .menu
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits);
+        let available = limits.max() - node.size();
+        node.move_to(Point::new(
+            self.anchor.x.clamp(0.0, available.width.max(0.0)),
+            self.anchor.y.clamp(0.0, available.height.max(0.0)),
+        ))
+    }
+
+    fn draw(
+        &self,
+        tree: &widget::Tree,
+        renderer: &mut iced::Renderer,
+        theme: &iced::Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.menu.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut widget::Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &iced::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        self.menu.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &widget::Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &iced::Renderer,
+    ) -> mouse::Interaction {
+        self.menu.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut widget::Tree,
+        layout: Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn widget::Operation,
+    ) {
+        self.menu
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+
+    fn overlay<'a>(
+        &'a mut self,
+        tree: &'a mut widget::Tree,
+        layout: Layout<'a>,
+        renderer: &iced::Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'a, Message, iced::Theme, iced::Renderer>> {
+        self.menu.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
     }
 }
 
@@ -1927,6 +2044,43 @@ mod tests {
         }
         while app.notice.is_some() {
             send(app, Message::NoticeDismissed);
+        }
+    }
+
+    #[test]
+    fn operation_context_menu_only_scrolls_if_taller_than_the_window() {
+        use iced::advanced::renderer::Headless;
+
+        let renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
+            iced::Font::DEFAULT,
+            iced::Pixels(12.0),
+            Some("tiny-skia"),
+        ))
+        .unwrap();
+        let (mut app, ids) = tree_app();
+        app.tree_menu = Some(TreeNode::Operation(ids[0]));
+        for (height, anchor_y, scrolling) in [
+            (600.0, 40.0, false),
+            (600.0, 590.0, false),
+            (180.0, 170.0, true),
+        ] {
+            app.window = Size::new(800.0, height);
+            app.op_menu_pos = Point::new(40.0, anchor_y);
+            let mut menu = app.tree_menu_overlay().unwrap();
+            let mut tree = widget::Tree::new(&menu);
+            let node = menu.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, app.window),
+            );
+            let scrollable = &node.children()[0];
+            let items = &scrollable.children()[0];
+            assert_eq!(items.size().height > scrollable.size().height, scrolling);
+
+            let bounds = node.bounds();
+            assert_eq!(bounds.x, app.op_menu_pos.x);
+            assert_eq!(bounds.y, anchor_y.min(height - bounds.height));
+            assert_eq!(bounds.height == height, scrolling);
         }
     }
 
