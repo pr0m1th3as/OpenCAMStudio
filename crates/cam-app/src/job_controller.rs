@@ -687,6 +687,10 @@ mod tests {
         });
         for point in [[2., 2.], [6., 6.]] {
             app.add_operation(Operation::Drill(DrillOp {
+                cycle: Default::default(),
+                tip_through_bottom: false,
+                geometry: Default::default(),
+                hole_heights: Vec::new(),
                 parameter_expressions: Default::default(),
                 id: 0,
                 tool: 1,

@@ -545,6 +545,10 @@ mod tests {
         let mut app = app();
         app.controller
             .add_operation(Operation::Drill(cam_model::DrillOp {
+                cycle: Default::default(),
+                tip_through_bottom: false,
+                geometry: Default::default(),
+                hole_heights: Vec::new(),
                 parameter_expressions: Default::default(),
                 id: 0,
                 tool: 999,

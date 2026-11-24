@@ -98,6 +98,14 @@ pub enum OperationParameter {
     DrillStartOffset,
     #[serde(rename = "peck")]
     Peck,
+    #[serde(rename = "peckReduction")]
+    PeckReduction,
+    #[serde(rename = "minimumPeck")]
+    MinimumPeck,
+    #[serde(rename = "accumulatedPeck")]
+    AccumulatedPeck,
+    #[serde(rename = "chipBreakDistance")]
+    ChipBreakDistance,
     #[serde(rename = "dwell")]
     Dwell,
     #[serde(rename = "chamferTop")]
@@ -230,7 +238,7 @@ pub enum OperationParameter {
     StartY,
 }
 impl OperationParameter {
-    pub const ALL: [Self; 111] = [
+    pub const ALL: [Self; 115] = [
         Self::CuttingSpeed,
         Self::FeedPerTooth,
         Self::LiftHeight,
@@ -277,6 +285,10 @@ impl OperationParameter {
         Self::FaceOvershoot,
         Self::DrillStartOffset,
         Self::Peck,
+        Self::PeckReduction,
+        Self::MinimumPeck,
+        Self::AccumulatedPeck,
+        Self::ChipBreakDistance,
         Self::Dwell,
         Self::ChamferTop,
         Self::ChamferWidth,
@@ -391,6 +403,10 @@ impl OperationParameter {
             Self::FaceOvershoot => "faceOvershoot",
             Self::DrillStartOffset => "drillStartOffset",
             Self::Peck => "peck",
+            Self::PeckReduction => "peckReduction",
+            Self::MinimumPeck => "minimumPeck",
+            Self::AccumulatedPeck => "accumulatedPeck",
+            Self::ChipBreakDistance => "chipBreakDistance",
             Self::Dwell => "dwell",
             Self::ChamferTop => "chamferTop",
             Self::ChamferWidth => "chamferWidth",
@@ -566,8 +582,32 @@ impl OperationParameter {
             (Operation::Face(o), Self::PlungeFeed) => Some(o.plunge_feed),
             (Operation::Drill(o), Self::Depth) => Some(o.depth),
             (Operation::Drill(o), Self::DrillStartOffset) => Some(o.start_offset),
-            (Operation::Drill(o), Self::Peck) => Some(o.peck.unwrap_or(0.0)),
-            (Operation::Drill(o), Self::Dwell) => Some(o.dwell.unwrap_or(0.0)),
+            (Operation::Drill(o), Self::Peck)
+                if o.cycle.mode.is_none() || o.cycle_mode().pecks() =>
+            {
+                Some(o.peck.unwrap_or(0.0))
+            }
+            (Operation::Drill(o), Self::Dwell)
+                if o.cycle.mode.is_none() || o.cycle_mode() != crate::DrillCycleMode::RapidOut =>
+            {
+                Some(o.dwell.unwrap_or(0.0))
+            }
+            (Operation::Drill(o), Self::PeckReduction) if o.cycle_mode().pecks() => {
+                Some(o.cycle.peck_reduction)
+            }
+            (Operation::Drill(o), Self::MinimumPeck) if o.cycle_mode().pecks() => {
+                Some(o.minimum_peck())
+            }
+            (Operation::Drill(o), Self::AccumulatedPeck)
+                if o.cycle_mode() == crate::DrillCycleMode::ChipBreaking =>
+            {
+                Some(o.cycle.accumulated_peck)
+            }
+            (Operation::Drill(o), Self::ChipBreakDistance)
+                if o.cycle_mode() == crate::DrillCycleMode::ChipBreaking =>
+            {
+                Some(o.cycle.chip_break_distance)
+            }
             (Operation::Drill(o), Self::Feed) => Some(o.feed),
             (Operation::Engrave(o), Self::Depth) => Some(o.depth),
             (Operation::Engrave(o), Self::Stepdown) => Some(o.stepdown),
@@ -1017,7 +1057,25 @@ impl OperationParameter {
                 o.start_offset = value;
             }
             (Operation::Drill(o), Self::Peck) => {
-                o.peck = (value > 0.).then_some(value);
+                o.set_peck(value);
+            }
+            (Operation::Drill(o), Self::PeckReduction) => {
+                if value != o.cycle.peck_reduction {
+                    o.set_cycle_mode(o.cycle_mode());
+                    o.cycle.peck_reduction = value;
+                }
+            }
+            (Operation::Drill(o), Self::MinimumPeck) => {
+                if value != o.minimum_peck() {
+                    o.set_cycle_mode(o.cycle_mode());
+                    o.cycle.minimum_peck = value;
+                }
+            }
+            (Operation::Drill(o), Self::AccumulatedPeck) => {
+                o.cycle.accumulated_peck = value;
+            }
+            (Operation::Drill(o), Self::ChipBreakDistance) => {
+                o.cycle.chip_break_distance = value;
             }
             (Operation::Drill(o), Self::Dwell) => {
                 o.dwell = (value > 0.).then_some(value);
@@ -1430,6 +1488,10 @@ impl OperationParameter {
         }
         let invalid = match self {
             Self::CuttingSpeed | Self::FeedPerTooth => value <= 0.,
+            Self::Peck if matches!(op, Operation::Drill(drill) if drill.cycle_mode().pecks()) => {
+                value <= 0.
+            }
+            Self::MinimumPeck | Self::ChipBreakDistance => value <= 0.,
             Self::MaximumStepover
             | Self::ContourRoughSmoothing
             | Self::Depth

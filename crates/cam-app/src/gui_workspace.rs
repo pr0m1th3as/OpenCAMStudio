@@ -1695,6 +1695,10 @@ mod tests {
         for x in [10., 25.] {
             app.controller
                 .add_operation(Operation::Drill(cam_model::DrillOp {
+                    cycle: Default::default(),
+                    tip_through_bottom: false,
+                    geometry: Default::default(),
+                    hole_heights: Vec::new(),
                     parameter_expressions: Default::default(),
                     id: 0,
                     tool: 1,
@@ -1814,6 +1818,10 @@ mod tests {
         let center = [(min[0] + max[0]) / 2., (min[1] + max[1]) / 2.];
         app.controller
             .add_operation(Operation::Drill(cam_model::DrillOp {
+                cycle: Default::default(),
+                tip_through_bottom: false,
+                geometry: Default::default(),
+                hole_heights: Vec::new(),
                 parameter_expressions: Default::default(),
                 id: 0,
                 tool: 1,
@@ -1896,6 +1904,10 @@ mod tests {
 
         app.controller
             .add_operation(Operation::Drill(cam_model::DrillOp {
+                cycle: Default::default(),
+                tip_through_bottom: false,
+                geometry: Default::default(),
+                hole_heights: Vec::new(),
                 parameter_expressions: Default::default(),
                 id: 0,
                 tool: 1,
@@ -1967,6 +1979,10 @@ mod tests {
         for x in [10., 25.] {
             app.controller
                 .add_operation(Operation::Drill(cam_model::DrillOp {
+                    cycle: Default::default(),
+                    tip_through_bottom: false,
+                    geometry: Default::default(),
+                    hole_heights: Vec::new(),
                     parameter_expressions: Default::default(),
                     id: 0,
                     tool: 1,

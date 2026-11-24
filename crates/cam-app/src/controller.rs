@@ -1197,7 +1197,7 @@ impl AppController {
             ) {
             crate::cad_operations::selection_height_defaults(&preview, &op)
         } else {
-            cam_model::OperationHeightSettings::default()
+            cam_model::OperationHeightSettings::for_operation(&op)
         };
         preview.setup_mut().height_settings.insert(id, settings);
         preview.setup_mut().operations.push(op);
@@ -1377,9 +1377,7 @@ impl AppController {
             );
         }
         let mut preview = self.geometry_state().clone();
-        if let Some(asset) = preview.assets.iter_mut().find(|a| a.id == id) {
-            *asset = replacement;
-        }
+        let mut rebound_drill = false;
         if !keep_references {
             let reason = match update {
                 CadModelUpdate::Replace(_) => "Model replaced; review and reselect its geometry",
@@ -1387,18 +1385,56 @@ impl AppController {
                     "Reloaded model geometry changed; review and reselect it"
                 }
             };
-            for binding in preview
+            for (&operation, binding) in preview
                 .bindings
-                .values_mut()
-                .filter(|b| b.selected.iter().any(|r| r.asset_id == id))
+                .iter_mut()
+                .filter(|(_, b)| b.selected.iter().any(|r| r.asset_id == id))
             {
+                let matches_diameter = self
+                    .setups()
+                    .iter()
+                    .flat_map(|setup| &setup.operations)
+                    .any(|op| {
+                        matches!(op, Operation::Drill(drill)
+                            if drill.id == operation && drill.geometry.select_same_diameter)
+                    });
+                if matches!(update, CadModelUpdate::Reload(_))
+                    && matches_diameter
+                    && matches!(binding.status, cam_model::ResolutionStatus::Resolved)
+                {
+                    let selected = binding
+                        .selected
+                        .iter()
+                        .map(|reference| {
+                            if reference.asset_id == id {
+                                cam_geometry3d::rebind_drill_face(old, &replacement, reference)
+                            } else {
+                                Some(reference.clone())
+                            }
+                        })
+                        .collect::<Option<Vec<_>>>();
+                    if let Some(selected) = selected {
+                        binding.selected = selected;
+                        binding.resolved_fingerprint = None;
+                        rebound_drill = true;
+                        continue;
+                    }
+                }
                 binding.status = cam_model::ResolutionStatus::NeedsReselection {
                     reason: reason.into(),
                 };
             }
         }
+        if let Some(asset) = preview.assets.iter_mut().find(|a| a.id == id) {
+            *asset = replacement;
+        }
         preview.validate()?;
-        self.edit_document(move |doc| doc.geometry = preview);
+        self.edit_document(move |doc| {
+            doc.geometry = preview;
+            if rebound_drill {
+                crate::cad_operations::refresh_binding_heights(doc);
+            }
+        });
         self.cad_selection.clear();
         self.invalidate();
         Ok(())
@@ -2110,7 +2146,7 @@ impl AppController {
         self.edit_setup_document(move |doc| {
             doc.setup_mut()
                 .height_settings
-                .insert(id, cam_model::OperationHeightSettings::default());
+                .insert(id, cam_model::OperationHeightSettings::for_operation(&op));
             doc.setup_mut().operations.push(op);
         });
         self.selection = Selection::Operation(id);
@@ -2452,6 +2488,10 @@ impl AppController {
                 })
             }
             OpKind::Drill => Operation::Drill(DrillOp {
+                cycle: Default::default(),
+                tip_through_bottom: false,
+                geometry: Default::default(),
+                hole_heights: Vec::new(),
                 parameter_expressions: Default::default(),
                 id: 0,
                 tool,
@@ -2999,6 +3039,10 @@ impl AppController {
                     let dia = (xmax - xmin).min(ymax - ymin);
                     if dia <= p.tool_diameter + 1e-9 {
                         operations.push(Operation::Drill(DrillOp {
+                            cycle: Default::default(),
+                            tip_through_bottom: false,
+                            geometry: Default::default(),
+                            hole_heights: Vec::new(),
                             parameter_expressions: Default::default(),
                             id,
                             tool: 1,
@@ -3928,6 +3972,10 @@ mod tests {
             doc.setup_mut()
                 .operations
                 .push(Operation::Drill(cam_model::DrillOp {
+                    cycle: Default::default(),
+                    tip_through_bottom: false,
+                    geometry: Default::default(),
+                    hole_heights: Vec::new(),
                     parameter_expressions: Default::default(),
                     id: third,
                     tool: 1,

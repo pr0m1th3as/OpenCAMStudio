@@ -22,6 +22,8 @@ mod spiral;
 pub use spiral::*;
 mod bore;
 pub use bore::{BoreOp, BoreOrder};
+mod drill_cycle;
+pub use drill_cycle::{DrillCycleMode, DrillCycleSettings};
 mod thread_standards;
 pub use thread_standards::*;
 mod document;
@@ -50,8 +52,8 @@ mod validate;
 pub use cam_cldata::Point3;
 pub use document::{
     AdaptiveContainment, AdaptiveOp, AdaptiveParams, Axis, CarveClearing, CarveOp, ChamferFace,
-    ChamferOp, CircularDistribution, ClearParams, Clearing, Comp, Document, DrillOp, EngraveOp,
-    ExecutionItem, FaceOp, Hand, Heights, Lead, LinearPatternDirection, Operation,
+    ChamferOp, CircularDistribution, ClearParams, Clearing, Comp, Document, DrillGeometry, DrillOp,
+    EngraveOp, ExecutionItem, FaceOp, Hand, Heights, Lead, LinearPatternDirection, Operation,
     OperationPattern, Origin, ParallelOp, PatternDirection, PatternKind, PatternOptions,
     PatternOrder, PatternSpacing, Plunge, PocketOp, ProfileContour, ProfileOp, ProfileTabs, Setup,
     Side, SpiralOp, Stock, StockAxis, StockAxisReference, StockOriginAxis, StockToLeave, ThreadOp,

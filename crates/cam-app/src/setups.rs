@@ -869,7 +869,7 @@ impl AppController {
         let id = operation.id();
         let mut document =
             self.prepare_operation_settings(operation, overrides, tools, geometry, None, None)?;
-        settings.resolve(
+        crate::cad_operations::resolve_height_settings(
             &document,
             document
                 .setup()
@@ -877,6 +877,7 @@ impl AppController {
                 .iter()
                 .find(|o| o.id() == id)
                 .unwrap(),
+            &settings,
         )?;
         document.setup_mut().height_settings.insert(id, settings);
         if document != *self.document() {
@@ -929,7 +930,7 @@ impl AppController {
             None,
             Some(index),
         )?;
-        settings.resolve(
+        crate::cad_operations::resolve_height_settings(
             &document,
             document
                 .setup()
@@ -937,6 +938,7 @@ impl AppController {
                 .iter()
                 .find(|o| o.id() == id)
                 .unwrap(),
+            &settings,
         )?;
         document.setup_mut().height_settings.insert(id, settings);
         if stock_to_leave.enabled {
@@ -1545,6 +1547,10 @@ mod tests {
     use super::*;
     fn drill() -> Operation {
         Operation::Drill(DrillOp {
+            cycle: Default::default(),
+            tip_through_bottom: false,
+            geometry: Default::default(),
+            hole_heights: Vec::new(),
             parameter_expressions: Default::default(),
             id: 0,
             tool: 1,

@@ -1115,8 +1115,16 @@ impl App {
             Field::Stepdown,
             Field::Overlap,
             Field::Peck,
+            Field::MinimumPeck,
         ] {
-            if matches!(field, Field::Stepdown | Field::Peck) && preset.stepdown.is_none() {
+            if matches!(field, Field::Stepdown | Field::Peck | Field::MinimumPeck)
+                && preset.stepdown.is_none()
+            {
+                continue;
+            }
+            if matches!(field, Field::Peck | Field::MinimumPeck)
+                && matches!(op, Operation::Drill(drill) if !drill.cycle_mode().pecks())
+            {
                 continue;
             }
             if field == Field::Overlap && preset.overlap.is_none() {

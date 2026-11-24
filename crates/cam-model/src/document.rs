@@ -972,13 +972,40 @@ impl ProfileOp {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct DrillGeometry {
+    pub select_same_diameter: bool,
+    pub auto_merge_hole_segments: bool,
+    pub order_by_depth: bool,
+    pub order: crate::BoreOrder,
+    pub reverse_order: bool,
+}
+
+impl DrillGeometry {
+    pub fn uses_model_heights(self) -> bool {
+        self.select_same_diameter || self.auto_merge_hole_segments || self.order_by_depth
+    }
+
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// A drilling operation: a set of holes taken to a depth, optionally pecked and
 /// dwelled. It is emitted as a Tier-2 cycle intent, so each post lowers it per
 /// its capabilities (canned `G83` on Fanuc, explicit pecks on grbl).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DrillOp {
+    #[serde(default, skip_serializing_if = "crate::DrillCycleSettings::is_default")]
+    pub cycle: crate::DrillCycleSettings,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub parameter_expressions: std::collections::BTreeMap<crate::OperationParameter, String>,
+    #[serde(default, skip_serializing_if = "DrillGeometry::is_default")]
+    pub geometry: DrillGeometry,
+    /// Setup-space cutting intervals aligned with points for resolved CAD holes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hole_heights: Vec<crate::CuttingHeights>,
     /// Operation id.
     pub id: u32,
     /// Tool number.
@@ -989,6 +1016,9 @@ pub struct DrillOp {
     /// starts** — i.e. from `top_of_stock + start_offset`. The bottom sits at
     /// absolute Z `top_of_stock + start_offset - depth`.
     pub depth: f64,
+    /// Align the full-diameter cutting lip with the programmed bottom.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tip_through_bottom: bool,
     /// Where the hole begins, as a height **above the stock top** (mm), matching the
     /// Face convention. `0` (the default) starts at the stock top; positive starts it
     /// above the surface (a proud boss); negative below (a recessed/faced surface).
@@ -3353,6 +3383,10 @@ mod tests {
     fn same_work_across_kinds_is_false() {
         let prof = profile(0);
         let drill = Operation::Drill(DrillOp {
+            cycle: Default::default(),
+            tip_through_bottom: false,
+            geometry: Default::default(),
+            hole_heights: Vec::new(),
             parameter_expressions: Default::default(),
             spindle_rpm: 0.0,
             tool_preset: None,

@@ -92,14 +92,16 @@ pub(super) fn operation_fields(op: &Operation) -> Vec<Field> {
             Field::Feed,
             Field::PlungeFeed,
         ],
-        Operation::Drill(_) => vec![
-            Field::Depth,
-            Field::DrillStartOffset,
-            Field::Peck,
-            Field::Dwell,
-            Field::SpindleRpm,
-            Field::Feed,
-        ],
+        Operation::Drill(drill) => {
+            let mut fields = vec![
+                Field::Depth,
+                Field::DrillStartOffset,
+                Field::SpindleRpm,
+                Field::Feed,
+            ];
+            fields.extend_from_slice(drill_cycle::fields(drill.cycle_mode()));
+            fields
+        }
         Operation::Chamfer(c) => {
             let mut fields = vec![
                 // Heights first and top-down, as the Setup inspector reads.

@@ -319,7 +319,12 @@ impl Operation {
             // A drilling feed is axial: use the preset's plunge feed.
             Self::Drill(o) => {
                 if let Some(step) = preset.stepdown {
-                    o.peck = Some(step);
+                    if o.cycle.mode.is_none() || o.cycle_mode().pecks() {
+                        o.peck = Some(step);
+                        if o.cycle.mode.is_some() {
+                            o.cycle.minimum_peck = o.cycle.minimum_peck.min(step);
+                        }
+                    }
                 }
                 (&mut o.feed, None, None, None, &mut o.tool_preset)
             }

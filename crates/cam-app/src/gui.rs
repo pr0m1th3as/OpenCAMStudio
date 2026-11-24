@@ -105,6 +105,8 @@ mod creation;
 mod cutting_data;
 #[path = "gui_cutting_forces.rs"]
 mod cutting_forces;
+#[path = "gui_drill_cycle.rs"]
+mod drill_cycle;
 #[cfg(test)]
 #[path = "gui_performance.rs"]
 mod performance;
@@ -1372,6 +1374,10 @@ enum Field {
     DrillStartOffset,
     /// Drill peck increment (mm); 0 = drill straight to depth (no peck).
     Peck,
+    PeckReduction,
+    MinimumPeck,
+    AccumulatedPeck,
+    ChipBreakDistance,
     /// Drill dwell at the hole bottom (seconds); 0 = no dwell.
     Dwell,
     Stepdown,
@@ -1564,8 +1570,12 @@ impl Field {
             Field::ToolThreadPitch => "Pitch (mm)",
             Field::Depth => "Depth (mm)",
             Field::DrillStartOffset => "Start offset (mm)",
-            Field::Peck => "Peck (mm, 0=off)",
-            Field::Dwell => "Dwell (s, 0=off)",
+            Field::Peck => "Pecking Depth (mm)",
+            Field::PeckReduction => "Pecking Depth Reduction (mm)",
+            Field::MinimumPeck => "Minimum Pecking Depth (mm)",
+            Field::AccumulatedPeck => "Accumulated Pecking Depth (mm)",
+            Field::ChipBreakDistance => "Chip Break Distance (mm)",
+            Field::Dwell => "Dwelling Period (s)",
             Field::TabWidth => "Tab width (mm)",
             Field::TabHeight => "Tab height (mm)",
             Field::TabSpacing => "Tab spacing (mm)",
@@ -1825,10 +1835,12 @@ impl Field {
                  (a recessed or faced surface). Depth is measured down from here."
             }
             Field::Peck => {
-                "Peck-drilling increment (mm): the drill cuts this deep, fully retracts \
-                 to clear chips, then returns and repeats until it reaches depth. \
-                 0 = drill straight to depth in one plunge (no pecking)."
+                "Depth of the first peck in millimetres."
             }
+            Field::PeckReduction => "Subtract this depth from each successive peck. Enter 0 to keep the peck depth constant.",
+            Field::MinimumPeck => "Lower limit for each peck after reduction. The last cut can be shorter to reach the exact hole bottom.",
+            Field::AccumulatedPeck => "After cutting this much depth since the previous full pullout, retract fully to clear chips. Enter 0 to use short withdrawals until the hole is complete.",
+            Field::ChipBreakDistance => "Distance the drill lifts between pecks to break the chip.",
             Field::Dwell => {
                 "Dwell at the bottom of the hole (seconds): the tool pauses with the \
                  spindle turning before retracting, cleaning up the hole bottom. \
@@ -2785,7 +2797,7 @@ fn drill_marks_of(program: &Program) -> Vec<DrillMark> {
                     k += 1;
                 }
             }
-            if c.dwell.is_some() {
+            if c.dwell.is_some_and(|seconds| seconds > 0.0) {
                 marks.push(DrillMark {
                     at: [x, y, c.depth as f32],
                     kind: DrillMarkKind::DwellBar,
@@ -2994,6 +3006,8 @@ enum Message {
     ParameterSuggestionMove(Field, i32),
     HeightReferenceChanged(cam_model::HeightPlaneKind, cam_model::HeightReference),
     HeightOffsetChanged(cam_model::HeightPlaneKind, String),
+    DrillTipThroughBottomToggled(bool),
+    DrillCycleChanged(cam_model::DrillCycleMode),
     HeightSourceToggled(cam_model::HeightPlaneKind, cam_model::HeightReference, bool),
     HeightSectionToggle(cam_model::HeightPlaneKind),
     HeightFeedEnabled(bool),
@@ -6320,6 +6334,14 @@ impl App {
                 self.height_offsets.insert(plane, value);
                 self.focused_height = Some(height_editor::plane_input_id(plane));
             }
+            Message::DrillTipThroughBottomToggled(enabled) => {
+                self.edit_operation_draft(|operation| {
+                    if let Operation::Drill(drill) = operation {
+                        drill.tip_through_bottom = enabled;
+                    }
+                });
+            }
+            Message::DrillCycleChanged(mode) => self.change_drill_cycle(mode),
             Message::HeightSourceToggled(plane, reference, on) => {
                 if let Some(settings) = &mut self.height_draft {
                     let sources = &mut settings.definition_mut(plane).sources;
@@ -6331,7 +6353,10 @@ impl App {
                 self.focused_height = Some(height_editor::plane_input_id(plane));
             }
             Message::HeightDefaults => {
-                let settings = cam_model::OperationHeightSettings::default();
+                let settings = self
+                    .parameter_operation()
+                    .map(cam_model::OperationHeightSettings::for_operation)
+                    .unwrap_or_default();
                 self.height_offsets = cam_model::HeightPlaneKind::ALL
                     .into_iter()
                     .map(|p| (p, fmt_num(settings.definition(p).offset)))
@@ -7936,10 +7961,17 @@ impl App {
                             .set_pending_operation_geometry(&selected, Some(point))
                         {
                             Ok(()) => {
-                                self.status = format!(
-                                "{} compatible feature(s) selected; Confirm creates the operation.",
-                                selected.len()
-                            )
+                                self.status = if self.geometry_editor.is_some() {
+                                    format!(
+                                        "{} compatible feature(s) selected. Use OK to stage them.",
+                                        selected.len()
+                                    )
+                                } else {
+                                    format!(
+                                        "{} compatible feature(s) selected; Confirm creates the operation.",
+                                        selected.len()
+                                    )
+                                };
                             }
                             Err(error) => self.report_error(error),
                         }
@@ -12455,7 +12487,11 @@ impl App {
                     return;
                 }
             }
-            let _ = self.update(Message::EditCadGeometry(id));
+            if self.geometry_operation_kind() == Some(OpKind::Drill) {
+                self.operation_geometry_message(GeometryMessage::Add(CadFilter::Face));
+            } else {
+                let _ = self.update(Message::EditCadGeometry(id));
+            }
             self.geometry_additive = true;
             self.geometry_auto_pick = false;
         }
@@ -13849,6 +13885,10 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Drill(o), Field::DrillStartOffset) => Some(o.start_offset),
         (Operation::Drill(o), Field::Peck) => Some(o.peck.unwrap_or(0.0)),
         (Operation::Drill(o), Field::Dwell) => Some(o.dwell.unwrap_or(0.0)),
+        (Operation::Drill(o), Field::PeckReduction) => Some(o.cycle.peck_reduction),
+        (Operation::Drill(o), Field::MinimumPeck) => Some(o.minimum_peck()),
+        (Operation::Drill(o), Field::AccumulatedPeck) => Some(o.cycle.accumulated_peck),
+        (Operation::Drill(o), Field::ChipBreakDistance) => Some(o.cycle.chip_break_distance),
         (Operation::Drill(o), Field::Feed) => Some(o.feed),
         (Operation::Engrave(o), Field::Depth) => Some(o.depth),
         (Operation::Engrave(o), Field::Stepdown) => Some(o.stepdown),
@@ -14106,14 +14146,26 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
                 o.start_offset = v;
             }
             if let Some(v) = get(Field::Peck) {
-                // 0 (or negative) clears pecking; the toolpath requires peck > 0.
-                o.peck = (v > 0.0).then_some(v);
+                o.set_peck(v);
             }
             if let Some(v) = get(Field::Dwell) {
                 o.dwell = (v > 0.0).then_some(v);
             }
             if let Some(v) = get(Field::Feed) {
                 o.feed = v;
+            }
+            let reduction = get(Field::PeckReduction).unwrap_or(o.cycle.peck_reduction);
+            let minimum = get(Field::MinimumPeck).unwrap_or_else(|| o.minimum_peck());
+            if reduction != o.cycle.peck_reduction || minimum != o.minimum_peck() {
+                o.set_cycle_mode(o.cycle_mode());
+                o.cycle.peck_reduction = reduction;
+                o.cycle.minimum_peck = minimum;
+            }
+            if let Some(v) = get(Field::AccumulatedPeck) {
+                o.cycle.accumulated_peck = v;
+            }
+            if let Some(v) = get(Field::ChipBreakDistance) {
+                o.cycle.chip_break_distance = v;
             }
         }
         Operation::Chamfer(o) => {
@@ -18398,6 +18450,10 @@ mod inspector_field_tests {
 
     fn drill(peck: Option<f64>, dwell: Option<f64>) -> Operation {
         Operation::Drill(DrillOp {
+            cycle: Default::default(),
+            tip_through_bottom: false,
+            geometry: Default::default(),
+            hole_heights: Vec::new(),
             parameter_expressions: Default::default(),
             spindle_rpm: 0.0,
             tool_preset: None,
@@ -18416,12 +18472,28 @@ mod inspector_field_tests {
     }
 
     #[test]
-    fn drill_exposes_peck_and_dwell_fields() {
-        // This used to hand-build the list it then asserted on, so it could only ever
-        // agree with itself. It now asks the inspector's own rule.
-        let fields = operation_fields(&drill(None, None));
-        assert!(fields.contains(&Field::Peck));
-        assert!(fields.contains(&Field::Dwell));
+    fn drill_exposes_fields_for_the_selected_cycle() {
+        use cam_model::DrillCycleMode;
+        let mut op = drill(None, None);
+        for mode in DrillCycleMode::ALL {
+            if let Operation::Drill(drill) = &mut op {
+                drill.set_cycle_mode(mode);
+            }
+            let fields = operation_fields(&op);
+            assert_eq!(fields.contains(&Field::Peck), mode.pecks());
+            assert_eq!(
+                fields.contains(&Field::Dwell),
+                mode != DrillCycleMode::RapidOut
+            );
+            assert_eq!(
+                fields.contains(&Field::ChipBreakDistance),
+                mode == DrillCycleMode::ChipBreaking
+            );
+            assert_eq!(
+                fields.contains(&Field::AccumulatedPeck),
+                mode == DrillCycleMode::ChipBreaking
+            );
+        }
     }
 
     fn chamfer(top: f64) -> Operation {

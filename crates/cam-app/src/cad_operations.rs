@@ -587,6 +587,10 @@ pub(crate) fn create_operation(
             clearing: Clearing::default(),
         }),
         OpKind::Drill => Operation::Drill(DrillOp {
+            cycle: Default::default(),
+            tip_through_bottom: false,
+            geometry: Default::default(),
+            hole_heights: Vec::new(),
             parameter_expressions: Default::default(),
             id,
             tool,
@@ -823,8 +827,141 @@ pub(crate) fn create_operation(
     Ok((op, binding))
 }
 
+/// Rebuild the cached drill sites and their shared reference interval from the model.
+pub(crate) fn apply_drill_holes(
+    drill: &mut DrillOp,
+    holes: &[cam_geometry3d::DrillHole],
+    stock_top: f64,
+) -> Result<CuttingHeights, String> {
+    let heights = drill_reference_heights(holes)?;
+    drill.points = holes
+        .iter()
+        .map(|hole| [hole.center.x, hole.center.y])
+        .collect();
+    drill.hole_heights = holes.iter().map(|hole| hole.heights).collect();
+    drill.depth = heights.depth();
+    drill.start_offset = heights.top - stock_top;
+    Ok(heights)
+}
+
+fn drill_reference_heights(holes: &[cam_geometry3d::DrillHole]) -> Result<CuttingHeights, String> {
+    let first = holes.first().ok_or("Select hole faces")?;
+    Ok(holes
+        .iter()
+        .skip(1)
+        .fold(first.heights, |heights, hole| CuttingHeights {
+            top: heights.top.max(hole.heights.top),
+            bottom: heights.bottom.min(hole.heights.bottom),
+        }))
+}
+
+fn uses_drill_model_heights(
+    document: &Document,
+    operation: &Operation,
+    binding: &GeometryBinding,
+) -> bool {
+    binding.recipe == ExtractionRecipe::DrillHoles
+        && matches!(operation, Operation::Drill(drill)
+            if drill.geometry.uses_model_heights()
+                || document.setup().height_settings.get(&drill.id)
+                    .is_some_and(OperationHeightSettings::uses_hole_references))
+}
+
+fn binding_base_heights(
+    document: &Document,
+    geometry: &GeometryState,
+    binding: &GeometryBinding,
+    operation: &Operation,
+) -> Result<CuttingHeights, String> {
+    match operation {
+        Operation::Drill(drill) if uses_drill_model_heights(document, operation, binding) => {
+            drill_reference_heights(&cam_geometry3d::drill_holes(
+                geometry,
+                binding,
+                drill.geometry,
+            )?)
+        }
+        _ => Ok(cam_geometry3d::resolve_binding_advisory(geometry, binding)?.heights),
+    }
+}
+
+pub(crate) fn resolve_height_settings(
+    document: &Document,
+    operation: &Operation,
+    settings: &OperationHeightSettings,
+) -> Result<ResolvedOperationHeights, String> {
+    if settings.uses_hole_references() {
+        if let Operation::Drill(drill) = operation {
+            if let Some(binding) = document.geometry.bindings.get(&drill.id) {
+                let geometry = geometry_for_operation(document, drill.id)?;
+                let holes = cam_geometry3d::drill_holes(&geometry, binding, drill.geometry)?;
+                let heights: Vec<_> = holes.iter().map(|hole| hole.heights).collect();
+                return settings
+                    .resolve_drill_holes(document, operation, &heights)
+                    .map(|(common, _)| common);
+            }
+        }
+    }
+    settings.resolve(document, operation)
+}
+
+fn apply_drill_height_settings(
+    document: &Document,
+    binding: &GeometryBinding,
+    base: CuttingHeights,
+    drill: &mut DrillOp,
+) -> Result<Option<ResolvedOperationHeights>, String> {
+    let Some(settings) = document.setup().height_settings.get(&drill.id) else {
+        return Ok(None);
+    };
+    let operation = Operation::Drill(drill.clone());
+    if settings.uses_hole_references() {
+        let (common, cutting) =
+            settings.resolve_drill_holes(document, &operation, &drill.hole_heights)?;
+        drill.hole_heights = cutting;
+        return Ok(Some(common));
+    }
+
+    let mut source = document
+        .indexed_view(drill.id)?
+        .unwrap_or_else(|| document.clone());
+    source.geometry.bindings.insert(
+        drill.id,
+        GeometryBinding {
+            heights: base,
+            ..binding.clone()
+        },
+    );
+    let heights = settings.resolve(&source, &operation)?;
+    let top = settings.definition(HeightPlaneKind::Top);
+    let bottom = settings.definition(HeightPlaneKind::Bottom);
+    // The default stock reference follows each hole's entry with stock allowance.
+    // A custom reference supplies one top plane for all holes.
+    let use_modeled_top =
+        top == OperationHeightSettings::default().definition(HeightPlaneKind::Top);
+    let stock_allowance = (heights.stock_top - source.height_model_bounds().1[2]).max(0.);
+    for hole in &mut drill.hole_heights {
+        hole.top = if use_modeled_top {
+            binding.overrides.top.unwrap_or(hole.top + stock_allowance)
+        } else {
+            heights.top
+        };
+        hole.bottom = match bottom.reference {
+            HeightReference::SelectedContours => hole.bottom + bottom.offset,
+            HeightReference::Plane(HeightPlaneKind::Top) => hole.top + bottom.offset,
+            _ => heights.bottom,
+        };
+        hole.validate()?;
+        if hole.top > heights.retract || hole.top > heights.clearance {
+            return Err("Drill hole entry height is above clearance or retract".into());
+        }
+    }
+    Ok(Some(heights))
+}
+
 /// A fresh topology resolution replaces every linked strategy input. Stale
 /// embedded contours are never a fallback after asset replacement or removal.
+#[cfg(test)]
 pub(crate) fn resolve_document(document: &Document) -> Result<Document, String> {
     resolve_document_checked(document, &|| false).map_err(|diagnostic| diagnostic.message)
 }
@@ -925,6 +1062,14 @@ pub(crate) fn resolve_document_checked(
     document: &Document,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Document, cam_toolpath::Diagnostic> {
+    resolve_document_input(document, cancelled, true)
+}
+
+fn resolve_document_input(
+    document: &Document,
+    cancelled: &dyn Fn() -> bool,
+    evaluate_heights: bool,
+) -> Result<Document, cam_toolpath::Diagnostic> {
     let error = |message: String| {
         cam_toolpath::Diagnostic::error(message)
             .with_code(cam_toolpath::DiagnosticCode::GeometryUnresolved)
@@ -948,11 +1093,17 @@ pub(crate) fn resolve_document_checked(
     // Resolve all reference geometry in its source placement, before rotating
     // instances for the strategy adapters. Keep a worker-only absolute snapshot.
     for operation in &prepared_operations {
-        if !document.operation_is_included(document.setup().id, operation.id()) {
+        if !evaluate_heights || !document.operation_is_included(document.setup().id, operation.id())
+        {
             continue;
         }
         if operation.rotary_wrap().is_some()
             || document.rotary_indexes.contains_key(&operation.id())
+            || document
+                .geometry
+                .bindings
+                .get(&operation.id())
+                .is_some_and(|binding| uses_drill_model_heights(document, operation, binding))
         {
             continue;
         }
@@ -990,7 +1141,13 @@ pub(crate) fn resolve_document_checked(
                 resolve_wrapped_operation(&resolved.geometry, operation)?;
                 resolved.geometry.bindings.remove(&id);
                 resolved.cad_linked_operations.remove(&id);
-                if let Some(settings) = resolved.setup().height_settings.get(&id).cloned() {
+                if let Some(settings) = resolved
+                    .setup()
+                    .height_settings
+                    .get(&id)
+                    .filter(|_| evaluate_heights)
+                    .cloned()
+                {
                     let mut settings = settings;
                     settings.resolved = None;
                     // The wrap now carries its developed CAD floor, but stock
@@ -1031,6 +1188,55 @@ pub(crate) fn resolve_document_checked(
             } else if !matches!(binding.recipe, ExtractionRecipe::ProfileEntries { .. }) {
                 validate_selection(&resolved.geometry, &binding.selected)
                     .map_err(|e| format!("Operation {id}: {e}"))?;
+            }
+            if uses_drill_model_heights(document, operation, binding) {
+                let Operation::Drill(drill) = operation else {
+                    unreachable!()
+                };
+                let tool = resolved
+                    .setup()
+                    .tools
+                    .iter()
+                    .find(|tool| tool.number == drill.tool)
+                    .ok_or("Missing drill tool")?;
+                let stock_top = resolved.setup().heights_for(id).top_of_stock;
+                let holes =
+                    cam_geometry3d::drill_holes(&resolved.geometry, binding, drill.geometry)?;
+                if holes
+                    .iter()
+                    .any(|hole| (hole.diameter - tool.diameter).abs() > 1e-3)
+                {
+                    return Err(format!(
+                        "Operation {id}: drill diameter must match the selected bore"
+                    ));
+                }
+                let heights = apply_drill_holes(drill, &holes, stock_top)?;
+                if evaluate_heights {
+                    if let Some(settings) =
+                        apply_drill_height_settings(document, binding, heights, drill)?
+                    {
+                        resolved
+                            .setup_mut()
+                            .height_settings
+                            .get_mut(&id)
+                            .unwrap()
+                            .resolved = Some(settings);
+                    }
+                }
+                let cache = resolved.geometry.bindings.get_mut(&id).unwrap();
+                cache.status = ResolutionStatus::Resolved;
+                cache.heights = heights;
+                cache.overrides = GeometryOverrides::default();
+                let fingerprint = resolved
+                    .geometry
+                    .binding_fingerprint(&resolved.geometry.bindings[&id]);
+                resolved
+                    .geometry
+                    .bindings
+                    .get_mut(&id)
+                    .unwrap()
+                    .resolved_fingerprint = Some(fingerprint);
+                return Ok(());
             }
             let mut current_binding = binding.clone();
             if surface_recipe(&binding.recipe) {
@@ -1221,6 +1427,7 @@ pub(crate) fn resolve_document_checked(
                         .iter()
                         .map(|h| [h.center.x, h.center.y])
                         .collect();
+                    p.hole_heights.clear();
                     p.depth = depth;
                     p.start_offset =
                         input.heights.top - document.setup().heights_for(id).top_of_stock;
@@ -1265,8 +1472,16 @@ pub(crate) fn resolve_document_checked(
         })();
         resolved.geometry.instances = base_instances;
         resolved_operation.map_err(|message| error(message).for_op(id))?;
-        if document.rotary_indexes.contains_key(&id) {
+        if evaluate_heights && document.rotary_indexes.contains_key(&id) {
             if let Some(settings) = document.setup().height_settings.get(&id) {
+                if document
+                    .geometry
+                    .bindings
+                    .get(&id)
+                    .is_some_and(|binding| uses_drill_model_heights(document, operation, binding))
+                {
+                    continue;
+                }
                 // References such as SelectedContours depend on the binding's
                 // cutting interval. Resolve it after extracting indexed CAD,
                 // while keeping original placements for the indexed view.
@@ -1328,10 +1543,10 @@ pub(crate) fn selection_height_defaults(
     document: &Document,
     operation: &Operation,
 ) -> OperationHeightSettings {
-    let mut settings = OperationHeightSettings::default();
+    let mut settings = OperationHeightSettings::for_operation(operation);
     // Pocket floors, loops and closed edge chains all describe the target
     // bottom plane. Start at stock top, including after geometry replacement.
-    if matches!(operation, Operation::Pocket(_)) {
+    if matches!(operation, Operation::Pocket(_) | Operation::Drill(_)) {
         return settings;
     }
     if matches!(
@@ -1425,8 +1640,8 @@ pub(crate) fn validate_binding_edit(document: &mut Document, id: u32) -> Result<
     let mut preview = document.clone();
     preview.setup_mut().operations.retain(|op| op.id() == id);
     // Geometry repair is independent of the height editor's pending references.
-    preview.setup_mut().height_settings.clear();
-    let resolved = resolve_document(&preview)?;
+    let resolved = resolve_document_input(&preview, &|| false, false)
+        .map_err(|diagnostic| diagnostic.message)?;
     let operation = resolved
         .setup()
         .operations
@@ -1449,10 +1664,10 @@ pub(crate) fn validate_binding_edit(document: &mut Document, id: u32) -> Result<
     if matches!(base.recipe, ExtractionRecipe::FaceRegion) {
         base.heights.top = operation_stock_top(document, id)?;
     }
-    let input =
-        cam_geometry3d::resolve_binding_advisory(&geometry_for_operation(document, id)?, &base)?;
+    let geometry = geometry_for_operation(document, id)?;
+    let heights = binding_base_heights(document, &geometry, &base, &operation)?;
     let binding = document.geometry.bindings.get_mut(&id).unwrap();
-    binding.heights = input.heights;
+    binding.heights = heights;
     binding.resolved_fingerprint = None;
     Ok(())
 }
@@ -1460,15 +1675,35 @@ pub(crate) fn validate_binding_edit(document: &mut Document, id: u32) -> Result<
 /// Keep displayed linked heights synchronized with placement and stock edits.
 /// Replacement/removal requests remain unresolved until explicit reselection.
 pub(crate) fn refresh_binding_heights(document: &mut Document) {
-    let updates: Vec<_> = document.geometry.bindings.iter().filter_map(|(&id,binding)| {
-        if matches!(&binding.status,ResolutionStatus::NeedsReselection{reason} if !reason.starts_with("Geometry changed:")) {return None;}
-        let mut base=binding.clone();base.overrides=GeometryOverrides::default();
-        let mut context=document.clone();
-        let owner=document.setups.iter().find(|s|s.operations.iter().any(|o|o.id()==id))?;
-        context.active_setup_id=owner.id;
-        if matches!(base.recipe,ExtractionRecipe::FaceRegion) {base.heights.top=operation_stock_top(&context,id).ok()?;}
-        Some((id,geometry_for_operation(&context,id).and_then(|geometry|cam_geometry3d::resolve_binding_advisory(&geometry,&base)).map(|input|input.heights)))
-    }).collect();
+    let updates: Vec<_> = document
+        .geometry
+        .bindings
+        .iter()
+        .filter_map(|(&id, binding)| {
+            if matches!(&binding.status, ResolutionStatus::NeedsReselection { reason }
+            if !reason.starts_with("Geometry changed:"))
+            {
+                return None;
+            }
+            let (owner, operation) = document.setups.iter().find_map(|setup| {
+                setup
+                    .operations
+                    .iter()
+                    .find(|operation| operation.id() == id)
+                    .map(|operation| (setup, operation))
+            })?;
+            let mut context = document.clone();
+            context.active_setup_id = owner.id;
+            let mut base = binding.clone();
+            base.overrides = GeometryOverrides::default();
+            if matches!(base.recipe, ExtractionRecipe::FaceRegion) {
+                base.heights.top = operation_stock_top(&context, id).ok()?;
+            }
+            let heights = geometry_for_operation(&context, id)
+                .and_then(|geometry| binding_base_heights(&context, &geometry, &base, operation));
+            Some((id, heights))
+        })
+        .collect();
     for (id, result) in updates {
         let binding = document.geometry.bindings.get_mut(&id).unwrap();
         binding.resolved_fingerprint = None;

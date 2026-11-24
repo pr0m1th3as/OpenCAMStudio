@@ -324,35 +324,51 @@ impl BoreStrategy {
 
 fn ordered_points(op: &BoreOp, cancel: &CancelToken) -> Vec<[f64; 2]> {
     let mut points = op.points.clone();
-    let distance = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]);
-    match op.order {
-        BoreOrder::Selected => {}
-        BoreOrder::X => points.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1]))),
-        BoreOrder::Y => points.sort_by(|a, b| a[1].total_cmp(&b[1]).then(a[0].total_cmp(&b[0]))),
-        BoreOrder::InsideOut => {
-            let center = [
-                points.iter().map(|p| p[0] / points.len() as f64).sum(),
-                points.iter().map(|p| p[1] / points.len() as f64).sum(),
-            ];
-            points.sort_by(|a, b| distance(*a, center).total_cmp(&distance(*b, center)));
-        }
-        BoreOrder::Optimized => {
-            for i in 1..points.len() {
-                if cancel.is_cancelled() {
-                    break;
-                }
-                let nearest = (i..points.len())
-                    .min_by(|&a, &b| {
-                        distance(points[a], points[i - 1])
-                            .total_cmp(&distance(points[b], points[i - 1]))
-                    })
-                    .unwrap();
-                points[i..=nearest].rotate_right(1);
-            }
-        }
-    }
+    order_holes(&mut points, op.order, |point| *point, cancel);
     if op.reverse_order {
         points.reverse();
     }
     points
+}
+
+pub(crate) fn order_holes<T>(
+    holes: &mut [T],
+    order: BoreOrder,
+    point: impl Fn(&T) -> [f64; 2],
+    cancel: &CancelToken,
+) {
+    let distance = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]);
+    let sort_axis = |a: &T, b: &T, axis: usize| {
+        let (a, b) = (point(a), point(b));
+        a[axis]
+            .total_cmp(&b[axis])
+            .then(a[1 - axis].total_cmp(&b[1 - axis]))
+    };
+    match order {
+        BoreOrder::Selected => {}
+        BoreOrder::X => holes.sort_by(|a, b| sort_axis(a, b, 0)),
+        BoreOrder::Y => holes.sort_by(|a, b| sort_axis(a, b, 1)),
+        BoreOrder::InsideOut => {
+            let center = [
+                holes.iter().map(|p| point(p)[0] / holes.len() as f64).sum(),
+                holes.iter().map(|p| point(p)[1] / holes.len() as f64).sum(),
+            ];
+            holes.sort_by(|a, b| distance(point(a), center).total_cmp(&distance(point(b), center)));
+        }
+        BoreOrder::Optimized => {
+            for i in 1..holes.len() {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                let previous = point(&holes[i - 1]);
+                let nearest = (i..holes.len())
+                    .min_by(|&a, &b| {
+                        distance(point(&holes[a]), previous)
+                            .total_cmp(&distance(point(&holes[b]), previous))
+                    })
+                    .unwrap();
+                holes[i..=nearest].rotate_right(1);
+            }
+        }
+    }
 }

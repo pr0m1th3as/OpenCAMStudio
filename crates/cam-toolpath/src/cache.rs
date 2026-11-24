@@ -234,6 +234,10 @@ mod tests {
     use cam_model::DrillOp;
     fn operation(id: u32) -> Operation {
         Operation::Drill(DrillOp {
+            cycle: Default::default(),
+            tip_through_bottom: false,
+            geometry: Default::default(),
+            hole_heights: Vec::new(),
             parameter_expressions: Default::default(),
             id,
             tool: 1,

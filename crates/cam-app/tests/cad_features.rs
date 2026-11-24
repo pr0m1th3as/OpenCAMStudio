@@ -1632,6 +1632,195 @@ fn persisted_mixed_geometry_cannot_generate_or_export_using_cached_contours() {
 }
 
 #[test]
+fn drill_geometry_matches_diameters_and_orders_modeled_entries() {
+    let mut fixture = Fixture::new();
+    let top = fixture.face(vec![square(0., 20., 0., 20., 0.)], [0., 0., 1.]);
+    let shoulder = fixture.face(vec![square(2., 8., 7., 13., -2.)], [0., 0., 1.]);
+    let bottom = fixture.face(vec![square(0., 20., 0., 20., -5.)], [0., 0., -1.]);
+    fixture.walls(0., 20., 0., 20., -5., 0.);
+    let seed = reference(fixture.bore([15., 15.], 1., top, bottom), EntityKind::Face);
+    fixture.bore([5., 10.], 2., top, shoulder);
+    fixture.bore([5., 10.], 1., shoulder, bottom);
+    let other_diameter = reference(fixture.bore([10., 15.], 1.5, top, bottom), EntityKind::Face);
+    let mut revised = Fixture {
+        t: fixture.t.clone(),
+        next: fixture.next,
+    };
+    revised.bore([15., 5.], 1., top, bottom);
+    revised.bore([10., 5.], 1.5, top, bottom);
+    let mut revised = revised.state();
+    revised.assets[0].revision += 1;
+    let mut app = controller();
+    let state = fixture.state();
+    app.add_cad_asset(state.assets[0].clone(), state.instances)
+        .unwrap();
+    select_all_models(&mut app);
+    let tool = app.use_tool(Tool {
+        number: 10,
+        diameter: 2.,
+        length: 30.,
+        flute_length: 20.,
+        kind: ToolKind::Drill {
+            point_angle_deg: 118.,
+        },
+        ..Default::default()
+    });
+    let id = app
+        .create_cad_operation_with_tool(OpKind::Drill, vec![seed.clone()], tool)
+        .unwrap();
+    let mut settings = OperationHeightSettings::default();
+    *settings.definition_mut(HeightPlaneKind::Feed) =
+        HeightDefinition::new(HeightReference::Disabled, 0.);
+    let mut draft = app.operation(id).unwrap().clone();
+    let Operation::Drill(drill) = &mut draft else {
+        panic!("expected drill")
+    };
+    drill.geometry.select_same_diameter = true;
+    drill.geometry.order_by_depth = true;
+    drill.geometry.order = BoreOrder::X;
+    app.apply_operation_height_settings(draft, None, Vec::new(), None, settings)
+        .unwrap();
+    assert_eq!(
+        app.geometry_state().bindings[&id].selected,
+        vec![seed.clone()]
+    );
+
+    let mut revised_binding = app.geometry_state().bindings[&id].clone();
+    revised_binding.selected = [seed, other_diameter]
+        .iter()
+        .map(|reference| {
+            cam_geometry3d::rebind_drill_face(&state.assets[0], &revised.assets[0], reference)
+                .unwrap()
+        })
+        .collect();
+    let new_matches = cam_geometry3d::drill_holes(
+        &revised,
+        &revised_binding,
+        DrillGeometry {
+            select_same_diameter: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(new_matches.len(), 5);
+    assert!(new_matches
+        .iter()
+        .any(|hole| hole.center == Point::new(15., 5.)));
+    assert!(new_matches
+        .iter()
+        .any(|hole| hole.center == Point::new(10., 5.)));
+
+    let cycles = |app: &mut AppController| {
+        let result = app.run(&CancelToken::new());
+        assert_eq!(
+            result.completion,
+            JobCompletion::Complete,
+            "{:?}",
+            result.diagnostics
+        );
+        result
+            .program
+            .steps()
+            .iter()
+            .flat_map(|step| match step {
+                cam_cldata::Step::Drill(cycle) => cycle
+                    .points
+                    .iter()
+                    .map(|point| (point[0], cycle.z_top, cycle.depth))
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(cycles(&mut app), vec![(5., -1., -5.), (15., 1., -5.)]);
+
+    let mut draft = app.operation(id).unwrap().clone();
+    let Operation::Drill(drill) = &mut draft else {
+        panic!("expected drill")
+    };
+    drill.geometry.auto_merge_hole_segments = true;
+    drill.geometry.reverse_order = true;
+    app.apply_operation_settings(draft, None).unwrap();
+    assert_eq!(cycles(&mut app), vec![(15., 1., -5.), (5., 1., -5.)]);
+    let path = std::env::temp_dir().join(format!("drill-geometry-{}.ocam", std::process::id()));
+    app.save_project(&path).unwrap();
+    let mut reopened = controller();
+    reopened.open_project(&path).unwrap();
+    assert_eq!(cycles(&mut reopened), vec![(15., 1., -5.), (5., 1., -5.)]);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn drill_hole_height_defaults_and_offsets_follow_each_selected_face() {
+    let mut fixture = Fixture::new();
+    let top = fixture.face(vec![square(0., 20., 0., 20., 0.)], [0., 0., 1.]);
+    let shelf = fixture.face(vec![square(2., 8., 7., 13., -2.)], [0., 0., 1.]);
+    let floor = fixture.face(vec![square(2., 8., 7., 13., -4.)], [0., 0., 1.]);
+    let bottom = fixture.face(vec![square(0., 20., 0., 20., -5.)], [0., 0., -1.]);
+    fixture.walls(0., 20., 0., 20., -5., 0.);
+    let holes = vec![
+        reference(fixture.bore([15., 15.], 1., top, bottom), EntityKind::Face),
+        reference(fixture.bore([5., 10.], 1., shelf, floor), EntityKind::Face),
+    ];
+    let mut app = controller();
+    let state = fixture.state();
+    app.add_cad_asset(state.assets[0].clone(), state.instances)
+        .unwrap();
+    select_all_models(&mut app);
+    let tool = app.use_tool(Tool {
+        number: 10,
+        diameter: 2.,
+        length: 30.,
+        flute_length: 20.,
+        kind: ToolKind::Drill {
+            point_angle_deg: 118.,
+        },
+        ..Default::default()
+    });
+    let id = app
+        .create_cad_operation_with_tool(OpKind::Drill, holes, tool)
+        .unwrap();
+    let mut settings = app.inspection_setup().height_settings[&id].clone();
+    assert_eq!(
+        settings.definition(HeightPlaneKind::Top),
+        &HeightDefinition::new(HeightReference::HoleTop, 0.)
+    );
+    assert_eq!(
+        settings.definition(HeightPlaneKind::Bottom),
+        &HeightDefinition::new(HeightReference::HoleBottom, 0.)
+    );
+    settings.definition_mut(HeightPlaneKind::Top).offset = 0.25;
+    settings.definition_mut(HeightPlaneKind::Bottom).offset = -0.5;
+    settings.definition_mut(HeightPlaneKind::Feed).reference = HeightReference::Disabled;
+    app.apply_operation_height_settings(
+        app.operation(id).unwrap().clone(),
+        None,
+        vec![],
+        None,
+        settings,
+    )
+    .unwrap();
+
+    let result = app.run(&CancelToken::new());
+    assert_eq!(
+        result.completion,
+        JobCompletion::Complete,
+        "{:?}",
+        result.diagnostics
+    );
+    let heights: Vec<_> = result
+        .program
+        .steps()
+        .iter()
+        .filter_map(|step| match step {
+            cam_cldata::Step::Drill(cycle) => Some((cycle.z_top, cycle.depth)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(heights, vec![(0.25, -5.5), (-1.75, -4.5)]);
+}
+
+#[test]
 fn linked_drill_previews_staged_cutter_and_bore_then_commits_in_one_undo() {
     let mut fixture = Fixture::new();
     let top = fixture.face(vec![square(0., 20., 0., 20., 0.)], [0., 0., 1.]);

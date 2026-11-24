@@ -420,6 +420,67 @@ mod tests {
         assert_eq!(app.height_offsets[&P::Clearance], "20");
     }
     #[test]
+    fn drill_tip_through_bottom_is_staged_with_the_operation() {
+        let (mut app, _) = operation_editor();
+        app.controller.new_operation(OpKind::Drill);
+        let Selection::Operation(id) = app.controller.selection() else {
+            panic!("expected selected drill");
+        };
+        let cutter = app.controller.use_tool(cam_model::Tool {
+            diameter: 5.0,
+            length: 40.0,
+            kind: cam_model::ToolKind::Drill {
+                point_angle_deg: 118.0,
+            },
+            ..Default::default()
+        });
+        app.controller.edit_operation(id, |op| op.set_tool(cutter));
+        app.begin_operation_draft(id);
+        let before = app.controller.document().clone();
+        let bottom = app.resolve_height_editor(id).unwrap().bottom;
+
+        let _ = app.update(Message::DrillTipThroughBottomToggled(true));
+        assert_eq!(app.controller.document(), &before);
+        assert_eq!(app.resolve_height_editor(id).unwrap().bottom, bottom);
+        let _ = app.update(Message::CancelOperationDraft);
+        assert!(matches!(
+            app.current_operation(id),
+            Some(Operation::Drill(drill)) if !drill.tip_through_bottom
+        ));
+
+        app.begin_operation_draft(id);
+        let _ = app.update(Message::DrillTipThroughBottomToggled(true));
+        let _ = app.update(Message::Apply);
+        let Some(Operation::Drill(drill)) = app.controller.operation(id) else {
+            panic!("expected saved drill");
+        };
+        assert!(drill.tip_through_bottom);
+        let setup = app.controller.inspection_setup();
+        let tip_bottom = bottom
+            - setup.origin_position(drill.work_offset)[2]
+            - 2.5 / 59.0_f64.to_radians().tan();
+        let outcome = app.controller.run(&cam_toolpath::CancelToken::new());
+        assert!(
+            outcome.program.steps().iter().any(|step| match step {
+                cam_cldata::Step::Drill(cycle) =>
+                    cycle.tag.op_id == id && (cycle.depth - tip_bottom).abs() < 1e-9,
+                cam_cldata::Step::Linear { to, tag, .. } =>
+                    tag.op_id == id && (to.z - tip_bottom).abs() < 1e-9,
+                _ => false,
+            }),
+            "{:?}",
+            outcome.diagnostics
+        );
+        let saved = serde_json::to_string(app.controller.document()).unwrap();
+        let reopened: cam_model::Document = serde_json::from_str(&saved).unwrap();
+        assert!(reopened.setup().operations.iter().any(
+            |operation| matches!(operation, Operation::Drill(drill) if drill.id == id && drill.tip_through_bottom)
+        ));
+        let _ = app.update(Message::Undo);
+        assert_eq!(app.controller.document(), &before);
+    }
+
+    #[test]
     fn all_five_planes_preview_live_offsets_in_the_setup_orientation_while_heights_is_selected() {
         use cam_model::HeightPlaneKind as P;
         let (mut app, id) = operation_editor();
@@ -722,6 +783,26 @@ mod tests {
                 10.
             );
             assert!(heights.top > heights.bottom);
+            if kind == OpKind::Drill {
+                for (plane, reference) in [(P::Top, R::HoleTop), (P::Bottom, R::HoleBottom)] {
+                    let options = R::options_for(plane, app.current_operation(id));
+                    assert!(options.contains(&R::HoleTop) && options.contains(&R::HoleBottom));
+                    assert_eq!(
+                        app.height_draft.as_ref().unwrap().definition(plane),
+                        &cam_model::HeightDefinition::new(reference, 0.)
+                    );
+                }
+                let _ = app.update(Message::HeightReferenceChanged(P::Top, R::StockTop));
+                let _ = app.update(Message::HeightDefaults);
+                assert_eq!(
+                    app.height_draft
+                        .as_ref()
+                        .unwrap()
+                        .definition(P::Top)
+                        .reference,
+                    R::HoleTop
+                );
+            }
             if kind == OpKind::Chamfer {
                 assert!((heights.bottom + 1.).abs() < 1e-9);
                 let _ = app.update(Message::HeightOffsetChanged(P::Bottom, "0.5".into()));

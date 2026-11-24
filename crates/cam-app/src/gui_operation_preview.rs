@@ -288,6 +288,7 @@ impl App {
         let frame = &self.controller.inspection_setup().frame;
         let mut outlines = Vec::new();
         let mut centers = Vec::new();
+        let mut drill_centers = Vec::new();
         let mut z = 0.0;
         if matches!(op, Operation::Profile(_)) {
             if let Some((profile, source_z)) = self.profile_tab_geometry() {
@@ -299,6 +300,35 @@ impl App {
                         .iter()
                         .map(|p| (p.chain.points().to_vec(), p.closed)),
                 );
+            }
+        } else if let (Operation::Drill(drill), Some(binding)) = (&op, binding.as_ref()) {
+            if drill.geometry.uses_model_heights() {
+                if let Ok(geometry) = crate::cad_operations::geometry_for_operation(
+                    self.controller.document(),
+                    drill.id,
+                ) {
+                    if let Ok(holes) =
+                        cam_geometry3d::drill_holes(&geometry, binding, drill.geometry)
+                    {
+                        drill_centers.extend(
+                            holes
+                                .into_iter()
+                                .map(|hole| [hole.center.x, hole.center.y, hole.heights.top]),
+                        );
+                    }
+                }
+            } else if let Ok(geometry) =
+                crate::cad_operations::geometry_for_setup(self.controller.document())
+            {
+                if let Ok(resolved) = cam_geometry3d::resolve_binding_advisory(&geometry, binding) {
+                    z = resolved.heights.top;
+                    centers.extend(
+                        resolved
+                            .holes
+                            .into_iter()
+                            .map(|hole| [hole.center.x, hole.center.y]),
+                    );
+                }
             }
         } else if let Some(binding) = binding.as_ref() {
             if let Ok(geometry) =
@@ -314,8 +344,7 @@ impl App {
                     } else if binding.recipe == cam_model::ExtractionRecipe::PocketBoundary
                         || matches!(
                             op,
-                            Operation::Drill(_)
-                                | Operation::Bore(_)
+                            Operation::Bore(_)
                                 | Operation::Thread(_)
                                 | Operation::Chamfer(_)
                                 | Operation::Engrave(_)
@@ -431,9 +460,13 @@ impl App {
             }
             scene.add_highlight(world, PICK_BOUNDARY);
         }
-        for point in centers {
+        for point in centers
+            .into_iter()
+            .map(|[x, y]| [x, y, z])
+            .chain(drill_centers)
+        {
             for axis in 0..2 {
-                let mut a = [point[0], point[1], z];
+                let mut a = point;
                 let mut b = a;
                 a[axis] -= 1.;
                 b[axis] += 1.;

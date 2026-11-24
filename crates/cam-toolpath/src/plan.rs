@@ -1204,6 +1204,8 @@ fn apply_feed_height(
     feed_z: f64,
     operation: &Operation,
 ) -> Result<Program, String> {
+    let peck_reentry = matches!(operation, Operation::Drill(drill)
+        if drill.cycle.mode.is_some_and(cam_model::DrillCycleMode::pecks));
     let plunge = match operation {
         Operation::Profile(o) => o.plunge_feed,
         Operation::Pocket(o) => o.clear.plunge_feed,
@@ -1281,7 +1283,9 @@ fn apply_feed_height(
                 if (from.x - to.x).abs() < 1e-9
                     && (from.y - to.y).abs() < 1e-9
                     && to.z < from.z
-                    && to.z < feed_z =>
+                    && to.z < feed_z
+                    // An explicit peck has already drilled its re-entry segment.
+                    && !(peck_reentry && tag.kind == MoveKind::Link) =>
             {
                 if from.z > feed_z {
                     out.push(Step::Rapid {
@@ -2173,6 +2177,10 @@ mod tests {
             operations: (0..operations)
                 .map(|id| {
                     Operation::Drill(DrillOp {
+                        cycle: Default::default(),
+                        tip_through_bottom: false,
+                        geometry: Default::default(),
+                        hole_heights: Vec::new(),
                         parameter_expressions: Default::default(),
                         id,
                         tool: 1,
@@ -3367,6 +3375,43 @@ mod tests {
             .steps()
             .iter()
             .any(|s| matches!(s,Step::Drill(c) if c.depth == -4.5)));
+    }
+
+    #[test]
+    fn explicit_peck_drilling_keeps_cutting_feed_on_entry_and_rapid_reentry() {
+        use cam_model::{DrillCycleMode, HeightPlaneKind as P, OperationHeightSettings};
+        let mut doc = document(1);
+        let Operation::Drill(drill) = &mut doc.setup_mut().operations[0] else {
+            panic!()
+        };
+        drill.set_cycle_mode(DrillCycleMode::DeepDrilling);
+        drill.depth = 3.0;
+        let mut settings = OperationHeightSettings::default();
+        settings.definition_mut(P::Feed).offset = 1.0;
+        doc.setup_mut().height_settings.insert(0, settings);
+
+        let result = build_job(&doc, 1000., SpindleDir::Cw, None, 50., &CancelToken::new());
+        assert_eq!(
+            result.completion,
+            JobCompletion::Complete,
+            "{:?}",
+            result.diagnostics
+        );
+        let mut feed_depths = Vec::new();
+        let mut resume = Vec::new();
+        for step in result.program.steps() {
+            match step {
+                Step::Linear { to, tag, .. } if tag.kind == MoveKind::Plunge => {
+                    feed_depths.push(to.z)
+                }
+                Step::Rapid { to, tag } if tag.kind == MoveKind::Link && to.z < 0.0 => {
+                    resume.push(to.z)
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(feed_depths, [-0.75, -1.5, -2.25, -3.0]);
+        assert_eq!(resume, [-0.25, -1.0, -1.75]);
     }
 
     #[test]

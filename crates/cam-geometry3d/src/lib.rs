@@ -10,6 +10,8 @@ pub use rotary::{
 };
 mod adaptive;
 mod advisory;
+mod drill_holes;
+pub use drill_holes::{drill_holes, rebind_drill_face, DrillHole};
 mod pocket_regions;
 mod pocket_stock;
 pub use advisory::{

@@ -122,6 +122,7 @@ pub(super) fn selection_icon(name: &str, size: f32) -> iced::widget::Svg<'static
         "all" => include_bytes!("../assets/icons/profile-selection/all.svg"),
         "outer" => include_bytes!("../assets/icons/profile-selection/outer.svg"),
         "inner" => include_bytes!("../assets/icons/profile-selection/inner.svg"),
+        "drill" => include_bytes!("../assets/icons/drill.svg"),
         "bore" => include_bytes!("../assets/icons/bore.svg"),
         "thread" => include_bytes!("../assets/icons/thread.svg"),
         "remove" => include_bytes!("../assets/icons/delete_operation.svg"),
@@ -221,6 +222,7 @@ impl App {
             | OpKind::Chamfer
             | OpKind::Engrave
             | OpKind::Carve
+            | OpKind::Drill
             | OpKind::Bore
             | OpKind::Thread
             | OpKind::Adaptive
@@ -370,8 +372,12 @@ impl App {
             || self.cad_editing_op.is_some()
             || self.drawing_editing_op.is_some()
         {
-            self.status =
-                "Click geometry in the viewport to add it. Use × to remove an item.".into();
+            self.status = if self.geometry_editor.is_some() {
+                "Select geometry in the viewport, then use OK to stage it."
+            } else {
+                "Click geometry in the viewport to add it. Use × to remove an item."
+            }
+            .into();
             return iced::Task::none();
         }
         if let Selection::Operation(id) = self.controller.selection() {
@@ -449,6 +455,9 @@ impl App {
                                 if op.points.len() > 1 && index < op.points.len() =>
                             {
                                 op.points.remove(index);
+                                if index < op.hole_heights.len() {
+                                    op.hole_heights.remove(index);
+                                }
                                 true
                             }
                             Operation::Thread(op)

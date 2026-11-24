@@ -857,6 +857,10 @@ mod tests {
         app.edit_setup(|s| {
             s.heights = cam_model::Heights::new(5., 2., 0.);
             s.operations.push(Operation::Drill(DrillOp {
+                cycle: Default::default(),
+                tip_through_bottom: false,
+                geometry: Default::default(),
+                hole_heights: Vec::new(),
                 parameter_expressions: Default::default(),
                 id: 1,
                 tool: 1,
@@ -1524,6 +1528,10 @@ mod tests {
         inherited_setup(&mut app);
         app.edit_setup(|s| {
             s.operations.push(Operation::Drill(DrillOp {
+                cycle: Default::default(),
+                tip_through_bottom: false,
+                geometry: Default::default(),
+                hole_heights: Vec::new(),
                 parameter_expressions: Default::default(),
                 id: 2,
                 tool: 1,

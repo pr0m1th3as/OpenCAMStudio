@@ -16,6 +16,8 @@ fn group(reference: Reference) -> u8 {
         | Reference::StockBottom
         | Reference::FixtureTop
         | Reference::FixtureBottom
+        | Reference::HoleTop
+        | Reference::HoleBottom
         | Reference::SelectedContours => 1,
         Reference::Selection | Reference::Origin => 2,
         Reference::Highest | Reference::Lowest => 3,
@@ -38,6 +40,8 @@ fn icon_bytes(reference: Reference) -> &'static [u8] {
         Reference::StockBottom => include_bytes!("../assets/icons/heights/stock_bottom.svg"),
         Reference::FixtureTop => include_bytes!("../assets/icons/heights/fixture_top.svg"),
         Reference::FixtureBottom => include_bytes!("../assets/icons/heights/fixture_bottom.svg"),
+        Reference::HoleTop => include_bytes!("../assets/icons/heights/hole_top.svg"),
+        Reference::HoleBottom => include_bytes!("../assets/icons/heights/hole_bottom.svg"),
         Reference::SelectedContours => include_bytes!("../assets/icons/heights/contours.svg"),
         Reference::Selection => include_bytes!("../assets/icons/heights/selection.svg"),
         Reference::Origin => include_bytes!("../assets/icons/heights/origin.svg"),
@@ -60,8 +64,12 @@ fn label<M: 'static>(reference: Reference) -> Element<'static, M> {
     .into()
 }
 
-pub(super) fn picker(plane: Plane, selected: Reference) -> Element<'static, Message> {
-    let options = Reference::options(plane);
+pub(super) fn picker(
+    plane: Plane,
+    selected: Reference,
+    operation: Option<&Operation>,
+) -> Element<'static, Message> {
+    let options = Reference::options_for(plane, operation);
     let setting = parameter_options::height_reference_setting(plane);
     let widget = icon_picker::picker(
         menu_id(plane),
@@ -80,9 +88,11 @@ mod tests {
 
     #[test]
     fn all_height_reference_icons_are_valid_square_svgs() {
-        let references = Reference::options(Plane::Feed)
-            .into_iter()
-            .chain([Reference::Plane(Plane::Feed)]);
+        let references = Reference::options(Plane::Feed).into_iter().chain([
+            Reference::Plane(Plane::Feed),
+            Reference::HoleTop,
+            Reference::HoleBottom,
+        ]);
         for reference in references {
             let source = std::str::from_utf8(icon_bytes(reference)).unwrap();
             let document = roxmltree::Document::parse(source).unwrap();

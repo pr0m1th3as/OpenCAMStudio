@@ -65,7 +65,7 @@ impl AppController {
             preview.geometry.bindings.insert(id, binding.clone());
             crate::cad_operations::selection_height_defaults(&preview, &operation)
         } else {
-            cam_model::OperationHeightSettings::default()
+            cam_model::OperationHeightSettings::for_operation(&operation)
         };
         document.setup_mut().height_settings.insert(id, settings);
         document.setup_mut().operations.push(operation);
@@ -196,7 +196,11 @@ impl AppController {
             .iter()
             .find(|o| o.id() == id)
             .unwrap();
-        document.setup().height_settings[&id].resolve(&document, operation)?;
+        crate::cad_operations::resolve_height_settings(
+            &document,
+            operation,
+            &document.setup().height_settings[&id],
+        )?;
         let used: BTreeSet<_> = document
             .setup()
             .operations
