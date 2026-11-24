@@ -68,11 +68,17 @@ followed by translation. A model move affects all its bodies and can be undone i
 one step. Linked toolpaths must be regenerated after a move.
 
 Projects embed imported geometry, so reopening does not require the original
-source file. Model replacement is available from the model context menu.
-Replacement requires reviewing and reselecting linked geometry before generating
-again. Missing or unresolved geometry in an included operation blocks generation
-and export. Excluded operations do not block the included job. Older imported
-models may need reimporting to enable newer spline or adaptive selections.
+source file. To pick up edits to a STEP or IGES file, right-click the model in the
+Models tree and choose **Reload model from file**. OpenCAMStudio reads the saved
+source path or asks you to choose the file if the project has no path for this
+platform. Reload keeps operations, setup assignments, and body placements. If the
+imported topology changes, review and reselect linked geometry before generating
+toolpaths again.
+If the source file has moved, use **Replace model…** to select its new location.
+If the set of body instances changes, import the file as a new model. Model
+replacement requires reviewing and reselecting linked geometry. Missing or
+unresolved geometry in an included operation blocks generation and export.
+Excluded operations do not block the included job.
 
 The **Output** pane identifies selection and generation errors by setup, operation
 and geometry. Drag to select text and use Cmd/Ctrl+C, or choose **Copy output**.

@@ -852,6 +852,7 @@ fn display_tessellation_quality_does_not_change_pocket_nc() {
             revision: 1,
             name: "plate".into(),
             source_format: CadFormat::Step,
+            source_path: None,
             source_data: vec![].into(),
             source_units: import.source_units,
             backend: import.backend,

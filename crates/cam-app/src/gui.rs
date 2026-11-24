@@ -3065,7 +3065,12 @@ enum Message {
     NoticeBackdrop,
     NoticeFilterChanged(usize, bool),
     ReplaceCadAsset(u64),
-    CadReplacementChosen(u64, Option<PathBuf>),
+    ReloadCadAsset(u64),
+    CadModelFileChosen {
+        id: u64,
+        path: Option<PathBuf>,
+        reload: bool,
+    },
     RemoveCadAsset(u64),
     CadFilterChanged(CadFilter),
     GeometryFilterChanged(CadFilter),
@@ -4273,6 +4278,8 @@ impl App {
                     | Message::ExportNc
                     | Message::ImportCad
                     | Message::ReplaceCadAsset(_)
+                    | Message::ReloadCadAsset(_)
+                    | Message::CadModelFileChosen { reload: true, .. }
                     | Message::RemoveCadAsset(_)
                     | Message::MoveOpen(_)
             )
@@ -4304,6 +4311,8 @@ impl App {
                     | Message::RunJob
                     | Message::ExportNc
                     | Message::ToolpathCommand(_, _)
+                    | Message::ReloadCadAsset(_)
+                    | Message::CadModelFileChosen { reload: true, .. }
                     | Message::OpenSample
                     | Message::NewProject
                     | Message::OpenProject
@@ -6831,29 +6840,72 @@ impl App {
             Message::ReplaceCadAsset(id) => {
                 return iced::Task::perform(
                     pick_open("Replace CAD model", &["step", "stp", "iges", "igs"]),
-                    move |path| Message::CadReplacementChosen(id, path),
+                    move |path| Message::CadModelFileChosen {
+                        id,
+                        path,
+                        reload: false,
+                    },
                 );
             }
-            Message::CadReplacementChosen(id, Some(path)) => {
-                match self.controller.start_cad_replacement(id, path) {
-                    Ok(_) => self.status = "Importing replacement model…".into(),
+            Message::ReloadCadAsset(id) => {
+                let Some(asset) = self.controller.geometry_state().asset(id) else {
+                    return iced::Task::none();
+                };
+                if let Some(path) = asset
+                    .source_path
+                    .as_deref()
+                    .map(Path::new)
+                    .filter(|path| path.is_absolute())
+                {
+                    return self.update(Message::CadModelFileChosen {
+                        id,
+                        path: Some(path.to_path_buf()),
+                        reload: true,
+                    });
+                }
+                return iced::Task::perform(
+                    pick_open(
+                        "Reload CAD model from file",
+                        &["step", "stp", "iges", "igs"],
+                    ),
+                    move |path| Message::CadModelFileChosen {
+                        id,
+                        path,
+                        reload: true,
+                    },
+                );
+            }
+            Message::CadModelFileChosen {
+                id,
+                path: Some(path),
+                reload,
+            } => {
+                let result = if reload {
+                    self.controller.start_cad_reload(id, path)
+                } else {
+                    self.controller.start_cad_replacement(id, path)
+                };
+                match result {
+                    Ok(_) => {
+                        self.status = if reload {
+                            "Reloading model from file…"
+                        } else {
+                            "Importing replacement model…"
+                        }
+                        .into();
+                    }
                     Err(error) => {
                         self.status = error.clone();
-                        return self.queue_notice(Notice {
-                            title: "Cannot replace model".into(),
-                            entries: vec![notices::NoticeEntry {
-                                severity: Severity::Error,
-                                message: error.clone(),
-                                source: None,
-                                verification_collision: false,
-                            }],
-                            detail: error,
-                            error: true,
-                        });
+                        let title = if reload {
+                            "Cannot reload model"
+                        } else {
+                            "Cannot replace model"
+                        };
+                        return self.queue_notice(Notice::error(title, error));
                     }
                 }
             }
-            Message::CadReplacementChosen(_, None) => {}
+            Message::CadModelFileChosen { path: None, .. } => {}
             Message::RemoveCadAsset(id) => {
                 if self.controller.remove_cad_asset(id) {
                     self.model_view = Some(TreeNode::Models);
@@ -17507,6 +17559,7 @@ mod multi_setup_draft_tests {
                     revision: 1,
                     name: "Model".into(),
                     source_format: CadFormat::Step,
+                    source_path: None,
                     source_data: vec![].into(),
                     import_options: None,
                     import_diagnostics: vec![],

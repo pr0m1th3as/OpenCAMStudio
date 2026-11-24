@@ -269,7 +269,7 @@ pub struct AppController {
     import_jobs: crate::import_jobs::ImportJobs<crate::cad_operations::PreparedImport>,
     document_epoch: u64,
     import_preview: Option<(u64, crate::cad_operations::PreparedImport)>,
-    import_replacement: Option<u64>,
+    import_update: Option<CadModelUpdate>,
     jobs: crate::jobs::JobService,
     operation_cache: cam_toolpath::OperationCache,
     toolpath_fingerprints: BTreeMap<u32, String>,
@@ -282,6 +282,20 @@ pub struct AppController {
     asset_id_floor: u64,
     instance_id_floor: u64,
     pattern_id_floor: u64,
+}
+
+#[derive(Clone, Copy)]
+enum CadModelUpdate {
+    Replace(u64),
+    Reload(u64),
+}
+
+impl CadModelUpdate {
+    fn asset_id(self) -> u64 {
+        match self {
+            Self::Replace(id) | Self::Reload(id) => id,
+        }
+    }
 }
 
 /// User-authored project state, excluding derived toolpaths and shop settings.
@@ -584,7 +598,7 @@ impl AppController {
             import_jobs: Default::default(),
             document_epoch: 0,
             import_preview: None,
-            import_replacement: None,
+            import_update: None,
             jobs: Default::default(),
             operation_cache: Default::default(),
             toolpath_fingerprints: Default::default(),
@@ -847,21 +861,36 @@ impl AppController {
     }
     pub fn start_cad_import(&mut self, path: PathBuf) -> u64 {
         self.import_preview = None;
-        self.import_replacement = None;
+        self.import_update = None;
         self.import_jobs.start(self.document_epoch, move || {
             crate::cad_operations::prepare_import(&path)
         })
     }
     pub fn start_cad_replacement(&mut self, asset_id: u64, path: PathBuf) -> Result<u64, String> {
-        if self.geometry_state().asset(asset_id).is_none() {
+        self.start_cad_model_update(CadModelUpdate::Replace(asset_id), path)
+    }
+    /// Reread a CAD file in the background for an existing model.
+    pub fn start_cad_reload(&mut self, asset_id: u64, path: PathBuf) -> Result<u64, String> {
+        self.start_cad_model_update(CadModelUpdate::Reload(asset_id), path)
+    }
+    fn start_cad_model_update(
+        &mut self,
+        update: CadModelUpdate,
+        path: PathBuf,
+    ) -> Result<u64, String> {
+        if self.geometry_state().asset(update.asset_id()).is_none() {
             return Err("Missing CAD asset".into());
         }
         let request = self.start_cad_import(path);
-        self.import_replacement = Some(asset_id);
+        self.import_update = Some(update);
         Ok(request)
     }
     pub fn cad_import_replacement(&self) -> Option<u64> {
-        self.import_replacement
+        self.import_update.map(CadModelUpdate::asset_id)
+    }
+    #[cfg(feature = "gui")]
+    pub(crate) fn cad_import_reloading(&self) -> bool {
+        matches!(self.import_update, Some(CadModelUpdate::Reload(_)))
     }
     pub fn cad_import_pending(&self) -> bool {
         self.import_jobs.pending()
@@ -869,7 +898,7 @@ impl AppController {
     pub fn cancel_cad_import(&mut self) {
         self.import_jobs.cancel();
         self.import_preview = None;
-        self.import_replacement = None;
+        self.import_update = None;
     }
     pub fn poll_cad_import(&mut self) -> Option<Result<usize, String>> {
         self.import_jobs.poll(self.document_epoch).map(|result| {
@@ -888,27 +917,28 @@ impl AppController {
         if epoch != self.document_epoch {
             return Err("Project changed after preview; import again".into());
         }
-        if let Some(id) = self.import_replacement.take() {
+        if let Some(update) = self.import_update.take() {
+            let id = update.asset_id();
             match prepared {
                 crate::cad_operations::PreparedImport::Solid { asset, instances } => {
-                    let existing: Vec<_> = self
+                    let mut existing: Vec<_> = self
                         .geometry_state()
                         .instances
                         .iter()
                         .filter(|i| i.asset_id == id)
+                        .map(|i| i.body_id)
                         .collect();
-                    if instances.len() != existing.len()
-                        || instances
-                            .iter()
-                            .any(|i| !existing.iter().any(|old| old.body_id == i.body_id))
-                    {
-                        return Err("Replacement changes body instances; add it as a new asset and review its geometry".into());
+                    let mut imported: Vec<_> = instances.iter().map(|i| i.body_id).collect();
+                    existing.sort_unstable();
+                    imported.sort_unstable();
+                    if existing != imported {
+                        return Err("The source changes the model's body instances. Import it as a new model and review its geometry.".into());
                     }
                     let count = instances.len();
-                    self.replace_cad_asset(id, asset)?;
+                    self.update_cad_asset(update, asset)?;
                     Ok(count)
                 }
-                _ => Err("Replace model requires a STEP/IGES solid, not a planar drawing".into()),
+                _ => Err("Updating a model requires a STEP or IGES solid".into()),
             }
         } else {
             self.commit_cad_import(prepared)
@@ -1303,11 +1333,31 @@ impl AppController {
     pub fn replace_cad_asset(
         &mut self,
         id: u64,
+        replacement: cam_model::GeometryAsset,
+    ) -> Result<(), String> {
+        self.update_cad_asset(CadModelUpdate::Replace(id), replacement)
+    }
+
+    fn update_cad_asset(
+        &mut self,
+        update: CadModelUpdate,
         mut replacement: cam_model::GeometryAsset,
     ) -> Result<(), String> {
+        let id = update.asset_id();
         let old = self.geometry_state().asset(id).ok_or("Missing CAD asset")?;
         replacement.id = id;
-        replacement.revision = old.revision + 1;
+        // Reuse references only when the entire topology, including entity IDs, matches.
+        let keep_references =
+            matches!(update, CadModelUpdate::Reload(_)) && replacement.topology == old.topology;
+        replacement.revision = if keep_references {
+            replacement.topology = old.topology.clone();
+            old.revision
+        } else {
+            old.revision + 1
+        };
+        if replacement == *old {
+            return Ok(());
+        }
         replacement.topology.validate()?;
         if self
             .geometry_state()
@@ -1330,14 +1380,22 @@ impl AppController {
         if let Some(asset) = preview.assets.iter_mut().find(|a| a.id == id) {
             *asset = replacement;
         }
-        for binding in preview
-            .bindings
-            .values_mut()
-            .filter(|b| b.selected.iter().any(|r| r.asset_id == id))
-        {
-            binding.status = cam_model::ResolutionStatus::NeedsReselection {
-                reason: "Model replaced; review and reselect its geometry".into(),
+        if !keep_references {
+            let reason = match update {
+                CadModelUpdate::Replace(_) => "Model replaced; review and reselect its geometry",
+                CadModelUpdate::Reload(_) => {
+                    "Reloaded model geometry changed; review and reselect it"
+                }
             };
+            for binding in preview
+                .bindings
+                .values_mut()
+                .filter(|b| b.selected.iter().any(|r| r.asset_id == id))
+            {
+                binding.status = cam_model::ResolutionStatus::NeedsReselection {
+                    reason: reason.into(),
+                };
+            }
         }
         preview.validate()?;
         self.edit_document(move |doc| doc.geometry = preview);

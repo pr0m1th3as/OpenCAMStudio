@@ -86,7 +86,8 @@ pub(crate) fn prepare_import(path: &Path) -> Result<PreparedImport, String> {
         .unwrap_or("Imported model")
         .to_owned();
     // Snapshot source bytes once so provenance cannot race a CAD re-export.
-    let source_data = std::fs::read(path).map_err(|e| e.to_string())?;
+    let source_data = std::fs::read(path)
+        .map_err(|error| format!("Could not read '{}': {error}", path.display()))?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| e.to_string())?
@@ -154,6 +155,9 @@ pub(crate) fn prepare_import(path: &Path) -> Result<PreparedImport, String> {
                 revision: 1,
                 name,
                 source_format: format,
+                source_path: std::path::absolute(path)
+                    .ok()
+                    .and_then(|path| path.into_os_string().into_string().ok()),
                 source_data: source_data.into(),
                 source_units: import.source_units,
                 backend: import.backend,

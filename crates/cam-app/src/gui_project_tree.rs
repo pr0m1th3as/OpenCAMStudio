@@ -1257,6 +1257,10 @@ impl App {
                         "Move model…".into(),
                         Message::MoveOpen(TreeNode::Asset(*id)),
                     ))
+                    .push(item(
+                        "Reload model from file".into(),
+                        Message::ReloadCadAsset(*id),
+                    ))
                     .push(item("Replace model…".into(), Message::ReplaceCadAsset(*id)))
                     .push(item("Remove model".into(), Message::RemoveCadAsset(*id)));
             }
@@ -1459,6 +1463,7 @@ mod tests {
                         revision: 1,
                         name: format!("Model {asset_id}"),
                         source_format: CadFormat::Step,
+                        source_path: None,
                         source_data: vec![].into(),
                         import_options: None,
                         import_diagnostics: vec![],

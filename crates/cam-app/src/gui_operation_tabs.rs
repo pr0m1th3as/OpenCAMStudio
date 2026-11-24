@@ -2340,6 +2340,7 @@ mod tests {
                     revision: 1,
                     name: "Analytic test plate".into(),
                     source_format: CadFormat::Step,
+                    source_path: None,
                     source_data: vec![].into(),
                     import_options: None,
                     import_diagnostics: vec![],

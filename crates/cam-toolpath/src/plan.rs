@@ -2440,6 +2440,7 @@ mod tests {
             revision: 1,
             name: "floor with hole and boss".into(),
             source_format: CadFormat::Step,
+            source_path: None,
             source_units: SourceUnits::Millimetres,
             source_data: Arc::new(vec![]),
             source_fingerprint: String::new(),

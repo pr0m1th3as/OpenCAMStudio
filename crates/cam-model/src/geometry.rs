@@ -415,6 +415,9 @@ pub struct GeometryAsset {
     pub revision: u64,
     pub name: String,
     pub source_format: CadFormat,
+    /// Original file location for reload. Embedded geometry remains self-contained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
     /// Shared immutable bytes; history edits never duplicate imported blobs.
     pub source_data: Arc<Vec<u8>>,
     pub source_units: SourceUnits,
@@ -434,6 +437,7 @@ impl PartialEq for GeometryAsset {
             && self.revision == other.revision
             && self.name == other.name
             && self.source_format == other.source_format
+            && self.source_path == other.source_path
             && self.source_units == other.source_units
             && self.backend == other.backend
             && self.import_diagnostics == other.import_diagnostics
@@ -1275,6 +1279,7 @@ mod tests {
                 revision: 2,
                 name: "plate".into(),
                 source_format: CadFormat::Step,
+                source_path: None,
                 source_data: b"ISO-10303-21;".to_vec().into(),
                 source_units: SourceUnits::Inches,
                 backend: "test-1".into(),
