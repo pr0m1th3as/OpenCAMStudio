@@ -1724,6 +1724,20 @@ fn compute_with_stock_and_preview(
     cutting_heights: Option<cam_model::CuttingHeights>,
     publish: &mut dyn FnMut(&Program),
 ) -> StrategyResult {
+    if let Some(tool) = operation
+        .tools()
+        .into_iter()
+        .filter_map(|number| env.tool(number))
+        .find(|tool| tool.kind.is_side_cutting_disc())
+    {
+        return StrategyResult {
+            diagnostics: vec![Diagnostic::error(format!(
+                "Tool {} ({}) requires a side-cutting strategy",
+                tool.number, tool.kind
+            ))],
+            ..Default::default()
+        };
+    }
     let (radial, axial) = stock_to_leave.effective();
     match operation {
         Operation::Spiral(op) => {
@@ -2185,6 +2199,35 @@ mod tests {
             stock_to_leave: Default::default(),
             tool_change_height: None,
         })
+    }
+
+    #[test]
+    fn side_cutting_discs_require_a_dedicated_strategy() {
+        for kind in [ToolKind::GrooveCutter, ToolKind::SlittingSaw] {
+            let mut doc = document(0);
+            let setup = doc.setup_mut();
+            setup.tools[0] = Tool {
+                number: 1,
+                diameter: 20.0,
+                flute_length: 1.5,
+                shank_diameter: 6.0,
+                length: 50.0,
+                flutes: 8,
+                kind,
+                ..Default::default()
+            };
+            setup.operations.push(profile_operation());
+            let job = build_job(&doc, 1000., SpindleDir::Cw, None, 50., &CancelToken::new());
+            assert_eq!(job.completion, JobCompletion::Failed);
+            assert!(job
+                .program
+                .steps()
+                .iter()
+                .all(|step| matches!(step, Step::Comment(_))));
+            assert!(job.diagnostics.iter().any(|finding| {
+                finding.op == Some(0) && finding.message.contains("requires a side-cutting strategy")
+            }));
+        }
     }
 
     #[test]

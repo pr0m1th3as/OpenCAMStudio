@@ -1095,9 +1095,25 @@ fn tool_kind_fields(kind: ToolKind) -> Vec<Field> {
         ToolKind::Drill { .. } => vec![Field::PointAngle],
         ToolKind::ThreadMill { .. } => vec![Field::ToolThreadPitch],
         ToolKind::VBit { .. } => vec![Field::PointAngle, Field::TipRadius],
-        ToolKind::EndMill | ToolKind::RoughingMill | ToolKind::BallMill | ToolKind::FaceMill => {
-            Vec::new()
+        ToolKind::EndMill
+        | ToolKind::RoughingMill
+        | ToolKind::BallMill
+        | ToolKind::FaceMill
+        | ToolKind::GrooveCutter
+        | ToolKind::SlittingSaw => Vec::new(),
+    }
+}
+
+fn disc_tool_field_label(kind: ToolKind, field: Field) -> Option<&'static str> {
+    match (kind, field) {
+        (ToolKind::GrooveCutter, Field::FluteLength) => Some("Cutter width (mm)"),
+        (ToolKind::SlittingSaw, Field::FluteLength) => Some("Blade thickness (mm)"),
+        (ToolKind::SlittingSaw, Field::ShankDiameter) => Some("Arbor diameter (mm)"),
+        (ToolKind::GrooveCutter | ToolKind::SlittingSaw, Field::ToolDiameter) => {
+            Some("Cutting diameter (mm)")
         }
+        (ToolKind::GrooveCutter | ToolKind::SlittingSaw, Field::Flutes) => Some("Teeth"),
+        _ => None,
     }
 }
 
@@ -1170,6 +1186,16 @@ fn apply_tool_dims(t: &mut cam_model::Tool, parsed: &BTreeMap<Field, f64>) {
         t.face_body_height = parsed.get(&Field::FaceBodyHeight).copied().unwrap_or(body);
         if let Some(&flute) = parsed.get(&Field::FluteLength) { t.flute_length = flute; }
         if let Some(&length) = parsed.get(&Field::ToolLength) { t.length = length; }
+        return;
+    }
+    // Disc width and assembly length are separate catalogue dimensions.
+    if t.kind.is_side_cutting_disc() {
+        if let Some(&width) = parsed.get(&Field::FluteLength) {
+            t.flute_length = width;
+        }
+        if let Some(&length) = parsed.get(&Field::ToolLength) {
+            t.length = length;
+        }
         return;
     }
     // overall = flute + shank. Snapshot the effective flute/shank *before* the edit.
@@ -1245,7 +1271,12 @@ fn apply_tool_kind_fields(kind: &mut ToolKind, parsed: &BTreeMap<Field, f64>) {
                 *tip_radius = v.max(0.0);
             }
         }
-        ToolKind::EndMill | ToolKind::RoughingMill | ToolKind::BallMill | ToolKind::FaceMill => {}
+        ToolKind::EndMill
+        | ToolKind::RoughingMill
+        | ToolKind::BallMill
+        | ToolKind::FaceMill
+        | ToolKind::GrooveCutter
+        | ToolKind::SlittingSaw => {}
     }
 }
 
@@ -8983,7 +9014,7 @@ impl App {
                     .unwrap_or(ToolKind::EndMill);
                 self.lib_sel = self.library.add_of_kind(seed_kind);
                 self.save_tool_libraries();
-                if self.controller.pending_op().is_some() {
+                if self.controller.pending_op().is_some() && !seed_kind.is_side_cutting_disc() {
                     if let Some(tool) = self.library.tools.get(self.lib_sel).cloned() {
                         let number = self.controller.use_tool(tool);
                         self.controller.set_pending_tool(number);
@@ -9942,7 +9973,11 @@ impl App {
         {
             return "Maximum Roughing Stepdown (mm)";
         }
-        match (self.inspected_tool_kind(), field) {
+        let kind = self.inspected_tool_kind();
+        if let Some(label) = kind.and_then(|kind| disc_tool_field_label(kind, field)) {
+            return label;
+        }
+        match (kind, field) {
             (Some(ToolKind::RadiusMill { .. }), Field::ToolDiameter) => "Tip diameter (mm)",
             // V-bit and chamfer mill: the single transverse ⌀ is the shaft they flare to.
             (Some(ToolKind::VBit { .. } | ToolKind::ChamferMill { .. }), Field::ToolDiameter) => {
@@ -9987,6 +10022,13 @@ impl App {
         }
         use ToolKind::*;
         match (self.inspected_tool_kind(), field) {
+            (Some(GrooveCutter | SlittingSaw), Field::ToolDiameter) => "Outside diameter across the cutting teeth.",
+            (Some(GrooveCutter), Field::FluteLength) => "Axial width of the cutting head. This sets the nominal groove width.",
+            (Some(SlittingSaw), Field::FluteLength) => "Axial thickness of the blade at the teeth. This sets the nominal slot width.",
+            (Some(SlittingSaw), Field::ShankDiameter) => "Outside diameter of the arbor next to the blade.",
+            (Some(GrooveCutter | SlittingSaw), Field::ToolLength) => "Length from the bottom of the cutting disc to the holder.",
+            (Some(GrooveCutter), Field::NeckLength) => "Length of the reduced neck above the cutter. Enter zero for a cutter with no separate neck.",
+            (Some(GrooveCutter | SlittingSaw), Field::Flutes) => "Number of cutting teeth around the disc.",
             (Some(RadiusMill { .. }), Field::ToolDiameter) => "Diameter of the cylindrical tip. The maximum cutting diameter is this value plus twice the corner radius.",
             (Some(RadiusMill { .. }), Field::CornerRadius) => "Radius of the concave cutting edge, measured from the tip to the outer cutting diameter.",
             // Cutting/flute diameter — the meaning turns on the kind.
@@ -10081,6 +10123,27 @@ impl App {
             }
         }
         let buf = |f: Field| self.fields.get(&f).and_then(|s| s.parse::<f64>().ok());
+        if self
+            .inspected_tool_kind()
+            .is_some_and(ToolKind::is_side_cutting_disc)
+        {
+            let width = buf(Field::FluteLength).unwrap_or(0.0);
+            let length = buf(Field::ToolLength).unwrap_or(0.0);
+            let neck = buf(Field::NeckLength).unwrap_or(0.0);
+            let diameter = buf(Field::ToolDiameter).unwrap_or(0.0);
+            match field {
+                Field::ToolDiameter => return value <= 0.0,
+                Field::FluteLength => return value <= 0.0 || value >= length - neck,
+                Field::ToolLength => return value <= width + neck,
+                Field::ShankDiameter => return value <= 0.0 || (neck == 0.0 && value >= diameter),
+                Field::NeckLength => return value < 0.0 || value >= length - width,
+                Field::NeckDiameter => return neck > 0.0 && (value <= 0.0 || value >= diameter),
+                Field::Flutes => {
+                    return value < 1.0 || value > f64::from(u32::MAX) || value.fract() != 0.0
+                }
+                _ => {}
+            }
+        }
         match field {
             Field::MachineTravelX | Field::MachineTravelY | Field::MachineTravelZ => value <= 0.0,
             Field::MachineMaxZ => buf(Field::MachineTravelZ)
@@ -10265,7 +10328,7 @@ impl App {
         let Some(v) = self.fields.get(&edited).and_then(|s| s.parse::<f64>().ok()) else {
             return; // empty / unparseable: hold the last valid working copy
         };
-        if v < 0.0 || (edited == Field::FluteLength && v <= 1e-9) {
+        if !v.is_finite() || v < 0.0 || (edited == Field::FluteLength && v <= 0.0) {
             return; // never write a zero/negative flute (keeps the last valid state)
         }
         let mut parsed: BTreeMap<Field, f64> = BTreeMap::new();
@@ -10279,13 +10342,15 @@ impl App {
             };
             apply_tool_dims(t, &parsed);
             apply_tool_kind_fields(&mut t.kind, &parsed);
-            [
-                (Field::FluteLength, t.flute_len()),
-                (Field::ShankLength, (t.length - t.flute_len()).max(0.0)),
-                (Field::ToolLength, t.length),
-            ]
+            (!t.kind.is_side_cutting_disc()).then(|| {
+                [
+                    (Field::FluteLength, t.flute_len()),
+                    (Field::ShankLength, (t.length - t.flute_len()).max(0.0)),
+                    (Field::ToolLength, t.length),
+                ]
+            })
         };
-        for (f, val) in derived {
+        for (f, val) in derived.into_iter().flatten() {
             if f != edited {
                 self.fields.insert(f, fmt_num(val));
             }
@@ -10477,6 +10542,22 @@ impl App {
                     Field::ToolDiameter,
                     Field::FluteLength,
                     Field::FaceBodyHeight,
+                    Field::ShankDiameter,
+                    Field::ToolLength,
+                    Field::Flutes,
+                ],
+                Some(ToolKind::GrooveCutter) => vec![
+                    Field::ToolDiameter,
+                    Field::FluteLength,
+                    Field::NeckDiameter,
+                    Field::NeckLength,
+                    Field::ShankDiameter,
+                    Field::ToolLength,
+                    Field::Flutes,
+                ],
+                Some(ToolKind::SlittingSaw) => vec![
+                    Field::ToolDiameter,
+                    Field::FluteLength,
                     Field::ShankDiameter,
                     Field::ToolLength,
                     Field::Flutes,
@@ -10864,6 +10945,14 @@ impl App {
                 }
             }
         }
+        if self
+            .inspected_tool_kind()
+            .is_some_and(ToolKind::is_side_cutting_disc)
+            && supported.iter().any(|&field| self.field_invalid(field))
+        {
+            self.status = "Correct invalid disc cutter dimensions before applying.".into();
+            return;
+        }
 
         // Library-tool editing writes to the library file, not the project — an
         // embedded copy in a project is a snapshot and is left untouched. The working
@@ -10878,6 +10967,10 @@ impl App {
                 self.tool_edit.clone(),
                 self.library.tools.get_mut(self.lib_sel),
             ) {
+                if let Err(error) = edit.validate_disc_dimensions() {
+                    self.report_error(error);
+                    return;
+                }
                 *slot = edit;
             }
             self.save_tool_libraries();
@@ -12685,6 +12778,13 @@ impl App {
         }
 
         if let Some(tool) = &self.tool_edit {
+            if tool.kind.is_side_cutting_disc() {
+                list = list.push(
+                    text("Toolpaths for side-cutting discs require a dedicated strategy.")
+                        .size(11)
+                        .color(INSPECTOR_MUTED),
+                );
+            }
             for (label, field, value) in [
                 (
                     "Description",
@@ -14302,6 +14402,14 @@ fn flute_count(flutes: u32) -> String {
     format!("{flutes} flute{}", if flutes == 1 { "" } else { "s" })
 }
 
+fn tooth_count(teeth: u32) -> String {
+    if teeth == 1 {
+        "1 tooth".into()
+    } else {
+        format!("{teeth} teeth")
+    }
+}
+
 /// The end-mill family — square, roughing, ball-nose and rounded-edge (bull-nose) end mills —
 /// which share a field set and dimensions, so switching between them preserves the
 /// tool's measurements (a Type change *across* families resets to defaults instead).
@@ -14375,6 +14483,11 @@ fn library_extra(t: &cam_model::Tool) -> Option<String> {
             flute_count(t.flutes)
         )),
         ToolKind::FaceMill => Some(flute_count(t.flutes)),
+        ToolKind::GrooveCutter | ToolKind::SlittingSaw => Some(format!(
+            "{} mm wide, {}",
+            fmt_num(t.flute_length),
+            tooth_count(t.flutes)
+        )),
         ToolKind::Drill { .. } => None,
     }
 }
@@ -14392,6 +14505,8 @@ fn kind_order(kind: ToolKind) -> u8 {
         ToolKind::VBit { .. } => 6,
         ToolKind::Drill { .. } => 7,
         ToolKind::ThreadMill { .. } => 8,
+        ToolKind::GrooveCutter => 10,
+        ToolKind::SlittingSaw => 11,
     }
 }
 
@@ -18041,6 +18156,35 @@ mod inspector_field_tests {
     use cam_model::{DrillOp, Tool};
 
     #[test]
+    fn disc_cutters_have_distinct_labels_and_independent_dimensions() {
+        let (mut app, _) = App::new();
+        app.workspace = Workspace::Tools;
+        app.reload_tool_edit();
+        for (kind, width_label) in [
+            (ToolKind::GrooveCutter, "Cutter width (mm)"),
+            (ToolKind::SlittingSaw, "Blade thickness (mm)"),
+        ] {
+            let _ = app.update(Message::ToolKindChanged(kind));
+            assert_eq!(app.field_label(Field::FluteLength), width_label);
+            assert_eq!(
+                app.inspector_fields().contains(&Field::NeckLength),
+                kind == ToolKind::GrooveCutter
+            );
+            let length = app.tool_edit.as_ref().unwrap().length;
+            let _ = app.update(Message::FieldChanged(Field::FluteLength, "0.75".into()));
+            assert!(!app.field_invalid(Field::FluteLength));
+            let _ = app.update(Message::Apply);
+            let tool = &app.library.tools[app.lib_sel];
+            assert_eq!(tool.kind, kind);
+            assert_eq!(tool.flute_length, 0.75);
+            assert_eq!(tool.length, length);
+            let _ = app.update(Message::FieldChanged(Field::FluteLength, "0".into()));
+            assert!(app.field_invalid(Field::FluteLength));
+            app.reload_tool_edit();
+        }
+    }
+
+    #[test]
     fn face_mill_flute_and_body_are_independent() {
         let (mut app, _) = App::new();
         app.workspace = Workspace::Tools;
@@ -18586,7 +18730,9 @@ mod ribbon_tests {
         ] {
             let expected: Vec<_> = F::ALL
                 .into_iter()
-                .filter(|family| *family != F::RadiusMill)
+                .filter(|family| {
+                    !matches!(family, F::RadiusMill | F::GrooveCutter | F::SlittingSaw)
+                })
                 .collect();
             assert_eq!(families_for(kind), expected.as_slice(), "{kind:?}");
         }

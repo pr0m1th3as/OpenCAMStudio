@@ -276,6 +276,10 @@ pub enum ToolKind {
     },
     /// Face mill.
     FaceMill,
+    /// Square-edged groove cutter (keyseat cutter) on a shank or reduced neck.
+    GrooveCutter,
+    /// Slitting saw blade mounted on an arbor.
+    SlittingSaw,
     /// Thread mill — helically interpolated to cut internal/external threads.
     /// `pitch` is `None` for a single-form (pitch-agnostic) mill, or `Some(p)` for
     /// a full-profile mill whose tooth comb is ground for pitch `p` mm.
@@ -305,10 +309,19 @@ impl std::fmt::Display for ToolKind {
             ToolKind::ChamferMill { .. } => "Chamfer mill",
             ToolKind::Drill { .. } => "Drill bit",
             ToolKind::FaceMill => "Face mill",
+            ToolKind::GrooveCutter => "Groove cutter",
+            ToolKind::SlittingSaw => "Slitting saw",
             ToolKind::ThreadMill { .. } => "Thread mill",
             ToolKind::VBit { .. } => "V-bit",
         };
         f.write_str(s)
+    }
+}
+
+impl ToolKind {
+    /// A radial cutter with an axial cutting width set by the head or blade.
+    pub fn is_side_cutting_disc(self) -> bool {
+        matches!(self, Self::GrooveCutter | Self::SlittingSaw)
     }
 }
 
@@ -374,7 +387,8 @@ pub struct Tool {
     pub diameter: f64,
     /// Overall tool length — the stickout below the holder, mm.
     pub length: f64,
-    /// Length of the cutting edge (length of cut) from the tip, mm. `0.0` = unspecified;
+    /// Axial length of cut from the tip, mm (head width or blade thickness for a disc).
+    /// `0.0` = unspecified for older tool kinds;
     /// see [`Tool::flute_len`] for the fallback. Drives the
     /// cutting/non-cutting split of a generated generatrix.
     #[serde(default)]
@@ -510,6 +524,51 @@ impl Tool {
         }
     }
 
+    /// Check the explicit dimensions needed to define a side-cutting disc.
+    pub fn validate_disc_dimensions(&self) -> Result<(), String> {
+        if !self.kind.is_side_cutting_disc() {
+            return Ok(());
+        }
+        let positive = |v: f64| v.is_finite() && v > 0.0;
+        if !positive(self.diameter) || !positive(self.flute_length) || self.flutes == 0 {
+            return Err(format!(
+                "Tool {} ({}) needs a positive cutting diameter, width and tooth count",
+                self.number, self.kind
+            ));
+        }
+        if !self.length.is_finite() || self.length <= self.flute_length {
+            return Err(format!(
+                "Tool {} must be longer than its cutting width",
+                self.number
+            ));
+        }
+        if !positive(self.shank_diameter) {
+            return Err(format!(
+                "Tool {} needs a positive shank or arbor diameter",
+                self.number
+            ));
+        }
+        if !self.neck_length.is_finite()
+            || self.neck_length < 0.0
+            || self.neck_length >= self.length - self.flute_length
+            || (self.kind == ToolKind::SlittingSaw && self.neck_length != 0.0)
+        {
+            return Err(format!("Tool {} has an invalid neck length", self.number));
+        }
+        let support = if self.neck_length > 0.0 {
+            self.neck_diameter
+        } else {
+            self.shank_diameter
+        };
+        if !positive(support) || support >= self.diameter {
+            return Err(format!(
+                "Tool {} needs a neck, shank or arbor at the disc narrower than its cutting diameter",
+                self.number
+            ));
+        }
+        Ok(())
+    }
+
     /// This tool's **2D revolve generatrix** (`TOOLING_PLAN.md` Phase 4): the built-in
     /// kinds mapped onto a kernel-neutral [`cam_geo::GeneratrixSpec`] and generated. The
     /// cutting-end shape comes from [`kind`](Self::kind); the flute/shank split from the
@@ -619,6 +678,7 @@ impl Tool {
             | ToolKind::RoughingMill
             | ToolKind::FaceMill
             | ToolKind::ThreadMill { .. } => BottomShape::Flat,
+            ToolKind::GrooveCutter | ToolKind::SlittingSaw => BottomShape::SideCuttingDisc,
             ToolKind::BallMill => BottomShape::Ball,
             ToolKind::BullNose { corner_radius } => BottomShape::BullNose { corner_radius },
             ToolKind::RadiusMill {

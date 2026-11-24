@@ -281,6 +281,7 @@ fn step(from: u32, doc: &mut Value) -> Result<(), MigrationError> {
             Ok(())
         }
         49 => Ok(()), // Parallel keeps its straight-line cutting turns by default.
+        50 => Ok(()), // Groove cutters and slitting saws add tool kinds.
         46 => Ok(()), // Optional expression maps; old operations retain their literal values.
         39 => Ok(()), // Optional cylindrical fourth-axis wrap settings.
         36 => Ok(()), // Fixture bodies default to empty; clearances default to 5 mm.

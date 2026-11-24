@@ -109,7 +109,8 @@ use crate::{BoreOp, Tool};
 /// v48: 3D Spiral finishing.
 /// v49: Parallel cutting turns and repositioning policy.
 /// v50: Parallel transition type.
-pub const SCHEMA_VERSION: u32 = 50;
+/// v51: groove cutter and slitting saw tool types.
+pub const SCHEMA_VERSION: u32 = 51;
 
 /// How repeated instances are traversed when executing a pattern.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

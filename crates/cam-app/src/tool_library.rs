@@ -49,6 +49,32 @@ pub fn default_tool(number: u32, kind: ToolKind) -> Tool {
             ..Default::default()
         };
     }
+    if kind == ToolKind::GrooveCutter {
+        return Tool {
+            number,
+            diameter: 12.0,
+            flute_length: 2.0,
+            neck_diameter: 6.0,
+            neck_length: 12.0,
+            shank_diameter: 8.0,
+            length: 50.0,
+            flutes: 4,
+            kind,
+            ..Default::default()
+        };
+    }
+    if kind == ToolKind::SlittingSaw {
+        return Tool {
+            number,
+            diameter: 63.0,
+            flute_length: 1.5,
+            shank_diameter: 22.0,
+            length: 55.0,
+            flutes: 48,
+            kind,
+            ..Default::default()
+        };
+    }
     let diameter = 6.0;
     let flute = 2.0 * diameter;
     let shank = 2.5 * flute;
@@ -71,7 +97,8 @@ pub fn default_tool(number: u32, kind: ToolKind) -> Tool {
 /// ever written already has, which is why an unversioned file reads as v1 rather
 /// than being refused. v2 adds managed materials and named cutter presets; v3 adds
 /// roughing end mills; v4 adds optional effective specific cutting force on materials.
-pub const LIBRARY_VERSION: u32 = 4;
+/// v5 adds groove cutters and slitting saws.
+pub const LIBRARY_VERSION: u32 = 5;
 
 /// Approximate effective coefficients, not raw kc1 reference values. See
 /// docs/cutting-forces.md for the assumptions and source data.
@@ -109,7 +136,7 @@ impl crate::config::ConfigFile for ToolLibrary {
 
     fn migrate(&mut self, _from: u32) {
         // v2 adds preset/material registries; v3 adds a new tool kind;
-        // v4's optional material coefficient defaults to unset.
+        // v4's optional material coefficient defaults to unset; v5 adds tool kinds.
         self.library_version = LIBRARY_VERSION;
     }
 
@@ -167,6 +194,11 @@ impl crate::config::ConfigFile for LibraryCollection {
     }
     fn migrate(&mut self, _: u32) {
         self.version = 1;
+        for library in self.libraries.values_mut() {
+            if library.library_version <= LIBRARY_VERSION {
+                library.migrate(library.library_version);
+            }
+        }
     }
     fn validate(&self) -> Result<(), String> {
         if self.libraries.is_empty() || !self.libraries.contains_key(&self.active) {
@@ -290,6 +322,7 @@ impl ToolLibrary {
             }
         }
         for tool in &self.tools {
+            tool.validate_disc_dimensions()?;
             tool.validate_presets()?;
         }
         Ok(())
@@ -528,8 +561,7 @@ impl ToolLibrary {
     ///
     /// In every case this is only a **default** — we never *reject* a tool the user
     /// picks; and if no tool of the preferred kind exists we fall back to the first
-    /// library tool (order = the user's own numbering). `None` only when the
-    /// library is empty.
+    /// library tool with a supported cutting strategy (order = the user's own numbering).
     pub fn default_tool_for(&self, kind: OpKind) -> Option<Tool> {
         // The middle tool of its kind, by diameter — not the first.
         //
@@ -609,7 +641,9 @@ impl ToolLibrary {
             // Engraving also allows other cutters along the same centre path.
             OpKind::Engrave | OpKind::Carve => nearest_vbit(),
         };
-        preferred.or_else(|| self.tools.first()).cloned()
+        preferred
+            .or_else(|| self.tools.iter().find(|t| !t.kind.is_side_cutting_disc()))
+            .cloned()
     }
 
     /// Append a fresh default tool (numbered one past the highest) and return its
@@ -705,12 +739,14 @@ pub enum ToolKindPick {
     ChamferMill,
     Drill,
     FaceMill,
+    GrooveCutter,
+    SlittingSaw,
     ThreadMill,
     VBit,
 }
 
 impl ToolKindPick {
-    pub const ALL: [ToolKindPick; 10] = [
+    pub const ALL: [ToolKindPick; 12] = [
         ToolKindPick::EndMill,
         ToolKindPick::RoughingMill,
         ToolKindPick::BallMill,
@@ -719,6 +755,8 @@ impl ToolKindPick {
         ToolKindPick::ChamferMill,
         ToolKindPick::Drill,
         ToolKindPick::FaceMill,
+        ToolKindPick::GrooveCutter,
+        ToolKindPick::SlittingSaw,
         ToolKindPick::ThreadMill,
         ToolKindPick::VBit,
     ];
@@ -733,6 +771,8 @@ impl ToolKindPick {
             ToolKind::ChamferMill { .. } => ToolKindPick::ChamferMill,
             ToolKind::Drill { .. } => ToolKindPick::Drill,
             ToolKind::FaceMill => ToolKindPick::FaceMill,
+            ToolKind::GrooveCutter => ToolKindPick::GrooveCutter,
+            ToolKind::SlittingSaw => ToolKindPick::SlittingSaw,
             ToolKind::ThreadMill { .. } => ToolKindPick::ThreadMill,
             ToolKind::VBit { .. } => ToolKindPick::VBit,
         }
@@ -758,6 +798,8 @@ impl ToolKindPick {
                 point_angle_deg: 118.0,
             },
             ToolKindPick::FaceMill => ToolKind::FaceMill,
+            ToolKindPick::GrooveCutter => ToolKind::GrooveCutter,
+            ToolKindPick::SlittingSaw => ToolKind::SlittingSaw,
             ToolKindPick::ThreadMill => ToolKind::ThreadMill { pitch: None },
             // A V-bit's point is always ground to a radius; 0 is unmakeable. 0.1 mm
             // is a typical carving tip.
@@ -814,6 +856,46 @@ mod library_file_tests {
     use crate::config::tests::Scratch;
 
     #[test]
+    fn side_cutting_discs_round_trip_with_their_own_profiles() {
+        let mut library = ToolLibrary::default();
+        let groove = library.add_of_kind(ToolKindPick::GrooveCutter.to_kind());
+        let saw = library.add_of_kind(ToolKindPick::SlittingSaw.to_kind());
+        let path = Scratch::new("disc-cutters");
+        library.save_to(&path.file("tools.json")).unwrap();
+        let (loaded, outcome) = ToolLibrary::load_from(&path.file("tools.json"));
+        assert_eq!(outcome, LibraryLoad::Loaded);
+        assert_eq!(loaded, library);
+
+        let exported = crate::OcamFile::Library(library.clone()).to_json().unwrap();
+        let reopened = crate::OcamFile::from_json(&exported).unwrap();
+        assert_eq!(reopened, crate::OcamFile::Library(library.clone()));
+
+        for (index, expected_radius) in [(groove, 3.0), (saw, 11.0)] {
+            let tool = &loaded.tools[index];
+            let profile = tool.profile();
+            assert_eq!(profile.max_radius(), tool.radius());
+            assert_eq!(profile.height(), tool.length);
+            assert_eq!(profile.cutting_flank_height(), tool.flute_length);
+            assert!(!profile.has_cutting_tip());
+            assert!(profile.segs.iter().any(|segment| {
+                !segment.cutting
+                    && segment.end == cam_geo::Point::new(expected_radius, tool.flute_length)
+            }));
+            assert!(crate::controller::sim_profile(tool).is_none());
+            assert!(!families_for(OpKind::Profile).contains(&ToolKindPick::of(tool.kind)));
+        }
+        assert!(loaded.default_tool_for(OpKind::Profile).is_none());
+
+        // Equal dimensions still describe distinct tool types.
+        let mut also_saw = loaded.tools[groove].clone();
+        also_saw.kind = ToolKind::SlittingSaw;
+        assert_ne!(also_saw.identity(), loaded.tools[groove].identity());
+
+        library.tools[saw].shank_diameter = library.tools[saw].diameter;
+        assert!(library.validate().is_err());
+    }
+
+    #[test]
     fn roughing_tool_round_trips_and_is_available_to_clearing() {
         let mut library = ToolLibrary::default();
         let index = library.add_of_kind(ToolKind::RoughingMill);
@@ -839,7 +921,7 @@ mod library_file_tests {
             ToolKind::EndMill
         );
         assert!(matches!(
-            crate::controller::sim_profile(&reopened.tools[index]).shape,
+            crate::controller::sim_profile(&reopened.tools[index]).unwrap().shape,
             cam_sim::ProfileShape::Flat
         ));
         let app = crate::AppController::new(crate::default_machine());
@@ -1588,6 +1670,7 @@ mod collection_tests {
     fn legacy_library_and_defaults_remain_distinct_and_round_trip() {
         let mut legacy = ToolLibrary::defaults();
         legacy.tools.pop();
+        legacy.library_version = LIBRARY_VERSION - 1;
         let mut collection = LibraryCollection::from_legacy(legacy.clone());
         assert_eq!(collection.active, "My tools");
         assert_eq!(collection.libraries["My tools"], legacy);
@@ -1606,6 +1689,7 @@ mod collection_tests {
             crate::config::load_from::<LibraryCollection>(&path.file("libraries.json"));
         assert_eq!(outcome, crate::config::ConfigLoad::Loaded);
         assert_eq!(loaded.active, "My tools (2)");
+        legacy.library_version = LIBRARY_VERSION;
         assert_eq!(loaded.libraries["My tools"], legacy);
         assert!(loaded.libraries["My tools (2)"].tools.is_empty());
         assert!(loaded.validate().is_ok());

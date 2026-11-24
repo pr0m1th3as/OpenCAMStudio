@@ -3370,7 +3370,7 @@ pub(crate) fn narrowest_cut_width(program: &Program, tools: &[Tool], surface_z: 
 
 /// Translate a document [`Tool`] into the simulator's [`ToolProfile`] — how its
 /// bottom removes material (flat, ball, bull-nose corner, or a chamfer/drill cone).
-pub(crate) fn sim_profile(tool: &Tool) -> ToolProfile {
+pub(crate) fn sim_profile(tool: &Tool) -> Option<ToolProfile> {
     let radius = tool.radius()
         + match tool.kind {
             ToolKind::RadiusMill { corner_radius, .. } => corner_radius.max(0.0),
@@ -3378,6 +3378,7 @@ pub(crate) fn sim_profile(tool: &Tool) -> ToolProfile {
         };
     let shape = match tool.kind {
         ToolKind::EndMill | ToolKind::RoughingMill | ToolKind::FaceMill => ProfileShape::Flat,
+        ToolKind::GrooveCutter | ToolKind::SlittingSaw => return None,
         ToolKind::BallMill => ProfileShape::Ball,
         ToolKind::BullNose { corner_radius } => ProfileShape::BullNose {
             corner_radius: corner_radius.clamp(0.0, radius),
@@ -3420,7 +3421,7 @@ pub(crate) fn sim_profile(tool: &Tool) -> ToolProfile {
             }
         }
     };
-    ToolProfile { radius, shape }
+    Some(ToolProfile { radius, shape })
 }
 
 /// Set an operation's id, whatever its kind.

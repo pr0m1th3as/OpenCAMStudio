@@ -39,6 +39,8 @@ enum ToolKindId {
     RoughingMill,
     BallMill,
     FaceMill,
+    GrooveCutter,
+    SlittingSaw,
     BullNose {
         corner_um: i64,
     },
@@ -69,6 +71,8 @@ fn kind_id(k: &ToolKind) -> ToolKindId {
         ToolKind::RoughingMill => ToolKindId::RoughingMill,
         ToolKind::BallMill => ToolKindId::BallMill,
         ToolKind::FaceMill => ToolKindId::FaceMill,
+        ToolKind::GrooveCutter => ToolKindId::GrooveCutter,
+        ToolKind::SlittingSaw => ToolKindId::SlittingSaw,
         ToolKind::BullNose { corner_radius } => ToolKindId::BullNose {
             corner_um: q(corner_radius),
         },

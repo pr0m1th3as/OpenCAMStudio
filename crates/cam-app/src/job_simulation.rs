@@ -2,6 +2,18 @@
 use super::*;
 use cam_sim::{Heightfield, SimResult};
 
+fn simulation_tool(tool: &cam_model::Tool, outline: &cam_geo::Profile2D) -> Option<SimTool> {
+    Some(SimTool {
+        number: tool.number,
+        profile: sim_profile(tool)?,
+        noncutting_tip_radius: outline
+            .segs
+            .first()
+            .filter(|s| !s.cutting && s.end.y.abs() < 1e-9)
+            .map(|s| s.end.x),
+    })
+}
+
 #[derive(Default)]
 pub(crate) struct StockSimulationCache {
     current: SimulationCache,
@@ -115,18 +127,7 @@ impl JobInputs {
             .setup()
             .tools
             .iter()
-            .map(|tool| {
-                let outline = tool.profile();
-                SimTool {
-                    number: tool.number,
-                    profile: sim_profile(tool),
-                    noncutting_tip_radius: outline
-                        .segs
-                        .first()
-                        .filter(|s| !s.cutting && s.end.y.abs() < 1e-9)
-                        .map(|s| s.end.x),
-                }
-            })
+            .filter_map(|tool| simulation_tool(tool, &tool.profile()))
             .collect();
         let fixture_contacts = self.fixture_collisions(program, cancel)?;
         let mut samples = if self.uses_rotary_stock(program) {
@@ -375,18 +376,7 @@ impl JobInputs {
         let tools = &self.document.setup().tools;
         let sim_tools: Vec<SimTool> = tools
             .iter()
-            .map(|t| {
-                let outline = t.profile();
-                SimTool {
-                    number: t.number,
-                    profile: sim_profile(t),
-                    noncutting_tip_radius: outline
-                        .segs
-                        .first()
-                        .filter(|s| !s.cutting && s.end.y.abs() < 1e-9)
-                        .map(|s| s.end.x),
-                }
-            })
+            .filter_map(|tool| simulation_tool(tool, &tool.profile()))
             .collect();
         let options = SimOptions {
             resolution,
@@ -441,8 +431,9 @@ impl JobInputs {
             .setup()
             .tools
             .iter()
-            .map(|t| {
+            .filter_map(|t| {
                 let outline = t.profile();
+                let tool = simulation_tool(t, &outline)?;
                 let flute = outline
                     .segs
                     .iter()
@@ -450,16 +441,8 @@ impl JobInputs {
                     .map(|s| s.end.y)
                     .fold(0., f64::max)
                     .max(1e-6);
-                cam_sim::RotaryTool {
-                    tool: SimTool {
-                        number: t.number,
-                        profile: sim_profile(t),
-                        noncutting_tip_radius: outline
-                            .segs
-                            .first()
-                            .filter(|s| !s.cutting && s.end.y.abs() < 1e-9)
-                            .map(|s| s.end.x),
-                    },
+                Some(cam_sim::RotaryTool {
+                    tool,
                     flute_length: flute,
                     length: t.length.max(flute),
                     neck_length: if matches!(t.kind, cam_model::ToolKind::ThreadMill { .. }) {
@@ -469,7 +452,7 @@ impl JobInputs {
                     },
                     neck_radius: t.neck_dia() / 2.,
                     shank_radius: t.shank_dia() / 2.,
-                }
+                })
             })
             .collect()
     }

@@ -50,6 +50,8 @@ pub struct Profile2D {
 pub enum BottomShape {
     /// Flat bottom (end mill / face mill).
     Flat,
+    /// A disc whose cutting edges are at its rim, with no axial cutting tip.
+    SideCuttingDisc,
     /// Full ball nose (corner radius = tool radius): a hemisphere, tip at the origin.
     Ball,
     /// Flat centre with a rounded corner of `corner_radius` mm (bull-nose).
@@ -122,6 +124,10 @@ pub fn generatrix(spec: &GeneratrixSpec) -> Profile2D {
     let z_side = match spec.bottom {
         BottomShape::Flat => {
             segs.push(line(Point::new(r, 0.0), true));
+            0.0
+        }
+        BottomShape::SideCuttingDisc => {
+            segs.push(line(Point::new(r, 0.0), false));
             0.0
         }
         BottomShape::Ball => {
