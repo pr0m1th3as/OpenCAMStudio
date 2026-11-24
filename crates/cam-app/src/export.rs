@@ -31,7 +31,8 @@ impl AppController {
             return Err(ExportError::HasErrors);
         }
         if self.block_export_on_verification_errors {
-            let collision_errors: [(CollisionKind, fn(usize) -> ExportError); 3] = [
+            type CollisionError = (CollisionKind, fn(usize) -> ExportError);
+            let collision_errors: [CollisionError; 3] = [
                 (
                     CollisionKind::RapidThroughStock,
                     ExportError::RapidThroughStock,

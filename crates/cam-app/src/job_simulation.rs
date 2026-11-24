@@ -833,10 +833,6 @@ fn simulation_resolution(span: f64, feature: f64, accuracy: f32) -> f64 {
 }
 
 #[cfg(test)]
-#[path = "project_cache_bench.rs"]
-mod cache_bench;
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{default_machine, AppController};

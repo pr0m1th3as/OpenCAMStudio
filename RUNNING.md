@@ -673,29 +673,3 @@ Run `cargo run -p cam-sim --release --example preview_bench` for a reproducible
 100 × 100 mm, eight-depth curved-cut benchmark. It reports fresh simulation,
 mesh generation, mesh memory, and median/p95 incremental frame CPU time. These
 measurements exclude toolpath generation, GPU upload and UI presentation.
-
-### Profile editor performance check
-
-With the local `testfiles/basket_1.ocam` project available, run:
-
-```bash
-cargo test -p cam-app --features gui --lib basket_ui_cpu_benchmark -- --ignored --nocapture
-```
-
-This reports CPU time for pocket/profile editor views, height validation and feed
-edits, including profile 13's expensive CAD contour. Viewport timings include the
-first geometry build; subsequent editor views exercise contour reuse. These
-measurements exclude GPU rendering and screen presentation. Changing a profile's
-source or geometry settings must refresh its contours; camera and cutting-data
-edits should reuse them.
-
-To check **new** profile creation on Body 5 (instance 8, body 5053), including
-direct loop selection, the named Chain submenu and the Silhouette submenu:
-
-```bash
-cargo test -p cam-app --features gui --lib basket_body_5_profile_creation_benchmark -- --ignored --nocapture
-```
-
-This includes the first selection and repeated validation/redraws while creating
-the operation. Feed changes must retain their current values when reusing resolved
-geometry. Source, depth and geometry-setting changes must invalidate that result.

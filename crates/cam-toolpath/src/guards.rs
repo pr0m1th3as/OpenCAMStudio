@@ -225,14 +225,21 @@ mod tests {
 
     #[test]
     fn reach_includes_a_chamfer_mills_cutting_cone_above_its_flat() {
-        let tool = tool(ToolKind::ChamferMill {
+        let mut tool = tool(ToolKind::ChamferMill {
             included_angle_deg: 90.,
             tip_diameter: 1.,
         });
+        // End the cutting edge at the top of the cone; a longer flute also
+        // has a cutting cylindrical flank above it.
+        tool.flute_length = 2.5;
         let mut diagnostics = Vec::new();
         warn_axial_reach(0, "chamfer", &tool, 2.4, &mut diagnostics);
         assert!(diagnostics.is_empty());
         warn_axial_reach(0, "chamfer", &tool, 2.6, &mut diagnostics);
         assert_eq!(diagnostics.len(), 1);
+        tool.flute_length = 12.;
+        diagnostics.clear();
+        warn_axial_reach(0, "chamfer", &tool, 2.6, &mut diagnostics);
+        assert!(diagnostics.is_empty());
     }
 }

@@ -77,7 +77,8 @@ impl Polygon {
     /// Classify a point against the filled region: strictly inside, strictly
     /// outside, or exactly on a boundary edge.
     ///
-    /// The test runs on the fixed integer grid, so it is robust to
+    /// The test recognizes points on the original edges within floating-point
+    /// tolerance, then runs on the fixed integer grid, so it is robust to
     /// floating-point round-off and fully deterministic — including the
     /// boundary case, which a bare winding number leaves ambiguous. A point is
     /// [`Containment::OnBoundary`] when, once snapped to the grid, it lies on any
@@ -85,6 +86,13 @@ impl Polygon {
     /// decides inside vs. outside (outer winds CCW at `+1`, holes CW at `-1`, so
     /// a point within a hole nets to zero).
     pub fn locate(&self, p: Point) -> Containment {
+        // A point interpolated on an edge may snap to a neighbouring grid cell
+        // instead of the snapped edge. Preserve the closed boundary in that case.
+        if on_float_ring(self.outer.points(), p)
+            || self.holes.iter().any(|h| on_float_ring(h.points(), p))
+        {
+            return Containment::OnBoundary;
+        }
         let px = snap(p.x);
         let py = snap(p.y);
 
@@ -142,6 +150,19 @@ impl Polygon {
 /// Collect a slice of polygons into an `i_overlay` "shapes" resource.
 pub(crate) fn to_shapes(polygons: &[Polygon]) -> Vec<Vec<Vec<Point>>> {
     polygons.iter().map(Polygon::to_shape).collect()
+}
+
+fn on_float_ring(pts: &[Point], p: Point) -> bool {
+    pts.iter().zip(pts.iter().cycle().skip(1)).any(|(a, b)| {
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let length2 = dx * dx + dy * dy;
+        if length2 == 0.0 {
+            return p.distance(*a) <= 1e-9;
+        }
+        let t = (((p.x - a.x) * dx + (p.y - a.y) * dy) / length2).clamp(0.0, 1.0);
+        p.distance(Point::new(a.x + t * dx, a.y + t * dy)) <= 1e-9
+    })
 }
 
 /// Rebuild polygons from an `i_overlay` shapes result.

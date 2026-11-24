@@ -1228,11 +1228,17 @@ fn apply_feed_height(
                 for &[x, y] in &c.points {
                     expanded.push(Step::Rapid {
                         to: Point3::new(x, y, c.retract.max(feed_z)),
-                        tag: c.tag,
+                        tag: Tag {
+                            kind: MoveKind::Link,
+                            ..c.tag
+                        },
                     });
                     expanded.push(Step::Rapid {
                         to: Point3::new(x, y, entry),
-                        tag: c.tag,
+                        tag: Tag {
+                            kind: MoveKind::Link,
+                            ..c.tag
+                        },
                     });
                     let mut previous = c.z_top;
                     let peck = c.peck.unwrap_or(c.z_top - c.depth);
@@ -1250,7 +1256,10 @@ fn apply_feed_height(
                         if index > 1 {
                             expanded.push(Step::Rapid {
                                 to: Point3::new(x, y, (previous + 0.5).min(entry)),
-                                tag: c.tag,
+                                tag: Tag {
+                                    kind: MoveKind::Link,
+                                    ..c.tag
+                                },
                             });
                         }
                         expanded.push(Step::Linear {
@@ -1265,7 +1274,10 @@ fn apply_feed_height(
                         }
                         expanded.push(Step::Rapid {
                             to: Point3::new(x, y, c.retract.max(feed_z)),
-                            tag: c.tag,
+                            tag: Tag {
+                                kind: MoveKind::Retract,
+                                ..c.tag
+                            },
                         });
                         previous = z;
                     }

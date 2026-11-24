@@ -134,7 +134,7 @@ pub struct Diagnostic {
     /// instead of only reporting a count.
     pub op: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pocket_helix_fit: Option<pocket_helix::PocketHelixFit>,
+    pocket_helix_fit: Option<Box<pocket_helix::PocketHelixFit>>,
 }
 
 impl Diagnostic {
@@ -153,7 +153,7 @@ impl Diagnostic {
     pub(crate) fn pocket_helix_fit(id: u32, fit: pocket_helix::PocketHelixFit) -> Self {
         let mut diagnostic =
             Self::error(format!("operation {id}: pocket toolpath failed: {fit}")).for_op(id);
-        diagnostic.pocket_helix_fit = Some(fit);
+        diagnostic.pocket_helix_fit = Some(Box::new(fit));
         diagnostic
     }
 

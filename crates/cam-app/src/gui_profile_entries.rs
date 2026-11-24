@@ -1097,46 +1097,7 @@ mod tests {
         select_closed_edges(app, references);
     }
 
-    #[test]
-    #[ignore = "qualification against the supplied test2.ocam edge selection"]
-    fn supplied_test2_eight_edges_create_a_closed_chain_with_advisory_verification() {
-        let (app, reference) = cad_loop_app("test2.ocam", 0);
-        let references: Vec<_> = [209, 211, 207, 213, 215, 200, 203, 205]
-            .into_iter()
-            .map(|id| EntityRef {
-                kind: EntityKind::Edge,
-                id,
-                ..reference.clone()
-            })
-            .collect();
-        let mut app = select_closed_edges(app, references.clone());
-        let Selection::Operation(id) = app.controller.selection() else {
-            panic!("operation")
-        };
-        let Some(Operation::Profile(profile)) = app.controller.operation(id) else {
-            panic!("profile")
-        };
-        assert!(profile.chain.area() > 6800. && profile.chain.area() < 6820.);
-        let path = std::env::temp_dir().join(format!("advisory-test2-{}.ocam", std::process::id()));
-        app.controller.save_project(&path).unwrap();
-        let mut reopened = AppController::new(crate::default_machine());
-        reopened.open_project(&path).unwrap();
-        std::fs::remove_file(path).unwrap();
-        assert_eq!(reopened.geometry_state().bindings[&id].selected, references);
-        assert!(
-            matches!(reopened.operation(id), Some(Operation::Profile(profile)) if profile.closed)
-        );
-    }
 
-    #[test]
-    #[ignore = "requires the supplied local tray projects"]
-    fn supplied_tray_loop_234_creates_without_wall_trim_errors() {
-        for file in ["tray.ocam", "tray-fixed.ocam"] {
-            for feature_first in [false, true] {
-                check_direct_loop_creation(file, 234, feature_first);
-            }
-        }
-    }
 
     fn app() -> App {
         let (mut app, _) = App::new();

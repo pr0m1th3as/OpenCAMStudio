@@ -187,20 +187,6 @@ cargo run --release -p cam-app --example project_io_bench -- /tmp/screw-state.oc
   --save-copy /tmp/screw-state-roundtrip.ocam
 ```
 
-
-The opt-in benchmark is in
-[`project_cache_bench.rs`](../crates/cam-app/src/project_cache_bench.rs). It works
-on a temporary core copy and never overwrites the source project.
-
-```sh
-OCAM_PROFILE_PROJECT=/path/to/screw_test.ocam OCAM_PROFILE_ACCURACY=0.75 \
-  cargo test --release -p cam-app --lib project_stock_cache_benchmark -- --ignored --nocapture
-```
-
-Set `OCAM_PROFILE_GENERATION_ONLY=1` to measure only core loading and path
-generation. The benchmark compares cached and uncached generated programs and
-compares fresh versus retained-cache remeshing of the same stock.
-
 ## Rotating-stock display follow-up
 
 The rotating-stock view had a separate CPU bottleneck after stock meshing. It

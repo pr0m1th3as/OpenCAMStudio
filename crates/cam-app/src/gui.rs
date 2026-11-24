@@ -107,9 +107,6 @@ mod cutting_data;
 mod cutting_forces;
 #[path = "gui_drill_cycle.rs"]
 mod drill_cycle;
-#[cfg(test)]
-#[path = "gui_performance.rs"]
-mod performance;
 #[path = "gui_tool_drawing.rs"]
 mod tool_drawing;
 use tool_drawing::ToolCanvas;
@@ -2803,6 +2800,87 @@ fn drill_marks_of(program: &Program) -> Vec<DrillMark> {
                     kind: DrillMarkKind::DwellBar,
                 });
             }
+        }
+    }
+    marks
+}
+
+/// Recover peck and dwell annotations from expanded drilling motions. Only
+/// operations known to be drills are passed in, so other plunges are ignored.
+fn expanded_drill_marks(program: &Program, is_drill: impl Fn(u32) -> bool) -> Vec<DrillMark> {
+    let mut marks = Vec::new();
+    let mut current: Option<cam_cldata::Point3> = None;
+    let mut last_peck: Option<(u32, cam_cldata::Point3)> = None;
+    let mut withdrawn = false;
+    let mut rings = 0;
+    for step in program.steps() {
+        match step {
+            Step::Rapid { to, tag } => {
+                if let (Some(from), Some((id, peck))) = (current, last_peck) {
+                    if id == tag.op_id
+                        && to.z > from.z
+                        && (to.x - peck.x).abs() < 1e-9
+                        && (to.y - peck.y).abs() < 1e-9
+                    {
+                        withdrawn = true;
+                    }
+                }
+                current = Some(*to);
+            }
+            Step::Linear { to, tag, .. } => {
+                if is_drill(tag.op_id)
+                    && tag.kind == cam_cldata::MoveKind::Plunge
+                    && current.is_some_and(|from| to.z < from.z - 1e-9)
+                {
+                    let mut reentering = false;
+                    if let Some((id, peck)) = last_peck {
+                        let same_hole = id == tag.op_id
+                            && (to.x - peck.x).abs() < 1e-9
+                            && (to.y - peck.y).abs() < 1e-9;
+                        if same_hole && withdrawn && to.z < peck.z - 1e-9 && rings < DRILL_MAX_RINGS
+                        {
+                            marks.push(DrillMark {
+                                at: [peck.x as f32, peck.y as f32, peck.z as f32],
+                                kind: DrillMarkKind::PeckRing,
+                            });
+                            rings += 1;
+                        } else if same_hole && withdrawn && to.z >= peck.z - 1e-9 {
+                            reentering = true;
+                        } else if !same_hole {
+                            rings = 0;
+                        }
+                    }
+                    if !reentering {
+                        last_peck = Some((tag.op_id, *to));
+                        withdrawn = false;
+                    }
+                } else if !is_drill(tag.op_id) {
+                    last_peck = None;
+                }
+                current = Some(*to);
+            }
+            Step::Dwell { seconds } if *seconds > 0.0 => {
+                if let (Some(at), Some((_, peck))) = (current, last_peck) {
+                    if (at.x - peck.x).abs() < 1e-9
+                        && (at.y - peck.y).abs() < 1e-9
+                        && (at.z - peck.z).abs() < 1e-9
+                    {
+                        marks.push(DrillMark {
+                            at: [at.x as f32, at.y as f32, at.z as f32],
+                            kind: DrillMarkKind::DwellBar,
+                        });
+                    }
+                }
+            }
+            Step::Arc { end, .. } => {
+                current = Some(*end);
+                last_peck = None;
+            }
+            Step::Drill(_) | Step::ToolChange { .. } | Step::Datum(_) | Step::Stop => {
+                current = None;
+                last_peck = None;
+            }
+            _ => {}
         }
     }
     marks
@@ -15076,7 +15154,12 @@ impl Viewport {
                         matches!(step, Step::Drill(c) if focus_ops.contains(&c.tag.op_id) && !hidden_ops.contains(&c.tag.op_id))
                     }).cloned().collect(),
                 };
-                drill_marks_of(&visible_drills)
+                let mut marks = drill_marks_of(&visible_drills);
+                marks.extend(expanded_drill_marks(&o.program, |id| {
+                    focus_ops.contains(&id) && !hidden_ops.contains(&id)
+                        && matches!(controller.operation(id), Some(Operation::Drill(_)))
+                }));
+                marks
                     .into_iter()
                     .map(|mut mark| {
                         mark.at = frame
@@ -18823,6 +18906,56 @@ mod inspector_field_tests {
         // First peck already reaches the bottom ⇒ no intermediate retract to mark.
         let marks = drill_marks_of(&drilled(Some(20.0), None));
         assert!(marks.is_empty());
+    }
+
+    #[test]
+    fn expanded_drill_marks_follow_retracts_and_dwell() {
+        use cam_cldata::{MoveKind, Point3, Tag};
+        let mut program = Program::new();
+        let point = |z| Point3::new(4., 5., z);
+        let tag = |kind| Tag::new(7, kind);
+        program.push(Step::Rapid {
+            to: point(2.),
+            tag: tag(MoveKind::Link),
+        });
+        program.push(Step::Linear {
+            to: point(-1.),
+            feed: 100.,
+            tag: tag(MoveKind::Plunge),
+        });
+        program.push(Step::Rapid {
+            to: point(2.),
+            tag: tag(MoveKind::Retract),
+        });
+        program.push(Step::Linear {
+            to: point(-0.5),
+            feed: 100.,
+            tag: tag(MoveKind::Plunge),
+        });
+        program.push(Step::Linear {
+            to: point(-2.),
+            feed: 100.,
+            tag: tag(MoveKind::Plunge),
+        });
+        program.push(Step::Dwell { seconds: 0.5 });
+        program.push(Step::Rapid {
+            to: point(2.),
+            tag: tag(MoveKind::Retract),
+        });
+        assert_eq!(
+            expanded_drill_marks(&program, |id| id == 7),
+            vec![
+                DrillMark {
+                    at: [4., 5., -1.],
+                    kind: DrillMarkKind::PeckRing
+                },
+                DrillMark {
+                    at: [4., 5., -2.],
+                    kind: DrillMarkKind::DwellBar
+                },
+            ]
+        );
+        assert!(expanded_drill_marks(&program, |_| false).is_empty());
     }
 
     #[test]

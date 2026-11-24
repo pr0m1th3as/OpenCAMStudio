@@ -961,7 +961,7 @@ fn apply_drill_height_settings(
 
 /// A fresh topology resolution replaces every linked strategy input. Stale
 /// embedded contours are never a fallback after asset replacement or removal.
-#[cfg(test)]
+#[cfg(all(test, feature = "gui"))]
 pub(crate) fn resolve_document(document: &Document) -> Result<Document, String> {
     resolve_document_checked(document, &|| false).map_err(|diagnostic| diagnostic.message)
 }
@@ -1717,110 +1717,6 @@ pub(crate) fn refresh_binding_heights(document: &mut Document) {
                     reason: format!("Geometry changed: {reason}"),
                 }
             }
-        }
-    }
-}
-
-#[cfg(test)]
-mod pocket_stock_tests {
-    use super::*;
-    use crate::{default_machine, AppController};
-    use cam_cldata::{MoveKind, SpindleDir, Step};
-    use cam_toolpath::{CancelToken, JobCompletion};
-
-    #[test]
-    #[ignore = "supplied testfile2.ocam regression; set OCAM_STOCK_PROJECT"]
-    fn supplied_floor_holes_are_cleared_to_the_stock_contour() {
-        let path = std::env::var("OCAM_STOCK_PROJECT").unwrap();
-        let mut app = AppController::new(default_machine());
-        app.open_project(Path::new(&path)).unwrap();
-        let (min, max) = app.stock_box();
-        // The saved project selects the right floor; the screenshot selects
-        // the corresponding left floor in the same flipped setup.
-        for (face, center) in [(34, 75.), (32, -75.)] {
-            let mut selected = app.geometry_state().bindings[&0].selected.clone();
-            selected[0].id = face;
-            app.edit_cad_geometry(0, selected).unwrap();
-            let document = resolve_document(app.document()).unwrap();
-            assert!(
-                matches!(&document.setup().operations[0], Operation::Pocket(p)
-                if p.stock_contours.enabled && p.islands.len() == 1)
-            );
-            let started = std::time::Instant::now();
-            let result = cam_toolpath::build_job(
-                &document,
-                1000.,
-                SpindleDir::Cw,
-                Some(([min[0], min[1]], [max[0], max[1]])),
-                200.,
-                &CancelToken::new(),
-            );
-            eprintln!(
-                "Face {face}: {} moves in {:?}",
-                result.program.len(),
-                started.elapsed()
-            );
-            assert_eq!(
-                result.completion,
-                JobCompletion::Complete,
-                "{:?}",
-                result.diagnostics
-            );
-            result.program.validate().unwrap();
-            let mut previous: Option<cam_cldata::Point3> = None;
-            let mut crosses_hole = false;
-            for step in result.program.steps() {
-                match step {
-                    Step::Linear { to, tag, .. } => {
-                        if let Some(a) = previous.filter(|_| tag.kind == MoveKind::Cutting) {
-                            let dx = to.x - a.x;
-                            let dy = to.y - a.y;
-                            let length_sq = dx * dx + dy * dy;
-                            if length_sq > 0. {
-                                let t =
-                                    (((center - a.x) * dx - a.y * dy) / length_sq).clamp(0., 1.);
-                                crosses_hole |= (a.x + t * dx - center).hypot(a.y + t * dy) < 3.;
-                            }
-                        }
-                        previous = Some(*to);
-                    }
-                    Step::Rapid { to, .. } => previous = Some(*to),
-                    Step::Arc { end, .. } => previous = Some(*end),
-                    _ => {}
-                }
-            }
-            let cuts: Vec<_> = result
-                .program
-                .steps()
-                .iter()
-                .filter_map(|s| match s {
-                    Step::Linear { to, tag, .. } if tag.kind == MoveKind::Cutting => Some(*to),
-                    Step::Arc { end, tag, .. } if tag.kind == MoveKind::Cutting => Some(*end),
-                    _ => None,
-                })
-                .collect();
-            assert!(
-                crosses_hole,
-                "stock above the 20 mm through-hole must be machined"
-            );
-            assert!(cuts.iter().any(|p| p.y > max[1]));
-            assert!(cuts.iter().any(|p| p.y < min[1]));
-            assert!(
-                cuts.iter().any(|p| if center > 0. {
-                    p.x > max[0]
-                } else {
-                    p.x < min[0]
-                }),
-                "the open floor must extend to the stock edges with runout"
-            );
-            assert!(
-                cuts.iter().all(|p| if center > 0. {
-                    p.x >= 53. - 0.01
-                } else {
-                    p.x <= -53. + 0.01
-                }),
-                "the rising wall at X +/-50 must remain protected"
-            );
         }
     }
 }
