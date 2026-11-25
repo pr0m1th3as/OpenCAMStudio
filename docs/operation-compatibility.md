@@ -48,7 +48,8 @@ drilling or pocket clearing before threading.
 During playback, stock contact on these moves pauses at first contact, colors
 the cutter red and shows the reason and coordinates. Press Play to acknowledge
 that contact and continue inspecting; rewinding allows it to be detected again.
-These collisions also block NC export until the machining sequence is corrected.
+These collisions also block NC export by default. **Preferences → General** can
+treat them as export warnings.
 
 Simulation combines a heightfield with bounded tooth cuts to display thread
 grooves and their machined flanks. It does not certify thread fit/class or support

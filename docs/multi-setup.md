@@ -58,8 +58,10 @@ uses the active work origin and the setup axes; it updates with the WCS preview.
 The model browser view uses the world grid.
 
 Stock supports a fixed-size box, positioned against the model along each axis,
-or a box with independent allowances on all six sides. Material is separate from
-stock shape. After the first setup, **From previous setup** uses the remaining
+or a relative-size box with independent offsets on all six sides. Negative offsets
+move a stock face inward. The resulting box must have positive dimensions.
+Material is separate from stock shape.
+After the first setup, **From previous setup** uses the remaining
 material after the immediately preceding setup's included operations. Generating
 or simulating recalculates the required earlier setups automatically, including
 chains of inherited stock. Reordering setups changes the source. Upstream edits,
@@ -128,7 +130,8 @@ sections and the protected material that needs another setup. A fully blocked
 profile instance fails. Other operations and unsupported profile configurations
 retain collision rejection. Every generated escape and re-entry is verified,
 including overhead-fixture conflicts. Playback checks the same envelopes
-and stops at contact. Fixture collisions block NC export. Holder and machine
+and stops at contact. Fixture collisions block NC export by default. **Preferences →
+General** can treat them as export warnings. Holder and machine
 geometry are not included. Fixtures remain visible when simulation hides the model.
 Changing fixtures, clearances, source revisions or placements invalidates generated
 results. Missing fixture geometry must be removed or reselected before generation.

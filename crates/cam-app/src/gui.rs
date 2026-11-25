@@ -105,9 +105,8 @@ mod creation;
 mod cutting_data;
 #[path = "gui_cutting_forces.rs"]
 mod cutting_forces;
-#[cfg(test)]
-#[path = "gui_performance.rs"]
-mod performance;
+#[path = "gui_drill_cycle.rs"]
+mod drill_cycle;
 #[path = "gui_tool_drawing.rs"]
 mod tool_drawing;
 use tool_drawing::ToolCanvas;
@@ -202,16 +201,7 @@ mod palette {
     pub const ERROR: Color = rgb(0.92, 0.30, 0.28);
 }
 
-/// The smallest tip **radius** a ground pointed tool can physically have, in mm.
-///
-/// Neither a chamfer mill nor a V-bit has a true `r = 0` point — it cannot be ground
-/// and would not survive contact. 50 µm is the practical floor for a ground tip; below
-/// it the number is fiction and the geometry degenerates (a V-bit's tip arc collapses,
-/// and a chamfer mill's non-cutting flat — the very thing that distinguishes it from a
-/// V-bit — disappears).
-///
-/// Applied as a **radius** to both, so the two are held to the same physical size: a
-/// V-bit's tip radius directly, a chamfer mill's tip *diameter* at twice this.
+/// Minimum V-bit tip radius, in mm.
 pub const MIN_TIP_RADIUS_MM: f64 = 0.05;
 
 /// Ribbon command icons. Each variant is a small embedded SVG (see
@@ -594,6 +584,19 @@ async fn confirm_export_duplicates(detail: String) -> bool {
         .show()
         .await
         == rfd::MessageDialogResult::Yes
+}
+
+async fn report_export_verification_warnings(count: usize) {
+    let detail = format!(
+        "Verification detected collisions with stock or fixtures ({count} total). Review the setup or operation status indicators for details."
+    );
+    rfd::AsyncMessageDialog::new()
+        .set_level(rfd::MessageLevel::Warning)
+        .set_title("G-code export has verification warnings")
+        .set_description(detail)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show()
+        .await;
 }
 
 /// Native error dialog for an export that cannot happen.
@@ -1091,9 +1094,25 @@ fn tool_kind_fields(kind: ToolKind) -> Vec<Field> {
         ToolKind::Drill { .. } => vec![Field::PointAngle],
         ToolKind::ThreadMill { .. } => vec![Field::ToolThreadPitch],
         ToolKind::VBit { .. } => vec![Field::PointAngle, Field::TipRadius],
-        ToolKind::EndMill | ToolKind::RoughingMill | ToolKind::BallMill | ToolKind::FaceMill => {
-            Vec::new()
+        ToolKind::EndMill
+        | ToolKind::RoughingMill
+        | ToolKind::BallMill
+        | ToolKind::FaceMill
+        | ToolKind::GrooveCutter
+        | ToolKind::SlittingSaw => Vec::new(),
+    }
+}
+
+fn disc_tool_field_label(kind: ToolKind, field: Field) -> Option<&'static str> {
+    match (kind, field) {
+        (ToolKind::GrooveCutter, Field::FluteLength) => Some("Cutter width (mm)"),
+        (ToolKind::SlittingSaw, Field::FluteLength) => Some("Blade thickness (mm)"),
+        (ToolKind::SlittingSaw, Field::ShankDiameter) => Some("Arbor diameter (mm)"),
+        (ToolKind::GrooveCutter | ToolKind::SlittingSaw, Field::ToolDiameter) => {
+            Some("Cutting diameter (mm)")
         }
+        (ToolKind::GrooveCutter | ToolKind::SlittingSaw, Field::Flutes) => Some("Teeth"),
+        _ => None,
     }
 }
 
@@ -1160,6 +1179,24 @@ fn apply_tool_dims(t: &mut cam_model::Tool, parsed: &BTreeMap<Field, f64>) {
         t.nominal_plunge_feed = v.max(0.0);
     }
 
+    // A face mill's cutting length, body height and overall length are independent.
+    if matches!(t.kind, ToolKind::FaceMill) {
+        let body = t.face_body_height();
+        t.face_body_height = parsed.get(&Field::FaceBodyHeight).copied().unwrap_or(body);
+        if let Some(&flute) = parsed.get(&Field::FluteLength) { t.flute_length = flute; }
+        if let Some(&length) = parsed.get(&Field::ToolLength) { t.length = length; }
+        return;
+    }
+    // Disc width and assembly length are separate catalogue dimensions.
+    if t.kind.is_side_cutting_disc() {
+        if let Some(&width) = parsed.get(&Field::FluteLength) {
+            t.flute_length = width;
+        }
+        if let Some(&length) = parsed.get(&Field::ToolLength) {
+            t.length = length;
+        }
+        return;
+    }
     // overall = flute + shank. Snapshot the effective flute/shank *before* the edit.
     let old_flute = t.flute_len();
     let old_shank = (t.length - old_flute).max(0.0);
@@ -1233,7 +1270,12 @@ fn apply_tool_kind_fields(kind: &mut ToolKind, parsed: &BTreeMap<Field, f64>) {
                 *tip_radius = v.max(0.0);
             }
         }
-        ToolKind::EndMill | ToolKind::RoughingMill | ToolKind::BallMill | ToolKind::FaceMill => {}
+        ToolKind::EndMill
+        | ToolKind::RoughingMill
+        | ToolKind::BallMill
+        | ToolKind::FaceMill
+        | ToolKind::GrooveCutter
+        | ToolKind::SlittingSaw => {}
     }
 }
 
@@ -1277,9 +1319,9 @@ enum Field {
     OriginIndex,
     ToolDiameter,
     ToolLength,
-    /// Length of cut (flute length) from the tip, mm. Also reused, kind-aware, as a face
-    /// mill's body height and a thread mill's thread length.
+    /// Length of cut (flute length) from the tip, mm.
     FluteLength,
+    FaceBodyHeight,
     /// Shank diameter, mm (a face mill's arbor diameter, kind-aware).
     ShankDiameter,
     /// Shank length, mm — a *derived* field: overall = flute + shank (editing it moves
@@ -1329,6 +1371,10 @@ enum Field {
     DrillStartOffset,
     /// Drill peck increment (mm); 0 = drill straight to depth (no peck).
     Peck,
+    PeckReduction,
+    MinimumPeck,
+    AccumulatedPeck,
+    ChipBreakDistance,
     /// Drill dwell at the hole bottom (seconds); 0 = no dwell.
     Dwell,
     Stepdown,
@@ -1490,6 +1536,7 @@ impl Field {
             Field::ToolDiameter => "Flute diameter (mm)",
             Field::ToolLength => "Overall length (mm)",
             Field::FluteLength => "Flute length (mm)",
+            Field::FaceBodyHeight => "Body height (mm)",
             Field::ShankDiameter => "Shank diameter (mm)",
             Field::ShankLength => "Shank length (mm)",
             Field::NeckLength => "Neck length (mm, 0=none)",
@@ -1520,8 +1567,12 @@ impl Field {
             Field::ToolThreadPitch => "Pitch (mm)",
             Field::Depth => "Depth (mm)",
             Field::DrillStartOffset => "Start offset (mm)",
-            Field::Peck => "Peck (mm, 0=off)",
-            Field::Dwell => "Dwell (s, 0=off)",
+            Field::Peck => "Pecking Depth (mm)",
+            Field::PeckReduction => "Pecking Depth Reduction (mm)",
+            Field::MinimumPeck => "Minimum Pecking Depth (mm)",
+            Field::AccumulatedPeck => "Accumulated Pecking Depth (mm)",
+            Field::ChipBreakDistance => "Chip Break Distance (mm)",
+            Field::Dwell => "Dwelling Period (s)",
             Field::TabWidth => "Tab width (mm)",
             Field::TabHeight => "Tab height (mm)",
             Field::TabSpacing => "Tab spacing (mm)",
@@ -1707,6 +1758,7 @@ impl Field {
                  rest of the tool, up to the overall length, is the non-cutting shank; \
                  the split is used for gouge/collision checks."
             }
+            Field::FaceBodyHeight => "Axial height of the face mill body, including its non-cutting portion.",
             Field::ShankDiameter => {
                 "Diameter of the non-cutting shank above the cutting portion (typically \
                  equal to the cutting diameter)."
@@ -1751,10 +1803,8 @@ impl Field {
                  90° for a 45° chamfer). Sets how cut depth maps to chamfer width."
             }
             Field::TipDiameter => {
-                "Diameter of the flat, non-cutting tip of a chamfer mill (min 0.10 mm — \
-                 a chamfer mill is always ground with a flat, and one cannot be ground \
-                 sharper). Only the angled flank cuts, which is why a chamfer mill \
-                 cannot engrave: use a V-bit."
+                "Diameter of the flat, non-cutting tip of a chamfer mill. Set to 0 \
+                 for a pointed tip. Only the angled flank cuts."
             }
             Field::TipRadius => {
                 "Rounded-tip radius of a carving V-bit (min 0.05 mm — a point is always \
@@ -1782,10 +1832,12 @@ impl Field {
                  (a recessed or faced surface). Depth is measured down from here."
             }
             Field::Peck => {
-                "Peck-drilling increment (mm): the drill cuts this deep, fully retracts \
-                 to clear chips, then returns and repeats until it reaches depth. \
-                 0 = drill straight to depth in one plunge (no pecking)."
+                "Depth of the first peck in millimetres."
             }
+            Field::PeckReduction => "Subtract this depth from each successive peck. Enter 0 to keep the peck depth constant.",
+            Field::MinimumPeck => "Lower limit for each peck after reduction. The last cut can be shorter to reach the exact hole bottom.",
+            Field::AccumulatedPeck => "After cutting this much depth since the previous full pullout, retract fully to clear chips. Enter 0 to use short withdrawals until the hole is complete.",
+            Field::ChipBreakDistance => "Distance the drill lifts between pecks to break the chip.",
             Field::Dwell => {
                 "Dwell at the bottom of the hole (seconds): the tool pauses with the \
                  spindle turning before retracting, cleaning up the hole bottom. \
@@ -1982,11 +2034,11 @@ impl Field {
 }
 
 /// Require a deliberate hover before showing help on any control.
-fn delayed_tooltip<'a>(
-    content: impl Into<Element<'a, Message>>,
-    help: impl Into<Element<'a, Message>>,
+fn delayed_tooltip<'a, M: 'a>(
+    content: impl Into<Element<'a, M>>,
+    help: impl Into<Element<'a, M>>,
     position: tooltip::Position,
-) -> tooltip::Tooltip<'a, Message> {
+) -> tooltip::Tooltip<'a, M> {
     tooltip(content, help, position).delay(std::time::Duration::from_millis(600))
 }
 
@@ -2742,12 +2794,93 @@ fn drill_marks_of(program: &Program) -> Vec<DrillMark> {
                     k += 1;
                 }
             }
-            if c.dwell.is_some() {
+            if c.dwell.is_some_and(|seconds| seconds > 0.0) {
                 marks.push(DrillMark {
                     at: [x, y, c.depth as f32],
                     kind: DrillMarkKind::DwellBar,
                 });
             }
+        }
+    }
+    marks
+}
+
+/// Recover peck and dwell annotations from expanded drilling motions. Only
+/// operations known to be drills are passed in, so other plunges are ignored.
+fn expanded_drill_marks(program: &Program, is_drill: impl Fn(u32) -> bool) -> Vec<DrillMark> {
+    let mut marks = Vec::new();
+    let mut current: Option<cam_cldata::Point3> = None;
+    let mut last_peck: Option<(u32, cam_cldata::Point3)> = None;
+    let mut withdrawn = false;
+    let mut rings = 0;
+    for step in program.steps() {
+        match step {
+            Step::Rapid { to, tag } => {
+                if let (Some(from), Some((id, peck))) = (current, last_peck) {
+                    if id == tag.op_id
+                        && to.z > from.z
+                        && (to.x - peck.x).abs() < 1e-9
+                        && (to.y - peck.y).abs() < 1e-9
+                    {
+                        withdrawn = true;
+                    }
+                }
+                current = Some(*to);
+            }
+            Step::Linear { to, tag, .. } => {
+                if is_drill(tag.op_id)
+                    && tag.kind == cam_cldata::MoveKind::Plunge
+                    && current.is_some_and(|from| to.z < from.z - 1e-9)
+                {
+                    let mut reentering = false;
+                    if let Some((id, peck)) = last_peck {
+                        let same_hole = id == tag.op_id
+                            && (to.x - peck.x).abs() < 1e-9
+                            && (to.y - peck.y).abs() < 1e-9;
+                        if same_hole && withdrawn && to.z < peck.z - 1e-9 && rings < DRILL_MAX_RINGS
+                        {
+                            marks.push(DrillMark {
+                                at: [peck.x as f32, peck.y as f32, peck.z as f32],
+                                kind: DrillMarkKind::PeckRing,
+                            });
+                            rings += 1;
+                        } else if same_hole && withdrawn && to.z >= peck.z - 1e-9 {
+                            reentering = true;
+                        } else if !same_hole {
+                            rings = 0;
+                        }
+                    }
+                    if !reentering {
+                        last_peck = Some((tag.op_id, *to));
+                        withdrawn = false;
+                    }
+                } else if !is_drill(tag.op_id) {
+                    last_peck = None;
+                }
+                current = Some(*to);
+            }
+            Step::Dwell { seconds } if *seconds > 0.0 => {
+                if let (Some(at), Some((_, peck))) = (current, last_peck) {
+                    if (at.x - peck.x).abs() < 1e-9
+                        && (at.y - peck.y).abs() < 1e-9
+                        && (at.z - peck.z).abs() < 1e-9
+                    {
+                        marks.push(DrillMark {
+                            at: [at.x as f32, at.y as f32, at.z as f32],
+                            kind: DrillMarkKind::DwellBar,
+                        });
+                    }
+                }
+            }
+            Step::Arc { end, .. } => {
+                current = Some(*end);
+                last_peck = None;
+            }
+            Step::Drill(_) | Step::ToolChange { .. } | Step::Datum(_) | Step::Stop => {
+                current = None;
+                last_peck = None;
+            }
+            _ => {}
         }
     }
     marks
@@ -2951,6 +3084,8 @@ enum Message {
     ParameterSuggestionMove(Field, i32),
     HeightReferenceChanged(cam_model::HeightPlaneKind, cam_model::HeightReference),
     HeightOffsetChanged(cam_model::HeightPlaneKind, String),
+    DrillTipThroughBottomToggled(bool),
+    DrillCycleChanged(cam_model::DrillCycleMode),
     HeightSourceToggled(cam_model::HeightPlaneKind, cam_model::HeightReference, bool),
     HeightSectionToggle(cam_model::HeightPlaneKind),
     HeightFeedEnabled(bool),
@@ -3022,7 +3157,12 @@ enum Message {
     NoticeBackdrop,
     NoticeFilterChanged(usize, bool),
     ReplaceCadAsset(u64),
-    CadReplacementChosen(u64, Option<PathBuf>),
+    ReloadCadAsset(u64),
+    CadModelFileChosen {
+        id: u64,
+        path: Option<PathBuf>,
+        reload: bool,
+    },
     RemoveCadAsset(u64),
     CadFilterChanged(CadFilter),
     GeometryFilterChanged(CadFilter),
@@ -3051,9 +3191,8 @@ enum Message {
     CadToImport(Option<PathBuf>),
     /// Prompt for a `.nc` export location.
     ExportNc,
-    /// Answer to the "export exact-duplicate operations anyway?" confirm dialog:
-    /// `true` proceeds to the save prompt, `false` aborts the export.
-    ExportDupConfirmed(String, bool),
+    /// The operator declined to export exact duplicate operations.
+    ExportDuplicatesDeclined,
     /// The chosen `.nc` path (`None` = cancelled).
     NcToExport(String, Option<PathBuf>),
     // --- Operation-creation wizard ---
@@ -4150,6 +4289,9 @@ impl App {
         }
         app.controller
             .set_simulation_accuracy(app.settings.simulation.accuracy);
+        app.controller.set_block_export_on_verification_errors(
+            app.settings.block_export_on_verification_errors,
+        );
         app.controller.select(Selection::Setup);
         app.restore_pane_preferences();
         // Always open on Home, regardless of the workspace last used.
@@ -4228,6 +4370,8 @@ impl App {
                     | Message::ExportNc
                     | Message::ImportCad
                     | Message::ReplaceCadAsset(_)
+                    | Message::ReloadCadAsset(_)
+                    | Message::CadModelFileChosen { reload: true, .. }
                     | Message::RemoveCadAsset(_)
                     | Message::MoveOpen(_)
             )
@@ -4259,6 +4403,8 @@ impl App {
                     | Message::RunJob
                     | Message::ExportNc
                     | Message::ToolpathCommand(_, _)
+                    | Message::ReloadCadAsset(_)
+                    | Message::CadModelFileChosen { reload: true, .. }
                     | Message::OpenSample
                     | Message::NewProject
                     | Message::OpenProject
@@ -6266,6 +6412,14 @@ impl App {
                 self.height_offsets.insert(plane, value);
                 self.focused_height = Some(height_editor::plane_input_id(plane));
             }
+            Message::DrillTipThroughBottomToggled(enabled) => {
+                self.edit_operation_draft(|operation| {
+                    if let Operation::Drill(drill) = operation {
+                        drill.tip_through_bottom = enabled;
+                    }
+                });
+            }
+            Message::DrillCycleChanged(mode) => self.change_drill_cycle(mode),
             Message::HeightSourceToggled(plane, reference, on) => {
                 if let Some(settings) = &mut self.height_draft {
                     let sources = &mut settings.definition_mut(plane).sources;
@@ -6277,7 +6431,10 @@ impl App {
                 self.focused_height = Some(height_editor::plane_input_id(plane));
             }
             Message::HeightDefaults => {
-                let settings = cam_model::OperationHeightSettings::default();
+                let settings = self
+                    .parameter_operation()
+                    .map(cam_model::OperationHeightSettings::for_operation)
+                    .unwrap_or_default();
                 self.height_offsets = cam_model::HeightPlaneKind::ALL
                     .into_iter()
                     .map(|p| (p, fmt_num(settings.definition(p).offset)))
@@ -6786,28 +6943,72 @@ impl App {
             Message::ReplaceCadAsset(id) => {
                 return iced::Task::perform(
                     pick_open("Replace CAD model", &["step", "stp", "iges", "igs"]),
-                    move |path| Message::CadReplacementChosen(id, path),
+                    move |path| Message::CadModelFileChosen {
+                        id,
+                        path,
+                        reload: false,
+                    },
                 );
             }
-            Message::CadReplacementChosen(id, Some(path)) => {
-                match self.controller.start_cad_replacement(id, path) {
-                    Ok(_) => self.status = "Importing replacement model…".into(),
+            Message::ReloadCadAsset(id) => {
+                let Some(asset) = self.controller.geometry_state().asset(id) else {
+                    return iced::Task::none();
+                };
+                if let Some(path) = asset
+                    .source_path
+                    .as_deref()
+                    .map(Path::new)
+                    .filter(|path| path.is_absolute())
+                {
+                    return self.update(Message::CadModelFileChosen {
+                        id,
+                        path: Some(path.to_path_buf()),
+                        reload: true,
+                    });
+                }
+                return iced::Task::perform(
+                    pick_open(
+                        "Reload CAD model from file",
+                        &["step", "stp", "iges", "igs"],
+                    ),
+                    move |path| Message::CadModelFileChosen {
+                        id,
+                        path,
+                        reload: true,
+                    },
+                );
+            }
+            Message::CadModelFileChosen {
+                id,
+                path: Some(path),
+                reload,
+            } => {
+                let result = if reload {
+                    self.controller.start_cad_reload(id, path)
+                } else {
+                    self.controller.start_cad_replacement(id, path)
+                };
+                match result {
+                    Ok(_) => {
+                        self.status = if reload {
+                            "Reloading model from file…"
+                        } else {
+                            "Importing replacement model…"
+                        }
+                        .into();
+                    }
                     Err(error) => {
                         self.status = error.clone();
-                        return self.queue_notice(Notice {
-                            title: "Cannot replace model".into(),
-                            entries: vec![notices::NoticeEntry {
-                                severity: Severity::Error,
-                                message: error.clone(),
-                                source: None,
-                            }],
-                            detail: error,
-                            error: true,
-                        });
+                        let title = if reload {
+                            "Cannot reload model"
+                        } else {
+                            "Cannot replace model"
+                        };
+                        return self.queue_notice(Notice::error(title, error));
                     }
                 }
             }
-            Message::CadReplacementChosen(_, None) => {}
+            Message::CadModelFileChosen { path: None, .. } => {}
             Message::RemoveCadAsset(id) => {
                 if self.controller.remove_cad_asset(id) {
                     self.model_view = Some(TreeNode::Models);
@@ -7353,26 +7554,31 @@ impl App {
                     })
                     .filter(|group| group.len() > 1)
                     .collect();
-                if groups.is_empty() {
-                    let kind = self.controller.post_kind();
-                    return iced::Task::perform(
-                        pick_save("G-code", kind.default_file_name(), kind.file_extensions()),
-                        move |path| Message::NcToExport(nc.clone(), path),
-                    );
-                }
-                return iced::Task::perform(
-                    confirm_export_duplicates(describe_duplicates(&groups)),
-                    move |confirmed| Message::ExportDupConfirmed(nc.clone(), confirmed),
-                );
-            }
-            Message::ExportDupConfirmed(nc, true) => {
+                let duplicates = (!groups.is_empty()).then(|| describe_duplicates(&groups));
+                let verification_warnings = self
+                    .controller
+                    .outcome()
+                    .map_or(0, |outcome| outcome.collisions.len());
                 let kind = self.controller.post_kind();
                 return iced::Task::perform(
-                    pick_save("G-code", kind.default_file_name(), kind.file_extensions()),
-                    move |path| Message::NcToExport(nc.clone(), path),
+                    async move {
+                        if let Some(detail) = duplicates {
+                            if !confirm_export_duplicates(detail).await {
+                                return Message::ExportDuplicatesDeclined;
+                            }
+                        }
+                        if verification_warnings > 0 {
+                            report_export_verification_warnings(verification_warnings).await;
+                        }
+                        let path =
+                            pick_save("G-code", kind.default_file_name(), kind.file_extensions())
+                                .await;
+                        Message::NcToExport(nc, path)
+                    },
+                    std::convert::identity,
                 );
             }
-            Message::ExportDupConfirmed(_, false) => {
+            Message::ExportDuplicatesDeclined => {
                 self.status =
                     "Export cancelled — exclude or edit the duplicate operation(s).".to_string();
             }
@@ -7833,10 +8039,17 @@ impl App {
                             .set_pending_operation_geometry(&selected, Some(point))
                         {
                             Ok(()) => {
-                                self.status = format!(
-                                "{} compatible feature(s) selected; Confirm creates the operation.",
-                                selected.len()
-                            )
+                                self.status = if self.geometry_editor.is_some() {
+                                    format!(
+                                        "{} compatible feature(s) selected. Use OK to stage them.",
+                                        selected.len()
+                                    )
+                                } else {
+                                    format!(
+                                        "{} compatible feature(s) selected; Confirm creates the operation.",
+                                        selected.len()
+                                    )
+                                };
                             }
                             Err(error) => self.report_error(error),
                         }
@@ -8285,6 +8498,8 @@ impl App {
                                 manufacturer: t.manufacturer.clone(),
                                 product_id: t.product_id.clone(),
                                 product_link: t.product_link.clone(),
+                                cutter_material: t.cutter_material.clone(),
+                                coating: t.coating.clone(),
                                 ..crate::tool_library::default_tool(t.number, kind)
                             };
                         }
@@ -8861,6 +9076,8 @@ impl App {
                         tool_presets::ToolDetail::Manufacturer => tool.manufacturer = value,
                         tool_presets::ToolDetail::ProductId => tool.product_id = value,
                         tool_presets::ToolDetail::ProductLink => tool.product_link = value,
+                        tool_presets::ToolDetail::CutterMaterial => tool.cutter_material = value,
+                        tool_presets::ToolDetail::Coating => tool.coating = value,
                     }
                 }
             }
@@ -8959,7 +9176,7 @@ impl App {
                     .unwrap_or(ToolKind::EndMill);
                 self.lib_sel = self.library.add_of_kind(seed_kind);
                 self.save_tool_libraries();
-                if self.controller.pending_op().is_some() {
+                if self.controller.pending_op().is_some() && !seed_kind.is_side_cutting_disc() {
                     if let Some(tool) = self.library.tools.get(self.lib_sel).cloned() {
                         let number = self.controller.use_tool(tool);
                         self.controller.set_pending_tool(number);
@@ -9918,7 +10135,11 @@ impl App {
         {
             return "Maximum Roughing Stepdown (mm)";
         }
-        match (self.inspected_tool_kind(), field) {
+        let kind = self.inspected_tool_kind();
+        if let Some(label) = kind.and_then(|kind| disc_tool_field_label(kind, field)) {
+            return label;
+        }
+        match (kind, field) {
             (Some(ToolKind::RadiusMill { .. }), Field::ToolDiameter) => "Tip diameter (mm)",
             // V-bit and chamfer mill: the single transverse ⌀ is the shaft they flare to.
             (Some(ToolKind::VBit { .. } | ToolKind::ChamferMill { .. }), Field::ToolDiameter) => {
@@ -9927,7 +10148,6 @@ impl App {
             // Face mill: cutting-⌀ disc, and the flute/shank fields describe the shell-mill
             // body and its arbor.
             (Some(ToolKind::FaceMill), Field::ToolDiameter) => "Cutting diameter (mm)",
-            (Some(ToolKind::FaceMill), Field::FluteLength) => "Body height (mm)",
             (Some(ToolKind::FaceMill), Field::ShankDiameter) => "Arbor diameter (mm)",
             // Thread mill: a single-point mill's ⌀ is the *minimum* cutting ⌀ (smallest
             // hole); FluteLength is its length of cut (reach) and it exposes the reduced
@@ -9964,6 +10184,13 @@ impl App {
         }
         use ToolKind::*;
         match (self.inspected_tool_kind(), field) {
+            (Some(GrooveCutter | SlittingSaw), Field::ToolDiameter) => "Outside diameter across the cutting teeth.",
+            (Some(GrooveCutter), Field::FluteLength) => "Axial width of the cutting head. This sets the nominal groove width.",
+            (Some(SlittingSaw), Field::FluteLength) => "Axial thickness of the blade at the teeth. This sets the nominal slot width.",
+            (Some(SlittingSaw), Field::ShankDiameter) => "Outside diameter of the arbor next to the blade.",
+            (Some(GrooveCutter | SlittingSaw), Field::ToolLength) => "Length from the bottom of the cutting disc to the holder.",
+            (Some(GrooveCutter), Field::NeckLength) => "Length of the reduced neck above the cutter. Enter zero for a cutter with no separate neck.",
+            (Some(GrooveCutter | SlittingSaw), Field::Flutes) => "Number of cutting teeth around the disc.",
             (Some(RadiusMill { .. }), Field::ToolDiameter) => "Diameter of the cylindrical tip. The maximum cutting diameter is this value plus twice the corner radius.",
             (Some(RadiusMill { .. }), Field::CornerRadius) => "Radius of the concave cutting edge, measured from the tip to the outer cutting diameter.",
             // Cutting/flute diameter — the meaning turns on the kind.
@@ -10000,10 +10227,7 @@ impl App {
                 "Flute length — the fluted (cutting) portion from the tip; the plain shank \
                  continues above it. Must be at least the drill-point cone height."
             }
-            (Some(FaceMill), Field::FluteLength) => {
-                "Body height — the axial length of the wide cutting body; the narrower \
-                 arbor continues above it up to the overall length."
-            }
+            (Some(FaceMill), Field::FluteLength) => "Axial cutting length from the tool tip; it cannot exceed the body height.",
             (Some(ThreadMill { pitch: None }), Field::FluteLength) => {
                 "Length of cut — how far down from the tip the single tooth can thread \
                  (the reduced-neck reach); it sets the maximum threaded depth."
@@ -10061,6 +10285,27 @@ impl App {
             }
         }
         let buf = |f: Field| self.fields.get(&f).and_then(|s| s.parse::<f64>().ok());
+        if self
+            .inspected_tool_kind()
+            .is_some_and(ToolKind::is_side_cutting_disc)
+        {
+            let width = buf(Field::FluteLength).unwrap_or(0.0);
+            let length = buf(Field::ToolLength).unwrap_or(0.0);
+            let neck = buf(Field::NeckLength).unwrap_or(0.0);
+            let diameter = buf(Field::ToolDiameter).unwrap_or(0.0);
+            match field {
+                Field::ToolDiameter => return value <= 0.0,
+                Field::FluteLength => return value <= 0.0 || value >= length - neck,
+                Field::ToolLength => return value <= width + neck,
+                Field::ShankDiameter => return value <= 0.0 || (neck == 0.0 && value >= diameter),
+                Field::NeckLength => return value < 0.0 || value >= length - width,
+                Field::NeckDiameter => return neck > 0.0 && (value <= 0.0 || value >= diameter),
+                Field::Flutes => {
+                    return value < 1.0 || value > f64::from(u32::MAX) || value.fract() != 0.0
+                }
+                _ => {}
+            }
+        }
         match field {
             Field::MachineTravelX | Field::MachineTravelY | Field::MachineTravelZ => value <= 0.0,
             Field::MachineMaxZ => buf(Field::MachineTravelZ)
@@ -10121,14 +10366,9 @@ impl App {
                 !(0.0 < a && a < 180.0)
             }
             Field::TipDiameter => {
-                // Physically a chamfer mill always has a *flat* at its point — it is
-                // ground that way, and that flat is precisely why it does not cut at
-                // its centre (and so cannot engrave). A zero flat would make it a
-                // V-bit, not a chamfer mill, so it must be positive; and it must stay
-                // narrower than the shaft ⌀, else there is no cone at all.
+                // A zero tip is allowed; the tip must be narrower than the shaft.
                 match (buf(Field::TipDiameter), buf(Field::ToolDiameter)) {
-                    // Held to the same physical radius as a V-bit's tip, hence 2×.
-                    (Some(tip), _) if tip < 2.0 * MIN_TIP_RADIUS_MM - 1e-9 => true,
+                    (Some(tip), _) if tip < 0.0 => true,
                     (Some(tip), Some(d)) => tip >= d - 1e-9,
                     _ => false,
                 }
@@ -10161,6 +10401,7 @@ impl App {
                     return true; // flute length cannot be 0 (anywhere)
                 }
                 match self.inspected_tool_kind() {
+                    Some(ToolKind::FaceMill) => matches!(buf(Field::FaceBodyHeight), Some(body) if fl > body + 1e-9),
                     Some(ToolKind::RadiusMill { .. }) => {
                         matches!((buf(Field::CornerRadius), buf(Field::TipLength)), (Some(cr), Some(tip)) if fl < cr + tip - 1e-9)
                     }
@@ -10179,6 +10420,7 @@ impl App {
                     _ => false,
                 }
             }
+            Field::FaceBodyHeight => value <= 0.0 || matches!(buf(Field::ToolLength), Some(length) if value > length + 1e-9),
             _ => false,
         }
     }
@@ -10248,7 +10490,7 @@ impl App {
         let Some(v) = self.fields.get(&edited).and_then(|s| s.parse::<f64>().ok()) else {
             return; // empty / unparseable: hold the last valid working copy
         };
-        if v < 0.0 || (edited == Field::FluteLength && v <= 1e-9) {
+        if !v.is_finite() || v < 0.0 || (edited == Field::FluteLength && v <= 0.0) {
             return; // never write a zero/negative flute (keeps the last valid state)
         }
         let mut parsed: BTreeMap<Field, f64> = BTreeMap::new();
@@ -10262,13 +10504,15 @@ impl App {
             };
             apply_tool_dims(t, &parsed);
             apply_tool_kind_fields(&mut t.kind, &parsed);
-            [
-                (Field::FluteLength, t.flute_len()),
-                (Field::ShankLength, (t.length - t.flute_len()).max(0.0)),
-                (Field::ToolLength, t.length),
-            ]
+            (!t.kind.is_side_cutting_disc()).then(|| {
+                [
+                    (Field::FluteLength, t.flute_len()),
+                    (Field::ShankLength, (t.length - t.flute_len()).max(0.0)),
+                    (Field::ToolLength, t.length),
+                ]
+            })
         };
-        for (f, val) in derived {
+        for (f, val) in derived.into_iter().flatten() {
             if f != edited {
                 self.fields.insert(f, fmt_num(val));
             }
@@ -10444,18 +10688,36 @@ impl App {
                     Field::TipRadius,
                 ],
                 // Chamfer mill: like a V-bit but its tip is a flat (non-cutting) instead of a
-                // rounded one — a single shaft ⌀, overall length, point angle, and a flat tip
+                // rounded one — a single shaft ⌀, flute and overall lengths, point angle, and a flat tip
                 // ⌀ in place of the V-bit's tip radius.
                 Some(ToolKind::ChamferMill { .. }) => vec![
                     Field::ToolDiameter,
+                    Field::FluteLength,
                     Field::ToolLength,
                     Field::ChamferAngle,
                     Field::TipDiameter,
                 ],
-                // Face mill (shell mill): a wide cutting body on a narrower arbor. FluteLength
-                // is relabelled "Body height" and ShankDiameter "Arbor diameter" (see
+                // Face mill (shell mill): a wide cutting body on a narrower arbor.
+                // ShankDiameter is relabelled "Arbor diameter" (see
                 // `field_label`). No shank-length / neck — the arbor length is overall − body.
                 Some(ToolKind::FaceMill) => vec![
+                    Field::ToolDiameter,
+                    Field::FluteLength,
+                    Field::FaceBodyHeight,
+                    Field::ShankDiameter,
+                    Field::ToolLength,
+                    Field::Flutes,
+                ],
+                Some(ToolKind::GrooveCutter) => vec![
+                    Field::ToolDiameter,
+                    Field::FluteLength,
+                    Field::NeckDiameter,
+                    Field::NeckLength,
+                    Field::ShankDiameter,
+                    Field::ToolLength,
+                    Field::Flutes,
+                ],
+                Some(ToolKind::SlittingSaw) => vec![
                     Field::ToolDiameter,
                     Field::FluteLength,
                     Field::ShankDiameter,
@@ -10643,6 +10905,7 @@ impl App {
                 Field::ToolLength => Some(t.length),
                 // Effective flute (resolves the 0-sentinel), so shank = overall − flute.
                 Field::FluteLength => Some(t.flute_len()),
+                Field::FaceBodyHeight => Some(t.face_body_height()),
                 Field::ShankDiameter => Some(t.shank_dia()),
                 Field::ShankLength => Some((t.length - t.flute_len()).max(0.0)),
                 Field::NeckLength => Some(t.neck_length),
@@ -10734,6 +10997,10 @@ impl App {
             },
             Field::FluteLength => match self.controller.selection() {
                 Selection::Tool(i) => setup.tools.get(i).map(|t| t.flute_len()),
+                _ => None,
+            },
+            Field::FaceBodyHeight => match self.controller.selection() {
+                Selection::Tool(i) => setup.tools.get(i).map(|t| t.face_body_height()),
                 _ => None,
             },
             Field::ShankDiameter => match self.controller.selection() {
@@ -10840,6 +11107,14 @@ impl App {
                 }
             }
         }
+        if self
+            .inspected_tool_kind()
+            .is_some_and(ToolKind::is_side_cutting_disc)
+            && supported.iter().any(|&field| self.field_invalid(field))
+        {
+            self.status = "Correct invalid disc cutter dimensions before applying.".into();
+            return;
+        }
 
         // Library-tool editing writes to the library file, not the project — an
         // embedded copy in a project is a snapshot and is left untouched. The working
@@ -10854,6 +11129,10 @@ impl App {
                 self.tool_edit.clone(),
                 self.library.tools.get_mut(self.lib_sel),
             ) {
+                if let Err(error) = edit.validate_disc_dimensions() {
+                    self.report_error(error);
+                    return;
+                }
                 *slot = edit;
             }
             self.save_tool_libraries();
@@ -12286,7 +12565,11 @@ impl App {
                     return;
                 }
             }
-            let _ = self.update(Message::EditCadGeometry(id));
+            if self.geometry_operation_kind() == Some(OpKind::Drill) {
+                self.operation_geometry_message(GeometryMessage::Add(CadFilter::Face));
+            } else {
+                let _ = self.update(Message::EditCadGeometry(id));
+            }
             self.geometry_additive = true;
             self.geometry_auto_pick = false;
         }
@@ -12661,6 +12944,13 @@ impl App {
         }
 
         if let Some(tool) = &self.tool_edit {
+            if tool.kind.is_side_cutting_disc() {
+                list = list.push(
+                    text("Toolpaths for side-cutting discs require a dedicated strategy.")
+                        .size(11)
+                        .color(INSPECTOR_MUTED),
+                );
+            }
             for (label, field, value) in [
                 (
                     "Description",
@@ -12682,6 +12972,12 @@ impl App {
                     tool_presets::ToolDetail::ProductLink,
                     &tool.product_link,
                 ),
+                (
+                    "Cutter material",
+                    tool_presets::ToolDetail::CutterMaterial,
+                    &tool.cutter_material,
+                ),
+                ("Coating", tool_presets::ToolDetail::Coating, &tool.coating),
             ] {
                 list = list.push(
                     row![
@@ -12745,17 +13041,16 @@ impl App {
             );
             if is_end_mill {
                 let dir_opts = if matches!(t.kind, ToolKind::EndMill | ToolKind::RoughingMill) {
-                    vec![CutDir::Down, CutDir::Up, CutDir::Straight]
+                    vec![CutDir::Down, CutDir::Up, CutDir::Straight, CutDir::Compression]
                 } else {
-                    vec![CutDir::Down, CutDir::Up]
+                    vec![CutDir::Down, CutDir::Up, CutDir::Compression]
                 };
                 list = list.push(
                     row![
                         help_wrap(
                             text("Cutting direction").width(Length::Fill).size(13),
-                            "Down-cut vs up-cut (helix direction); a physical property of the \
-                             tool, like the flute count. Flat end mills also allow a straight \
-                             (axial) flute.",
+                            "Flute direction: up-cut, down-cut, or compression (up-cut at \
+                             the tip and down-cut above). Flat end mills also allow straight flutes.",
                             self.tooltips,
                         ),
                         pick_list(
@@ -13668,6 +13963,10 @@ fn op_field(op: &Operation, field: Field) -> Option<f64> {
         (Operation::Drill(o), Field::DrillStartOffset) => Some(o.start_offset),
         (Operation::Drill(o), Field::Peck) => Some(o.peck.unwrap_or(0.0)),
         (Operation::Drill(o), Field::Dwell) => Some(o.dwell.unwrap_or(0.0)),
+        (Operation::Drill(o), Field::PeckReduction) => Some(o.cycle.peck_reduction),
+        (Operation::Drill(o), Field::MinimumPeck) => Some(o.minimum_peck()),
+        (Operation::Drill(o), Field::AccumulatedPeck) => Some(o.cycle.accumulated_peck),
+        (Operation::Drill(o), Field::ChipBreakDistance) => Some(o.cycle.chip_break_distance),
         (Operation::Drill(o), Field::Feed) => Some(o.feed),
         (Operation::Engrave(o), Field::Depth) => Some(o.depth),
         (Operation::Engrave(o), Field::Stepdown) => Some(o.stepdown),
@@ -13925,14 +14224,26 @@ fn apply_op_fields(op: &mut Operation, parsed: &BTreeMap<Field, f64>) {
                 o.start_offset = v;
             }
             if let Some(v) = get(Field::Peck) {
-                // 0 (or negative) clears pecking; the toolpath requires peck > 0.
-                o.peck = (v > 0.0).then_some(v);
+                o.set_peck(v);
             }
             if let Some(v) = get(Field::Dwell) {
                 o.dwell = (v > 0.0).then_some(v);
             }
             if let Some(v) = get(Field::Feed) {
                 o.feed = v;
+            }
+            let reduction = get(Field::PeckReduction).unwrap_or(o.cycle.peck_reduction);
+            let minimum = get(Field::MinimumPeck).unwrap_or_else(|| o.minimum_peck());
+            if reduction != o.cycle.peck_reduction || minimum != o.minimum_peck() {
+                o.set_cycle_mode(o.cycle_mode());
+                o.cycle.peck_reduction = reduction;
+                o.cycle.minimum_peck = minimum;
+            }
+            if let Some(v) = get(Field::AccumulatedPeck) {
+                o.cycle.accumulated_peck = v;
+            }
+            if let Some(v) = get(Field::ChipBreakDistance) {
+                o.cycle.chip_break_distance = v;
             }
         }
         Operation::Chamfer(o) => {
@@ -14273,6 +14584,14 @@ fn flute_count(flutes: u32) -> String {
     format!("{flutes} flute{}", if flutes == 1 { "" } else { "s" })
 }
 
+fn tooth_count(teeth: u32) -> String {
+    if teeth == 1 {
+        "1 tooth".into()
+    } else {
+        format!("{teeth} teeth")
+    }
+}
+
 /// The end-mill family — square, roughing, ball-nose and rounded-edge (bull-nose) end mills —
 /// which share a field set and dimensions, so switching between them preserves the
 /// tool's measurements (a Type change *across* families resets to defaults instead).
@@ -14298,6 +14617,7 @@ fn library_extra(t: &cam_model::Tool) -> Option<String> {
         CutDir::Down => "D",
         CutDir::Up => "U",
         CutDir::Straight => "S",
+        CutDir::Compression => "C",
     };
     match t.kind {
         ToolKind::EndMill | ToolKind::RoughingMill | ToolKind::BallMill => Some(format!(
@@ -14345,6 +14665,11 @@ fn library_extra(t: &cam_model::Tool) -> Option<String> {
             flute_count(t.flutes)
         )),
         ToolKind::FaceMill => Some(flute_count(t.flutes)),
+        ToolKind::GrooveCutter | ToolKind::SlittingSaw => Some(format!(
+            "{} mm wide, {}",
+            fmt_num(t.flute_length),
+            tooth_count(t.flutes)
+        )),
         ToolKind::Drill { .. } => None,
     }
 }
@@ -14362,6 +14687,8 @@ fn kind_order(kind: ToolKind) -> u8 {
         ToolKind::VBit { .. } => 6,
         ToolKind::Drill { .. } => 7,
         ToolKind::ThreadMill { .. } => 8,
+        ToolKind::GrooveCutter => 10,
+        ToolKind::SlittingSaw => 11,
     }
 }
 
@@ -14827,7 +15154,12 @@ impl Viewport {
                         matches!(step, Step::Drill(c) if focus_ops.contains(&c.tag.op_id) && !hidden_ops.contains(&c.tag.op_id))
                     }).cloned().collect(),
                 };
-                drill_marks_of(&visible_drills)
+                let mut marks = drill_marks_of(&visible_drills);
+                marks.extend(expanded_drill_marks(&o.program, |id| {
+                    focus_ops.contains(&id) && !hidden_ops.contains(&id)
+                        && matches!(controller.operation(id), Some(Operation::Drill(_)))
+                }));
+                marks
                     .into_iter()
                     .map(|mut mark| {
                         mark.at = frame
@@ -17362,6 +17694,7 @@ mod multi_setup_draft_tests {
                     revision: 1,
                     name: "Model".into(),
                     source_format: CadFormat::Step,
+                    source_path: None,
                     source_data: vec![].into(),
                     import_options: None,
                     import_diagnostics: vec![],
@@ -17532,6 +17865,45 @@ mod multi_setup_draft_tests {
                 offsets: [[2., 3., 4.], [5., 6., 7.]]
             }
         );
+    }
+
+    #[test]
+    fn negative_relative_box_offsets_apply_the_previewed_stock() {
+        let mut app = model_list_app();
+        let before = app.controller.document().clone();
+        send(&mut app, Message::SetupModelToggled(1, true));
+        send(
+            &mut app,
+            Message::SetupStockKindChanged(StockEditorKind::RelativeBox),
+        );
+        send(&mut app, Message::SetupStockNumberChanged(5, "-11".into()));
+        send(&mut app, Message::SetupCommit);
+        assert!(app.status.contains("positive dimensions"), "{}", app.status);
+        assert!(app.setup_draft.is_some());
+        assert_eq!(app.controller.document(), &before);
+
+        send(&mut app, Message::SetupStockNumberChanged(0, "-2".into()));
+        send(&mut app, Message::SetupStockNumberChanged(5, "-6".into()));
+        let draft = app.setup_draft.as_ref().unwrap();
+        let expected_stock = draft.stock;
+        let bounds = ([2., -1., -1.], [11., 11., 4.]);
+        assert_eq!(app.controller.pending_setup_stock_bounds(draft), bounds);
+        let (vertices, _) = workspace_view::uncut_stock_mesh_for_setup(&app.controller, draft);
+        assert!(vertices.iter().any(|vertex| vertex.position[2] == 4.));
+        assert!(vertices.iter().all(|vertex| vertex.position[2] <= 4.));
+
+        send(&mut app, Message::SetupCommit);
+        assert!(app.setup_draft.is_none(), "{}", app.status);
+        assert_eq!(app.controller.inspection_setup().stock, expected_stock);
+        assert_eq!(app.controller.stock_box(), bounds);
+
+        let scratch = crate::config::tests::Scratch::new("relative-box-offsets");
+        let path = scratch.file("stock.ocam");
+        app.controller.save_project(&path).unwrap();
+        let mut reopened = AppController::new(crate::default_machine());
+        reopened.open_project(&path).unwrap();
+        assert_eq!(reopened.inspection_setup().stock, expected_stock);
+        assert_eq!(reopened.stock_box(), bounds);
     }
 
     #[test]
@@ -17972,11 +18344,78 @@ mod inspector_field_tests {
     use cam_model::{DrillOp, Tool};
 
     #[test]
+    fn disc_cutters_have_distinct_labels_and_independent_dimensions() {
+        let (mut app, _) = App::new();
+        app.workspace = Workspace::Tools;
+        app.reload_tool_edit();
+        for (kind, width_label) in [
+            (ToolKind::GrooveCutter, "Cutter width (mm)"),
+            (ToolKind::SlittingSaw, "Blade thickness (mm)"),
+        ] {
+            let _ = app.update(Message::ToolKindChanged(kind));
+            assert_eq!(app.field_label(Field::FluteLength), width_label);
+            assert_eq!(
+                app.inspector_fields().contains(&Field::NeckLength),
+                kind == ToolKind::GrooveCutter
+            );
+            let length = app.tool_edit.as_ref().unwrap().length;
+            let _ = app.update(Message::FieldChanged(Field::FluteLength, "0.75".into()));
+            assert!(!app.field_invalid(Field::FluteLength));
+            let _ = app.update(Message::Apply);
+            let tool = &app.library.tools[app.lib_sel];
+            assert_eq!(tool.kind, kind);
+            assert_eq!(tool.flute_length, 0.75);
+            assert_eq!(tool.length, length);
+            let _ = app.update(Message::FieldChanged(Field::FluteLength, "0".into()));
+            assert!(app.field_invalid(Field::FluteLength));
+            app.reload_tool_edit();
+        }
+    }
+
+    #[test]
+    fn face_mill_flute_and_body_are_independent() {
+        let (mut app, _) = App::new();
+        app.workspace = Workspace::Tools;
+        app.tool_edit = Some(Tool { diameter: 50.0, length: 60.0, flute_length: 25.0, shank_diameter: 16.0, kind: ToolKind::FaceMill, ..Default::default() });
+        assert!(app.inspector_fields().contains(&Field::FluteLength));
+        assert!(app.inspector_fields().contains(&Field::FaceBodyHeight));
+        app.fields.insert(Field::FaceBodyHeight, "25".into());
+        app.fields.insert(Field::ToolLength, "60".into());
+        app.fields.insert(Field::FluteLength, "5".into());
+        app.live_edit(Field::FluteLength);
+        let tool = app.tool_edit.as_ref().unwrap();
+        assert_eq!((tool.flute_len(), tool.face_body_height(), tool.length), (5.0, 25.0, 60.0));
+        assert!(!app.field_invalid(Field::FluteLength));
+        app.fields.insert(Field::FluteLength, "26".into());
+        assert!(app.field_invalid(Field::FluteLength));
+    }
+
+    #[test]
+    fn chamfer_flute_and_zero_tip_are_editable() {
+        let (mut app, _) = App::new();
+        app.workspace = Workspace::Tools;
+        app.tool_edit = Some(Tool {
+            diameter: 6.0,
+            length: 40.0,
+            kind: ToolKindPick::ChamferMill.to_kind(),
+            ..Default::default()
+        });
+        assert!(app.inspector_fields().contains(&Field::FluteLength));
+        app.fields.insert(Field::ToolDiameter, "6".into());
+        app.fields.insert(Field::TipDiameter, "0".into());
+        assert!(!app.field_invalid(Field::TipDiameter));
+        app.fields.insert(Field::TipDiameter, "-0.01".into());
+        assert!(app.field_invalid(Field::TipDiameter));
+        app.fields.insert(Field::TipDiameter, "6".into());
+        assert!(app.field_invalid(Field::TipDiameter));
+        app.fields.insert(Field::FluteLength, "2".into());
+        app.live_edit(Field::FluteLength);
+        assert_eq!(app.tool_edit.as_ref().unwrap().flute_length, 2.0);
+    }
+
+    #[test]
     fn new_pointed_tools_seed_a_physically_real_tip() {
-        // Ground truth: neither tool has a true r=0 point — one cannot be ground and
-        // would not survive contact. The kinds differ by what the tip *is*: a chamfer
-        // mill's flat does not cut (so it cannot engrave), a V-bit's rounded tip does.
-        // A zero on either would collapse them into the same geometry.
+        // Default tools retain a small flat or rounded tip respectively.
         match ToolKindPick::ChamferMill.to_kind() {
             ToolKind::ChamferMill { tip_diameter, .. } => {
                 assert!(
@@ -18094,6 +18533,10 @@ mod inspector_field_tests {
 
     fn drill(peck: Option<f64>, dwell: Option<f64>) -> Operation {
         Operation::Drill(DrillOp {
+            cycle: Default::default(),
+            tip_through_bottom: false,
+            geometry: Default::default(),
+            hole_heights: Vec::new(),
             parameter_expressions: Default::default(),
             spindle_rpm: 0.0,
             tool_preset: None,
@@ -18112,12 +18555,28 @@ mod inspector_field_tests {
     }
 
     #[test]
-    fn drill_exposes_peck_and_dwell_fields() {
-        // This used to hand-build the list it then asserted on, so it could only ever
-        // agree with itself. It now asks the inspector's own rule.
-        let fields = operation_fields(&drill(None, None));
-        assert!(fields.contains(&Field::Peck));
-        assert!(fields.contains(&Field::Dwell));
+    fn drill_exposes_fields_for_the_selected_cycle() {
+        use cam_model::DrillCycleMode;
+        let mut op = drill(None, None);
+        for mode in DrillCycleMode::ALL {
+            if let Operation::Drill(drill) = &mut op {
+                drill.set_cycle_mode(mode);
+            }
+            let fields = operation_fields(&op);
+            assert_eq!(fields.contains(&Field::Peck), mode.pecks());
+            assert_eq!(
+                fields.contains(&Field::Dwell),
+                mode != DrillCycleMode::RapidOut
+            );
+            assert_eq!(
+                fields.contains(&Field::ChipBreakDistance),
+                mode == DrillCycleMode::ChipBreaking
+            );
+            assert_eq!(
+                fields.contains(&Field::AccumulatedPeck),
+                mode == DrillCycleMode::ChipBreaking
+            );
+        }
     }
 
     fn chamfer(top: f64) -> Operation {
@@ -18450,6 +18909,56 @@ mod inspector_field_tests {
     }
 
     #[test]
+    fn expanded_drill_marks_follow_retracts_and_dwell() {
+        use cam_cldata::{MoveKind, Point3, Tag};
+        let mut program = Program::new();
+        let point = |z| Point3::new(4., 5., z);
+        let tag = |kind| Tag::new(7, kind);
+        program.push(Step::Rapid {
+            to: point(2.),
+            tag: tag(MoveKind::Link),
+        });
+        program.push(Step::Linear {
+            to: point(-1.),
+            feed: 100.,
+            tag: tag(MoveKind::Plunge),
+        });
+        program.push(Step::Rapid {
+            to: point(2.),
+            tag: tag(MoveKind::Retract),
+        });
+        program.push(Step::Linear {
+            to: point(-0.5),
+            feed: 100.,
+            tag: tag(MoveKind::Plunge),
+        });
+        program.push(Step::Linear {
+            to: point(-2.),
+            feed: 100.,
+            tag: tag(MoveKind::Plunge),
+        });
+        program.push(Step::Dwell { seconds: 0.5 });
+        program.push(Step::Rapid {
+            to: point(2.),
+            tag: tag(MoveKind::Retract),
+        });
+        assert_eq!(
+            expanded_drill_marks(&program, |id| id == 7),
+            vec![
+                DrillMark {
+                    at: [4., 5., -1.],
+                    kind: DrillMarkKind::PeckRing
+                },
+                DrillMark {
+                    at: [4., 5., -2.],
+                    kind: DrillMarkKind::DwellBar
+                },
+            ]
+        );
+        assert!(expanded_drill_marks(&program, |_| false).is_empty());
+    }
+
+    #[test]
     fn a_negative_peck_is_treated_as_off_not_stored() {
         let mut op = drill(Some(1.0), None);
         let mut parsed = BTreeMap::new();
@@ -18479,7 +18988,9 @@ mod ribbon_tests {
         ] {
             let expected: Vec<_> = F::ALL
                 .into_iter()
-                .filter(|family| *family != F::RadiusMill)
+                .filter(|family| {
+                    !matches!(family, F::RadiusMill | F::GrooveCutter | F::SlittingSaw)
+                })
                 .collect();
             assert_eq!(families_for(kind), expected.as_slice(), "{kind:?}");
         }

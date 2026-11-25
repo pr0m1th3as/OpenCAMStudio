@@ -1,7 +1,7 @@
 //! Checkboxes and dropdowns that store an operation parameter.
 use super::*;
 use cam_model::{
-    AdaptiveContainment, BoreOrder, Comp, Cooling, HeightPlaneKind as Plane,
+    AdaptiveContainment, BoreOrder, Comp, Cooling, DrillCycleMode, HeightPlaneKind as Plane,
     HeightReference as Reference, OperationHeightSettings, ParallelTransition, ProfileCorner,
     RotaryAxis, RotaryIndex, RotaryWrap, ScallopOrder, ScallopRetraction, SpiralBoundary,
     SpiralCutDirection, SpiralMilling, SpiralMode, SpiralOrder, TabShape,
@@ -246,6 +246,7 @@ settings! {
         _ => None,
     }, Message::LeadOutKindChanged;
     PLUNGE: PlungeKind = "plungeType", |op| App::op_plunge_styles(op).0.map(PlungeKind::of), Message::PlungeKindChanged;
+    DRILL_CYCLE: DrillCycleMode = "drillCycleType", get!(Drill(drill) => drill.cycle_mode()), Message::DrillCycleChanged;
     BORE_INTERNAL: bool = "internalHole", get!(Bore(b) => b.internal), |v| Message::BoreOption(BoreOption::Internal(v));
     BORE_CLIMB: bool = "climb", get!(Bore(b) => b.climb), |v| Message::BoreOption(BoreOption::Climb(v));
     BORE_ANGLE: bool = "useRampAngle", get!(Bore(b) => b.ramp_angle.is_some()), |v| Message::BoreOption(BoreOption::Angle(v));
@@ -308,17 +309,17 @@ settings! {
     PROFILE_EXIT: bool = "leadOutEnabled", get!(Profile(p) => ProfileToggle::LeadOutEnabled.get(p)), |v| Message::ProfilePassToggle(ProfileToggle::LeadOutEnabled, v);
     PROFILE_LEAD_END: bool = "useLeadEndDistance", get!(Profile(p) => ProfileToggle::LeadEndDistance.get(p)), |v| Message::ProfilePassToggle(ProfileToggle::LeadEndDistance, v);
     PROFILE_ROUGH_FINAL: bool = "roughFinalDepths", get!(Profile(p) => ProfileToggle::RoughFinal.get(p)), |v| Message::ProfilePassToggle(ProfileToggle::RoughFinal, v);
-    HEIGHT_CLEARANCE: Reference = "clearanceReference", |_| height_reference(Plane::Clearance), |value| Message::HeightReferenceChanged(Plane::Clearance, value);
-    HEIGHT_RETRACT: Reference = "retractReference", |_| height_reference(Plane::Retract), |value| Message::HeightReferenceChanged(Plane::Retract, value);
-    HEIGHT_FEED: Reference = "feedReference", |_| height_reference(Plane::Feed), |value| Message::HeightReferenceChanged(Plane::Feed, value);
-    HEIGHT_TOP: Reference = "topReference", |_| height_reference(Plane::Top), |value| Message::HeightReferenceChanged(Plane::Top, value);
-    HEIGHT_BOTTOM: Reference = "bottomReference", |_| height_reference(Plane::Bottom), |value| Message::HeightReferenceChanged(Plane::Bottom, value);
-    HEIGHT_FEED_ENABLED: bool = "feedHeightEnabled", |_| Some(height_reference(Plane::Feed) != Some(Reference::Disabled)), Message::HeightFeedEnabled;
+    HEIGHT_CLEARANCE: Reference = "clearanceReference", |op| height_reference(Plane::Clearance, op), |value| Message::HeightReferenceChanged(Plane::Clearance, value);
+    HEIGHT_RETRACT: Reference = "retractReference", |op| height_reference(Plane::Retract, op), |value| Message::HeightReferenceChanged(Plane::Retract, value);
+    HEIGHT_FEED: Reference = "feedReference", |op| height_reference(Plane::Feed, op), |value| Message::HeightReferenceChanged(Plane::Feed, value);
+    HEIGHT_TOP: Reference = "topReference", |op| height_reference(Plane::Top, op), |value| Message::HeightReferenceChanged(Plane::Top, value);
+    HEIGHT_BOTTOM: Reference = "bottomReference", |op| height_reference(Plane::Bottom, op), |value| Message::HeightReferenceChanged(Plane::Bottom, value);
+    HEIGHT_FEED_ENABLED: bool = "feedHeightEnabled", |op| Some(height_reference(Plane::Feed, op) != Some(Reference::Disabled)), Message::HeightFeedEnabled;
 }
 
-fn height_reference(plane: Plane) -> Option<Reference> {
+fn height_reference(plane: Plane, operation: &Operation) -> Option<Reference> {
     Some(
-        OperationHeightSettings::default()
+        OperationHeightSettings::for_operation(operation)
             .definition(plane)
             .reference,
     )
@@ -490,8 +491,8 @@ impl App {
                 | Message::CarveClearLeadOutChanged(_),
                 Operation::Carve(c),
             ) => c.clear.is_some(),
-            (Message::HeightReferenceChanged(plane, reference), _) => {
-                Reference::options(*plane).contains(reference)
+            (Message::HeightReferenceChanged(plane, reference), op) => {
+                Reference::options_for(*plane, Some(op)).contains(reference)
             }
             (Message::ProfileCompChanged(Comp::Control), _) => {
                 self.controller.post_kind().supports_cutter_comp()

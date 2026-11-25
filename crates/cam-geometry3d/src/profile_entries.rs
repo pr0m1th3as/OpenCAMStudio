@@ -16,12 +16,99 @@ pub(super) fn body_groups(selected: &[EntityRef]) -> Vec<Vec<EntityRef>> {
     groups
 }
 
+/// Give each connected CAD edge chain its own entry, retaining the selected
+/// direction and per-contour settings. Explicit Closed entries keep their
+/// existing closed-boundary validation.
+pub fn split_profile_chain_entry(
+    state: &GeometryState,
+    entry: &ProfileGeometryEntry,
+) -> Result<Option<Vec<ProfileGeometryEntry>>, String> {
+    let selected = match &entry.source {
+        ProfileGeometrySource::Cad(selected)
+            if entry.kind == ProfileGeometryKind::Chain
+                && entry.chain_mode != ProfileChainMode::Closed
+                && selected.len() > 1
+                && selected.iter().all(|r| r.kind == EntityKind::Edge) =>
+        {
+            selected
+        }
+        _ => return Ok(None),
+    };
+    let mut chains = Vec::new();
+    for refs in body_groups(selected) {
+        let view = View::for_path(state, &refs)?;
+        let endpoints = refs
+            .iter()
+            .map(|reference| {
+                let points =
+                    view.curve_points(view.edge(reference.id)?, false, MACHINING_CHORD_TOLERANCE)?;
+                Ok([points[0], *points.last().unwrap()])
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let mut chain_ids = vec![None; refs.len()];
+        for seed in 0..refs.len() {
+            if chain_ids[seed].is_some() {
+                continue;
+            }
+            let chain_id = chains.len();
+            chains.push(Vec::new());
+            chain_ids[seed] = Some(chain_id);
+            let mut pending = vec![seed];
+            while let Some(current) = pending.pop() {
+                for (candidate, id) in chain_ids.iter_mut().enumerate().skip(seed + 1) {
+                    if id.is_none()
+                        && endpoints[current].iter().any(|start| {
+                            endpoints[candidate]
+                                .iter()
+                                .any(|end| distance(*start, *end) < T)
+                        })
+                    {
+                        *id = Some(chain_id);
+                        pending.push(candidate);
+                    }
+                }
+            }
+        }
+        // Keep the original pick order within each chain for side and direction.
+        for (reference, id) in refs.into_iter().zip(chain_ids) {
+            chains[id.unwrap()].push(reference);
+        }
+    }
+    if chains.len() <= 1 {
+        return Ok(None);
+    }
+    let mut template = entry.clone();
+    template.source = ProfileGeometrySource::Cad(Vec::new());
+    template.side_overrides.clear();
+    template.contour_count = 1;
+    Ok(Some(
+        chains
+            .into_iter()
+            .enumerate()
+            .map(|(index, refs)| {
+                let mut part = template.clone();
+                if index > 0 {
+                    part.name = format!("{} ({})", entry.name, index + 1);
+                }
+                part.source = ProfileGeometrySource::Cad(refs);
+                if let Some(&side) = entry.side_overrides.get(&index) {
+                    part.side_overrides.insert(0, side);
+                }
+                part
+            })
+            .collect(),
+    ))
+}
+
 /// Resolve named entries independently, allowing faces, chains and silhouettes
 /// in one operation with advisory feature verification.
 pub fn profile_entry_contours(
     state: &GeometryState,
     entry: &ProfileGeometryEntry,
 ) -> Result<(Vec<ProfileContour>, Option<CuttingHeights>), String> {
+    if let Some(entries) = split_profile_chain_entry(state, entry)? {
+        return collect(state, &entries);
+    }
     let mut heights = None;
     let mut contours = match &entry.source {
         ProfileGeometrySource::Contours(contours) => contours.clone(),

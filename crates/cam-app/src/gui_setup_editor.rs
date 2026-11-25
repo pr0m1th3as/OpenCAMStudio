@@ -2,6 +2,24 @@
 use super::*;
 use iced::widget::column;
 
+fn setup_dimensions_row(label: &'static str, dimensions: [f64; 3]) -> Element<'static, Message> {
+    row![
+        text(label)
+            .size(12)
+            .color(INSPECTOR_TEXT)
+            .width(Length::Fill),
+        text(format!(
+            "{:.3} × {:.3} × {:.3} mm",
+            dimensions[0], dimensions[1], dimensions[2]
+        ))
+        .size(11)
+        .color(INSPECTOR_MUTED),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
+    .into()
+}
+
 impl App {
     fn setup_geometry_list(&self, draft: &cam_model::Setup, fixture: bool) -> Element<'_, Message> {
         let instances = if fixture {
@@ -381,7 +399,7 @@ impl App {
                         }
                     }
                     cam_model::Stock::RelativeBox { offsets } => {
-                        list = list.push(inspector_section("Stock allowance"));
+                        list = list.push(inspector_section("Stock offsets"));
                         for (side, side_offsets) in offsets.iter().enumerate() {
                             for (axis, offset) in side_offsets.iter().enumerate() {
                                 let i = side * 3 + axis;
@@ -477,26 +495,31 @@ impl App {
                 }
                 let (model_min, model_max) = self.controller.pending_setup_model_bounds(draft);
                 let dimensions = std::array::from_fn::<_, 3, _>(|i| model_max[i] - model_min[i]);
-                list = list.push(inspector_section("Model bounds"));
-                list = list.push(
-                    text(format!(
-                        "{:.3} × {:.3} × {:.3} mm",
-                        dimensions[0], dimensions[1], dimensions[2]
-                    ))
-                    .size(11)
-                    .color(INSPECTOR_MUTED),
-                );
                 let (stock_min, stock_max) = self.controller.pending_setup_stock_bounds(draft);
+                list = list.push(inspector_section("Information"));
+                list = list.push(setup_dimensions_row("Model bound", dimensions));
+                if !matches!(
+                    draft.stock,
+                    cam_model::Stock::FixedBox { .. } | cam_model::Stock::FixedRound { .. }
+                ) {
+                    let stock_dimensions = std::array::from_fn(|i| stock_max[i] - stock_min[i]);
+                    list = list.push(setup_dimensions_row("Stock size", stock_dimensions));
+                }
                 if draft.stock != cam_model::Stock::PreviousSetup
                     && (0..3).any(|i| {
                         stock_min[i] > model_min[i] + 1e-6 || stock_max[i] < model_max[i] - 1e-6
                     })
                 {
-                    list = list.push(
-                        text("Stock does not contain the selected machining model.")
-                            .size(11)
-                            .color(palette::ERROR),
-                    );
+                    let (message, color) = match draft.stock {
+                        cam_model::Stock::RelativeBox { .. } => {
+                            ("Part of the model lies outside the stock.", INSPECTOR_MUTED)
+                        }
+                        _ => (
+                            "Stock does not contain the selected machining model.",
+                            palette::ERROR,
+                        ),
+                    };
+                    list = list.push(text(message).size(11).color(color));
                 }
             }
             SetupEditorTab::Postprocess => {

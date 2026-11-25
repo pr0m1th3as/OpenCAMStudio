@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 280" role="img" aria-label="Drilling cycle motion diagrams">
+  <title>Drilling cycle motion diagrams</title>
+  <desc>Five panels show a straight plunge and rapid out, a pause at the bottom, short chip-breaking lifts, full peck withdrawals, and synchronized tapping.</desc>
+  <defs>
+    <marker id="feed" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+      <path d="M0 0l7 3.5L0 7z" fill="#60c9ef"/>
+    </marker>
+    <marker id="rapid" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+      <path d="M0 0l7 3.5L0 7z" fill="#efba59"/>
+    </marker>
+    <g id="panel">
+      <rect width="126" height="108" rx="7" fill="#2b323c"/>
+      <path d="M8 56h110v43H8z" fill="#49545f"/>
+      <path d="M8 56h110" stroke="#8594a0"/>
+      <path d="M8 33h110" stroke="#667785" stroke-dasharray="3 3"/>
+    </g>
+    <g id="bit">
+      <path d="M18 23h10v22l-5 6-5-6z" fill="#dce6ed"/>
+      <path d="M21 40l4-8m-4 13l4-8" stroke="#667785"/>
+    </g>
+  </defs>
+  <style>
+    text {font: 11px DejaVu Sans, Arial, sans-serif; fill: #dce6ed}
+    .title {font-weight: bold}
+    .feed {stroke: #60c9ef; stroke-width: 2; fill: none; marker-end: url(#feed)}
+    .rapid {stroke: #efba59; stroke-width: 2; stroke-dasharray: 3 2; fill: none; marker-end: url(#rapid)}
+  </style>
+  <rect width="420" height="280" rx="8" fill="#1f242b"/>
+  <g transform="translate(12 12)">
+    <use href="#panel"/><use href="#bit"/>
+    <text class="title" x="9" y="16">Rapid out</text>
+    <path class="feed" d="M41 33v60"/>
+    <path class="rapid" d="M41 93h52V33"/>
+  </g>
+  <g transform="translate(147 12)">
+    <use href="#panel"/><use href="#bit"/>
+    <text class="title" x="9" y="16">Counterboring</text>
+    <path class="feed" d="M41 33v60"/>
+    <path class="rapid" d="M70 93h23V33"/>
+    <path d="M51 87v10m6-10v10" stroke="#dce6ed" stroke-width="2"/>
+  </g>
+  <g transform="translate(282 12)">
+    <use href="#panel"/><use href="#bit"/>
+    <text class="title" x="9" y="16">Chip breaking</text>
+    <path class="feed" d="M39 33v35M63 59v23M84 73v23"/>
+    <path class="rapid" d="M39 68h12v-9M63 82h11v-9M84 96h26V33"/>
+  </g>
+  <g transform="translate(12 129)">
+    <use href="#panel"/><use href="#bit"/>
+    <text class="title" x="9" y="16">Deep drilling</text>
+    <path class="feed" d="M39 33v35M66 60v21M91 72v24"/>
+    <path class="rapid" d="M39 68h13V33M66 81h12V33M91 96h19V33"/>
+  </g>
+  <g transform="translate(147 129)">
+    <use href="#panel"/>
+    <text class="title" x="9" y="16">Tapping</text>
+    <path d="M17 24h12v26l-6 5-6-5z" fill="#dce6ed"/>
+    <path d="M18 44l10-5m-10 10l10-5m-10 10l10-5" stroke="#667785"/>
+    <path class="feed" d="M42 33v60M94 93V33"/>
+    <path d="M61 87a8 8 0 1 1 7 9m0-4v4l4 2" fill="none" stroke="#dce6ed" stroke-width="1.5"/>
+  </g>
+  <g transform="translate(294 141)">
+    <path class="feed" d="M0 5h22"/><text x="32" y="9">Feed</text>
+    <path class="rapid" d="M0 27h22"/><text x="32" y="31">Rapid</text>
+    <path d="M1 44v10m6-10v10" stroke="#dce6ed" stroke-width="2"/><text x="32" y="53">Dwell</text>
+    <path d="M0 69h22" stroke="#667785" stroke-dasharray="3 3"/><text x="32" y="73">Retract plane</text>
+  </g>
+  <text x="14" y="260">Arrows show Z motion in sequence. Tapping reverses spindle at depth.</text>
+</svg>

@@ -110,7 +110,9 @@ fn convert(v: &Value) -> Result<(Tool, String), String> {
     };
     let description = string(v, "description").unwrap_or_default();
     let lower = description.to_lowercase();
-    let cutting_direction = if lower.contains("downcut") || lower.contains("down cut") {
+    let cutting_direction = if lower.contains("compression") {
+        CutDir::Compression
+    } else if lower.contains("downcut") || lower.contains("down cut") {
         CutDir::Down
     } else if lower.contains("upcut") || lower.contains("up cut") {
         CutDir::Up
@@ -166,7 +168,8 @@ fn convert(v: &Value) -> Result<(Tool, String), String> {
     if skipped > 0 {
         warnings.push(format!("{skipped} invalid preset(s) skipped"));
     }
-    if !lower.contains("downcut")
+    if !lower.contains("compression")
+        && !lower.contains("downcut")
         && !lower.contains("down cut")
         && !lower.contains("upcut")
         && !lower.contains("up cut")
@@ -182,6 +185,13 @@ fn convert(v: &Value) -> Result<(Tool, String), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn imports_compression_direction_even_when_description_mentions_both_cuts() {
+        let json = r#"{"data":[{"type":"flat end mill","unit":"millimeters","description":"compression upcut downcut","geometry":{"DC":6,"OAL":50,"LCF":20,"SFDM":6,"NOF":2}}]}"#;
+        let entries = parse(json).unwrap();
+        assert_eq!(entries[0].tool.as_ref().unwrap().cutting_direction, CutDir::Compression);
+        assert!(!entries[0].detail.contains("Cut direction unspecified"));
+    }
     #[test]
     fn converts_units_presets_and_reports_unsupported_tools() {
         let json = r#"{"data":[{"type":"flat end mill","unit":"inches","description":"upcut","geometry":{"DC":0.25,"OAL":2,"LCF":1,"SFDM":0.25,"NOF":2},"start-values":{"presets":[{"name":"wood","n":12000,"v_f":10,"v_f_plunge":5}]}},{"type":"unsupported","unit":"millimeters","geometry":{"DC":3,"OAL":30,"LCF":10,"NOF":2}}]}"#;

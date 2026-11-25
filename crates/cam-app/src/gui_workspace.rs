@@ -1695,6 +1695,10 @@ mod tests {
         for x in [10., 25.] {
             app.controller
                 .add_operation(Operation::Drill(cam_model::DrillOp {
+                    cycle: Default::default(),
+                    tip_through_bottom: false,
+                    geometry: Default::default(),
+                    hole_heights: Vec::new(),
                     parameter_expressions: Default::default(),
                     id: 0,
                     tool: 1,
@@ -1741,6 +1745,12 @@ mod tests {
         );
         let first_marks = app.machining_viewport().drill_marks;
         assert!(!first_marks.is_empty());
+        assert!(first_marks
+            .iter()
+            .any(|mark| mark.kind == DrillMarkKind::PeckRing));
+        assert!(first_marks
+            .iter()
+            .any(|mark| mark.kind == DrillMarkKind::DwellBar));
         assert!(app.operation_draft.is_none());
         assert!(app.pane_handle(Pane::Inspector).is_none());
 
@@ -1814,6 +1824,10 @@ mod tests {
         let center = [(min[0] + max[0]) / 2., (min[1] + max[1]) / 2.];
         app.controller
             .add_operation(Operation::Drill(cam_model::DrillOp {
+                cycle: Default::default(),
+                tip_through_bottom: false,
+                geometry: Default::default(),
+                hole_heights: Vec::new(),
                 parameter_expressions: Default::default(),
                 id: 0,
                 tool: 1,
@@ -1896,6 +1910,10 @@ mod tests {
 
         app.controller
             .add_operation(Operation::Drill(cam_model::DrillOp {
+                cycle: Default::default(),
+                tip_through_bottom: false,
+                geometry: Default::default(),
+                hole_heights: Vec::new(),
                 parameter_expressions: Default::default(),
                 id: 0,
                 tool: 1,
@@ -1967,6 +1985,10 @@ mod tests {
         for x in [10., 25.] {
             app.controller
                 .add_operation(Operation::Drill(cam_model::DrillOp {
+                    cycle: Default::default(),
+                    tip_through_bottom: false,
+                    geometry: Default::default(),
+                    hole_heights: Vec::new(),
                     parameter_expressions: Default::default(),
                     id: 0,
                     tool: 1,
@@ -3383,123 +3405,7 @@ mod performance_tests {
         }
     }
 
-    /// Reproduce menu pointer traffic and camera motion against the bundled CAD job.
-    /// Run manually with `cargo test -p cam-app --features gui viewport_interaction_benchmark -- --ignored --nocapture`.
-    #[test]
-    #[ignore = "manual performance measurement"]
-    fn viewport_interaction_benchmark() {
-        let mut app = cad_app();
-        black_box(app.machining_viewport());
-        for (label, orbit) in [("menu pointer", false), ("orbit", true)] {
-            let start = Instant::now();
-            for i in 0..60 {
-                let message = if orbit {
-                    Message::OrbitBy(0.01, 0.005)
-                } else {
-                    Message::WindowCursor(iced::Point::new(i as f32, 20.))
-                };
-                let _ = app.update(message);
-                let viewport = app.machining_viewport();
-                black_box(shader::Program::draw(
-                    &viewport,
-                    &Default::default(),
-                    iced::mouse::Cursor::Unavailable,
-                    iced::Rectangle::with_size(iced::Size::new(1000., 700.)),
-                ));
-            }
-            eprintln!(
-                "{label}: {:.3} ms/update+draw",
-                start.elapsed().as_secs_f64() * 1000. / 60.
-            );
-        }
-        for editing in [false, true] {
-            if editing {
-                let id = app.controller.inspection_setup().operations[0].id();
-                app.begin_operation_draft(id);
-            }
-            black_box(app.view());
-            let start = Instant::now();
-            for _ in 0..60 {
-                let _ = app.update(Message::OrbitBy(0.01, 0.005));
-                black_box(app.view());
-            }
-            eprintln!(
-                "full UI construction (editing={editing}): {:.3} ms/update+view",
-                start.elapsed().as_secs_f64() * 1000. / 60.
-            );
-        }
-    }
 
-    /// Profile a supplied saved project without changing it. Override the input
-    /// with OPENCAM_BENCH_PROJECT; run with --ignored --nocapture.
-    #[test]
-    #[ignore = "manual supplied-project performance measurement"]
-    fn supplied_project_interaction_benchmark() {
-        let (mut app, _) = App::new();
-        app.settings = crate::Settings::default();
-        app.controller = AppController::new(crate::default_machine());
-        let path = std::env::var_os("OPENCAM_BENCH_PROJECT")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testfiles/test2.ocam")
-            });
-        macro_rules! measure {
-            ($label:expr, $n:expr, $body:expr) => {{
-                let start = Instant::now();
-                for _ in 0..$n {
-                    black_box($body);
-                }
-                eprintln!(
-                    "{}: {:.3} ms/call",
-                    $label,
-                    start.elapsed().as_secs_f64() * 1000. / $n as f64
-                );
-            }};
-        }
-        measure!(
-            "open project",
-            1,
-            app.controller.open_project(&path).unwrap()
-        );
-        measure!("initial viewport", 1, app.machining_viewport());
-        measure!("setup update + view", 5, {
-            let _ = app.update(Message::OrbitBy(0.01, 0.005));
-            app.view()
-        });
-        let id = app.controller.inspection_setup().operations[0].id();
-        measure!("open operation editor", 1, app.begin_operation_draft(id));
-        measure!("first editing view (cold geometry)", 1, app.view());
-        measure!("dirty check", 100, app.controller.has_unsaved_changes());
-        let geometry = app.controller.setup_geometry_state().unwrap();
-        let binding = &app.controller.geometry_state().bindings[&id];
-        measure!(
-            "first resolve binding",
-            1,
-            cam_geometry3d::resolve_binding(&geometry, binding).unwrap()
-        );
-        measure!(
-            "resolve binding (warm)",
-            3,
-            cam_geometry3d::resolve_binding(&geometry, binding).unwrap()
-        );
-        measure!(
-            "profile selection geometry",
-            3,
-            app.profile_selection_geometry()
-        );
-        measure!(
-            "validate editor geometry",
-            3,
-            app.validate_active_profile_geometry()
-        );
-        measure!("first editing viewport", 1, app.machining_viewport());
-        measure!("cached viewport", 3, app.machining_viewport());
-        measure!("inspector", 3, app.inspector());
-        measure!("editing update + view", 3, {
-            let _ = app.update(Message::OrbitBy(0.01, 0.005));
-            app.view()
-        });
-    }
 }
 
 #[cfg(test)]

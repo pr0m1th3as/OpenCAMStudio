@@ -2,6 +2,18 @@
 use super::*;
 use cam_sim::{Heightfield, SimResult};
 
+fn simulation_tool(tool: &cam_model::Tool, outline: &cam_geo::Profile2D) -> Option<SimTool> {
+    Some(SimTool {
+        number: tool.number,
+        profile: sim_profile(tool)?,
+        noncutting_tip_radius: outline
+            .segs
+            .first()
+            .filter(|s| !s.cutting && s.end.y.abs() < 1e-9)
+            .map(|s| s.end.x),
+    })
+}
+
 #[derive(Default)]
 pub(crate) struct StockSimulationCache {
     current: SimulationCache,
@@ -115,18 +127,7 @@ impl JobInputs {
             .setup()
             .tools
             .iter()
-            .map(|tool| {
-                let outline = tool.profile();
-                SimTool {
-                    number: tool.number,
-                    profile: sim_profile(tool),
-                    noncutting_tip_radius: outline
-                        .segs
-                        .first()
-                        .filter(|s| !s.cutting && s.end.y.abs() < 1e-9)
-                        .map(|s| s.end.x),
-                }
-            })
+            .filter_map(|tool| simulation_tool(tool, &tool.profile()))
             .collect();
         let fixture_contacts = self.fixture_collisions(program, cancel)?;
         let mut samples = if self.uses_rotary_stock(program) {
@@ -375,18 +376,7 @@ impl JobInputs {
         let tools = &self.document.setup().tools;
         let sim_tools: Vec<SimTool> = tools
             .iter()
-            .map(|t| {
-                let outline = t.profile();
-                SimTool {
-                    number: t.number,
-                    profile: sim_profile(t),
-                    noncutting_tip_radius: outline
-                        .segs
-                        .first()
-                        .filter(|s| !s.cutting && s.end.y.abs() < 1e-9)
-                        .map(|s| s.end.x),
-                }
-            })
+            .filter_map(|tool| simulation_tool(tool, &tool.profile()))
             .collect();
         let options = SimOptions {
             resolution,
@@ -441,8 +431,9 @@ impl JobInputs {
             .setup()
             .tools
             .iter()
-            .map(|t| {
+            .filter_map(|t| {
                 let outline = t.profile();
+                let tool = simulation_tool(t, &outline)?;
                 let flute = outline
                     .segs
                     .iter()
@@ -450,16 +441,8 @@ impl JobInputs {
                     .map(|s| s.end.y)
                     .fold(0., f64::max)
                     .max(1e-6);
-                cam_sim::RotaryTool {
-                    tool: SimTool {
-                        number: t.number,
-                        profile: sim_profile(t),
-                        noncutting_tip_radius: outline
-                            .segs
-                            .first()
-                            .filter(|s| !s.cutting && s.end.y.abs() < 1e-9)
-                            .map(|s| s.end.x),
-                    },
+                Some(cam_sim::RotaryTool {
+                    tool,
                     flute_length: flute,
                     length: t.length.max(flute),
                     neck_length: if matches!(t.kind, cam_model::ToolKind::ThreadMill { .. }) {
@@ -469,7 +452,7 @@ impl JobInputs {
                     },
                     neck_radius: t.neck_dia() / 2.,
                     shank_radius: t.shank_dia() / 2.,
-                }
+                })
             })
             .collect()
     }
@@ -850,10 +833,6 @@ fn simulation_resolution(span: f64, feature: f64, accuracy: f32) -> f64 {
 }
 
 #[cfg(test)]
-#[path = "project_cache_bench.rs"]
-mod cache_bench;
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{default_machine, AppController};
@@ -874,6 +853,10 @@ mod tests {
         app.edit_setup(|s| {
             s.heights = cam_model::Heights::new(5., 2., 0.);
             s.operations.push(Operation::Drill(DrillOp {
+                cycle: Default::default(),
+                tip_through_bottom: false,
+                geometry: Default::default(),
+                hole_heights: Vec::new(),
                 parameter_expressions: Default::default(),
                 id: 1,
                 tool: 1,
@@ -901,6 +884,7 @@ mod tests {
                 revision: 1,
                 name: "Vise".into(),
                 source_format: CadFormat::Step,
+                source_path: None,
                 source_data: Vec::new().into(),
                 source_units: SourceUnits::Millimetres,
                 backend: "analytic fixture".into(),
@@ -1540,6 +1524,10 @@ mod tests {
         inherited_setup(&mut app);
         app.edit_setup(|s| {
             s.operations.push(Operation::Drill(DrillOp {
+                cycle: Default::default(),
+                tip_through_bottom: false,
+                geometry: Default::default(),
+                hole_heights: Vec::new(),
                 parameter_expressions: Default::default(),
                 id: 2,
                 tool: 1,
@@ -1621,6 +1609,7 @@ mod tests {
                 revision: 1,
                 name: "Offset block".into(),
                 source_format: CadFormat::Step,
+                source_path: None,
                 source_data: Vec::new().into(),
                 source_units: SourceUnits::Millimetres,
                 backend: "analytic test".into(),

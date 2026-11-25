@@ -1,5 +1,6 @@
 //! Import completion and explicitly opened warning/error dialogs.
 use super::*;
+use crate::Settings;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Notice {
@@ -14,16 +15,18 @@ pub(super) struct NoticeEntry {
     pub severity: Severity,
     pub message: String,
     pub source: Option<String>,
+    pub verification_collision: bool,
 }
 
 impl Notice {
-    fn import_error(detail: String) -> Self {
+    pub(super) fn error(title: &str, detail: String) -> Self {
         Self {
-            title: "Cannot import geometry".into(),
+            title: title.into(),
             entries: vec![NoticeEntry {
                 severity: Severity::Error,
                 message: detail.clone(),
                 source: None,
+                verification_collision: false,
             }],
             detail,
             error: true,
@@ -33,7 +36,7 @@ impl Notice {
 
 #[cfg(test)]
 pub(super) fn job_notice(outcome: &crate::RunOutcome) -> Option<Notice> {
-    let notice = job_notice_with_info(outcome)?;
+    let notice = job_notice_with_info(outcome, &Settings::default())?;
     notice
         .entries
         .iter()
@@ -41,39 +44,41 @@ pub(super) fn job_notice(outcome: &crate::RunOutcome) -> Option<Notice> {
         .then_some(notice)
 }
 
-pub(super) fn job_notice_with_info(outcome: &crate::RunOutcome) -> Option<Notice> {
+pub(super) fn job_notice_with_info(
+    outcome: &crate::RunOutcome,
+    settings: &Settings,
+) -> Option<Notice> {
     let mut entries: Vec<_> = outcome
         .diagnostics
         .iter()
         .map(|diagnostic| NoticeEntry {
             severity: diagnostic.severity,
-            message: diagnostic.message.clone(),
+            message: settings.format_diagnostic(diagnostic).into_owned(),
             source: None,
+            verification_collision: false,
         })
         .collect();
-    entries.extend(outcome.collisions.iter().map(|collision| NoticeEntry {
-        severity: Severity::Error,
-        message: format!("Verification: {}", collision.message),
-        source: None,
-    }));
-    let error = entries
-        .iter()
-        .any(|entry| entry.severity == Severity::Error)
-        || matches!(
-            outcome.completion,
-            JobCompletion::Failed | JobCompletion::Incomplete
-        );
-    if error
-        && !entries
-            .iter()
-            .any(|entry| entry.severity == Severity::Error)
+    if matches!(
+        outcome.completion,
+        JobCompletion::Failed | JobCompletion::Incomplete
+    ) && !outcome.has_errors()
     {
         entries.push(NoticeEntry {
             severity: Severity::Error,
             message: "The toolpath or verification did not complete. Export is unavailable.".into(),
             source: None,
+            verification_collision: false,
         });
     }
+    entries.extend(outcome.collisions.iter().map(|collision| NoticeEntry {
+        severity: Severity::Error,
+        message: format!("Verification: {}", collision.message),
+        source: None,
+        verification_collision: true,
+    }));
+    let error = entries
+        .iter()
+        .any(|entry| entry.severity == Severity::Error);
     (!entries.is_empty()).then(|| Notice {
         title: if error {
             "Toolpath / verification errors"
@@ -231,6 +236,10 @@ impl App {
     pub(super) fn complete_import(&mut self, result: Result<usize, String>) -> iced::Task<Message> {
         let preview = self.controller.cad_import_preview();
         let replacement = self.controller.cad_import_replacement();
+        let reloading = self.controller.cad_import_reloading();
+        let previous_revision = replacement
+            .and_then(|id| self.controller.geometry_state().asset(id))
+            .map(|asset| asset.revision);
         let linked_replacement = replacement.is_some_and(|asset| {
             self.controller
                 .geometry_state()
@@ -244,7 +253,14 @@ impl App {
                 })
         });
         let result = result.and_then(|_| {
-            if self.setup_draft_dirty() || self.inspector_dirty() || self.any_field_invalid() || self.creating_operation() || self.cad_editing_op.is_some() || self.drawing_editing_op.is_some() {
+            if self.setup_draft_dirty()
+                || self.inspector_dirty()
+                || self.any_field_invalid()
+                || self.creating_operation()
+                || self.cad_editing_op.is_some()
+                || self.drawing_editing_op.is_some()
+                || (reloading && (self.move_draft.is_some() || self.pattern_draft.is_some()))
+            {
                 self.controller.cancel_cad_import();
                 return Err("An editor or geometry selection changed during import. Finish or Cancel that task, then import again.".into());
             }
@@ -253,14 +269,22 @@ impl App {
         match result {
             Err(error) => {
                 self.controller.cancel_cad_import();
-                self.status = format!("Import failed: {error}");
-                self.queue_notice(Notice::import_error(error))
+                let (title, status) = if reloading {
+                    ("Cannot reload model", "Reload failed")
+                } else {
+                    ("Cannot import geometry", "Import failed")
+                };
+                self.status = format!("{status}: {error}");
+                self.queue_notice(Notice::error(title, error))
             }
             Ok(count) => {
-                self.cad_hidden.clear();
-                self.hidden_assets.clear();
-                self.model_view = (!self.controller.geometry_state().instances.is_empty())
-                    .then_some(TreeNode::Models);
+                if !reloading {
+                    self.cad_hidden.clear();
+                    self.hidden_assets.clear();
+                    self.model_view = (!self.controller.geometry_state().instances.is_empty())
+                        .then_some(TreeNode::Models);
+                    self.view = ViewControls::default();
+                }
                 self.cad_hover = None;
                 self.cad_candidates.clear();
                 self.cad_pending_kind = None;
@@ -272,16 +296,27 @@ impl App {
                 self.operation_geometry = None;
                 self.operation_binding_preview = None;
                 self.operation_tools.clear();
-                self.view = ViewControls::default();
                 self.controller.select(Selection::Setup);
                 self.end_setup_draft();
                 self.refresh_fields();
-                self.status = format!("Imported {count} geometry item(s).");
+                self.status = if reloading {
+                    "Model reloaded from file.".into()
+                } else {
+                    format!("Imported {count} geometry item(s).")
+                };
                 let mut warnings = preview
                     .map(|preview| preview.diagnostics)
                     .unwrap_or_default();
-                if linked_replacement {
-                    warnings.push("The model was replaced. Dependent operations require geometry reselection before generation or export.".into());
+                let current_revision = replacement
+                    .and_then(|id| self.controller.geometry_state().asset(id))
+                    .map(|asset| asset.revision);
+                if linked_replacement && previous_revision != current_revision {
+                    let change = if reloading {
+                        "The reloaded model geometry changed."
+                    } else {
+                        "The model was replaced."
+                    };
+                    warnings.push(format!("{change} Dependent operations require geometry reselection before generation or export."));
                 }
                 if warnings.is_empty() {
                     iced::Task::none()
@@ -295,6 +330,7 @@ impl App {
                                 severity: Severity::Warning,
                                 message,
                                 source: None,
+                                verification_collision: false,
                             })
                             .collect(),
                         error: false,
@@ -320,6 +356,10 @@ mod tests {
 
     fn poll_import(app: &mut App, path: std::path::PathBuf) {
         let _ = app.update(Message::CadToImport(Some(path)));
+        finish_import(app);
+    }
+
+    fn finish_import(app: &mut App) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while app.controller.cad_import_pending() {
             let _ = app.update(Message::PollCadImport);
@@ -405,11 +445,110 @@ mod tests {
         assert_eq!(app.controller.document(), &before);
     }
 
+    #[cfg(feature = "occt")]
+    #[test]
+    fn reload_from_saved_source_keeps_operations_and_reads_updated_geometry() {
+        let mut app = app();
+        let files = tempfile::tempdir().unwrap();
+        let source = files.path().join("model.step");
+        let project = files.path().join("project.ocam");
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../cam-kernel/fixtures");
+        std::fs::copy(fixtures.join("box-mm.step"), &source).unwrap();
+        poll_import(&mut app, source.clone());
+
+        let geometry = app.controller.geometry_state();
+        let asset = &geometry.assets[0];
+        let instance = &geometry.instances[0];
+        let face = asset.topology.faces.iter().find(|face| {
+            matches!(face.surface, cam_model::CadSurface::Plane { normal, .. } if normal[2] > 0.9)
+        }).unwrap();
+        let selected = EntityRef {
+            asset_id: asset.id,
+            revision: asset.revision,
+            instance_id: instance.id,
+            body_id: instance.body_id,
+            kind: EntityKind::Face,
+            id: face.id,
+        };
+        let placement = cam_model::RigidTransform {
+            translation: [2., 3., 0.],
+            ..instance.placement
+        };
+        app.controller
+            .place_cad_instance(selected.instance_id, placement)
+            .unwrap();
+        app.controller
+            .edit_setup(|setup| setup.model_instances = vec![selected.instance_id]);
+        let op = app
+            .controller
+            .create_cad_operation(OpKind::Face, vec![selected.clone()])
+            .unwrap();
+        app.controller.save_project(&project).unwrap();
+        app.controller.open_project(&project).unwrap();
+        app.refresh_fields();
+        let before = app.controller.document().clone();
+
+        let reload = |app: &mut App| {
+            let _ = app.update(Message::Tree(TreeMessage::Open(TreeNode::Asset(
+                selected.asset_id,
+            ))));
+            let _ = app.update(Message::Tree(TreeMessage::Command(Box::new(
+                Message::ReloadCadAsset(selected.asset_id),
+            ))));
+            assert!(app.controller.cad_import_pending());
+            finish_import(app);
+        };
+        reload(&mut app);
+        assert_eq!(app.status, "Model reloaded from file.");
+        assert_eq!(app.controller.document(), &before);
+        assert!(app.notice.is_none());
+
+        std::fs::copy(fixtures.join("pocket-island-holes-mm.step"), &source).unwrap();
+        reload(&mut app);
+        assert_eq!(app.status, "Model reloaded from file.");
+        let after = app.controller.document();
+        assert_eq!(after.setups, before.setups);
+        assert_eq!(after.geometry.instances, before.geometry.instances);
+        assert_ne!(
+            after.geometry.assets[0].topology,
+            before.geometry.assets[0].topology
+        );
+        assert_eq!(after.geometry.assets[0].id, selected.asset_id);
+        assert_eq!(after.geometry.assets[0].revision, selected.revision + 1);
+        assert_eq!(
+            after.geometry.bindings[&op].selected,
+            vec![selected.clone()]
+        );
+        assert!(matches!(
+            after.geometry.bindings[&op].status,
+            cam_model::ResolutionStatus::NeedsReselection { .. }
+        ));
+        assert!(app
+            .notice
+            .as_ref()
+            .is_some_and(|notice| notice.detail.contains("require geometry reselection")));
+        assert!(app.controller.undo());
+        assert_eq!(app.controller.document(), &before);
+
+        let _ = app.update(Message::NoticeDismissed);
+        std::fs::remove_file(source).unwrap();
+        reload(&mut app);
+        assert_eq!(app.controller.document(), &before);
+        assert!(app
+            .notice
+            .as_ref()
+            .is_some_and(|notice| notice.error && notice.title == "Cannot reload model"));
+    }
+
     #[test]
     fn run_errors_wait_for_a_status_indicator_click() {
         let mut app = app();
         app.controller
             .add_operation(Operation::Drill(cam_model::DrillOp {
+                cycle: Default::default(),
+                tip_through_bottom: false,
+                geometry: Default::default(),
+                hole_heights: Vec::new(),
                 parameter_expressions: Default::default(),
                 id: 0,
                 tool: 999,
@@ -483,7 +622,7 @@ mod tests {
     #[test]
     fn filters_change_while_modal_is_open_and_reset_for_next_notice() {
         let mut app = app();
-        let notice = Notice::import_error("First error".into());
+        let notice = Notice::error("Cannot import geometry", "First error".into());
         let _ = app.queue_notice(notice.clone());
         let _ = app.queue_notice(notice);
         let _ = app.update(Message::NoticeFilterChanged(0, false));
@@ -506,6 +645,7 @@ mod tests {
                 severity: Severity::Warning,
                 message: "Test warning".into(),
                 source: None,
+                verification_collision: false,
             }],
             error: false,
         });

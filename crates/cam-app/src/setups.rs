@@ -869,7 +869,7 @@ impl AppController {
         let id = operation.id();
         let mut document =
             self.prepare_operation_settings(operation, overrides, tools, geometry, None, None)?;
-        settings.resolve(
+        crate::cad_operations::resolve_height_settings(
             &document,
             document
                 .setup()
@@ -877,6 +877,7 @@ impl AppController {
                 .iter()
                 .find(|o| o.id() == id)
                 .unwrap(),
+            &settings,
         )?;
         document.setup_mut().height_settings.insert(id, settings);
         if document != *self.document() {
@@ -929,7 +930,7 @@ impl AppController {
             None,
             Some(index),
         )?;
-        settings.resolve(
+        crate::cad_operations::resolve_height_settings(
             &document,
             document
                 .setup()
@@ -937,6 +938,7 @@ impl AppController {
                 .iter()
                 .find(|o| o.id() == id)
                 .unwrap(),
+            &settings,
         )?;
         document.setup_mut().height_settings.insert(id, settings);
         if stock_to_leave.enabled {
@@ -1346,10 +1348,8 @@ impl AppController {
                     "Choose positive stock dimensions and model positions within the stock".into(),
                 )
             }
-            Stock::RelativeBox { offsets }
-                if offsets.iter().flatten().any(|v| !v.is_finite() || *v < 0.) =>
-            {
-                return Err("Stock allowances must be finite and non-negative".into())
+            Stock::RelativeBox { offsets } if offsets.iter().flatten().any(|v| !v.is_finite()) => {
+                return Err("Stock offsets must be finite".into());
             }
             Stock::FixedRound {
                 diameter,
@@ -1416,8 +1416,11 @@ impl AppController {
         }) {
             return Err("Stock must have finite, positive dimensions on all axes".into());
         }
-        if setup.stock != Stock::PreviousSetup
-            && !self.geometry_state().instances.is_empty()
+        // A negative relative offset deliberately puts a stock face inside the model bounds.
+        if !matches!(
+            setup.stock,
+            Stock::RelativeBox { .. } | Stock::PreviousSetup
+        ) && !self.geometry_state().instances.is_empty()
             && (0..3).any(|i| stock_min[i] > min[i] + 1e-6 || stock_max[i] < max[i] - 1e-6)
         {
             return Err("Stock does not contain the selected machining model".into());
@@ -1544,6 +1547,10 @@ mod tests {
     use super::*;
     fn drill() -> Operation {
         Operation::Drill(DrillOp {
+            cycle: Default::default(),
+            tip_through_bottom: false,
+            geometry: Default::default(),
+            hole_heights: Vec::new(),
             parameter_expressions: Default::default(),
             id: 0,
             tool: 1,
@@ -1576,6 +1583,13 @@ mod tests {
             Some(heights),
         )
         .unwrap();
+        app.select(Selection::Operation(id));
+        app.duplicate_selected_operation();
+        let operation_copy = app.selected_operation().unwrap().id();
+        assert_eq!(app.setup().heights_for(operation_copy), heights);
+        assert!(!app.setup().height_settings.contains_key(&operation_copy));
+        assert!(app.undo());
+
         let duplicated = app.duplicate_setup(first).unwrap();
         let copy_id = app.setup().operations[0].id();
         assert_ne!(copy_id, id);
@@ -1632,10 +1646,12 @@ mod tests {
             .iter()
             .filter_map(|step| match step {
                 cam_cldata::Step::Drill(cycle) => Some(cycle.tag.op_id),
+                cam_cldata::Step::Linear { tag, .. }
+                    if tag.kind == cam_cldata::MoveKind::Plunge => Some(tag.op_id),
                 _ => None,
             })
             .collect();
-        assert_eq!(actual, order);
+        assert_eq!(actual, order, "diagnostics: {:?}", planned.diagnostics);
         assert!(app.undo());
         assert_eq!(app.document(), &original);
         assert!(app.redo());

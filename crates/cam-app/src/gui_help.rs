@@ -19,6 +19,13 @@ pub(super) fn height_help(plane: cam_model::HeightPlaneKind) -> &'static str {
 }
 
 fn illustration(help: &str) -> Option<&'static [u8]> {
+    if help == drill_cycle::CYCLE_HELP
+        || cam_model::DrillCycleMode::ALL
+            .into_iter()
+            .any(|mode| drill_cycle::help(mode) == help)
+    {
+        return Some(include_bytes!("../assets/help/drill-cycles.svg").as_slice());
+    }
     if help == help::CLIMB {
         Some(include_bytes!("../assets/help/climb-conventional.svg").as_slice())
     } else if [
@@ -237,6 +244,10 @@ mod tests {
     #[test]
     fn illustrated_help_assets_are_valid_and_have_text_descriptions() {
         for (name, bytes) in [
+            (
+                "drill cycles",
+                include_str!("../assets/help/drill-cycles.svg"),
+            ),
             ("sides", include_str!("../assets/help/sides.svg")),
             ("allowances", include_str!("../assets/help/allowances.svg")),
             ("passes", include_str!("../assets/help/passes.svg")),

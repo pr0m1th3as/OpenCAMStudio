@@ -39,6 +39,8 @@ enum ToolKindId {
     RoughingMill,
     BallMill,
     FaceMill,
+    GrooveCutter,
+    SlittingSaw,
     BullNose {
         corner_um: i64,
     },
@@ -69,6 +71,8 @@ fn kind_id(k: &ToolKind) -> ToolKindId {
         ToolKind::RoughingMill => ToolKindId::RoughingMill,
         ToolKind::BallMill => ToolKindId::BallMill,
         ToolKind::FaceMill => ToolKindId::FaceMill,
+        ToolKind::GrooveCutter => ToolKindId::GrooveCutter,
+        ToolKind::SlittingSaw => ToolKindId::SlittingSaw,
         ToolKind::BullNose { corner_radius } => ToolKindId::BullNose {
             corner_um: q(corner_radius),
         },
@@ -113,6 +117,7 @@ pub struct ToolIdentity {
     diameter_um: i64,
     length_um: i64,
     flute_len_um: i64,
+    face_body_height_um: i64,
     shank_dia_um: i64,
     neck_len_um: i64,
     neck_dia_um: i64,
@@ -128,6 +133,7 @@ impl Tool {
             diameter_um: q(self.diameter),
             length_um: q(self.length),
             flute_len_um: q(self.flute_len()),
+            face_body_height_um: if matches!(self.kind, ToolKind::FaceMill) { q(self.face_body_height()) } else { 0 },
             shank_dia_um: q(self.shank_dia()),
             neck_len_um: q(self.neck_length),
             neck_dia_um: q(self.neck_dia()),
@@ -417,6 +423,10 @@ mod tests {
     fn operation_tool_references_are_rewritten() {
         let mk_drill = |id: u32, tool: u32| {
             Operation::Drill(DrillOp {
+                cycle: Default::default(),
+                tip_through_bottom: false,
+                geometry: Default::default(),
+                hole_heights: Vec::new(),
                 parameter_expressions: Default::default(),
                 spindle_rpm: 0.0,
                 tool_preset: None,

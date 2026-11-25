@@ -164,8 +164,10 @@ persists the corresponding settings. `export_tool_library` writes a separate
 4. In desktop mode, use `desktop_simulation` with action `open` to inspect playback.
    Other actions include play, pause, seek, speed and point/operation stepping.
 5. Call `export_nc` to return G-code, or supply `path` to write it. Incomplete or
-   failed planning, unsafe stock collisions and post/machine validation errors
-   block export through the same application checks as the GUI.
+   failed planning and post/machine validation errors block export. Stock and
+   fixture collisions block export by default. The preference
+   `block_export_on_verification_errors` controls whether `get_run_status` reports
+   collisions as errors or warnings and whether they block export.
 
 Exact duplicate included operations require `allow_duplicates: true` on export,
 matching the desktop's confirmation for intentional repeated cuts.

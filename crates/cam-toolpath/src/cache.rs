@@ -2,7 +2,7 @@
 //! the planner assembles links, datums, spindle and shutdown on every run.
 use crate::{CancelToken, JobEnv, StrategyResult};
 use cam_cldata::SpindleDir;
-use cam_model::{CuttingHeights, Heights, Operation, OperationParameter, StockToLeave, Tool};
+use cam_model::{CuttingHeights, Heights, Operation, OperationParameter, Plunge, StockToLeave, Tool};
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
@@ -72,6 +72,10 @@ pub(crate) struct CacheExtras {
 /// Revision for operations that can emit concentric clearing passes.
 pub fn concentric_clearing_revision(operation: &Operation) -> Option<u32> {
     let can_clear = match operation {
+        Operation::Pocket(p) if matches!(p.clear.plunge, Plunge::Helix { .. }) => {
+            // Recompute saved helices when stay-down linking can replace them.
+            return Some(if p.clear.keep_tool_down { 4 } else { 3 });
+        }
         Operation::Pocket(_) | Operation::Adaptive(_) => true,
         Operation::Profile(p) => {
             p.stepover > 0.
@@ -232,6 +236,10 @@ mod tests {
     use cam_model::DrillOp;
     fn operation(id: u32) -> Operation {
         Operation::Drill(DrillOp {
+            cycle: Default::default(),
+            tip_through_bottom: false,
+            geometry: Default::default(),
+            hole_heights: Vec::new(),
             parameter_expressions: Default::default(),
             id,
             tool: 1,

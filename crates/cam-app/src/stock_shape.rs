@@ -205,6 +205,7 @@ mod tests {
             revision: 1,
             name: "Blank".into(),
             source_format: CadFormat::Step,
+            source_path: None,
             source_data: Vec::new().into(),
             source_units: SourceUnits::Millimetres,
             backend: "test".into(),

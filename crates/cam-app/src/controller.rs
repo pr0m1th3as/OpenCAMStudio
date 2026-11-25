@@ -179,9 +179,7 @@ pub enum ExportError {
     Incomplete,
     /// The last run produced errors, so its G-code is unsafe to emit.
     HasErrors,
-    /// The simulation found `n` rapid(s) plowing through remaining stock — a
-    /// machine-crash hazard, blocked by default. (A future preference could let
-    /// the user downgrade this to a warning.)
+    /// The simulation found `n` rapid moves through remaining stock.
     RapidThroughStock(usize),
     /// Non-cutting feeds or cutter tips contact remaining stock.
     NonCuttingThroughStock(usize),
@@ -271,18 +269,33 @@ pub struct AppController {
     import_jobs: crate::import_jobs::ImportJobs<crate::cad_operations::PreparedImport>,
     document_epoch: u64,
     import_preview: Option<(u64, crate::cad_operations::PreparedImport)>,
-    import_replacement: Option<u64>,
+    import_update: Option<CadModelUpdate>,
     jobs: crate::jobs::JobService,
     operation_cache: cam_toolpath::OperationCache,
     toolpath_fingerprints: BTreeMap<u32, String>,
     saved_verification: BTreeMap<u64, crate::project::StoredVerification>,
     automatic_toolpath_run: bool,
     simulation_accuracy: f32,
+    block_export_on_verification_errors: bool,
     operation_id_floor: u32,
     setup_id_floor: u64,
     asset_id_floor: u64,
     instance_id_floor: u64,
     pattern_id_floor: u64,
+}
+
+#[derive(Clone, Copy)]
+enum CadModelUpdate {
+    Replace(u64),
+    Reload(u64),
+}
+
+impl CadModelUpdate {
+    fn asset_id(self) -> u64 {
+        match self {
+            Self::Replace(id) | Self::Reload(id) => id,
+        }
+    }
 }
 
 /// User-authored project state, excluding derived toolpaths and shop settings.
@@ -585,13 +598,14 @@ impl AppController {
             import_jobs: Default::default(),
             document_epoch: 0,
             import_preview: None,
-            import_replacement: None,
+            import_update: None,
             jobs: Default::default(),
             operation_cache: Default::default(),
             toolpath_fingerprints: Default::default(),
             saved_verification: Default::default(),
             automatic_toolpath_run: false,
             simulation_accuracy: 1.0,
+            block_export_on_verification_errors: true,
             operation_id_floor: 0,
             setup_id_floor: 1,
             asset_id_floor: 1,
@@ -847,21 +861,36 @@ impl AppController {
     }
     pub fn start_cad_import(&mut self, path: PathBuf) -> u64 {
         self.import_preview = None;
-        self.import_replacement = None;
+        self.import_update = None;
         self.import_jobs.start(self.document_epoch, move || {
             crate::cad_operations::prepare_import(&path)
         })
     }
     pub fn start_cad_replacement(&mut self, asset_id: u64, path: PathBuf) -> Result<u64, String> {
-        if self.geometry_state().asset(asset_id).is_none() {
+        self.start_cad_model_update(CadModelUpdate::Replace(asset_id), path)
+    }
+    /// Reread a CAD file in the background for an existing model.
+    pub fn start_cad_reload(&mut self, asset_id: u64, path: PathBuf) -> Result<u64, String> {
+        self.start_cad_model_update(CadModelUpdate::Reload(asset_id), path)
+    }
+    fn start_cad_model_update(
+        &mut self,
+        update: CadModelUpdate,
+        path: PathBuf,
+    ) -> Result<u64, String> {
+        if self.geometry_state().asset(update.asset_id()).is_none() {
             return Err("Missing CAD asset".into());
         }
         let request = self.start_cad_import(path);
-        self.import_replacement = Some(asset_id);
+        self.import_update = Some(update);
         Ok(request)
     }
     pub fn cad_import_replacement(&self) -> Option<u64> {
-        self.import_replacement
+        self.import_update.map(CadModelUpdate::asset_id)
+    }
+    #[cfg(feature = "gui")]
+    pub(crate) fn cad_import_reloading(&self) -> bool {
+        matches!(self.import_update, Some(CadModelUpdate::Reload(_)))
     }
     pub fn cad_import_pending(&self) -> bool {
         self.import_jobs.pending()
@@ -869,7 +898,7 @@ impl AppController {
     pub fn cancel_cad_import(&mut self) {
         self.import_jobs.cancel();
         self.import_preview = None;
-        self.import_replacement = None;
+        self.import_update = None;
     }
     pub fn poll_cad_import(&mut self) -> Option<Result<usize, String>> {
         self.import_jobs.poll(self.document_epoch).map(|result| {
@@ -888,27 +917,28 @@ impl AppController {
         if epoch != self.document_epoch {
             return Err("Project changed after preview; import again".into());
         }
-        if let Some(id) = self.import_replacement.take() {
+        if let Some(update) = self.import_update.take() {
+            let id = update.asset_id();
             match prepared {
                 crate::cad_operations::PreparedImport::Solid { asset, instances } => {
-                    let existing: Vec<_> = self
+                    let mut existing: Vec<_> = self
                         .geometry_state()
                         .instances
                         .iter()
                         .filter(|i| i.asset_id == id)
+                        .map(|i| i.body_id)
                         .collect();
-                    if instances.len() != existing.len()
-                        || instances
-                            .iter()
-                            .any(|i| !existing.iter().any(|old| old.body_id == i.body_id))
-                    {
-                        return Err("Replacement changes body instances; add it as a new asset and review its geometry".into());
+                    let mut imported: Vec<_> = instances.iter().map(|i| i.body_id).collect();
+                    existing.sort_unstable();
+                    imported.sort_unstable();
+                    if existing != imported {
+                        return Err("The source changes the model's body instances. Import it as a new model and review its geometry.".into());
                     }
                     let count = instances.len();
-                    self.replace_cad_asset(id, asset)?;
+                    self.update_cad_asset(update, asset)?;
                     Ok(count)
                 }
-                _ => Err("Replace model requires a STEP/IGES solid, not a planar drawing".into()),
+                _ => Err("Updating a model requires a STEP or IGES solid".into()),
             }
         } else {
             self.commit_cad_import(prepared)
@@ -1167,7 +1197,7 @@ impl AppController {
             ) {
             crate::cad_operations::selection_height_defaults(&preview, &op)
         } else {
-            cam_model::OperationHeightSettings::default()
+            cam_model::OperationHeightSettings::for_operation(&op)
         };
         preview.setup_mut().height_settings.insert(id, settings);
         preview.setup_mut().operations.push(op);
@@ -1303,11 +1333,31 @@ impl AppController {
     pub fn replace_cad_asset(
         &mut self,
         id: u64,
+        replacement: cam_model::GeometryAsset,
+    ) -> Result<(), String> {
+        self.update_cad_asset(CadModelUpdate::Replace(id), replacement)
+    }
+
+    fn update_cad_asset(
+        &mut self,
+        update: CadModelUpdate,
         mut replacement: cam_model::GeometryAsset,
     ) -> Result<(), String> {
+        let id = update.asset_id();
         let old = self.geometry_state().asset(id).ok_or("Missing CAD asset")?;
         replacement.id = id;
-        replacement.revision = old.revision + 1;
+        // Reuse references only when the entire topology, including entity IDs, matches.
+        let keep_references =
+            matches!(update, CadModelUpdate::Reload(_)) && replacement.topology == old.topology;
+        replacement.revision = if keep_references {
+            replacement.topology = old.topology.clone();
+            old.revision
+        } else {
+            old.revision + 1
+        };
+        if replacement == *old {
+            return Ok(());
+        }
         replacement.topology.validate()?;
         if self
             .geometry_state()
@@ -1327,20 +1377,64 @@ impl AppController {
             );
         }
         let mut preview = self.geometry_state().clone();
+        let mut rebound_drill = false;
+        if !keep_references {
+            let reason = match update {
+                CadModelUpdate::Replace(_) => "Model replaced; review and reselect its geometry",
+                CadModelUpdate::Reload(_) => {
+                    "Reloaded model geometry changed; review and reselect it"
+                }
+            };
+            for (&operation, binding) in preview
+                .bindings
+                .iter_mut()
+                .filter(|(_, b)| b.selected.iter().any(|r| r.asset_id == id))
+            {
+                let matches_diameter = self
+                    .setups()
+                    .iter()
+                    .flat_map(|setup| &setup.operations)
+                    .any(|op| {
+                        matches!(op, Operation::Drill(drill)
+                            if drill.id == operation && drill.geometry.select_same_diameter)
+                    });
+                if matches!(update, CadModelUpdate::Reload(_))
+                    && matches_diameter
+                    && matches!(binding.status, cam_model::ResolutionStatus::Resolved)
+                {
+                    let selected = binding
+                        .selected
+                        .iter()
+                        .map(|reference| {
+                            if reference.asset_id == id {
+                                cam_geometry3d::rebind_drill_face(old, &replacement, reference)
+                            } else {
+                                Some(reference.clone())
+                            }
+                        })
+                        .collect::<Option<Vec<_>>>();
+                    if let Some(selected) = selected {
+                        binding.selected = selected;
+                        binding.resolved_fingerprint = None;
+                        rebound_drill = true;
+                        continue;
+                    }
+                }
+                binding.status = cam_model::ResolutionStatus::NeedsReselection {
+                    reason: reason.into(),
+                };
+            }
+        }
         if let Some(asset) = preview.assets.iter_mut().find(|a| a.id == id) {
             *asset = replacement;
         }
-        for binding in preview
-            .bindings
-            .values_mut()
-            .filter(|b| b.selected.iter().any(|r| r.asset_id == id))
-        {
-            binding.status = cam_model::ResolutionStatus::NeedsReselection {
-                reason: "Model replaced; review and reselect its geometry".into(),
-            };
-        }
         preview.validate()?;
-        self.edit_document(move |doc| doc.geometry = preview);
+        self.edit_document(move |doc| {
+            doc.geometry = preview;
+            if rebound_drill {
+                crate::cad_operations::refresh_binding_heights(doc);
+            }
+        });
         self.cad_selection.clear();
         self.invalidate();
         Ok(())
@@ -2052,7 +2146,7 @@ impl AppController {
         self.edit_setup_document(move |doc| {
             doc.setup_mut()
                 .height_settings
-                .insert(id, cam_model::OperationHeightSettings::default());
+                .insert(id, cam_model::OperationHeightSettings::for_operation(&op));
             doc.setup_mut().operations.push(op);
         });
         self.selection = Selection::Operation(id);
@@ -2122,11 +2216,18 @@ impl AppController {
             if doc.cad_linked_operations.contains(&sel) {
                 doc.cad_linked_operations.insert(new_id);
             }
-            let stock = doc.setup().stock_to_leave_for(sel);
-            if stock.enabled {
-                doc.setup_mut().stock_to_leave.insert(new_id, stock);
+            let setup = doc.setup_mut();
+            if let Some(heights) = setup.height_settings.get(&sel).cloned() {
+                setup.height_settings.insert(new_id, heights);
             }
-            doc.setup_mut().operations.insert(insert_after, copy);
+            if let Some(heights) = setup.operation_heights.get(&sel).copied() {
+                setup.operation_heights.insert(new_id, heights);
+            }
+            let stock = setup.stock_to_leave_for(sel);
+            if stock.enabled {
+                setup.stock_to_leave.insert(new_id, stock);
+            }
+            setup.operations.insert(insert_after, copy);
         });
         self.selection = Selection::Operation(new_id);
         self.invalidate();
@@ -2387,6 +2488,10 @@ impl AppController {
                 })
             }
             OpKind::Drill => Operation::Drill(DrillOp {
+                cycle: Default::default(),
+                tip_through_bottom: false,
+                geometry: Default::default(),
+                hole_heights: Vec::new(),
                 parameter_expressions: Default::default(),
                 id: 0,
                 tool,
@@ -2934,6 +3039,10 @@ impl AppController {
                     let dia = (xmax - xmin).min(ymax - ymin);
                     if dia <= p.tool_diameter + 1e-9 {
                         operations.push(Operation::Drill(DrillOp {
+                            cycle: Default::default(),
+                            tip_through_bottom: false,
+                            geometry: Default::default(),
+                            hole_heights: Vec::new(),
                             parameter_expressions: Default::default(),
                             id,
                             tool: 1,
@@ -3370,7 +3479,7 @@ pub(crate) fn narrowest_cut_width(program: &Program, tools: &[Tool], surface_z: 
 
 /// Translate a document [`Tool`] into the simulator's [`ToolProfile`] — how its
 /// bottom removes material (flat, ball, bull-nose corner, or a chamfer/drill cone).
-pub(crate) fn sim_profile(tool: &Tool) -> ToolProfile {
+pub(crate) fn sim_profile(tool: &Tool) -> Option<ToolProfile> {
     let radius = tool.radius()
         + match tool.kind {
             ToolKind::RadiusMill { corner_radius, .. } => corner_radius.max(0.0),
@@ -3378,6 +3487,7 @@ pub(crate) fn sim_profile(tool: &Tool) -> ToolProfile {
         };
     let shape = match tool.kind {
         ToolKind::EndMill | ToolKind::RoughingMill | ToolKind::FaceMill => ProfileShape::Flat,
+        ToolKind::GrooveCutter | ToolKind::SlittingSaw => return None,
         ToolKind::BallMill => ProfileShape::Ball,
         ToolKind::BullNose { corner_radius } => ProfileShape::BullNose {
             corner_radius: corner_radius.clamp(0.0, radius),
@@ -3420,7 +3530,7 @@ pub(crate) fn sim_profile(tool: &Tool) -> ToolProfile {
             }
         }
     };
-    ToolProfile { radius, shape }
+    Some(ToolProfile { radius, shape })
 }
 
 /// Set an operation's id, whatever its kind.
@@ -3862,6 +3972,10 @@ mod tests {
             doc.setup_mut()
                 .operations
                 .push(Operation::Drill(cam_model::DrillOp {
+                    cycle: Default::default(),
+                    tip_through_bottom: false,
+                    geometry: Default::default(),
+                    hole_heights: Vec::new(),
                     parameter_expressions: Default::default(),
                     id: third,
                     tool: 1,
@@ -4237,9 +4351,24 @@ mod tests {
 
     #[test]
     fn duplicate_delete_and_reorder_operations() {
+        use cam_model::{
+            HeightDefinition, HeightPlaneKind, HeightReference, OperationHeightSettings,
+        };
+
         let mut app = AppController::new(machine());
         app.open_dxf(PART_DXF, "part.dxf").unwrap();
         assert_eq!(op_ids(&app), vec![0, 1]);
+        let mut heights = OperationHeightSettings::default();
+        *heights.definition_mut(HeightPlaneKind::Bottom) =
+            HeightDefinition::new(HeightReference::SelectedContours, -2.0);
+        app.apply_operation_height_settings(
+            app.operation(0).unwrap().clone(),
+            None,
+            vec![],
+            None,
+            heights.clone(),
+        )
+        .unwrap();
 
         // Duplicate op 0: the copy gets a fresh id, is inserted right after it,
         // and becomes the selection.
@@ -4247,6 +4376,7 @@ mod tests {
         app.duplicate_selected_operation();
         assert_eq!(op_ids(&app), vec![0, 2, 1]);
         assert_eq!(app.selection(), Selection::Operation(2));
+        assert_eq!(app.setup().height_settings.get(&2), Some(&heights));
 
         // Move the copy down past op 1, then back up.
         app.move_selected_operation(false);
@@ -4267,6 +4397,7 @@ mod tests {
         // All of it is undoable, one step at a time.
         assert!(app.undo()); // undo delete
         assert_eq!(op_ids(&app), vec![0, 2, 1]);
+        assert_eq!(app.setup().height_settings.get(&2), Some(&heights));
     }
 
     #[test]
@@ -4867,6 +4998,7 @@ mod tests {
     #[test]
     fn non_complete_previews_cannot_export_even_without_error_diagnostics() {
         let mut app = AppController::new(machine());
+        app.set_block_export_on_verification_errors(false);
         app.open_dxf(PART_DXF, "part.dxf").unwrap();
         let complete = app.run(&CancelToken::new()).clone();
         assert!(!complete.has_errors());

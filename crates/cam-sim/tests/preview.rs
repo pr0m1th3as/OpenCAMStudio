@@ -1,6 +1,7 @@
 use cam_cldata::{ArcDir, MoveKind, Point3, Program, ProgramBuilder, Step};
 use cam_sim::{
-    simulate, Heightfield, ProfileShape, SimOptions, SimTool, SimulationCache, ToolProfile,
+    simulate, Heightfield, ProfileShape, SimOptions, SimTool, SimulationCache, StockMeshCache,
+    ToolProfile,
 };
 use std::cell::Cell;
 
@@ -90,6 +91,73 @@ fn circular_wall_vertices_follow_the_cutter_rather_than_the_grid() {
         assert!(
             worst < resolution as f32 * 0.06,
             "{resolution}: contour error {worst}"
+        );
+    }
+}
+
+#[test]
+fn shallow_helix_playback_recovers_the_cutter_wall_and_keeps_the_ramp() {
+    let resolution = 0.5;
+    let options = SimOptions {
+        resolution,
+        tool_radius: 1.9,
+    };
+    let center = Point3::new(16., 16., 0.);
+    let start = Point3::new(19., 16., 0.08);
+    let min = [0., 0., -5.];
+    let max = [32., 32., 0.];
+    let mut cache = SimulationCache::default();
+    let mut mesh_cache = StockMeshCache::default();
+    for angle in [60_f64, 135., 85., 170.] {
+        let (sin, cos) = angle.to_radians().sin_cos();
+        let tip = Point3::new(
+            center.x + 3. * cos,
+            center.y + 3. * sin,
+            start.z - angle / 200.,
+        );
+        let program = ProgramBuilder::new()
+            .op(7)
+            .feed(100.)
+            .rapid(start, MoveKind::Link)
+            .arc(tip, center, ArcDir::Ccw, MoveKind::Plunge)
+            .build();
+        let sim = cache
+            .simulate_controlled(&program, min, max, &options, &[], &|| false, |_, _| {})
+            .unwrap();
+        let mesh = mesh_cache
+            .mesh_controlled(&sim.field, min[2], &|| false)
+            .unwrap();
+        let fresh = simulate(&program, min, max, &options, &[]);
+        assert_eq!(
+            mesh,
+            StockMeshCache::default()
+                .mesh_controlled(&fresh.field, min[2], &|| false)
+                .unwrap()
+        );
+
+        // The forward cap of the sweep is a cylinder centered at the current
+        // tip, even when the cut is shallower than the usual wall threshold.
+        let mut cap = 0;
+        let mut ramp = 0;
+        for (i, (p, n)) in mesh.positions.iter().zip(&mesh.normals).enumerate() {
+            if !mesh.machined[i] {
+                continue;
+            }
+            assert_eq!(mesh.operations[i], Some(7));
+            let dx = f64::from(p[0]) - tip.x;
+            let dy = f64::from(p[1]) - tip.y;
+            if n[2].abs() < 0.01 && -sin * dx + cos * dy > options.tool_radius * 0.75 {
+                assert!((dx.hypot(dy) - options.tool_radius).abs() < resolution * 0.15);
+                cap += 1;
+            }
+            if n[2] > 0.95 && n[2] < 0.99999 && p[2] < -0.05 && f64::from(p[2]) > tip.z {
+                ramp += 1;
+            }
+        }
+        assert!(cap > 4, "{angle}°: only {cap} vertices on the cutter wall");
+        assert!(
+            ramp > 4,
+            "{angle}°: only {ramp} vertices on the smooth ramp"
         );
     }
 }

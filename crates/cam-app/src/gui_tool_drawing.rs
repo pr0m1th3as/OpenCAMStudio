@@ -45,14 +45,15 @@ impl ToolCanvas {
             // V-bits, chamfer mills, face mills and thread mills show no flute helix (the
             // cone / shell-mill body / thread teeth read cleaner without it); a drill's
             // helix revolves every ~3·⌀.
-            draw_flutes: !matches!(
-                tool.kind,
-                ToolKind::VBit { .. }
-                    | ToolKind::RadiusMill { .. }
-                    | ToolKind::ChamferMill { .. }
-                    | ToolKind::FaceMill
-                    | ToolKind::ThreadMill { .. }
-            ),
+            draw_flutes: !tool.kind.is_side_cutting_disc()
+                && !matches!(
+                    tool.kind,
+                    ToolKind::VBit { .. }
+                        | ToolKind::RadiusMill { .. }
+                        | ToolKind::ChamferMill { .. }
+                        | ToolKind::FaceMill
+                        | ToolKind::ThreadMill { .. }
+                ),
             flute_pitch: match tool.kind {
                 ToolKind::Drill { .. } => (3.0 * tool.diameter).max(1e-3),
                 _ => cutting_top,
@@ -252,7 +253,14 @@ impl canvas::Program<Message> for ToolCanvas {
                         let mut seg: Vec<P> = Vec::new();
                         for i in 0..=steps {
                             let z = flute_len * (i as f64) / (steps as f64);
-                            let psi = psi0 + s * TAU * (z / pitch);
+                            // Compression changes helix direction at mid-length. Its
+                            // actual transition height is not specified by the tool data.
+                            let advance = if self.cutting_direction == CutDir::Compression {
+                                if z <= flute_len * 0.5 { -z } else { z - flute_len }
+                            } else {
+                                s * z
+                            };
+                            let psi = psi0 + TAU * advance / pitch;
                             if psi.cos() > 0.0 {
                                 seg.push(map(radius_at(z) * psi.sin(), z, 1.0));
                             } else if seg.len() >= 2 {
@@ -302,6 +310,7 @@ pub(super) fn is_parameter(field: Field) -> bool {
         Field::ToolDiameter
             | Field::ToolLength
             | Field::FluteLength
+            | Field::FaceBodyHeight
             | Field::ShankDiameter
             | Field::ShankLength
             | Field::NeckLength
@@ -389,13 +398,13 @@ fn dimensions(tool: &cam_model::Tool) -> Vec<Dimension> {
             lane: 0.0,
         },
     );
-    if !conical {
+    if !matches!(tool.kind, ToolKind::VBit { .. }) {
         add(
             FluteLength,
-            if matches!(tool.kind, ToolKind::FaceMill) {
-                "Body"
-            } else {
-                "Lc"
+            match tool.kind {
+                ToolKind::GrooveCutter => "Width",
+                ToolKind::SlittingSaw => "Thickness",
+                _ => "Lc",
             },
             flute,
             Vertical {
@@ -406,9 +415,16 @@ fn dimensions(tool: &cam_model::Tool) -> Vec<Dimension> {
                 lane: 0.0,
             },
         );
+    }
+    if matches!(tool.kind, ToolKind::FaceMill) {
+        add(FaceBodyHeight, "Body", tool.face_body_height(), Vertical {
+            radius: r, from: 0.0, to: tool.face_body_height(), left: false, lane: 1.0,
+        });
+    }
+    if !conical {
         add(
             ShankDiameter,
-            if matches!(tool.kind, ToolKind::FaceMill) {
+            if matches!(tool.kind, ToolKind::FaceMill | ToolKind::SlittingSaw) {
                 "Arbor ⌀"
             } else {
                 "Shank ⌀"
@@ -420,7 +436,7 @@ fn dimensions(tool: &cam_model::Tool) -> Vec<Dimension> {
                 above: true,
             },
         );
-        if !matches!(tool.kind, ToolKind::FaceMill) {
+        if !matches!(tool.kind, ToolKind::FaceMill) && !tool.kind.is_side_cutting_disc() {
             add(
                 ShankLength,
                 "Ls",
@@ -686,14 +702,19 @@ impl ToolCanvas {
         if self.compact {
             let field = self.selected.unwrap_or(Field::ToolDiameter);
             let title = if field == Field::Flutes {
-                format!("{} flutes · {}", self.flutes, self.cutting_direction)
+                if self.tool.kind.is_side_cutting_disc() {
+                    tooth_count(self.flutes)
+                } else {
+                    format!("{} · {}", flute_count(self.flutes), self.cutting_direction)
+                }
+            } else if let Some(label) = disc_tool_field_label(self.tool.kind, field) {
+                label.to_string()
             } else {
                 match (self.tool.kind, field) {
                     (ToolKind::VBit { .. } | ToolKind::ChamferMill { .. }, Field::ToolDiameter) => {
                         "Shank diameter (mm)"
                     }
                     (ToolKind::FaceMill, Field::ToolDiameter) => "Cutting diameter (mm)",
-                    (ToolKind::FaceMill, Field::FluteLength) => "Body height (mm)",
                     (ToolKind::FaceMill, Field::ShankDiameter) => "Arbor diameter (mm)",
                     (ToolKind::ThreadMill { pitch: None }, Field::FluteLength) => {
                         "Length of cut (mm)"
@@ -713,11 +734,13 @@ impl ToolCanvas {
                 ..Default::default()
             });
         } else {
+            let cutter = if self.tool.kind.is_side_cutting_disc() {
+                tooth_count(self.flutes)
+            } else {
+                format!("{} flutes · {}", self.flutes, self.cutting_direction)
+            };
             frame.fill_text(canvas::Text {
-                content: format!(
-                    "{} flutes · {} · dimensions in mm",
-                    self.flutes, self.cutting_direction
-                ),
+                content: format!("{cutter} · dimensions in mm"),
                 position: P::new(8.0, 4.0),
                 color: fg,
                 size: iced::Pixels(12.0),

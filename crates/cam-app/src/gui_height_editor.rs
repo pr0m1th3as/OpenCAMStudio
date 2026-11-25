@@ -203,6 +203,10 @@ impl App {
         } else if let Some(binding) = &self.operation_binding_preview {
             document.geometry.bindings.insert(id, binding.clone());
         }
+        let settings = self.edited_height_settings()?;
+        if settings.uses_hole_references() {
+            return crate::cad_operations::resolve_height_settings(&document, &op, &settings);
+        }
         if document.rotary_indexes.contains_key(&id)
             && !matches!(&op, Operation::Profile(p) if p.selections.is_some())
         {
@@ -223,7 +227,7 @@ impl App {
                 document.geometry.bindings.insert(id, binding);
             }
         }
-        self.edited_height_settings()?.resolve(&document, &op)
+        settings.resolve(&document, &op)
     }
     pub(super) fn height_reference_selected(&mut self, plane: Plane, reference: Reference) {
         if let Some(settings) = &mut self.height_draft {
@@ -261,6 +265,7 @@ impl App {
             return text("Open the operation editor to set heights").into();
         };
         let resolved = self.resolve_height_editor(id);
+        let operation = self.current_operation(id);
         let mut controls = column![row![
             help_wrap(
                 inspector_section_label("Reference planes and offsets").width(Length::Fill),
@@ -297,7 +302,7 @@ impl App {
                             illustrated_help::height_help(plane),
                             self.tooltips
                         ),
-                        super::height_reference::picker(plane, d.reference)
+                        super::height_reference::picker(plane, d.reference, operation)
                     ]
                     .spacing(8)
                     .align_y(Alignment::Center),
@@ -343,12 +348,15 @@ impl App {
                                 .size(11)
                                 .color(INSPECTOR_MUTED),
                         );
-                        for reference in Reference::options(plane).into_iter().filter(|r| {
-                            !matches!(
-                                r,
-                                Reference::Disabled | Reference::Highest | Reference::Lowest
-                            )
-                        }) {
+                        for reference in Reference::options_for(plane, operation)
+                            .into_iter()
+                            .filter(|r| {
+                                !matches!(
+                                    r,
+                                    Reference::Disabled | Reference::Highest | Reference::Lowest
+                                )
+                            })
+                        {
                             section = section.push(
                                 checkbox(d.sources.contains(&reference))
                                     .label(reference.to_string())
@@ -454,6 +462,25 @@ impl App {
                             );
                         }
                     }
+                }
+            }
+            if plane == Plane::Bottom && !collapsed {
+                if let Some(Operation::Drill(drill)) = self.current_operation(id) {
+                    section = section.push(help_wrap(
+                        row![
+                            text("Drill Tip Through Bottom")
+                                .size(12)
+                                .color(INSPECTOR_TEXT)
+                                .width(Length::Fill),
+                            checkbox(drill.tip_through_bottom)
+                                .size(15)
+                                .on_toggle(Message::DrillTipThroughBottomToggled),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                        "Extend the drill point beyond the programmed bottom so the cutting lip reaches full diameter at that plane.",
+                        self.tooltips,
+                    ));
                 }
             }
             controls = controls.push(section.width(Length::Fill));

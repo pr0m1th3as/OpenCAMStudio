@@ -86,7 +86,8 @@ pub(crate) fn prepare_import(path: &Path) -> Result<PreparedImport, String> {
         .unwrap_or("Imported model")
         .to_owned();
     // Snapshot source bytes once so provenance cannot race a CAD re-export.
-    let source_data = std::fs::read(path).map_err(|e| e.to_string())?;
+    let source_data = std::fs::read(path)
+        .map_err(|error| format!("Could not read '{}': {error}", path.display()))?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| e.to_string())?
@@ -154,6 +155,9 @@ pub(crate) fn prepare_import(path: &Path) -> Result<PreparedImport, String> {
                 revision: 1,
                 name,
                 source_format: format,
+                source_path: std::path::absolute(path)
+                    .ok()
+                    .and_then(|path| path.into_os_string().into_string().ok()),
                 source_data: source_data.into(),
                 source_units: import.source_units,
                 backend: import.backend,
@@ -208,21 +212,23 @@ pub(crate) fn recipe(
         OpKind::Profile if selected.len() == 1 && selected[0].kind == EntityKind::Silhouette => {
             ExtractionRecipe::ProfileSilhouette
         }
-        OpKind::Profile
-            if selected.first().is_some_and(|first| {
+        OpKind::Profile => {
+            let mixed = selected.first().is_some_and(|first| {
                 selected.iter().any(|reference| {
                     reference.kind != first.kind
                         || reference.instance_id != first.instance_id
                         || reference.asset_id != first.asset_id
                         || reference.body_id != first.body_id
                 })
-            }) =>
-        {
-            ExtractionRecipe::ProfileEntries {
-                entries: profile_entries_from_selection(selected),
+            });
+            if mixed || selected.len() > 1 && selected[0].kind == EntityKind::Edge {
+                let entries = profile_entries_from_selection(geometry, selected);
+                if mixed || entries.len() > 1 {
+                    return Ok(ExtractionRecipe::ProfileEntries { entries });
+                }
             }
+            ExtractionRecipe::ProfileContours
         }
-        OpKind::Profile => ExtractionRecipe::ProfileContours,
         OpKind::Face => ExtractionRecipe::FaceRegion,
         OpKind::Parallel => ExtractionRecipe::ParallelFinishing,
         OpKind::Spiral => ExtractionRecipe::SpiralFinishing,
@@ -230,7 +236,10 @@ pub(crate) fn recipe(
     })
 }
 
-pub(crate) fn profile_entries_from_selection(selected: &[EntityRef]) -> Vec<ProfileGeometryEntry> {
+pub(crate) fn profile_entries_from_selection(
+    geometry: &GeometryState,
+    selected: &[EntityRef],
+) -> Vec<ProfileGeometryEntry> {
     let mut entries: Vec<ProfileGeometryEntry> = Vec::new();
     for reference in selected {
         if matches!(reference.kind, EntityKind::Edge | EntityKind::Face) {
@@ -259,6 +268,14 @@ pub(crate) fn profile_entries_from_selection(selected: &[EntityRef]) -> Vec<Prof
         entries.push(entry);
     }
     entries
+        .into_iter()
+        .flat_map(|entry| {
+            cam_geometry3d::split_profile_chain_entry(geometry, &entry)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| vec![entry])
+        })
+        .collect()
 }
 
 /// Source topology stays immutable. Only instance placements are rotated into
@@ -583,6 +600,10 @@ pub(crate) fn create_operation(
             clearing: Clearing::default(),
         }),
         OpKind::Drill => Operation::Drill(DrillOp {
+            cycle: Default::default(),
+            tip_through_bottom: false,
+            geometry: Default::default(),
+            hole_heights: Vec::new(),
             parameter_expressions: Default::default(),
             id,
             tool,
@@ -819,8 +840,141 @@ pub(crate) fn create_operation(
     Ok((op, binding))
 }
 
+/// Rebuild the cached drill sites and their shared reference interval from the model.
+pub(crate) fn apply_drill_holes(
+    drill: &mut DrillOp,
+    holes: &[cam_geometry3d::DrillHole],
+    stock_top: f64,
+) -> Result<CuttingHeights, String> {
+    let heights = drill_reference_heights(holes)?;
+    drill.points = holes
+        .iter()
+        .map(|hole| [hole.center.x, hole.center.y])
+        .collect();
+    drill.hole_heights = holes.iter().map(|hole| hole.heights).collect();
+    drill.depth = heights.depth();
+    drill.start_offset = heights.top - stock_top;
+    Ok(heights)
+}
+
+fn drill_reference_heights(holes: &[cam_geometry3d::DrillHole]) -> Result<CuttingHeights, String> {
+    let first = holes.first().ok_or("Select hole faces")?;
+    Ok(holes
+        .iter()
+        .skip(1)
+        .fold(first.heights, |heights, hole| CuttingHeights {
+            top: heights.top.max(hole.heights.top),
+            bottom: heights.bottom.min(hole.heights.bottom),
+        }))
+}
+
+fn uses_drill_model_heights(
+    document: &Document,
+    operation: &Operation,
+    binding: &GeometryBinding,
+) -> bool {
+    binding.recipe == ExtractionRecipe::DrillHoles
+        && matches!(operation, Operation::Drill(drill)
+            if drill.geometry.uses_model_heights()
+                || document.setup().height_settings.get(&drill.id)
+                    .is_some_and(OperationHeightSettings::uses_hole_references))
+}
+
+fn binding_base_heights(
+    document: &Document,
+    geometry: &GeometryState,
+    binding: &GeometryBinding,
+    operation: &Operation,
+) -> Result<CuttingHeights, String> {
+    match operation {
+        Operation::Drill(drill) if uses_drill_model_heights(document, operation, binding) => {
+            drill_reference_heights(&cam_geometry3d::drill_holes(
+                geometry,
+                binding,
+                drill.geometry,
+            )?)
+        }
+        _ => Ok(cam_geometry3d::resolve_binding_advisory(geometry, binding)?.heights),
+    }
+}
+
+pub(crate) fn resolve_height_settings(
+    document: &Document,
+    operation: &Operation,
+    settings: &OperationHeightSettings,
+) -> Result<ResolvedOperationHeights, String> {
+    if settings.uses_hole_references() {
+        if let Operation::Drill(drill) = operation {
+            if let Some(binding) = document.geometry.bindings.get(&drill.id) {
+                let geometry = geometry_for_operation(document, drill.id)?;
+                let holes = cam_geometry3d::drill_holes(&geometry, binding, drill.geometry)?;
+                let heights: Vec<_> = holes.iter().map(|hole| hole.heights).collect();
+                return settings
+                    .resolve_drill_holes(document, operation, &heights)
+                    .map(|(common, _)| common);
+            }
+        }
+    }
+    settings.resolve(document, operation)
+}
+
+fn apply_drill_height_settings(
+    document: &Document,
+    binding: &GeometryBinding,
+    base: CuttingHeights,
+    drill: &mut DrillOp,
+) -> Result<Option<ResolvedOperationHeights>, String> {
+    let Some(settings) = document.setup().height_settings.get(&drill.id) else {
+        return Ok(None);
+    };
+    let operation = Operation::Drill(drill.clone());
+    if settings.uses_hole_references() {
+        let (common, cutting) =
+            settings.resolve_drill_holes(document, &operation, &drill.hole_heights)?;
+        drill.hole_heights = cutting;
+        return Ok(Some(common));
+    }
+
+    let mut source = document
+        .indexed_view(drill.id)?
+        .unwrap_or_else(|| document.clone());
+    source.geometry.bindings.insert(
+        drill.id,
+        GeometryBinding {
+            heights: base,
+            ..binding.clone()
+        },
+    );
+    let heights = settings.resolve(&source, &operation)?;
+    let top = settings.definition(HeightPlaneKind::Top);
+    let bottom = settings.definition(HeightPlaneKind::Bottom);
+    // The default stock reference follows each hole's entry with stock allowance.
+    // A custom reference supplies one top plane for all holes.
+    let use_modeled_top =
+        top == OperationHeightSettings::default().definition(HeightPlaneKind::Top);
+    let stock_allowance = (heights.stock_top - source.height_model_bounds().1[2]).max(0.);
+    for hole in &mut drill.hole_heights {
+        hole.top = if use_modeled_top {
+            binding.overrides.top.unwrap_or(hole.top + stock_allowance)
+        } else {
+            heights.top
+        };
+        hole.bottom = match bottom.reference {
+            HeightReference::SelectedContours => hole.bottom + bottom.offset,
+            HeightReference::Plane(HeightPlaneKind::Top) => hole.top + bottom.offset,
+            _ => heights.bottom,
+        };
+        hole.validate()?;
+        if hole.top > heights.retract || hole.top > heights.clearance {
+            return Err("Drill hole entry height is above clearance or retract".into());
+        }
+    }
+    Ok(Some(heights))
+}
+
 /// A fresh topology resolution replaces every linked strategy input. Stale
 /// embedded contours are never a fallback after asset replacement or removal.
+#[cfg(all(test, feature = "gui"))]
 pub(crate) fn resolve_document(document: &Document) -> Result<Document, String> {
     resolve_document_checked(document, &|| false).map_err(|diagnostic| diagnostic.message)
 }
@@ -921,6 +1075,14 @@ pub(crate) fn resolve_document_checked(
     document: &Document,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Document, cam_toolpath::Diagnostic> {
+    resolve_document_input(document, cancelled, true)
+}
+
+fn resolve_document_input(
+    document: &Document,
+    cancelled: &dyn Fn() -> bool,
+    evaluate_heights: bool,
+) -> Result<Document, cam_toolpath::Diagnostic> {
     let error = |message: String| {
         cam_toolpath::Diagnostic::error(message)
             .with_code(cam_toolpath::DiagnosticCode::GeometryUnresolved)
@@ -944,11 +1106,17 @@ pub(crate) fn resolve_document_checked(
     // Resolve all reference geometry in its source placement, before rotating
     // instances for the strategy adapters. Keep a worker-only absolute snapshot.
     for operation in &prepared_operations {
-        if !document.operation_is_included(document.setup().id, operation.id()) {
+        if !evaluate_heights || !document.operation_is_included(document.setup().id, operation.id())
+        {
             continue;
         }
         if operation.rotary_wrap().is_some()
             || document.rotary_indexes.contains_key(&operation.id())
+            || document
+                .geometry
+                .bindings
+                .get(&operation.id())
+                .is_some_and(|binding| uses_drill_model_heights(document, operation, binding))
         {
             continue;
         }
@@ -986,7 +1154,13 @@ pub(crate) fn resolve_document_checked(
                 resolve_wrapped_operation(&resolved.geometry, operation)?;
                 resolved.geometry.bindings.remove(&id);
                 resolved.cad_linked_operations.remove(&id);
-                if let Some(settings) = resolved.setup().height_settings.get(&id).cloned() {
+                if let Some(settings) = resolved
+                    .setup()
+                    .height_settings
+                    .get(&id)
+                    .filter(|_| evaluate_heights)
+                    .cloned()
+                {
                     let mut settings = settings;
                     settings.resolved = None;
                     // The wrap now carries its developed CAD floor, but stock
@@ -1027,6 +1201,55 @@ pub(crate) fn resolve_document_checked(
             } else if !matches!(binding.recipe, ExtractionRecipe::ProfileEntries { .. }) {
                 validate_selection(&resolved.geometry, &binding.selected)
                     .map_err(|e| format!("Operation {id}: {e}"))?;
+            }
+            if uses_drill_model_heights(document, operation, binding) {
+                let Operation::Drill(drill) = operation else {
+                    unreachable!()
+                };
+                let tool = resolved
+                    .setup()
+                    .tools
+                    .iter()
+                    .find(|tool| tool.number == drill.tool)
+                    .ok_or("Missing drill tool")?;
+                let stock_top = resolved.setup().heights_for(id).top_of_stock;
+                let holes =
+                    cam_geometry3d::drill_holes(&resolved.geometry, binding, drill.geometry)?;
+                if holes
+                    .iter()
+                    .any(|hole| (hole.diameter - tool.diameter).abs() > 1e-3)
+                {
+                    return Err(format!(
+                        "Operation {id}: drill diameter must match the selected bore"
+                    ));
+                }
+                let heights = apply_drill_holes(drill, &holes, stock_top)?;
+                if evaluate_heights {
+                    if let Some(settings) =
+                        apply_drill_height_settings(document, binding, heights, drill)?
+                    {
+                        resolved
+                            .setup_mut()
+                            .height_settings
+                            .get_mut(&id)
+                            .unwrap()
+                            .resolved = Some(settings);
+                    }
+                }
+                let cache = resolved.geometry.bindings.get_mut(&id).unwrap();
+                cache.status = ResolutionStatus::Resolved;
+                cache.heights = heights;
+                cache.overrides = GeometryOverrides::default();
+                let fingerprint = resolved
+                    .geometry
+                    .binding_fingerprint(&resolved.geometry.bindings[&id]);
+                resolved
+                    .geometry
+                    .bindings
+                    .get_mut(&id)
+                    .unwrap()
+                    .resolved_fingerprint = Some(fingerprint);
+                return Ok(());
             }
             let mut current_binding = binding.clone();
             if surface_recipe(&binding.recipe) {
@@ -1217,6 +1440,7 @@ pub(crate) fn resolve_document_checked(
                         .iter()
                         .map(|h| [h.center.x, h.center.y])
                         .collect();
+                    p.hole_heights.clear();
                     p.depth = depth;
                     p.start_offset =
                         input.heights.top - document.setup().heights_for(id).top_of_stock;
@@ -1261,8 +1485,16 @@ pub(crate) fn resolve_document_checked(
         })();
         resolved.geometry.instances = base_instances;
         resolved_operation.map_err(|message| error(message).for_op(id))?;
-        if document.rotary_indexes.contains_key(&id) {
+        if evaluate_heights && document.rotary_indexes.contains_key(&id) {
             if let Some(settings) = document.setup().height_settings.get(&id) {
+                if document
+                    .geometry
+                    .bindings
+                    .get(&id)
+                    .is_some_and(|binding| uses_drill_model_heights(document, operation, binding))
+                {
+                    continue;
+                }
                 // References such as SelectedContours depend on the binding's
                 // cutting interval. Resolve it after extracting indexed CAD,
                 // while keeping original placements for the indexed view.
@@ -1324,10 +1556,10 @@ pub(crate) fn selection_height_defaults(
     document: &Document,
     operation: &Operation,
 ) -> OperationHeightSettings {
-    let mut settings = OperationHeightSettings::default();
+    let mut settings = OperationHeightSettings::for_operation(operation);
     // Pocket floors, loops and closed edge chains all describe the target
     // bottom plane. Start at stock top, including after geometry replacement.
-    if matches!(operation, Operation::Pocket(_)) {
+    if matches!(operation, Operation::Pocket(_) | Operation::Drill(_)) {
         return settings;
     }
     if matches!(
@@ -1421,8 +1653,8 @@ pub(crate) fn validate_binding_edit(document: &mut Document, id: u32) -> Result<
     let mut preview = document.clone();
     preview.setup_mut().operations.retain(|op| op.id() == id);
     // Geometry repair is independent of the height editor's pending references.
-    preview.setup_mut().height_settings.clear();
-    let resolved = resolve_document(&preview)?;
+    let resolved = resolve_document_input(&preview, &|| false, false)
+        .map_err(|diagnostic| diagnostic.message)?;
     let operation = resolved
         .setup()
         .operations
@@ -1445,10 +1677,10 @@ pub(crate) fn validate_binding_edit(document: &mut Document, id: u32) -> Result<
     if matches!(base.recipe, ExtractionRecipe::FaceRegion) {
         base.heights.top = operation_stock_top(document, id)?;
     }
-    let input =
-        cam_geometry3d::resolve_binding_advisory(&geometry_for_operation(document, id)?, &base)?;
+    let geometry = geometry_for_operation(document, id)?;
+    let heights = binding_base_heights(document, &geometry, &base, &operation)?;
     let binding = document.geometry.bindings.get_mut(&id).unwrap();
-    binding.heights = input.heights;
+    binding.heights = heights;
     binding.resolved_fingerprint = None;
     Ok(())
 }
@@ -1456,15 +1688,35 @@ pub(crate) fn validate_binding_edit(document: &mut Document, id: u32) -> Result<
 /// Keep displayed linked heights synchronized with placement and stock edits.
 /// Replacement/removal requests remain unresolved until explicit reselection.
 pub(crate) fn refresh_binding_heights(document: &mut Document) {
-    let updates: Vec<_> = document.geometry.bindings.iter().filter_map(|(&id,binding)| {
-        if matches!(&binding.status,ResolutionStatus::NeedsReselection{reason} if !reason.starts_with("Geometry changed:")) {return None;}
-        let mut base=binding.clone();base.overrides=GeometryOverrides::default();
-        let mut context=document.clone();
-        let owner=document.setups.iter().find(|s|s.operations.iter().any(|o|o.id()==id))?;
-        context.active_setup_id=owner.id;
-        if matches!(base.recipe,ExtractionRecipe::FaceRegion) {base.heights.top=operation_stock_top(&context,id).ok()?;}
-        Some((id,geometry_for_operation(&context,id).and_then(|geometry|cam_geometry3d::resolve_binding_advisory(&geometry,&base)).map(|input|input.heights)))
-    }).collect();
+    let updates: Vec<_> = document
+        .geometry
+        .bindings
+        .iter()
+        .filter_map(|(&id, binding)| {
+            if matches!(&binding.status, ResolutionStatus::NeedsReselection { reason }
+            if !reason.starts_with("Geometry changed:"))
+            {
+                return None;
+            }
+            let (owner, operation) = document.setups.iter().find_map(|setup| {
+                setup
+                    .operations
+                    .iter()
+                    .find(|operation| operation.id() == id)
+                    .map(|operation| (setup, operation))
+            })?;
+            let mut context = document.clone();
+            context.active_setup_id = owner.id;
+            let mut base = binding.clone();
+            base.overrides = GeometryOverrides::default();
+            if matches!(base.recipe, ExtractionRecipe::FaceRegion) {
+                base.heights.top = operation_stock_top(&context, id).ok()?;
+            }
+            let heights = geometry_for_operation(&context, id)
+                .and_then(|geometry| binding_base_heights(&context, &geometry, &base, operation));
+            Some((id, heights))
+        })
+        .collect();
     for (id, result) in updates {
         let binding = document.geometry.bindings.get_mut(&id).unwrap();
         binding.resolved_fingerprint = None;
@@ -1478,110 +1730,6 @@ pub(crate) fn refresh_binding_heights(document: &mut Document) {
                     reason: format!("Geometry changed: {reason}"),
                 }
             }
-        }
-    }
-}
-
-#[cfg(test)]
-mod pocket_stock_tests {
-    use super::*;
-    use crate::{default_machine, AppController};
-    use cam_cldata::{MoveKind, SpindleDir, Step};
-    use cam_toolpath::{CancelToken, JobCompletion};
-
-    #[test]
-    #[ignore = "supplied testfile2.ocam regression; set OCAM_STOCK_PROJECT"]
-    fn supplied_floor_holes_are_cleared_to_the_stock_contour() {
-        let path = std::env::var("OCAM_STOCK_PROJECT").unwrap();
-        let mut app = AppController::new(default_machine());
-        app.open_project(Path::new(&path)).unwrap();
-        let (min, max) = app.stock_box();
-        // The saved project selects the right floor; the screenshot selects
-        // the corresponding left floor in the same flipped setup.
-        for (face, center) in [(34, 75.), (32, -75.)] {
-            let mut selected = app.geometry_state().bindings[&0].selected.clone();
-            selected[0].id = face;
-            app.edit_cad_geometry(0, selected).unwrap();
-            let document = resolve_document(app.document()).unwrap();
-            assert!(
-                matches!(&document.setup().operations[0], Operation::Pocket(p)
-                if p.stock_contours.enabled && p.islands.len() == 1)
-            );
-            let started = std::time::Instant::now();
-            let result = cam_toolpath::build_job(
-                &document,
-                1000.,
-                SpindleDir::Cw,
-                Some(([min[0], min[1]], [max[0], max[1]])),
-                200.,
-                &CancelToken::new(),
-            );
-            eprintln!(
-                "Face {face}: {} moves in {:?}",
-                result.program.len(),
-                started.elapsed()
-            );
-            assert_eq!(
-                result.completion,
-                JobCompletion::Complete,
-                "{:?}",
-                result.diagnostics
-            );
-            result.program.validate().unwrap();
-            let mut previous: Option<cam_cldata::Point3> = None;
-            let mut crosses_hole = false;
-            for step in result.program.steps() {
-                match step {
-                    Step::Linear { to, tag, .. } => {
-                        if let Some(a) = previous.filter(|_| tag.kind == MoveKind::Cutting) {
-                            let dx = to.x - a.x;
-                            let dy = to.y - a.y;
-                            let length_sq = dx * dx + dy * dy;
-                            if length_sq > 0. {
-                                let t =
-                                    (((center - a.x) * dx - a.y * dy) / length_sq).clamp(0., 1.);
-                                crosses_hole |= (a.x + t * dx - center).hypot(a.y + t * dy) < 3.;
-                            }
-                        }
-                        previous = Some(*to);
-                    }
-                    Step::Rapid { to, .. } => previous = Some(*to),
-                    Step::Arc { end, .. } => previous = Some(*end),
-                    _ => {}
-                }
-            }
-            let cuts: Vec<_> = result
-                .program
-                .steps()
-                .iter()
-                .filter_map(|s| match s {
-                    Step::Linear { to, tag, .. } if tag.kind == MoveKind::Cutting => Some(*to),
-                    Step::Arc { end, tag, .. } if tag.kind == MoveKind::Cutting => Some(*end),
-                    _ => None,
-                })
-                .collect();
-            assert!(
-                crosses_hole,
-                "stock above the 20 mm through-hole must be machined"
-            );
-            assert!(cuts.iter().any(|p| p.y > max[1]));
-            assert!(cuts.iter().any(|p| p.y < min[1]));
-            assert!(
-                cuts.iter().any(|p| if center > 0. {
-                    p.x > max[0]
-                } else {
-                    p.x < min[0]
-                }),
-                "the open floor must extend to the stock edges with runout"
-            );
-            assert!(
-                cuts.iter().all(|p| if center > 0. {
-                    p.x >= 53. - 0.01
-                } else {
-                    p.x <= -53. + 0.01
-                }),
-                "the rising wall at X +/-50 must remain protected"
-            );
         }
     }
 }

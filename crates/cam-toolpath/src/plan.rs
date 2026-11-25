@@ -1204,6 +1204,8 @@ fn apply_feed_height(
     feed_z: f64,
     operation: &Operation,
 ) -> Result<Program, String> {
+    let peck_reentry = matches!(operation, Operation::Drill(drill)
+        if drill.cycle.mode.is_some_and(cam_model::DrillCycleMode::pecks));
     let plunge = match operation {
         Operation::Profile(o) => o.plunge_feed,
         Operation::Pocket(o) => o.clear.plunge_feed,
@@ -1226,11 +1228,17 @@ fn apply_feed_height(
                 for &[x, y] in &c.points {
                     expanded.push(Step::Rapid {
                         to: Point3::new(x, y, c.retract.max(feed_z)),
-                        tag: c.tag,
+                        tag: Tag {
+                            kind: MoveKind::Link,
+                            ..c.tag
+                        },
                     });
                     expanded.push(Step::Rapid {
                         to: Point3::new(x, y, entry),
-                        tag: c.tag,
+                        tag: Tag {
+                            kind: MoveKind::Link,
+                            ..c.tag
+                        },
                     });
                     let mut previous = c.z_top;
                     let peck = c.peck.unwrap_or(c.z_top - c.depth);
@@ -1248,7 +1256,10 @@ fn apply_feed_height(
                         if index > 1 {
                             expanded.push(Step::Rapid {
                                 to: Point3::new(x, y, (previous + 0.5).min(entry)),
-                                tag: c.tag,
+                                tag: Tag {
+                                    kind: MoveKind::Link,
+                                    ..c.tag
+                                },
                             });
                         }
                         expanded.push(Step::Linear {
@@ -1263,7 +1274,10 @@ fn apply_feed_height(
                         }
                         expanded.push(Step::Rapid {
                             to: Point3::new(x, y, c.retract.max(feed_z)),
-                            tag: c.tag,
+                            tag: Tag {
+                                kind: MoveKind::Retract,
+                                ..c.tag
+                            },
                         });
                         previous = z;
                     }
@@ -1281,7 +1295,9 @@ fn apply_feed_height(
                 if (from.x - to.x).abs() < 1e-9
                     && (from.y - to.y).abs() < 1e-9
                     && to.z < from.z
-                    && to.z < feed_z =>
+                    && to.z < feed_z
+                    // An explicit peck has already drilled its re-entry segment.
+                    && !(peck_reentry && tag.kind == MoveKind::Link) =>
             {
                 if from.z > feed_z {
                     out.push(Step::Rapid {
@@ -1724,6 +1740,20 @@ fn compute_with_stock_and_preview(
     cutting_heights: Option<cam_model::CuttingHeights>,
     publish: &mut dyn FnMut(&Program),
 ) -> StrategyResult {
+    if let Some(tool) = operation
+        .tools()
+        .into_iter()
+        .filter_map(|number| env.tool(number))
+        .find(|tool| tool.kind.is_side_cutting_disc())
+    {
+        return StrategyResult {
+            diagnostics: vec![Diagnostic::error(format!(
+                "Tool {} ({}) requires a side-cutting strategy",
+                tool.number, tool.kind
+            ))],
+            ..Default::default()
+        };
+    }
     let (radial, axial) = stock_to_leave.effective();
     match operation {
         Operation::Spiral(op) => {
@@ -2159,6 +2189,10 @@ mod tests {
             operations: (0..operations)
                 .map(|id| {
                     Operation::Drill(DrillOp {
+                        cycle: Default::default(),
+                        tip_through_bottom: false,
+                        geometry: Default::default(),
+                        hole_heights: Vec::new(),
                         parameter_expressions: Default::default(),
                         id,
                         tool: 1,
@@ -2185,6 +2219,35 @@ mod tests {
             stock_to_leave: Default::default(),
             tool_change_height: None,
         })
+    }
+
+    #[test]
+    fn side_cutting_discs_require_a_dedicated_strategy() {
+        for kind in [ToolKind::GrooveCutter, ToolKind::SlittingSaw] {
+            let mut doc = document(0);
+            let setup = doc.setup_mut();
+            setup.tools[0] = Tool {
+                number: 1,
+                diameter: 20.0,
+                flute_length: 1.5,
+                shank_diameter: 6.0,
+                length: 50.0,
+                flutes: 8,
+                kind,
+                ..Default::default()
+            };
+            setup.operations.push(profile_operation());
+            let job = build_job(&doc, 1000., SpindleDir::Cw, None, 50., &CancelToken::new());
+            assert_eq!(job.completion, JobCompletion::Failed);
+            assert!(job
+                .program
+                .steps()
+                .iter()
+                .all(|step| matches!(step, Step::Comment(_))));
+            assert!(job.diagnostics.iter().any(|finding| {
+                finding.op == Some(0) && finding.message.contains("requires a side-cutting strategy")
+            }));
+        }
     }
 
     #[test]
@@ -2397,6 +2460,7 @@ mod tests {
             revision: 1,
             name: "floor with hole and boss".into(),
             source_format: CadFormat::Step,
+            source_path: None,
             source_units: SourceUnits::Millimetres,
             source_data: Arc::new(vec![]),
             source_fingerprint: String::new(),
@@ -3323,6 +3387,43 @@ mod tests {
             .steps()
             .iter()
             .any(|s| matches!(s,Step::Drill(c) if c.depth == -4.5)));
+    }
+
+    #[test]
+    fn explicit_peck_drilling_keeps_cutting_feed_on_entry_and_rapid_reentry() {
+        use cam_model::{DrillCycleMode, HeightPlaneKind as P, OperationHeightSettings};
+        let mut doc = document(1);
+        let Operation::Drill(drill) = &mut doc.setup_mut().operations[0] else {
+            panic!()
+        };
+        drill.set_cycle_mode(DrillCycleMode::DeepDrilling);
+        drill.depth = 3.0;
+        let mut settings = OperationHeightSettings::default();
+        settings.definition_mut(P::Feed).offset = 1.0;
+        doc.setup_mut().height_settings.insert(0, settings);
+
+        let result = build_job(&doc, 1000., SpindleDir::Cw, None, 50., &CancelToken::new());
+        assert_eq!(
+            result.completion,
+            JobCompletion::Complete,
+            "{:?}",
+            result.diagnostics
+        );
+        let mut feed_depths = Vec::new();
+        let mut resume = Vec::new();
+        for step in result.program.steps() {
+            match step {
+                Step::Linear { to, tag, .. } if tag.kind == MoveKind::Plunge => {
+                    feed_depths.push(to.z)
+                }
+                Step::Rapid { to, tag } if tag.kind == MoveKind::Link && to.z < 0.0 => {
+                    resume.push(to.z)
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(feed_depths, [-0.75, -1.5, -2.25, -3.0]);
+        assert_eq!(resume, [-0.25, -1.0, -1.75]);
     }
 
     #[test]

@@ -89,6 +89,8 @@ pub struct Settings {
     pub settings_version: u32,
     /// Decimal places used to display tool dimensions and cutting data.
     pub number_decimals: u8,
+    /// Block G-code export when verification detects a stock or fixture collision.
+    pub block_export_on_verification_errors: bool,
     pub view: ViewPrefs,
     pub snapping: SnapPrefs,
     pub panes: PanePrefs,
@@ -453,6 +455,7 @@ impl Default for Settings {
         Self {
             settings_version: SETTINGS_VERSION,
             number_decimals: 2,
+            block_export_on_verification_errors: true,
             view: ViewPrefs::default(),
             snapping: SnapPrefs::default(),
             panes: PanePrefs::default(),
@@ -503,6 +506,14 @@ impl Settings {
         } else {
             formatted
         }
+    }
+
+    #[cfg(feature = "gui")]
+    pub(crate) fn format_diagnostic<'a>(
+        &self,
+        diagnostic: &'a cam_toolpath::Diagnostic,
+    ) -> std::borrow::Cow<'a, str> {
+        diagnostic.display_message(self.number_decimals, |value| self.format_number(value))
     }
 
     /// Keep in-progress text intact; format only inactive numeric inputs.
@@ -968,6 +979,7 @@ mod tests {
         assert!(!got.view.tooltips, "the stated value wins");
         assert_eq!(got.view.gizmo_size, 110.0, "the rest are defaults");
         assert_eq!(got.panes, PanePrefs::default());
+        assert!(got.block_export_on_verification_errors);
     }
 
     #[test]

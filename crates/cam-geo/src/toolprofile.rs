@@ -50,6 +50,8 @@ pub struct Profile2D {
 pub enum BottomShape {
     /// Flat bottom (end mill / face mill).
     Flat,
+    /// A disc whose cutting edges are at its rim, with no axial cutting tip.
+    SideCuttingDisc,
     /// Full ball nose (corner radius = tool radius): a hemisphere, tip at the origin.
     Ball,
     /// Flat centre with a rounded corner of `corner_radius` mm (bull-nose).
@@ -124,6 +126,10 @@ pub fn generatrix(spec: &GeneratrixSpec) -> Profile2D {
             segs.push(line(Point::new(r, 0.0), true));
             0.0
         }
+        BottomShape::SideCuttingDisc => {
+            segs.push(line(Point::new(r, 0.0), false));
+            0.0
+        }
         BottomShape::Ball => {
             // Hemisphere: tip (0,0), equator (r, r), centre (0, r); a CCW quarter-arc.
             segs.push(arc(Point::new(r, r), Point::new(0.0, r), true, true));
@@ -173,7 +179,14 @@ pub fn generatrix(spec: &GeneratrixSpec) -> Profile2D {
             } else {
                 0.0
             };
-            segs.push(line(Point::new(r, z_apex), true));
+            if spec.flute_length > EPS && spec.flute_length < z_apex - EPS {
+                let z = spec.flute_length;
+                let radius = rf + (r - rf) * z / z_apex;
+                segs.push(line(Point::new(radius, z), true));
+                segs.push(line(Point::new(r, z_apex), false));
+            } else {
+                segs.push(line(Point::new(r, z_apex), true));
+            }
             z_apex
         }
         BottomShape::VTip {

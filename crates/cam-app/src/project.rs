@@ -423,6 +423,7 @@ impl Project {
                 }
             }
             for tool in &setup.tools {
+                tool.validate_disc_dimensions()?;
                 tool.validate_presets()?;
             }
             for operation in &setup.operations {

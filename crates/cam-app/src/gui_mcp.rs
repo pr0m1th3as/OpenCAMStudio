@@ -225,6 +225,9 @@ impl App {
         };
         pending.persist(path)?;
         self.settings = settings;
+        self.controller.set_block_export_on_verification_errors(
+            self.settings.block_export_on_verification_errors,
+        );
         if mcp_changed {
             self.mcp_feedback = None;
             if let Some(server) = server {

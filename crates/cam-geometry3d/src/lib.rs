@@ -10,6 +10,8 @@ pub use rotary::{
 };
 mod adaptive;
 mod advisory;
+mod drill_holes;
+pub use drill_holes::{drill_holes, rebind_drill_face, DrillHole};
 mod pocket_regions;
 mod pocket_stock;
 pub use advisory::{
@@ -28,7 +30,7 @@ pub use adaptive::{
 use cam_geo::{Contour, Point, Polygon};
 use cam_model::*;
 pub use profile_contours::coplanar_faces as coplanar_profile_faces;
-pub use profile_entries::profile_entry_contours;
+pub use profile_entries::{profile_entry_contours, split_profile_chain_entry};
 use std::{collections::BTreeSet, f64::consts::TAU};
 
 /// Recognition and machining budgets are independent of display tessellation.
@@ -1866,6 +1868,7 @@ mod tests {
                     revision: 1,
                     name: "analytic".into(),
                     source_format: CadFormat::Step,
+                    source_path: None,
                     source_data: vec![].into(),
                     source_units: SourceUnits::Millimetres,
                     backend: "analytic test fixture (not imported STEP)".into(),
@@ -2799,15 +2802,64 @@ mod tests {
             .unwrap_err()
             .contains("Complete the chain"));
         entry.chain_mode = ProfileChainMode::Open;
-        entry.source = ProfileGeometrySource::Cad(vec![edges[0].clone(), edges[2].clone()]);
-        assert!(profile_entry_contours(&state, &entry)
-            .unwrap_err()
-            .contains("connect without gaps"));
         state.instances[0].placement.rotation = [[1., 0., 0.], [0., 0., -1.], [0., 1., 0.]];
         entry.source = ProfileGeometrySource::Cad(vec![edges[1].clone()]);
         assert!(profile_entry_contours(&state, &entry)
             .unwrap_err()
             .contains("one accessible plane"));
+    }
+
+    #[test]
+    fn interleaved_profile_edges_split_into_independent_open_chains() {
+        let (state, face) = plate_with_hole();
+        let topology = &state.assets[0].topology;
+        let edges = |outer| {
+            topology
+                .loops
+                .iter()
+                .find(|wire| wire.face_id == face.id && wire.is_outer == outer)
+                .unwrap()
+                .edge_uses
+                .iter()
+                .map(|usage| reference(usage.edge_id, EntityKind::Edge))
+                .collect::<Vec<_>>()
+        };
+        let outer = edges(true);
+        let inner = edges(false);
+        let groups = [
+            vec![outer[1].clone(), outer[0].clone()],
+            vec![inner[0].clone()],
+            vec![inner[2].clone()],
+        ];
+        let picks = vec![
+            groups[0][0].clone(),
+            groups[1][0].clone(),
+            groups[2][0].clone(),
+            groups[0][1].clone(),
+        ];
+        let mut entry = ProfileGeometryEntry::new(ProfileGeometryKind::Chain, "Open rims".into());
+        entry.chain_mode = ProfileChainMode::Open;
+        entry.source = ProfileGeometrySource::Cad(picks);
+        entry.reversed = true;
+        entry.side_overrides.insert(1, Side::On);
+
+        let split = split_profile_chain_entry(&state, &entry).unwrap().unwrap();
+        assert_eq!(split.len(), 3);
+        for (entry, refs) in split.iter().zip(groups) {
+            assert_eq!(entry.source, ProfileGeometrySource::Cad(refs));
+            assert!(entry.reversed);
+            assert_eq!(entry.contour_count, 1);
+        }
+        assert_eq!(split[1].side_overrides.get(&0), Some(&Side::On));
+        let (contours, heights) = profile_entry_contours(&state, &entry).unwrap();
+        assert!(heights.is_none());
+        assert_eq!(contours.len(), 3);
+        assert!(contours.iter().all(|contour| !contour.closed));
+        assert_eq!(contours[0].chain.len(), 3);
+        assert_eq!(contours[1].side, Side::On);
+
+        entry.chain_mode = ProfileChainMode::Closed;
+        assert!(profile_entry_contours(&state, &entry).is_err());
     }
 
     #[test]
@@ -3160,6 +3212,7 @@ mod tests {
                 revision: 1,
                 name: "L".into(),
                 source_format: CadFormat::Step,
+                source_path: None,
                 source_data: vec![].into(),
                 source_units: SourceUnits::Millimetres,
                 backend: "test".into(),

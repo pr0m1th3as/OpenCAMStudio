@@ -716,6 +716,7 @@ mod tests {
                     revision: 1,
                     name: "Pattern references".into(),
                     source_format: CadFormat::Step,
+                    source_path: None,
                     source_data: vec![].into(),
                     source_units: SourceUnits::Millimetres,
                     backend: "test".into(),

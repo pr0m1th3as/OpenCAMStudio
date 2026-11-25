@@ -86,6 +86,8 @@ pub(super) enum ToolDetail {
     Manufacturer,
     ProductId,
     ProductLink,
+    CutterMaterial,
+    Coating,
 }
 
 /// Preserve each cutter's pending edits while browsing another cutter.
@@ -1113,8 +1115,16 @@ impl App {
             Field::Stepdown,
             Field::Overlap,
             Field::Peck,
+            Field::MinimumPeck,
         ] {
-            if matches!(field, Field::Stepdown | Field::Peck) && preset.stepdown.is_none() {
+            if matches!(field, Field::Stepdown | Field::Peck | Field::MinimumPeck)
+                && preset.stepdown.is_none()
+            {
+                continue;
+            }
+            if matches!(field, Field::Peck | Field::MinimumPeck)
+                && matches!(op, Operation::Drill(drill) if !drill.cycle_mode().pecks())
+            {
                 continue;
             }
             if field == Field::Overlap && preset.overlap.is_none() {
@@ -1724,6 +1734,8 @@ mod tests {
             (ToolDetail::Manufacturer, "Example Tools"),
             (ToolDetail::ProductId, "EM-6"),
             (ToolDetail::ProductLink, "https://example.com/EM-6"),
+            (ToolDetail::CutterMaterial, "Carbide"),
+            (ToolDetail::Coating, "TiAlN"),
         ] {
             send(&mut app, Message::ToolDetailChanged(field, value.into()));
         }
@@ -1752,8 +1764,28 @@ mod tests {
             app.tool_edit.as_ref().unwrap().product_link,
             edited.product_link
         );
+        assert_eq!(app.tool_edit.as_ref().unwrap().cutter_material, edited.cutter_material);
+        assert_eq!(app.tool_edit.as_ref().unwrap().coating, edited.coating);
         send(&mut app, Message::CancelToolDraft);
         assert_eq!(app.tool_edit.as_ref().unwrap(), &saved);
+        send(&mut app, Message::ToolDetailChanged(ToolDetail::CutterMaterial, "Carbide".into()));
+        send(&mut app, Message::ToolDetailChanged(ToolDetail::Coating, "TiAlN".into()));
+        send(&mut app, Message::Apply);
+        assert_eq!(app.library.tools[0].cutter_material, "Carbide");
+        assert_eq!(app.library.tools[0].coating, "TiAlN");
+    }
+
+    #[test]
+    fn compression_direction_can_be_applied_to_a_tool() {
+        let mut app = app();
+        app.switch_workspace(Workspace::Tools);
+        app.lib_sel = 0;
+        app.reload_tool_edit();
+        send(&mut app, Message::ToolCuttingDirChanged(CutDir::Compression));
+        assert!(app.inspector_dirty());
+        assert!(library_extra(app.tool_edit.as_ref().unwrap()).unwrap().contains(", C"));
+        send(&mut app, Message::Apply);
+        assert_eq!(app.library.tools[0].cutting_direction, CutDir::Compression);
     }
 
     #[test]

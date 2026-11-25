@@ -138,6 +138,7 @@ impl App {
             toggle,
         );
         let heading = match section.label {
+            "Cycle" => help_wrap(heading, drill_cycle::CYCLE_HELP, self.tooltips),
             "Holding tabs" => help_wrap(heading, illustrated_help::HOLDING_TABS, self.tooltips),
             "Finishing passes" => help_wrap(
                 heading,

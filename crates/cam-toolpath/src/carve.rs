@@ -440,6 +440,7 @@ impl CarveStrategy {
                             .unwrap_or_default();
                         let job = crate::clearing::ClearJob {
                             lift_height: cp.lift_height,
+                            keep_tool_down: false,
                             id: op.id,
                             simplification_tolerance: crate::frontadvance::SIMPLIFY_EPS,
                             radius: r,
@@ -457,6 +458,7 @@ impl CarveStrategy {
                             start: op.start,
                             end: op.end,
                             guard: &guards,
+                            helix: None,
                             spindle: env.spindle,
                         };
                         match crate::clearing::clear(
@@ -480,10 +482,7 @@ impl CarveStrategy {
                                     ..Default::default()
                                 };
                             }
-                            Err(
-                                crate::rings::RingsError::Offset(e)
-                                | crate::rings::RingsError::Limit(e),
-                            ) => {
+                            Err(e) => {
                                 fail!("operation {}: clearing offset failed: {e}", op.id)
                             }
                         }

@@ -22,6 +22,8 @@ mod spiral;
 pub use spiral::*;
 mod bore;
 pub use bore::{BoreOp, BoreOrder};
+mod drill_cycle;
+pub use drill_cycle::{DrillCycleMode, DrillCycleSettings};
 mod thread_standards;
 pub use thread_standards::*;
 mod document;
@@ -50,8 +52,8 @@ mod validate;
 pub use cam_cldata::Point3;
 pub use document::{
     AdaptiveContainment, AdaptiveOp, AdaptiveParams, Axis, CarveClearing, CarveOp, ChamferFace,
-    ChamferOp, CircularDistribution, ClearParams, Clearing, Comp, Document, DrillOp, EngraveOp,
-    ExecutionItem, FaceOp, Hand, Heights, Lead, LinearPatternDirection, Operation,
+    ChamferOp, CircularDistribution, ClearParams, Clearing, Comp, Document, DrillGeometry, DrillOp,
+    EngraveOp, ExecutionItem, FaceOp, Hand, Heights, Lead, LinearPatternDirection, Operation,
     OperationPattern, Origin, ParallelOp, PatternDirection, PatternKind, PatternOptions,
     PatternOrder, PatternSpacing, Plunge, PocketOp, ProfileContour, ProfileOp, ProfileTabs, Setup,
     Side, SpiralOp, Stock, StockAxis, StockAxisReference, StockOriginAxis, StockToLeave, ThreadOp,
@@ -276,6 +278,10 @@ pub enum ToolKind {
     },
     /// Face mill.
     FaceMill,
+    /// Square-edged groove cutter (keyseat cutter) on a shank or reduced neck.
+    GrooveCutter,
+    /// Slitting saw blade mounted on an arbor.
+    SlittingSaw,
     /// Thread mill — helically interpolated to cut internal/external threads.
     /// `pitch` is `None` for a single-form (pitch-agnostic) mill, or `Some(p)` for
     /// a full-profile mill whose tooth comb is ground for pitch `p` mm.
@@ -305,10 +311,19 @@ impl std::fmt::Display for ToolKind {
             ToolKind::ChamferMill { .. } => "Chamfer mill",
             ToolKind::Drill { .. } => "Drill bit",
             ToolKind::FaceMill => "Face mill",
+            ToolKind::GrooveCutter => "Groove cutter",
+            ToolKind::SlittingSaw => "Slitting saw",
             ToolKind::ThreadMill { .. } => "Thread mill",
             ToolKind::VBit { .. } => "V-bit",
         };
         f.write_str(s)
+    }
+}
+
+impl ToolKind {
+    /// A radial cutter with an axial cutting width set by the head or blade.
+    pub fn is_side_cutting_disc(self) -> bool {
+        matches!(self, Self::GrooveCutter | Self::SlittingSaw)
     }
 }
 
@@ -328,6 +343,8 @@ pub enum CutDir {
     Up,
     /// Straight (axial) flutes — no helix. Only meaningful for a square end mill.
     Straight,
+    /// Up-cut near the tip and down-cut above it, directing chips inward.
+    Compression,
 }
 
 impl std::fmt::Display for CutDir {
@@ -336,6 +353,7 @@ impl std::fmt::Display for CutDir {
             CutDir::Down => "Down-cut",
             CutDir::Up => "Up-cut",
             CutDir::Straight => "Straight flute",
+            CutDir::Compression => "Compression",
         })
     }
 }
@@ -359,17 +377,27 @@ pub struct Tool {
     pub product_id: String,
     #[serde(default)]
     pub product_link: String,
+    /// Cutter substrate, such as carbide or high-speed steel.
+    #[serde(default)]
+    pub cutter_material: String,
+    /// Cutter coating, such as TiAlN; empty when unspecified.
+    #[serde(default)]
+    pub coating: String,
     /// Tool number (emitted as `Tn`).
     pub number: u32,
     /// Cutting diameter, mm.
     pub diameter: f64,
     /// Overall tool length — the stickout below the holder, mm.
     pub length: f64,
-    /// Length of the cutting edge (length of cut) from the tip, mm. `0.0` = unspecified
-    /// → treated as fully fluted (equals `length`); see [`Tool::flute_len`]. Drives the
+    /// Axial length of cut from the tip, mm (head width or blade thickness for a disc).
+    /// `0.0` = unspecified for older tool kinds;
+    /// see [`Tool::flute_len`] for the fallback. Drives the
     /// cutting/non-cutting split of a generated generatrix.
     #[serde(default)]
     pub flute_length: f64,
+    /// Face mill body height; zero means the legacy flute length.
+    #[serde(default)]
+    pub face_body_height: f64,
     /// Shank diameter, mm. `0.0` = unspecified → equals the cutting `diameter` (no
     /// distinct shank); see [`Tool::shank_dia`].
     #[serde(default)]
@@ -422,10 +450,13 @@ impl Default for Tool {
             manufacturer: String::new(),
             product_id: String::new(),
             product_link: String::new(),
+            cutter_material: String::new(),
+            coating: String::new(),
             number: 0,
             diameter: 0.0,
             length: 0.0,
             flute_length: 0.0,
+            face_body_height: 0.0,
             shank_diameter: 0.0,
             neck_length: 0.0,
             neck_diameter: 0.0,
@@ -449,10 +480,22 @@ impl Tool {
     }
 
     /// Effective length of cut: the explicit [`flute_length`](Self::flute_length), or
-    /// the overall [`length`](Self::length) when unspecified (`0.0` ⇒ fully fluted).
+    /// the overall length when unspecified. For a chamfer mill the unspecified
+    /// length is the cone height, preserving its original cutting profile.
     pub fn flute_len(&self) -> f64 {
         if self.flute_length > 0.0 {
             self.flute_length
+        } else if let ToolKind::ChamferMill {
+            included_angle_deg,
+            tip_diameter,
+        } = self.kind
+        {
+            let tangent = (included_angle_deg * 0.5).to_radians().tan();
+            if tangent > 0.0 {
+                ((self.diameter - tip_diameter).max(0.0) * 0.5 / tangent).min(self.length)
+            } else {
+                self.length
+            }
         } else {
             self.length
         }
@@ -468,6 +511,11 @@ impl Tool {
         }
     }
 
+    /// Face mill body height, with a fallback for older saved tools.
+    pub fn face_body_height(&self) -> f64 {
+        if self.face_body_height > 0.0 { self.face_body_height } else { self.flute_len() }
+    }
+
     /// Effective neck diameter: the explicit [`neck_diameter`](Self::neck_diameter),
     /// or the cutting [`diameter`](Self::diameter) when unspecified.
     pub fn neck_dia(&self) -> f64 {
@@ -478,6 +526,51 @@ impl Tool {
         }
     }
 
+    /// Check the explicit dimensions needed to define a side-cutting disc.
+    pub fn validate_disc_dimensions(&self) -> Result<(), String> {
+        if !self.kind.is_side_cutting_disc() {
+            return Ok(());
+        }
+        let positive = |v: f64| v.is_finite() && v > 0.0;
+        if !positive(self.diameter) || !positive(self.flute_length) || self.flutes == 0 {
+            return Err(format!(
+                "Tool {} ({}) needs a positive cutting diameter, width and tooth count",
+                self.number, self.kind
+            ));
+        }
+        if !self.length.is_finite() || self.length <= self.flute_length {
+            return Err(format!(
+                "Tool {} must be longer than its cutting width",
+                self.number
+            ));
+        }
+        if !positive(self.shank_diameter) {
+            return Err(format!(
+                "Tool {} needs a positive shank or arbor diameter",
+                self.number
+            ));
+        }
+        if !self.neck_length.is_finite()
+            || self.neck_length < 0.0
+            || self.neck_length >= self.length - self.flute_length
+            || (self.kind == ToolKind::SlittingSaw && self.neck_length != 0.0)
+        {
+            return Err(format!("Tool {} has an invalid neck length", self.number));
+        }
+        let support = if self.neck_length > 0.0 {
+            self.neck_diameter
+        } else {
+            self.shank_diameter
+        };
+        if !positive(support) || support >= self.diameter {
+            return Err(format!(
+                "Tool {} needs a neck, shank or arbor at the disc narrower than its cutting diameter",
+                self.number
+            ));
+        }
+        Ok(())
+    }
+
     /// This tool's **2D revolve generatrix** (`TOOLING_PLAN.md` Phase 4): the built-in
     /// kinds mapped onto a kernel-neutral [`cam_geo::GeneratrixSpec`] and generated. The
     /// cutting-end shape comes from [`kind`](Self::kind); the flute/shank split from the
@@ -485,6 +578,21 @@ impl Tool {
     /// repeated full-form teeth, with the non-cutting tip, neck and shank tagged.
     pub fn profile(&self) -> cam_geo::Profile2D {
         use cam_geo::BottomShape;
+        if matches!(self.kind, ToolKind::FaceMill) {
+            use cam_geo::{Point, Profile2D, ProfileSeg, SegShape};
+            let r = self.radius().max(0.0);
+            let body = self.face_body_height().max(0.0);
+            let flute = self.flute_len().clamp(0.0, body);
+            let length = self.length.max(body);
+            let shank = self.shank_dia().max(0.0) * 0.5;
+            let line = |r, z, cutting| ProfileSeg { shape: SegShape::Line, end: Point::new(r, z), cutting };
+            let mut segs = vec![line(r, 0.0, true), line(r, flute, true)];
+            if body > flute { segs.push(line(r, body, false)); }
+            if (shank - r).abs() > 1e-9 { segs.push(line(shank, body, false)); }
+            if length > body { segs.push(line(shank, length, false)); }
+            if shank > 1e-9 { segs.push(line(0.0, length, false)); }
+            return Profile2D { start: Point::new(0.0, 0.0), segs };
+        }
         // Single-profile (single-point) thread mill: one 60° tooth at the tip, a sharply
         // reduced neck over the length of cut (its reach), then the shank. The neck ⌀ sets
         // the max thread depth = (min cutting ⌀ − neck ⌀)/2. Built directly, since the
@@ -572,6 +680,7 @@ impl Tool {
             | ToolKind::RoughingMill
             | ToolKind::FaceMill
             | ToolKind::ThreadMill { .. } => BottomShape::Flat,
+            ToolKind::GrooveCutter | ToolKind::SlittingSaw => BottomShape::SideCuttingDisc,
             ToolKind::BallMill => BottomShape::Ball,
             ToolKind::BullNose { corner_radius } => BottomShape::BullNose { corner_radius },
             ToolKind::RadiusMill {
@@ -587,9 +696,7 @@ impl Tool {
             } => {
                 // Like a V-bit but with a flat, **non-cutting** tip instead of a rounded
                 // one: the cone flank is the only cutting surface, flaring exactly to the
-                // shaft. Single diameter (= shaft); flute_length 0 leaves the shaft
-                // non-cutting.
-                flute_length = 0.0;
+                // shaft. The flute length controls where the cutting edge ends.
                 shank_radius = self.radius();
                 BottomShape::Cone {
                     half_angle_rad: (included_angle_deg * 0.5).to_radians(),
@@ -787,6 +894,15 @@ mod tests {
     }
 
     #[test]
+    fn compression_direction_round_trips_and_has_distinct_identity() {
+        let down = Tool { kind: ToolKind::EndMill, ..Default::default() };
+        let compression = Tool { cutting_direction: CutDir::Compression, ..down.clone() };
+        let loaded: Tool = serde_json::from_str(&serde_json::to_string(&compression).unwrap()).unwrap();
+        assert_eq!(loaded.cutting_direction, CutDir::Compression);
+        assert_ne!(compression.identity(), down.identity());
+    }
+
+    #[test]
     fn radius_mill_profile_and_identity_round_trip() {
         use cam_geo::{Point, SegShape};
         let tool = Tool {
@@ -859,12 +975,36 @@ mod tests {
             .iter()
             .filter(|s| s.cutting)
             .all(|s| s.end.x <= 4.0 + 1e-9));
+        let mut short = mk(ToolKind::ChamferMill {
+            included_angle_deg: 90.0,
+            tip_diameter: 0.0,
+        });
+        short.flute_length = 2.0;
+        let profile = short.profile();
+        assert!(profile.segs.iter().any(|s| s.cutting && (s.end.y - 2.0).abs() < 1e-9));
+        assert!(profile.segs.iter().filter(|s| s.cutting).all(|s| s.end.y <= 2.0 + 1e-9));
+        assert!(profile.segs.iter().any(|s| !s.cutting && (s.end.y - 4.0).abs() < 1e-9));
+        short.flute_length = 0.0;
+        assert!((short.flute_len() - 4.0).abs() < 1e-9);
         // Flute split honoured: nothing above z=20 cuts.
         assert!(em
             .segs
             .iter()
             .filter(|s| s.cutting)
             .all(|s| s.end.y <= 20.0 + 1e-9));
+    }
+
+    #[test]
+    fn face_mill_body_and_cutting_length_are_distinct() {
+        let mut tool = Tool { diameter: 50.0, length: 60.0, flute_length: 25.0, shank_diameter: 16.0, kind: ToolKind::FaceMill, ..Default::default() };
+        assert_eq!(tool.face_body_height(), 25.0);
+        tool.face_body_height = 25.0;
+        tool.flute_length = 5.0;
+        let profile = tool.profile();
+        assert!(profile.segs.iter().any(|s| s.cutting && s.end.y == 5.0));
+        assert!(profile.segs.iter().any(|s| !s.cutting && s.end.x == 25.0 && s.end.y == 25.0));
+        let json = serde_json::to_string(&tool).unwrap();
+        assert_eq!(serde_json::from_str::<Tool>(&json).unwrap(), tool);
     }
 
     #[test]

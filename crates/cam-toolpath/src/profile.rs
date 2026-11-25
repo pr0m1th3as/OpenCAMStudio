@@ -459,6 +459,7 @@ impl ProfileStrategy {
                 // ring sits at the tool radius.
                 let job = crate::clearing::ClearJob {
                     lift_height: 0.0,
+                    keep_tool_down: false,
                     id: op.id,
                     simplification_tolerance: crate::frontadvance::SIMPLIFY_EPS,
                     radius,
@@ -478,6 +479,7 @@ impl ProfileStrategy {
                     start: op.start,
                     end: None,
                     guard: &[],
+                    helix: None,
                     spindle: env.spindle,
                 };
                 match crate::clearing::clear(
@@ -504,7 +506,7 @@ impl ProfileStrategy {
                             ..Default::default()
                         };
                     }
-                    Err(crate::rings::RingsError::Offset(e) | crate::rings::RingsError::Limit(e)) => {
+                    Err(e) => {
                         diagnostics.push(Diagnostic::error(format!(
                             "operation {}: offset failed: {e}",
                             op.id

@@ -358,22 +358,22 @@ a different machine legitimately changes the height of its lifts.
   cutting** shank/neck/tip — never colour alone). Every field or picker change
   updates the preview immediately; **Apply** commits it to the library on disk and
   is greyed until there is an unsaved change.
+- Every tool can record its cutter material and coating as optional text. These are
+  separate from the workpiece material used by cutting-data presets.
 - **Tool kinds**, each with its own fields, validation, and silhouette:
   - **End mills** — Square, Ball-nose, Rounded-edge (bull-nose; adds a corner
     radius). Flute ⌀ / flute length / shank ⌀ / shank length / overall / flutes,
     plus a **cutting direction** (Down / Up, and Straight for square) shown as the
-    flute-helix lean.
+    flute-helix lean, including compression (up-cut at the tip and down-cut above).
   - **Drill bit** — adds a point angle (bounded 90–135°); the helix reads as a
     right-hand twist.
   - **V-bit** — a single shaft ⌀ + point angle + **rounded** tip radius (the cone
     flares exactly to the shaft). The rounded tip *cuts*, which is what lets a V-bit
     engrave.
-  - **Chamfer mill** — a cone with a flat, **non-cutting** tip (only the angled
-    flank cuts). This is exactly what separates it from a V-bit, and why it cannot
-    engrave. Both tips have a physical **minimum size** — no cutter is ground to a
-    true zero point — so a V-bit's tip radius must be ≥ 0.05 mm and a chamfer mill's
-    tip ⌀ ≥ 0.10 mm; below that the field is flagged and **Apply** stays disabled.
-  - **Face mill** — a shell mill: cutting ⌀, body height, arbor ⌀, overall, and an
+  - **Chamfer mill** — a cone with a tip diameter that may be zero, and an editable
+    flute length. A flat tip is non-cutting; the angled flank cuts up to the flute
+    length. A V-bit's tip radius must be ≥ 0.05 mm.
+  - **Face mill** — a shell mill: cutting ⌀, flute length, body height, arbor ⌀, overall, and an
     insert count drawn as a row of 90° inserts on the body.
   - **Thread mill** — a **Single-point / Full-form** toggle. Single-point (single
     profile) has a min cutting ⌀, a reduced neck (which sets the max thread depth),
@@ -385,6 +385,9 @@ a different machine legitimately changes the height of its lifts.
 **Preferences** sits beside **About**, right of the ribbon tabs. It opens a separate
 window with General, Snapping, Stock, Simulation, Shortcuts, and MCP tabs.
 
+- **Block G-code export on verification errors** is enabled by default under **General**.
+  Turn it off to allow export of completed toolpaths with stock or fixture collisions.
+  The app marks the collisions as warnings and shows a warning before the save dialog.
 - **Pickbox size** — the aperture of the square that follows the cursor during a pick.
   Its half-size is also the vertex-snap tolerance. The object-snap catch distance is
   shown beneath it but is **not separately settable**: it stays a fixed 1.5× the
@@ -479,7 +482,7 @@ on a carve means hundreds of times.
 
 **A blocked export never opens a file dialog.** The G-code is posted the moment you
 click Export, so if the job cannot be exported — a toolpath larger than the machine's
-travel, operations still marked ⚠, a rapid that would plow through uncut stock — you get
+travel, a failed toolpath run, a stock collision with blocking enabled — you get
 an error dialog *then*, and no file chooser appears. Picking a folder and a filename only
 to be refused afterwards reads as "saved", and sends you looking for a file that was
 never written. The dialog is used rather than the status line because the **Output** pane
@@ -516,8 +519,8 @@ can be hidden, and a refusal is the one message that must not be missable.
   sub-millimetre engraved groove is actually visible rather than falling between
   cells; it is capped so refining cannot turn a preview into a hang.
 - **Home → Export** posts the toolpath to the selected controller dialect. It is
-  blocked if the run had errors **or** the simulation found a rapid through stock;
-  the status line says why. Otherwise it reports the line count. Program comments are
+  blocked if the run failed, the post rejects the program, or verification finds a
+  collision with blocking enabled. The status line reports the export result. Program comments are
   reduced to printable ASCII (`°` becomes `deg`, `⌀` becomes `dia`) — grbl tolerates
   UTF-8, Fanuc/Haas controls and 7-bit DNC links often do not.
 - **Undo / Redo** step through document edits.
@@ -670,29 +673,3 @@ Run `cargo run -p cam-sim --release --example preview_bench` for a reproducible
 100 × 100 mm, eight-depth curved-cut benchmark. It reports fresh simulation,
 mesh generation, mesh memory, and median/p95 incremental frame CPU time. These
 measurements exclude toolpath generation, GPU upload and UI presentation.
-
-### Profile editor performance check
-
-With the local `testfiles/basket_1.ocam` project available, run:
-
-```bash
-cargo test -p cam-app --features gui --lib basket_ui_cpu_benchmark -- --ignored --nocapture
-```
-
-This reports CPU time for pocket/profile editor views, height validation and feed
-edits, including profile 13's expensive CAD contour. Viewport timings include the
-first geometry build; subsequent editor views exercise contour reuse. These
-measurements exclude GPU rendering and screen presentation. Changing a profile's
-source or geometry settings must refresh its contours; camera and cutting-data
-edits should reuse them.
-
-To check **new** profile creation on Body 5 (instance 8, body 5053), including
-direct loop selection, the named Chain submenu and the Silhouette submenu:
-
-```bash
-cargo test -p cam-app --features gui --lib basket_body_5_profile_creation_benchmark -- --ignored --nocapture
-```
-
-This includes the first selection and repeated validation/redraws while creating
-the operation. Feed changes must retain their current values when reusing resolved
-geometry. Source, depth and geometry-setting changes must invalidate that result.

@@ -345,6 +345,28 @@ fn clip_keeps_the_outside_portions() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn interpolated_edge_point_stays_on_boundary_after_grid_snapping() {
+    let triangle = Polygon::new(Contour::new(vec![
+        Point::new(0., 0.),
+        Point::new(3., 1.),
+        Point::new(0., 3.),
+    ]))
+    .unwrap();
+    assert_eq!(
+        triangle.locate(Point::new(1., 1. / 3.)),
+        Containment::OnBoundary
+    );
+    assert_eq!(
+        triangle.locate(Point::new(1., 1. / 3. - 0.001)),
+        Containment::Outside
+    );
+    assert_eq!(
+        triangle.locate(Point::new(1., 1. / 3. + 0.001)),
+        Containment::Inside
+    );
+}
+
+#[test]
 fn locate_classifies_inside_outside_and_boundary() {
     let s = square(0.0, 0.0, 10.0);
     assert_eq!(s.locate(Point::new(5.0, 5.0)), Containment::Inside);

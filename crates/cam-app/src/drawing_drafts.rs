@@ -67,7 +67,8 @@ impl AppController {
                 op.additional_regions = new.additional_regions;
             }
             (Operation::Drill(op), Operation::Drill(_)) => {
-                op.points = self.selected_centers(selected)?
+                op.points = self.selected_centers(selected)?;
+                op.hole_heights.clear();
             }
             (Operation::Face(op), Operation::Face(new)) => op.boundary = new.boundary,
             (Operation::Chamfer(op), Operation::Chamfer(new)) => {

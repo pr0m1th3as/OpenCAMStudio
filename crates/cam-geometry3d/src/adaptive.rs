@@ -1109,6 +1109,7 @@ mod tests {
                 revision: 1,
                 name: "test".into(),
                 source_format: CadFormat::Step,
+                source_path: None,
                 source_data: Arc::new(vec![]),
                 source_units: SourceUnits::Millimetres,
                 backend: "test".into(),

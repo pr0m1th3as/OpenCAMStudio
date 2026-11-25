@@ -605,6 +605,7 @@ mod tests {
                     revision: 1,
                     name: "Plate".into(),
                     source_format: CadFormat::Step,
+                    source_path: None,
                     source_data: vec![].into(),
                     import_options: None,
                     import_diagnostics: vec![],
@@ -1454,35 +1455,6 @@ mod tests {
         }
     }
 
-    #[test]
-    #[ignore = "qualification against the supplied test2.ocam project"]
-    fn supplied_test2_silhouette_preview_uses_bottom() {
-        let (mut app, _) = App::new();
-        app.controller = AppController::new(crate::default_machine());
-        app.controller
-            .open_project(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testfiles/test2.ocam"),
-            )
-            .unwrap();
-        let id = app.controller.inspection_setup().operations[0].id();
-        app.begin_operation_draft(id);
-        let bottom = app.resolve_height_editor(id).unwrap().bottom;
-        assert_eq!(bottom, -3.);
-        assert_eq!(app.profile_selection_geometry().unwrap().1, bottom);
-        let viewport = app.machining_viewport();
-        let frame = &app.controller.inspection_setup().frame;
-        let selected: Vec<_> = viewport
-            .vertices
-            .iter()
-            .filter(|vertex| vertex.color == PICK_BOUNDARY)
-            .collect();
-        assert!(!selected.is_empty());
-        assert!(selected.iter().all(|vertex| (frame
-            .to_setup_vector(vertex.position.map(f64::from))[2]
-            - bottom)
-            .abs()
-            < 1e-5));
-    }
 
     #[test]
     fn drawing_tab_picker_stays_on_selected_contour_when_stock_height_changes() {

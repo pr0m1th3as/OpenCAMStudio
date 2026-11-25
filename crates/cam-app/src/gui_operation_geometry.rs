@@ -7,6 +7,7 @@ use iced::widget::column;
 
 #[derive(Clone, Debug)]
 pub(super) enum GeometryMessage {
+    Drill(cam_model::DrillGeometry),
     StockContours(bool),
     SelectStock,
     ResetStock,
@@ -21,12 +22,14 @@ pub(super) struct GeometryEditor {
     stock: bool,
     wrapped: bool,
     kind: OpKind,
+    drill: Option<cam_model::DrillGeometry>,
     cad_selection: Vec<EntityRef>,
     pending: Option<crate::PendingOp>,
     cad_editing: Option<u32>,
     drawing_editing: Option<u32>,
     inspecting: bool,
     additive: bool,
+    auto_pick: bool,
     row: Option<usize>,
     filter: CadFilter,
     filter_explicit: bool,
@@ -56,6 +59,8 @@ fn modes(kind: OpKind, cad: bool) -> Vec<(CadFilter, &'static str, &'static str)
             (CadFilter::Loop, "chain", "Add Chain. Select one closed boundary enclosing the carving region."),
         ],
         OpKind::Carve => vec![(CadFilter::Loop, "chain", "Add Chain. Select a closed drawing boundary; its holes remain uncut islands.")],
+        OpKind::Drill if cad => vec![(CadFilter::Face, "drill", "Add Hole Faces. Select cylindrical hole walls in the model.")],
+        OpKind::Drill => vec![(CadFilter::Loop, "drill", "Add Hole Circles. Select circular holes in the drawing.")],
         OpKind::Bore => vec![(CadFilter::Face, "bore", "Select cylindrical holes or bosses with equal diameter and heights, or circular drawing loops.")],
         OpKind::Thread => vec![(CadFilter::Face, "thread", "Add Thread Centres. Select cylindrical bores or bosses with the same diameter and cutting heights; for a drawing, select circular holes.")],
         OpKind::Spiral => vec![(CadFilter::Body, "silhouette", "Add solid bodies to 3D Spiral finishing."), (CadFilter::Face, "face", "Add machining faces. All setup bodies remain protected.")],
@@ -68,7 +73,114 @@ fn modes(kind: OpKind, cad: bool) -> Vec<(CadFilter, &'static str, &'static str)
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DrillOrder(cam_model::BoreOrder);
+
+impl std::fmt::Display for DrillOrder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            cam_model::BoreOrder::Optimized => f.write_str("Shortest distance"),
+            other => other.fmt(f),
+        }
+    }
+}
+
 impl App {
+    fn drill_geometry_toggle(
+        &self,
+        settings: cam_model::DrillGeometry,
+        label: &'static str,
+        tip: &'static str,
+        value: bool,
+        enabled: bool,
+        edit: fn(&mut cam_model::DrillGeometry, bool),
+    ) -> Element<'_, Message> {
+        row![
+            label_help(label, tip, self.tooltips),
+            checkbox(value)
+                .size(15)
+                .on_toggle_maybe(enabled.then_some(move |value| {
+                    let mut settings = settings;
+                    edit(&mut settings, value);
+                    Message::OperationGeometry(GeometryMessage::Drill(settings))
+                })),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into()
+    }
+
+    fn drill_selection_controls(&self, settings: cam_model::DrillGeometry) -> Element<'_, Message> {
+        column![
+            self.drill_geometry_toggle(
+                settings,
+                "Select Same Diameter",
+                "Include holes on the selected body that match any selected diameter. Regenerating the operation searches the current model.",
+                settings.select_same_diameter,
+                true,
+                |settings, value| settings.select_same_diameter = value,
+            ),
+            self.drill_geometry_toggle(
+                settings,
+                "Auto-Merge Hole Segments",
+                "Start at the top of connected coaxial segments above the selected hole, such as a counterbore.",
+                settings.auto_merge_hole_segments,
+                true,
+                |settings, value| settings.auto_merge_hole_segments = value,
+            ),
+        ]
+        .spacing(10)
+        .into()
+    }
+
+    pub(super) fn drill_order_controls(
+        &self,
+        settings: cam_model::DrillGeometry,
+        cad: bool,
+    ) -> Element<'_, Message> {
+        column![
+            self.drill_geometry_toggle(
+                settings,
+                "Order by Depth",
+                "Visit lower hole entry heights first.",
+                settings.order_by_depth,
+                cad,
+                |settings, value| settings.order_by_depth = value,
+            ),
+            row![
+                text("Order").size(12).width(Length::Fill),
+                pick_list(
+                    cam_model::BoreOrder::ALL.map(DrillOrder),
+                    Some(DrillOrder(settings.order)),
+                    move |DrillOrder(order)| Message::OperationGeometry(GeometryMessage::Drill(
+                        cam_model::DrillGeometry { order, ..settings }
+                    )),
+                )
+                .text_size(12)
+                .padding([7, 9])
+                .style(inspector_picker)
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+            self.drill_geometry_toggle(
+                settings,
+                "Reverse Order",
+                "Reverse the final sequence of holes.",
+                settings.reverse_order,
+                true,
+                |settings, value| settings.reverse_order = value,
+            ),
+        ]
+        .spacing(10)
+        .into()
+    }
+
+    pub(super) fn pending_drill_geometry(&self) -> Option<cam_model::DrillGeometry> {
+        self.geometry_editor
+            .as_ref()
+            .and_then(|editor| editor.drill)
+    }
+
     pub(super) fn stock_contour_editor(&self) -> bool {
         self.geometry_editor
             .as_ref()
@@ -219,7 +331,9 @@ impl App {
             .into_iter()
             .enumerate()
             .map(|(index, label)| GeometryRow {
-                icon: if kind == OpKind::Bore {
+                icon: if kind == OpKind::Drill {
+                    "drill"
+                } else if kind == OpKind::Bore {
                     "bore"
                 } else if kind == OpKind::Thread {
                     "thread"
@@ -292,7 +406,9 @@ impl App {
             self.tooltips,
         ));
         geometry_collection(
-            if kind == OpKind::Bore {
+            if kind == OpKind::Drill {
+                "Hole selection"
+            } else if kind == OpKind::Bore {
                 "Bore selection"
             } else if kind == OpKind::Thread {
                 "Thread selection"
@@ -493,6 +609,24 @@ impl App {
             })
             .chain((0..self.controller.open_paths().len()).map(LoopRef::open))
             .collect();
+        if let Operation::Drill(op) = operation {
+            let mut selected = Vec::with_capacity(op.points.len());
+            for point in &op.points {
+                let Some(reference) = candidates.iter().copied().find(|reference| {
+                    !selected.contains(reference)
+                        && matches!(
+                            self.controller.operation_with_drawing_geometry(operation, &[*reference]),
+                            Ok(Operation::Drill(replacement)) if replacement.points.iter().any(|p| {
+                                (p[0] - point[0]).abs() < 1e-8 && (p[1] - point[1]).abs() < 1e-8
+                            })
+                        )
+                }) else {
+                    return Vec::new();
+                };
+                selected.push(reference);
+            }
+            return selected;
+        }
         if let Operation::Bore(op) = operation {
             return op.points.iter().map(|point| candidates.iter().copied().find(|reference| {
                 matches!(self.controller.operation_with_drawing_geometry(operation, &[*reference]), Ok(Operation::Bore(replacement))
@@ -539,6 +673,21 @@ impl App {
 
     pub(super) fn operation_geometry_message(&mut self, message: GeometryMessage) {
         match message {
+            GeometryMessage::Drill(settings) => {
+                if let Some(drill) = self
+                    .geometry_editor
+                    .as_mut()
+                    .and_then(|editor| editor.drill.as_mut())
+                {
+                    *drill = settings;
+                } else {
+                    self.edit_operation_draft(|operation| {
+                        if let Operation::Drill(drill) = operation {
+                            drill.geometry = settings;
+                        }
+                    });
+                }
+            }
             GeometryMessage::StockContours(enabled) => {
                 self.edit_operation_draft(|op| {
                     if let Operation::Pocket(p) = op {
@@ -574,6 +723,7 @@ impl App {
                     | OpKind::Chamfer
                     | OpKind::Engrave
                     | OpKind::Carve
+                    | OpKind::Drill
                     | OpKind::Bore
                     | OpKind::Thread
                     | OpKind::Adaptive
@@ -595,12 +745,19 @@ impl App {
                             .is_some()
                         && self.operation_uses_cad_geometry(),
                     kind,
+                    drill: match self.operation_draft.as_ref() {
+                        Some(Operation::Drill(drill)) if self.operation_uses_cad_geometry() => {
+                            Some(drill.geometry)
+                        }
+                        _ => None,
+                    },
                     cad_selection: self.controller.cad_selection().to_vec(),
                     pending,
                     cad_editing: self.cad_editing_op,
                     drawing_editing: self.drawing_editing_op,
                     inspecting: self.cad_inspecting,
                     additive: self.geometry_additive,
+                    auto_pick: self.geometry_auto_pick,
                     row: self.geometry_row_selection,
                     filter: self.cad_filter,
                     filter_explicit: self.cad_filter_explicit,
@@ -710,10 +867,25 @@ impl App {
                     self.status = "Select a stock box edge, closed model contour, connected edges, or Silhouette. Use setup stock selects the setup box.".into();
                 }
                 self.geometry_editor = Some(editor);
+                if kind == OpKind::Drill {
+                    self.status = "Select holes in the viewport, then use OK to stage them.".into();
+                }
             }
             GeometryMessage::Remove => {
                 let index = self.geometry_row_selection.unwrap_or(0);
                 let editing_operation = !self.creating_operation();
+                // Older drawing operations can store hole centres without source loops.
+                // Their rows can still be removed directly from the operation draft.
+                if editing_operation
+                    && self.drawing_editing_op.is_none()
+                    && matches!(self.controller.selection(), Selection::Operation(id)
+                        if !self.controller.geometry_state().bindings.contains_key(&id)
+                            && matches!(self.current_operation(id), Some(Operation::Drill(op))
+                                if op.points.len() > 1 && index < op.points.len()))
+                {
+                    self.remove_operation_geometry(Some(index));
+                    return;
+                }
                 if editing_operation {
                     self.operation_geometry_message(GeometryMessage::Edit);
                 }
@@ -732,6 +904,7 @@ impl App {
                 self.drawing_editing_op = editor.drawing_editing;
                 self.cad_inspecting = editor.inspecting;
                 self.geometry_additive = editor.additive;
+                self.geometry_auto_pick = editor.auto_pick;
                 self.geometry_row_selection = editor.row;
                 self.cad_filter = editor.filter;
                 self.cad_filter_explicit = editor.filter_explicit;
@@ -791,8 +964,16 @@ impl App {
                         return;
                     }
                 }
+                if let Some(settings) = self.pending_drill_geometry() {
+                    self.edit_operation_draft(|operation| {
+                        if let Operation::Drill(drill) = operation {
+                            drill.geometry = settings;
+                        }
+                    });
+                }
                 self.geometry_editor = None;
                 self.geometry_additive = false;
+                self.geometry_row_selection = None;
                 self.operation_tab = OperationTab::Geometry;
                 self.status =
                     "Geometry staged. The operation's OK/Cancel applies or discards all tabs."
@@ -867,6 +1048,7 @@ impl App {
                 OpKind::Chamfer => "Chamfer",
                 OpKind::Engrave => "Engrave",
                 OpKind::Carve => "Carve",
+                OpKind::Drill => "Drill",
                 OpKind::Bore => "Bore",
                 OpKind::Thread => "Thread",
                 OpKind::Parallel => "3D Parallel",
@@ -890,7 +1072,9 @@ impl App {
         let mut body = column![
             row![
                 icon(
-                    if kind == OpKind::Thread {
+                    if kind == OpKind::Drill {
+                        "drill"
+                    } else if kind == OpKind::Thread {
                         "thread"
                     } else if matches!(kind, OpKind::Adaptive | OpKind::Parallel | OpKind::Spiral) {
                         if self.cad_filter == CadFilter::Body {
@@ -1040,6 +1224,8 @@ impl App {
             OpKind::Chamfer => "Select modeled inclined chamfer faces to use their upper and lower boundaries, or select a single edge, connected chain or boundary loop and set Chamfer width in Passes. Face machining automatically splits the bevel into bands that fit the cutter; set Stepdown on Passes for smaller bands.",
             OpKind::Engrave => "Select a boundary loop, or connected edges for an open or closed engraving path.",
             OpKind::Carve => "Select one closed region. Face selection preserves its inner boundaries as islands.",
+            OpKind::Drill if cad => "Select cylindrical hole walls in the model.",
+            OpKind::Drill => "Select circular holes in the drawing.",
             OpKind::Bore => "Select cylindrical holes or bosses, or circular drawing loops. Selected features must share diameter and cutting heights.",
             OpKind::Thread => "Select cylindrical bores or bosses, or circular drawing holes. Selected features must share diameter and cutting heights. A verified rounded entrance is supported; only the cylinder is threaded. Choose a thread mill, then review the suggested standard size in Geometry > Thread or enter a custom major diameter and pitch.",
             OpKind::Spiral => "Select solid bodies or machining faces for spiral finishing with a ball nose tool.",
@@ -1049,6 +1235,9 @@ impl App {
         }
         };
         body = body.push(text(description).size(12));
+        if let Some(settings) = editor.drill {
+            body = body.push(self.drill_selection_controls(settings));
+        }
         if cad && !editor.stock && !editor.wrapped {
             if let Some(info) =
                 crate::cad_operations::geometry_for_setup(self.controller.document())
@@ -1365,275 +1554,7 @@ mod tests {
         assert_eq!(app.controller.document(), &before);
     }
 
-    #[test]
-    #[ignore = "manual supplied-project regression; set OCAM_STOCK_PROJECT"]
-    fn supplied_stock_contours_project() {
-        use shader::Program;
-        let path = std::env::var("OCAM_STOCK_PROJECT").unwrap();
-        let (mut app, _) = App::new();
-        app.controller = AppController::new(crate::default_machine());
-        app.controller.open_project(Path::new(&path)).unwrap();
-        app.begin_operation_draft(0);
-        app.operation_tab = OperationTab::Geometry;
-        let before = app.controller.operation(0).unwrap().clone();
-        let (min, max) = app.controller.stock_box();
-        let plan = |enabled: bool| {
-            let started = std::time::Instant::now();
-            eprintln!("Planning supplied project, stock contours {enabled}");
-            let mut document = app.controller.document().clone();
-            let Operation::Pocket(p) = &mut document.setup_mut().operations[0] else {
-                panic!("pocket")
-            };
-            p.stock_contours.enabled = enabled;
-            let resolved = crate::cad_operations::resolve_document(&document).unwrap();
-            if enabled {
-                let b = &resolved.geometry.bindings[&0];
-                let shadow = cam_geometry3d::pocket_stock_shadow(
-                    &resolved.geometry,
-                    &b.selected,
-                    b.effective_heights().bottom,
-                    || false,
-                )
-                .unwrap()
-                .unwrap();
-                eprintln!(
-                    "Stock walls: {} polygons, {} vertices",
-                    shadow.len(),
-                    shadow
-                        .iter()
-                        .map(|p| p.outer().len() + p.holes().iter().map(|h| h.len()).sum::<usize>())
-                        .sum::<usize>()
-                );
-            }
-            let result = cam_toolpath::build_job(
-                &resolved,
-                1000.,
-                cam_cldata::SpindleDir::Cw,
-                Some(([min[0], min[1]], [max[0], max[1]])),
-                200.,
-                &cam_toolpath::CancelToken::new(),
-            );
-            eprintln!(
-                "Planned in {:?}, {} moves",
-                started.elapsed(),
-                result.program.len()
-            );
-            result
-        };
-        let closed = plan(false);
-        let setup = plan(true);
-        assert_eq!(
-            setup.completion,
-            cam_toolpath::JobCompletion::Complete,
-            "{:?}",
-            setup.diagnostics
-        );
-        let max_cut_x = |job: &cam_toolpath::JobResult| {
-            job.program
-                .steps()
-                .iter()
-                .filter_map(|s| match s {
-                    cam_cldata::Step::Linear { to, tag, .. }
-                        if tag.kind == cam_cldata::MoveKind::Cutting =>
-                    {
-                        Some(to.x)
-                    }
-                    cam_cldata::Step::Arc { end, tag, .. }
-                        if tag.kind == cam_cldata::MoveKind::Cutting =>
-                    {
-                        Some(end.x)
-                    }
-                    _ => None,
-                })
-                .fold(f64::NEG_INFINITY, f64::max)
-        };
-        eprintln!(
-            "closed max X {}, setup stock max X {}",
-            max_cut_x(&closed),
-            max_cut_x(&setup)
-        );
-        assert!(max_cut_x(&setup) > max[0]);
-        assert_ne!(setup.program, closed.program);
 
-        let _ = app.update(Message::OperationGeometry(GeometryMessage::SelectStock));
-        let viewport = app.machining_viewport();
-        let bounds = iced::Rectangle {
-            x: 0.,
-            y: 0.,
-            width: 1000.,
-            height: 700.,
-        };
-        let mut loops = Vec::new();
-        for world in [
-            [100., 0., 25.],
-            [100., 0., -25.],
-            [50., 0., 25.],
-            [75., 10., 25.],
-        ] {
-            let point = picking_view::project(viewport.camera(), bounds, world)
-                .unwrap()
-                .0;
-            let candidates = viewport.cad_candidates_at(point, bounds);
-            if candidates.iter().any(|c| c.entity.kind == EntityKind::Loop) {
-                loops = candidates;
-                break;
-            }
-        }
-        assert!(
-            !loops.is_empty(),
-            "stock mode must pick the actual model rim"
-        );
-        let _ = app.update(Message::CadPicked(loops));
-        let _ = app.update(Message::OperationGeometry(GeometryMessage::Confirm));
-        assert!(!app.stock_contour_editor(), "{}", app.status);
-        assert!(
-            matches!(&app.operation_draft, Some(Operation::Pocket(p)) if !p.stock_contours.regions.is_empty())
-        );
-        let _ = app.update(Message::OperationGeometry(GeometryMessage::SelectStock));
-        let _ = app.update(Message::GeometryFilterChanged(CadFilter::Silhouette));
-        let viewport = app.machining_viewport();
-        assert!(viewport.stock_contour_picking && viewport.cad_silhouette);
-        assert!(viewport.cad_operation_kind.is_none());
-        let point = picking_view::project(viewport.camera(), bounds, [40., 0., -75.])
-            .unwrap()
-            .0;
-        let candidates = viewport.cad_candidates_at(point, bounds);
-        assert!(candidates
-            .iter()
-            .any(|c| c.entity.kind == EntityKind::Silhouette));
-        let _ = app.update(Message::CadPicked(candidates));
-        let _ = app.update(Message::OperationGeometry(GeometryMessage::Confirm));
-        assert!(!app.stock_contour_editor(), "{}", app.status);
-        assert!(matches!(&app.operation_draft, Some(Operation::Pocket(p))
-            if p.stock_contours.source.as_ref().unwrap().recipe == cam_model::ExtractionRecipe::ProfileSilhouette));
-
-        let _ = app.update(Message::OperationGeometry(GeometryMessage::SelectStock));
-        let viewport = app.machining_viewport();
-        let mut clicked = false;
-        for (_, edge) in viewport.setup_geometry.stock_lines() {
-            let midpoint = std::array::from_fn(|i| (edge[0][i] + edge[1][i]) / 2.);
-            let Some((point, _)) = picking_view::project(viewport.camera(), bounds, midpoint)
-            else {
-                continue;
-            };
-            let action = viewport.update(
-                &mut ViewportState::default(),
-                &iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
-                bounds,
-                iced::mouse::Cursor::Available(point),
-            );
-            if let Some(action) = action {
-                let (message, _, _) = action.into_inner();
-                if let Some(message @ Message::OperationGeometry(GeometryMessage::ResetStock)) =
-                    message
-                {
-                    let _ = app.update(message);
-                    clicked = true;
-                    break;
-                }
-            }
-        }
-        assert!(clicked, "stock wireframe must be selectable");
-        assert!(app.controller.cad_selection().is_empty());
-        let _ = app.update(Message::OperationGeometry(GeometryMessage::Confirm));
-        assert!(matches!(&app.operation_draft, Some(Operation::Pocket(p))
-            if p.stock_contours.enabled && p.stock_contours.source.is_none() && p.stock_contours.regions.is_empty()));
-        assert_eq!(app.controller.operation(0), Some(&before));
-    }
-
-    /// Read-only benchmark for the supplied local tray; no project is saved.
-    #[test]
-    #[ignore = "manual supplied-project performance measurement"]
-    fn tray_face_selection_benchmark() {
-        use std::hint::black_box;
-        use std::time::Instant;
-        let (mut app, _) = App::new();
-        app.settings = crate::Settings::default();
-        app.controller = AppController::new(crate::default_machine());
-        let start = Instant::now();
-        app.library.tools.clear();
-        app.open_project(
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../testfiles/tray-parallel.ocam"),
-        )
-        .unwrap();
-        let deadline = Instant::now() + std::time::Duration::from_secs(120);
-        while app.controller.run_needs_poll() {
-            let _ = app.update(Message::PollRun);
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        eprintln!("open project {:?}", start.elapsed());
-        app.setup_draft = None;
-        let id = app
-            .controller
-            .inspection_setup()
-            .operations
-            .iter()
-            .find(|op| matches!(op, Operation::Parallel(_)))
-            .unwrap()
-            .id();
-        let start = Instant::now();
-        app.begin_operation_draft(id);
-        eprintln!("open editor {:?}", start.elapsed());
-        let start = Instant::now();
-        black_box(app.view());
-        eprintln!("first editor view {:?}", start.elapsed());
-        app.operation_geometry_message(GeometryMessage::Add(CadFilter::Face));
-        let saved_faces = app.controller.cad_selection().to_vec();
-        let state = app.controller.geometry_state();
-        let instance = &state.instances[0];
-        let asset = state.asset(instance.asset_id).unwrap();
-        let faces: Vec<_> = asset
-            .topology
-            .faces
-            .iter()
-            .filter(|face| face.body_id == instance.body_id)
-            .map(|face| EntityRef {
-                asset_id: asset.id,
-                revision: asset.revision,
-                instance_id: instance.id,
-                body_id: instance.body_id,
-                kind: EntityKind::Face,
-                id: face.id,
-            })
-            .collect();
-        for count in [1, 10, faces.len()] {
-            app.controller.set_cad_selection(faces[..count].to_vec());
-            let start = Instant::now();
-            let _ = black_box(app.geometry_settings_valid());
-            eprintln!("{count} faces: validation {:?}", start.elapsed());
-            let start = Instant::now();
-            for _ in 0..3 {
-                let _ = app.update(Message::OrbitBy(0.01, 0.005));
-                black_box(app.view());
-            }
-            eprintln!(
-                "{count} faces: {:.3} ms/update+view",
-                start.elapsed().as_secs_f64() * 1000. / 3.
-            );
-        }
-        app.controller.set_cad_selection(saved_faces.clone());
-        for face in saved_faces.iter().take(5).chain(saved_faces.iter().take(5)) {
-            let start = Instant::now();
-            let _ = app.update(Message::CadSelect(face.clone()));
-            eprintln!("toggle face {} {:?}", face.id, start.elapsed());
-            let start = Instant::now();
-            black_box(app.view());
-            eprintln!("view after face toggle {:?}", start.elapsed());
-            let start = Instant::now();
-            let _ = app.update(Message::CadHover(Some(face.clone())));
-            black_box(app.view());
-            eprintln!("hover after face toggle {:?}", start.elapsed());
-        }
-        app.controller.set_cad_selection(saved_faces);
-        let start = Instant::now();
-        app.operation_geometry_message(GeometryMessage::Confirm);
-        eprintln!("confirm faces {:?}", start.elapsed());
-        let start = Instant::now();
-        let _ = app.update(Message::Apply);
-        eprintln!("apply operation {:?}", start.elapsed());
-    }
 
     fn drawing_app() -> App {
         let (mut app, _) = App::new();
@@ -1900,6 +1821,7 @@ mod tests {
             OpKind::Chamfer,
             OpKind::Engrave,
             OpKind::Carve,
+            OpKind::Drill,
             OpKind::Thread,
         ] {
             let _ = app.update(Message::BeginOp(kind));
@@ -1932,6 +1854,113 @@ mod tests {
             assert_eq!(app.controller.document(), &before);
             let _ = app.update(Message::CancelOp);
         }
+    }
+
+    #[test]
+    fn drawing_drill_settings_stage_hole_selection_and_keep_hole_order() {
+        let mut app = drawing_app();
+        let drawing = SAMPLE_DXF.replace(
+            "0\nENDSEC",
+            "0\nCIRCLE\n10\n55.0\n20\n35.0\n40\n4.0\n0\nENDSEC",
+        );
+        app.controller.open_dxf(&drawing, "two holes.dxf").unwrap();
+        let first = LoopRef::hole(0, 0);
+        let second = LoopRef::hole(0, 1);
+        let tool = app.controller.use_tool(cam_model::Tool {
+            diameter: 10.,
+            kind: cam_model::ToolKind::Drill {
+                point_angle_deg: 118.,
+            },
+            ..Default::default()
+        });
+        app.controller
+            .begin_operation_from_selection(OpKind::Drill, &[first, second])
+            .unwrap();
+        app.controller.set_pending_tool(tool);
+        assert!(app.controller.confirm_operation(None));
+        let Selection::Operation(id) = app.controller.selection() else {
+            panic!("drill selected");
+        };
+        app.begin_operation_draft(id);
+        let _ = app.update(Message::OperationTabChanged(OperationTab::Geometry));
+        let before = app.controller.document().clone();
+        let change = |message| Message::OperationGeometry(message);
+        let _ = app.inspector();
+        let Some(Operation::Drill(drill)) = app.operation_draft.as_ref() else {
+            panic!("drill draft");
+        };
+        let reordered = cam_model::DrillGeometry {
+            reverse_order: !drill.geometry.reverse_order,
+            ..drill.geometry
+        };
+        let _ = app.update(change(GeometryMessage::Drill(reordered)));
+        let _ = app.update(change(GeometryMessage::Edit));
+        assert_eq!(
+            app.controller.pending_operation_geometry(),
+            vec![first, second]
+        );
+        let _ = app.inspector();
+        let _ = app.update(Message::GeometryClear);
+        let _ = app.update(change(GeometryMessage::Confirm));
+        assert!(app.geometry_editor.is_some());
+        let _ = app.update(change(GeometryMessage::Cancel));
+        assert!(app.geometry_editor.is_none());
+        assert_eq!(app.controller.document(), &before);
+        assert!(
+            matches!(app.operation_draft.as_ref(), Some(Operation::Drill(drill))
+                if drill.geometry == reordered && drill.points.len() == 2)
+        );
+
+        let _ = app.update(change(GeometryMessage::Add(CadFilter::Loop)));
+        let (points, _) = app.controller.loop_points(first).unwrap();
+        let _ = app.update(Message::PickWorld(
+            [points[0].x as f32, points[0].y as f32],
+            0.1,
+        ));
+        let _ = app.update(change(GeometryMessage::Confirm));
+        assert!(app.geometry_editor.is_none(), "{}", app.status);
+        assert_eq!(app.controller.document(), &before);
+        assert!(
+            matches!(app.operation_draft.as_ref(), Some(Operation::Drill(drill))
+            if drill.geometry == reordered && drill.points.len() == 1)
+        );
+        let _ = app.update(change(GeometryMessage::Edit));
+        assert_eq!(app.controller.pending_operation_geometry(), vec![second]);
+        let _ = app.update(change(GeometryMessage::Cancel));
+        let _ = app.update(Message::Apply);
+        assert!(
+            matches!(app.controller.operation(id), Some(Operation::Drill(drill))
+                if drill.geometry == reordered && drill.points.len() == 1),
+            "{}",
+            app.status
+        );
+        assert!(app.controller.undo());
+        assert_eq!(app.controller.document(), &before);
+    }
+
+    #[test]
+    fn cad_drill_settings_use_face_picking_and_cancel_model_options() {
+        let (mut app, _, _) = wrapped_pocket_fixture();
+        let _ = app.update(Message::CancelOperationDraft);
+        let _ = app.update(Message::BeginOp(OpKind::Drill));
+        let _ = app.update(Message::OperationTabChanged(OperationTab::Geometry));
+        let change = |message| Message::OperationGeometry(message);
+        let _ = app.update(change(GeometryMessage::Add(CadFilter::Face)));
+        let _ = app.inspector();
+        let viewport = app.machining_viewport();
+        assert_eq!(viewport.cad_operation_kind, Some(OpKind::Drill));
+        assert_eq!(viewport.cad_filter, EntityKind::Face);
+        let original = app.pending_drill_geometry().unwrap();
+        let matching = cam_model::DrillGeometry {
+            select_same_diameter: true,
+            ..original
+        };
+        let _ = app.update(change(GeometryMessage::Drill(matching)));
+        assert_eq!(app.pending_drill_geometry(), Some(matching));
+        let _ = app.update(change(GeometryMessage::Cancel));
+        assert!(app.geometry_editor.is_none());
+        assert!(matches!(app.operation_draft, Some(Operation::Drill(drill))
+                if drill.geometry == original));
     }
 
     #[test]

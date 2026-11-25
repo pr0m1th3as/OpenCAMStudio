@@ -46,6 +46,8 @@ pub enum HeightReference {
     StockBottom,
     FixtureTop,
     FixtureBottom,
+    HoleTop,
+    HoleBottom,
     SelectedContours,
     Selection,
     Origin,
@@ -54,6 +56,10 @@ pub enum HeightReference {
 }
 impl HeightReference {
     pub fn options(plane: HeightPlaneKind) -> Vec<Self> {
+        Self::options_for(plane, None)
+    }
+
+    pub fn options_for(plane: HeightPlaneKind, operation: Option<&Operation>) -> Vec<Self> {
         let mut choices: Vec<_> = HeightPlaneKind::ALL
             .into_iter()
             .filter(|p| *p != plane)
@@ -69,6 +75,11 @@ impl HeightReference {
             Self::StockBottom,
             Self::FixtureTop,
             Self::FixtureBottom,
+        ]);
+        if matches!(operation, Some(Operation::Drill(_))) {
+            choices.extend([Self::HoleTop, Self::HoleBottom]);
+        }
+        choices.extend([
             Self::SelectedContours,
             Self::Selection,
             Self::Origin,
@@ -90,6 +101,8 @@ impl std::fmt::Display for HeightReference {
                 Self::StockBottom => "Stock bottom",
                 Self::FixtureTop => "Fixture top",
                 Self::FixtureBottom => "Fixture bottom",
+                Self::HoleTop => "Hole top",
+                Self::HoleBottom => "Hole bottom",
                 Self::SelectedContours => "Selected contour(s)",
                 Self::Selection => "Selection",
                 Self::Origin => "Origin (absolute)",
@@ -212,7 +225,61 @@ impl ResolvedOperationHeights {
         Ok(())
     }
 }
+
+struct HeightContext<'a> {
+    document: &'a Document,
+    operation: &'a Operation,
+    hole: Option<CuttingHeights>,
+    model_min: [f64; 3],
+    model_max: [f64; 3],
+    stock_min: [f64; 3],
+    stock_max: [f64; 3],
+}
+
+impl<'a> HeightContext<'a> {
+    fn new(document: &'a Document, operation: &'a Operation) -> Self {
+        let (model_min, model_max) = document.height_model_bounds();
+        let (stock_min, stock_max) = document.stock_bounds_for(document.setup());
+        Self {
+            document,
+            operation,
+            hole: None,
+            model_min,
+            model_max,
+            stock_min,
+            stock_max,
+        }
+    }
+}
+
 impl OperationHeightSettings {
+    pub fn for_operation(operation: &Operation) -> Self {
+        let mut settings = Self::default();
+        if matches!(operation, Operation::Drill(_)) {
+            *settings.definition_mut(HeightPlaneKind::Top) =
+                HeightDefinition::new(HeightReference::HoleTop, 0.);
+            *settings.definition_mut(HeightPlaneKind::Bottom) =
+                HeightDefinition::new(HeightReference::HoleBottom, 0.);
+        }
+        settings
+    }
+
+    pub fn uses_hole_references(&self) -> bool {
+        let is_hole = |reference| {
+            matches!(
+                reference,
+                HeightReference::HoleTop | HeightReference::HoleBottom
+            )
+        };
+        self.planes.iter().any(|definition| {
+            is_hole(definition.reference)
+                || (matches!(
+                    definition.reference,
+                    HeightReference::Highest | HeightReference::Lowest
+                ) && definition.sources.iter().copied().any(is_hole))
+        })
+    }
+
     pub fn definition(&self, plane: HeightPlaneKind) -> &HeightDefinition {
         &self.planes[plane.index()]
     }
@@ -264,19 +331,59 @@ impl OperationHeightSettings {
             return self.resolve(&view, operation);
         }
         self.validate_structure()?;
+        self.resolve_in_context(&HeightContext::new(document, operation))
+    }
+
+    /// Cutting planes follow each modeled hole. Use common safety planes high
+    /// enough for every site so all traverses share the same safe envelope.
+    pub fn resolve_drill_holes(
+        &self,
+        document: &Document,
+        operation: &Operation,
+        holes: &[CuttingHeights],
+    ) -> Result<(ResolvedOperationHeights, Vec<CuttingHeights>), String> {
+        if let Some(view) = document.indexed_view(operation.id())? {
+            return self.resolve_drill_holes(&view, operation, holes);
+        }
+        self.validate_structure()?;
+        let mut context = HeightContext::new(document, operation);
+        let mut cutting = Vec::with_capacity(holes.len());
+        let mut per_hole = holes.iter().map(|&hole| {
+            context.hole = Some(hole);
+            let heights = self.resolve_in_context(&context)?;
+            cutting.push(heights.cutting());
+            Ok::<_, String>(heights)
+        });
+        let mut common = per_hole.next().ok_or("Select hole faces")??;
+        for heights in per_hole {
+            let heights = heights?;
+            common.clearance = common.clearance.max(heights.clearance);
+            common.retract = common.retract.max(heights.retract);
+            common.feed = common.feed.zip(heights.feed).map(|(a, b)| a.max(b));
+            common.top = common.top.max(heights.top);
+            common.bottom = common.bottom.min(heights.bottom);
+        }
+        Ok((common, cutting))
+    }
+
+    fn resolve_in_context(
+        &self,
+        context: &HeightContext<'_>,
+    ) -> Result<ResolvedOperationHeights, String> {
         let mut values = [None; 5];
         let mut visiting = [false; 5];
         for p in HeightPlaneKind::ALL {
-            self.resolve_plane(p, document, operation, &mut values, &mut visiting)?;
+            self.resolve_plane(p, context, &mut values, &mut visiting)?;
         }
+        let document = context.document;
+        let operation = context.operation;
         let stock_top = if let Some(wrap) = operation.rotary_wrap() {
             wrap.stock_top(document)?
         } else {
-            let (model_min, model_max) = document.height_model_bounds();
             document
                 .setup()
                 .stock
-                .resolve_bounds(model_min, model_max)
+                .resolve_bounds(context.model_min, context.model_max)
                 .1[2]
         };
         let resolved = ResolvedOperationHeights {
@@ -301,8 +408,7 @@ impl OperationHeightSettings {
     fn resolve_plane(
         &self,
         p: HeightPlaneKind,
-        doc: &Document,
-        op: &Operation,
+        context: &HeightContext<'_>,
         values: &mut [Option<f64>; 5],
         visiting: &mut [bool; 5],
     ) -> Result<Option<f64>, String> {
@@ -318,7 +424,7 @@ impl OperationHeightSettings {
             return Ok(None);
         }
         visiting[i] = true;
-        let base = self.resolve_reference(d.reference, d, doc, op, values, visiting)?;
+        let base = self.resolve_reference(d.reference, d, context, values, visiting)?;
         let z = base + d.offset;
         if !z.is_finite() {
             return Err(format!("{p}: resolved height is not finite"));
@@ -331,12 +437,13 @@ impl OperationHeightSettings {
         &self,
         reference: HeightReference,
         d: &HeightDefinition,
-        doc: &Document,
-        op: &Operation,
+        context: &HeightContext<'_>,
         values: &mut [Option<f64>; 5],
         visiting: &mut [bool; 5],
     ) -> Result<f64, String> {
         use HeightReference::*;
+        let doc = context.document;
+        let op = context.operation;
         let setup = doc.setup();
         if let Some(wrap) = op.rotary_wrap() {
             match reference {
@@ -354,19 +461,37 @@ impl OperationHeightSettings {
                 _=>{}
             }
         }
-        let (model_min, model_max) = doc.height_model_bounds();
-        let (stock_min, stock_max) = doc.stock_bounds_for(setup);
         Ok(match reference {
             Plane(p) => self
-                .resolve_plane(p, doc, op, values, visiting)?
+                .resolve_plane(p, context, values, visiting)?
                 .ok_or("A height cannot reference disabled feed height")?,
             Disabled => return Err("Disabled height cannot be a reference".into()),
-            ModelTop => model_max[2],
-            ModelBottom => model_min[2],
-            StockTop => stock_max[2],
-            StockBottom => stock_min[2],
+            ModelTop => context.model_max[2],
+            ModelBottom => context.model_min[2],
+            StockTop => context.stock_max[2],
+            StockBottom => context.stock_min[2],
             Origin => setup.origin_position(op.work_offset())[2],
-            SelectedContours => doc.selected_contour_height(op)?,
+            HoleTop | HoleBottom => {
+                if !matches!(op, Operation::Drill(_)) {
+                    return Err("Hole height references require a Drill operation".into());
+                }
+                let hole = context.hole.unwrap_or_else(|| {
+                    doc.geometry
+                        .bindings
+                        .get(&op.id())
+                        .map(|binding| binding.effective_heights())
+                        .unwrap_or_else(|| doc.operation_base_cutting_heights(op))
+                });
+                if reference == HoleTop {
+                    hole.top
+                } else {
+                    hole.bottom
+                }
+            }
+            SelectedContours => match context.hole {
+                Some(hole) => hole.bottom,
+                None => doc.selected_contour_height(op)?,
+            },
             Selection | FixtureTop | FixtureBottom => {
                 let (min, max) = doc.height_definition_bounds(d)?;
                 if reference == Selection && (max[2] - min[2]).abs() > 1e-5 {
@@ -387,7 +512,7 @@ impl OperationHeightSettings {
                             let (min, max) = doc.height_definition_bounds(d)?;
                             Ok(if reference == Highest { max[2] } else { min[2] })
                         } else {
-                            self.resolve_reference(*source, d, doc, op, values, visiting)
+                            self.resolve_reference(*source, d, context, values, visiting)
                         }
                     })
                     .collect::<Result<Vec<_>, String>>()?;
@@ -1043,6 +1168,10 @@ mod tests {
     fn doc() -> Document {
         let mut doc:Document=serde_json::from_value(serde_json::json!({"schema_version":18,"setups":[{"id":1,"name":"reference test","heights":{"clearance":5.,"retract":2.,"top_of_stock":0.},"stock":{"BoundingBox":{"x_offset":0.,"y_offset":0.,"top":10.,"thickness":15.}},"tools":[],"operations":[]}]})).unwrap();
         doc.setup_mut().operations.push(Operation::Drill(DrillOp {
+            cycle: Default::default(),
+            tip_through_bottom: false,
+            geometry: Default::default(),
+            hole_heights: Vec::new(),
             parameter_expressions: Default::default(),
             id: 1,
             tool: 1,
@@ -1117,6 +1246,7 @@ mod tests {
             revision: 1,
             name: "Round part".into(),
             source_format: CadFormat::Step,
+            source_path: None,
             source_data: vec![].into(),
             source_units: SourceUnits::Millimetres,
             backend: "test".into(),
@@ -1327,6 +1457,7 @@ mod tests {
             revision: 1,
             name: "fixture".into(),
             source_format: CadFormat::Step,
+            source_path: None,
             source_data: vec![].into(),
             source_units: SourceUnits::Millimetres,
             backend: "height test".into(),

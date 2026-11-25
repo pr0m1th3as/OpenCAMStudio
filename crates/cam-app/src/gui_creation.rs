@@ -95,6 +95,7 @@ impl App {
         self.operation_geometry = None;
         let mut operation = self.controller.operation_template(kind, 0);
         Self::seed_programmed_parameter_defaults(&mut operation);
+        let settings = cam_model::OperationHeightSettings::for_operation(&operation);
         self.operation_draft = Some(operation);
         self.stock_to_leave_draft = Some(
             self.controller
@@ -105,7 +106,6 @@ impl App {
         );
         self.stock_to_leave_initialized = self.stock_to_leave_value().enabled;
         self.height_draft_id = Some(0);
-        let settings = cam_model::OperationHeightSettings::default();
         self.height_offsets = cam_model::HeightPlaneKind::ALL
             .into_iter()
             .map(|p| (p, fmt_num(settings.definition(p).offset)))
@@ -127,6 +127,10 @@ impl App {
         use cam_model::OperationParameter as Parameter;
 
         let kind = AppController::operation_kind(op);
+        if let Operation::Drill(drill) = op {
+            drill.geometry.order = cam_model::BoreOrder::Optimized;
+            drill.set_cycle_mode(cam_model::DrillCycleMode::RapidOut);
+        }
         if let Operation::Pocket(pocket) = op {
             pocket.clear.adaptive_enabled = Some(false);
             Parameter::Engagement.set_source(op, DEFAULT_POCKET_ENGAGEMENT);
@@ -240,6 +244,11 @@ impl App {
             .operation_draft
             .clone()
             .ok_or("Operation unavailable")?;
+        if let (Operation::Drill(drill), Some(settings)) =
+            (&mut draft, self.pending_drill_geometry())
+        {
+            drill.geometry = settings;
+        }
         self.wizard_tool().ok_or("Choose a cutter")?;
         self.wizard_cutting().ok_or("Enter valid cutting data")?;
         let fields = self
@@ -321,7 +330,26 @@ impl App {
                     op.additional_regions = new.additional_regions;
                 }
                 (Operation::Face(op), Operation::Face(new)) => op.boundary = new.boundary,
-                (Operation::Drill(op), Operation::Drill(new)) => op.points = new.points,
+                (Operation::Drill(op), Operation::Drill(new)) => {
+                    if op.geometry.uses_model_heights()
+                        || self
+                            .height_draft
+                            .as_ref()
+                            .is_some_and(cam_model::OperationHeightSettings::uses_hole_references)
+                    {
+                        let geometry =
+                            crate::cad_operations::geometry_for_operation(&document, op.id)?;
+                        let holes = cam_geometry3d::drill_holes(&geometry, &binding, op.geometry)?;
+                        binding.heights = crate::cad_operations::apply_drill_holes(
+                            op,
+                            &holes,
+                            self.controller.stock_box().1[2],
+                        )?;
+                    } else {
+                        op.points = new.points;
+                        op.hole_heights.clear();
+                    }
+                }
                 (Operation::Chamfer(op), Operation::Chamfer(new)) => {
                     op.chain = new.chain;
                     op.closed = new.closed;
@@ -434,9 +462,12 @@ impl App {
                 if let Some(binding) = binding {
                     document.geometry.bindings.insert(0, binding);
                 }
-                self.edited_height_settings()?
-                    .resolve(&document, &op)
-                    .map(|_| ())
+                crate::cad_operations::resolve_height_settings(
+                    &document,
+                    &op,
+                    &self.edited_height_settings()?,
+                )
+                .map(|_| ())
             })
             .is_ok()
     }

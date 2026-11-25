@@ -197,6 +197,10 @@ pub(super) fn operation_field_invalid(op: &Operation, field: Field, value: f64) 
         return true;
     }
     match field {
+        Field::Peck if matches!(op, Operation::Drill(drill) if drill.cycle_mode().pecks()) => {
+            value <= 0.
+        }
+        Field::MinimumPeck | Field::ChipBreakDistance => value <= 0.,
         Field::ContourRoughStepover | Field::ContourRoughSmoothing | Field::PocketStepover => {
             value <= 0.
         }
@@ -450,6 +454,7 @@ impl App {
             match tab {
                 OperationTab::Tool => Some("Tool"),
                 OperationTab::Geometry => Some("Geometry"),
+                OperationTab::Passes if matches!(op, Operation::Drill(_)) => Some("Cycle"),
                 OperationTab::Passes => Some("Passes"),
                 OperationTab::MultiAxis => Some("Multi-axis"),
                 OperationTab::Heights | OperationTab::Linking => None,
@@ -583,7 +588,10 @@ impl App {
                     "Projected facing boundary".into()
                 }
                 Operation::Face(_) => "Rectangular facing boundary".into(),
-                Operation::Drill(o) => format!("{} hole centres", o.points.len()),
+                Operation::Drill(o) => linked.map_or_else(
+                    || format!("{} hole centres", o.points.len()),
+                    |binding| format!("{} selected hole face(s)", binding.selected.len()),
+                ),
                 Operation::Bore(o) => format!("{} bore centres", o.points.len()),
                 Operation::Thread(o) => format!("{} thread centres", o.points.len()),
                 Operation::Parallel(_) | Operation::Spiral(_) | Operation::Adaptive(_) => linked
@@ -611,14 +619,25 @@ impl App {
                 list = list.push(self.geometry_list(operation_geometry_labels(op)));
             }
         }
-
+        if let (OperationTab::Geometry, Operation::Drill(drill)) = (tab, op) {
+            list = list.section("Geometry").push(self.drill_order_controls(
+                drill.geometry,
+                linked.is_some() || self.operation_uses_cad_geometry(),
+            ));
+        }
         if tab == OperationTab::Heights {
             list = list.push(self.reference_height_controls(id));
         }
         if tab == OperationTab::Linking {
             list = list.push(self.operation_linking_controls(op, linked.is_some()));
         }
+        if let (OperationTab::Passes, Operation::Drill(drill)) = (tab, op) {
+            list = list.push(self.drill_cycle_controls(drill));
+        }
         for field in self.geometry_operation_fields(op) {
+            if drill_cycle::FIELDS.contains(&field) {
+                continue;
+            }
             if matches!(field, Field::Wrap(_)) {
                 continue;
             }
@@ -691,8 +710,7 @@ impl App {
                     continue;
                 }
             }
-            let preset_parameter =
-                tab == OperationTab::Tool && matches!(field, Field::Peck | Field::ChamferStep);
+            let preset_parameter = tab == OperationTab::Tool && field == Field::ChamferStep;
             if (!preset_parameter && field_tab(field) != tab) || is_clear_field(field) {
                 continue;
             }
@@ -1505,6 +1523,11 @@ impl App {
             .current_operation(id)
             .cloned()
             .ok_or("Operation unavailable")?;
+        if let (Operation::Drill(drill), Some(settings)) =
+            (&mut operation, self.pending_drill_geometry())
+        {
+            drill.geometry = settings;
+        }
         let fields = self
             .inspector_fields()
             .into_iter()
@@ -2340,6 +2363,7 @@ mod tests {
                     revision: 1,
                     name: "Analytic test plate".into(),
                     source_format: CadFormat::Step,
+                    source_path: None,
                     source_data: vec![].into(),
                     import_options: None,
                     import_diagnostics: vec![],

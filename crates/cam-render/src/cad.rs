@@ -990,6 +990,7 @@ mod tests {
                 revision: 1,
                 name: "part".into(),
                 source_format: CadFormat::Step,
+                source_path: None,
                 source_data: vec![].into(),
                 source_units: SourceUnits::Millimetres,
                 backend: "fixture".into(),

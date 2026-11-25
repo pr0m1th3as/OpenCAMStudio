@@ -7,7 +7,14 @@ use rayon::prelude::*;
 #[derive(Clone, Copy)]
 struct Corner {
     xy: [f32; 2],
-    normal: Option<[f32; 3]>,
+    wall_normal: Option<[f32; 2]>,
+    flat_cut_rim: bool,
+}
+
+impl Corner {
+    fn separates(&self, lower: f32, upper: f32, stock_top: f32, wall_step: f32) -> bool {
+        upper - lower > wall_step || (self.flat_cut_rim && lower < stock_top && upper == stock_top)
+    }
 }
 
 // Sweeps near each mesh tile, used to reconstruct the union of overlapping
@@ -275,31 +282,32 @@ impl Heightfield {
     fn contour_corner(&self, x: usize, y: usize, wall_step: f32, sweeps: &SweepIndex) -> Corner {
         let mut corner = Corner {
             xy: self.grid_xy(x, y),
-            normal: None,
+            wall_normal: None,
+            flat_cut_rim: false,
         };
-        if x == 0 || y == 0 || x == self.nx || y == self.ny {
-            return corner;
-        }
-        let ids = [
-            (y - 1) * self.nx + x - 1,
-            (y - 1) * self.nx + x,
-            y * self.nx + x,
-            y * self.nx + x - 1,
-        ];
+        let left = x.saturating_sub(1);
+        let right = x.min(self.nx - 1);
+        let below = y.saturating_sub(1) * self.nx;
+        let above = y.min(self.ny - 1) * self.nx;
+        let ids = [below + left, below + right, above + right, above + left];
         let heights = ids.map(|i| self.z[i]);
         if heights.iter().all(|&z| z == heights[0]) {
             return corner;
         }
-        let mut sorted = heights;
-        sorted.sort_unstable_by(f32::total_cmp);
-        let (gap, split) = (0..3)
-            .map(|i| (sorted[i + 1] - sorted[i], i))
-            .max_by(|a, b| a.0.total_cmp(&b.0))
-            .unwrap();
-        if gap <= wall_step {
+        corner.flat_cut_rim = self.flat_cut_rim(ids, heights);
+        if x == 0 || y == 0 || x == self.nx || y == self.ny {
             return corner;
         }
-        let level = f64::from((sorted[split] + sorted[split + 1]) * 0.5);
+        let mut sorted = heights;
+        sorted.sort_unstable_by(f32::total_cmp);
+        let Some([lower, upper]) = (0..3)
+            .map(|i| [sorted[i], sorted[i + 1]])
+            .filter(|&[low, high]| corner.separates(low, high, self.top, wall_step))
+            .max_by(|a, b| (a[1] - a[0]).total_cmp(&(b[1] - b[0])))
+        else {
+            return corner;
+        };
+        let level = (f64::from(lower) + f64::from(upper)) * 0.5;
         let low = heights.map(|h| f64::from(h) < level);
         // A saddle contains two separate contours; a single dual vertex must not
         // connect the two voids or erase the intervening material.
@@ -406,14 +414,48 @@ impl Heightfield {
             });
             let len = normal[0].hypot(normal[1]);
             if len > 1e-9 {
-                corner.normal = Some([(normal[0] / len) as f32, (normal[1] / len) as f32, 0.]);
+                corner.wall_normal = Some([(normal[0] / len) as f32, (normal[1] / len) as f32]);
             }
         }
         corner
     }
+
+    fn flat_cut_rim(&self, ids: [usize; 4], heights: [f32; 4]) -> bool {
+        if !self.uncut_z.is_empty() || !heights.contains(&self.top) {
+            return false;
+        }
+        // A flat cutter can leave a vertical wall even when the cut is shallow.
+        // Use the footprint to distinguish its rim from a ramp meeting the stock plane.
+        (0..4).any(|i| {
+            let j = (i + 1) % 4;
+            let (low, high) = if heights[i] < heights[j] {
+                (i, j)
+            } else {
+                (j, i)
+            };
+            heights[low] < self.top
+                && heights[high] == self.top
+                && self
+                    .cuts
+                    .get(self.winners[ids[low]] as usize)
+                    .is_some_and(|cut| {
+                        let (cx, cy) = self.center(ids[high] % self.nx, ids[high] / self.nx);
+                        cut.tool.shape == crate::ProfileShape::Flat
+                            && cut.projection(cx, cy).1 > cut.tool.radius.powi(2)
+                    })
+        })
+    }
+
     /// Surface at a shared corner, excluding neighbours across a vertical wall.
     /// Compatible slopes share heights and normals, so curved floors shade smoothly.
-    fn corner_surface(&self, x: usize, y: usize, z: f32, wall_step: f32) -> (f32, [f32; 3], bool) {
+    fn corner_surface(
+        &self,
+        x: usize,
+        y: usize,
+        z: f32,
+        wall_step: f32,
+        corner: Corner,
+    ) -> (f32, [f32; 3], bool) {
         let (x, y) = (x as isize, y as isize);
         let mut h =
             [(x - 1, y - 1), (x, y - 1), (x, y), (x - 1, y)].map(|(i, j)| self.height(i, j));
@@ -422,7 +464,7 @@ impl Heightfield {
         let mut low = f32::NEG_INFINITY;
         let mut high = f32::INFINITY;
         for pair in sorted.windows(2) {
-            if pair[1] - pair[0] > wall_step {
+            if corner.separates(pair[0], pair[1], self.top, wall_step) {
                 if z <= pair[0] {
                     high = high.min(pair[0]);
                 }
@@ -614,7 +656,10 @@ impl Heightfield {
                 }
                 let coords = [(x, y), (x + 1, y), (x + 1, y + 1), (x, y + 1)];
                 let c = coords.map(|(i, j)| corners[(j - y0) * corner_width + i - x0]);
-                let h = coords.map(|(i, j)| self.corner_surface(i, j, z, wall_step));
+                let h = std::array::from_fn(|i| {
+                    let (x, y) = coords[i];
+                    self.corner_surface(x, y, z, wall_step, c[i])
+                });
                 let p: [[f32; 3]; 4] =
                     std::array::from_fn(|i| [c[i].xy[0], c[i].xy[1], h[i].0.max(f)]);
                 if !interior {
@@ -642,18 +687,23 @@ impl Heightfield {
                     (3, 2, 0, 1, [0., 1., 0.]),
                 ] {
                     let nb = self.height(x as isize + dx, y as isize + dy);
-                    if nb.is_some_and(|v| v > f + 1e-4 && z - v <= wall_step) {
+                    if nb.is_some_and(|v| {
+                        v > f + 1e-4
+                            && !c[a].separates(v, z, self.top, wall_step)
+                            && !c[b].separates(v, z, self.top, wall_step)
+                    }) {
                         continue;
                     }
                     let lower = |i: usize| {
                         nb.map_or(f, |v| {
                             let (cx, cy) = coords[i];
-                            self.corner_surface(cx, cy, v, wall_step).0.max(f)
+                            self.corner_surface(cx, cy, v, wall_step, c[i]).0.max(f)
                         })
                     };
                     let n = |i: usize| {
-                        c[i].normal
+                        c[i].wall_normal
                             .filter(|n| n[0] * axis[0] + n[1] * axis[1] > 0.01)
+                            .map(|[nx, ny]| [nx, ny, 0.])
                             .unwrap_or(axis)
                     };
                     let top = [p[a], p[b]];
