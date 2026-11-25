@@ -243,6 +243,7 @@ pub(super) struct ViewportKey {
     hidden: Vec<u32>,
     model_view: bool,
     tree_body: Option<InstanceId>,
+    scale_preview: Option<scale_view::ScalePreview>,
     show_stock: bool,
     show_origin: bool,
     envelope: Option<[f32; 3]>,
@@ -422,6 +423,7 @@ impl App {
             return;
         }
         if self.setup_draft_dirty()
+            || self.scale_draft.is_some()
             || !self.tool_drafts.is_empty()
             || self.inspector_dirty()
             || self.any_field_invalid()
@@ -619,7 +621,8 @@ impl App {
 
     pub(super) fn machining_viewport(&self) -> Viewport {
         let mut cad_hidden = self.viewport_hidden_instances();
-        if self
+        let scale_preview = self.scale_draft.as_ref().map(scale_view::ScaleDraft::preview);
+        if scale_preview.is_none() && self
             .simulation
             .as_ref()
             .is_some_and(|p| !p.options.show_model)
@@ -639,7 +642,9 @@ impl App {
                     .map(|i| i.id),
             );
         }
-        let model_view = self.model_view.is_some() || self.controller.setups().is_empty();
+        let model_view = scale_preview.is_some()
+            || self.model_view.is_some()
+            || self.controller.setups().is_empty();
         let hidden: Vec<_> = self
             .controller
             .setups()
@@ -703,6 +708,7 @@ impl App {
             hidden: hidden.clone(),
             model_view,
             tree_body,
+            scale_preview,
             show_stock: self.show_stock,
             show_origin: self.show_origin,
             envelope: self.show_envelope.then(|| {
@@ -820,6 +826,7 @@ impl App {
                 ),
                 self.setup_draft.as_ref(),
                 tree_body,
+                scale_preview,
             );
             if let Some(player) = self.simulation.as_ref().filter(|_| !model_view && !editing) {
                 if player.options.rotary_view
@@ -1004,6 +1011,9 @@ impl App {
         );
         if self.move_draft.is_some() {
             viewport.frame_bounds = self.cached_cad_scene(&cad_hidden).bounds();
+        }
+        if let Some(draft) = &self.scale_draft {
+            viewport.frame_bounds = union_bounds(viewport.bounds, Some(draft.original_frame()));
         }
         if self.pattern_draft.is_some() {
             viewport.frame_bounds = union_bounds(viewport.frame_bounds, viewport.bounds);
@@ -2522,6 +2532,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         viewport.browser_overlay_width = 250.;
         let bounds = iced::Rectangle {
@@ -2633,6 +2644,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let bounds = iced::Rectangle {
             x: 0.,
@@ -2707,6 +2719,7 @@ mod tests {
             None,
             false,
             true,
+            None,
             None,
             None,
             None,
@@ -3089,6 +3102,7 @@ mod performance_tests {
                 None,
                 false,
                 false,
+                None,
                 None,
                 None,
                 None,

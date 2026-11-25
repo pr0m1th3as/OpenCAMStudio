@@ -31,6 +31,8 @@ use cam_toolpath::{CancelToken, Diagnostic, JobCompletion, Severity};
 mod cad_creation;
 #[path = "drawing_drafts.rs"]
 mod drawing_drafts;
+#[path = "geometry_scaling.rs"]
+mod geometry_scaling;
 
 #[path = "commands.rs"]
 mod commands;
@@ -268,6 +270,7 @@ pub struct AppController {
     cad_selection: Vec<cam_model::EntityRef>,
     import_jobs: crate::import_jobs::ImportJobs<crate::cad_operations::PreparedImport>,
     document_epoch: u64,
+    cad_revision_floor: u64,
     import_preview: Option<(u64, crate::cad_operations::PreparedImport)>,
     import_update: Option<CadModelUpdate>,
     jobs: crate::jobs::JobService,
@@ -597,6 +600,7 @@ impl AppController {
             cad_selection: Vec::new(),
             import_jobs: Default::default(),
             document_epoch: 0,
+            cad_revision_floor: 0,
             import_preview: None,
             import_update: None,
             jobs: Default::default(),
@@ -781,11 +785,8 @@ impl AppController {
         Ok(self.regions.len())
     }
 
-    /// Import a CAD file (`.dxf` ASCII/binary or `.dwg`) via acadrust, replacing
-    /// any current drawing with **geometry only** — no operations are fabricated;
-    /// the user creates them by picking boundaries. Returns the region count. This
-    /// does not set the project path — an imported drawing is saved as a new
-    /// `.ocam` project.
+    /// Add CAD geometry to the current project. Returns the number of imported
+    /// drawing contours and paths, or the number of solid body instances.
     pub fn import_cad(&mut self, path: impl AsRef<Path>) -> Result<usize, ImportError> {
         let prepared =
             crate::cad_operations::prepare_import(path.as_ref()).map_err(ImportError::Io)?;
@@ -921,12 +922,13 @@ impl AppController {
             let id = update.asset_id();
             match prepared {
                 crate::cad_operations::PreparedImport::Solid { asset, instances } => {
-                    let mut existing: Vec<_> = self
-                        .geometry_state()
+                    let geometry = self.geometry_state();
+                    let previous = geometry.asset(id).ok_or("Missing CAD asset")?;
+                    let mut existing: Vec<_> = geometry
                         .instances
                         .iter()
                         .filter(|i| i.asset_id == id)
-                        .map(|i| i.body_id)
+                        .map(|i| previous.topology.source_body_id(i.body_id))
                         .collect();
                     let mut imported: Vec<_> = instances.iter().map(|i| i.body_id).collect();
                     existing.sort_unstable();
@@ -959,11 +961,20 @@ impl AppController {
         match prepared {
             crate::cad_operations::PreparedImport::Drawing { import, name } => {
                 let count = import.regions.len() + import.open_chains.len();
+                let mut drawings = self.drawing_records();
+                if count != 0 {
+                    drawings.push(cam_model::Drawing {
+                        name: name.clone(),
+                        regions: import.regions.len(),
+                        paths: import.open_chains.len(),
+                    });
+                }
                 if self.source_name.is_empty() {
                     self.source_name = name;
                     self.project_view = None;
                 }
                 self.edit_document(move |doc| {
+                    doc.drawings = drawings;
                     doc.geometry.drawing_regions.extend(import.regions);
                     doc.geometry.drawing_paths.extend(import.open_chains);
                 });
@@ -1353,7 +1364,7 @@ impl AppController {
             replacement.topology = old.topology.clone();
             old.revision
         } else {
-            old.revision + 1
+            self.next_cad_revision(old.revision)?
         };
         if replacement == *old {
             return Ok(());
@@ -1369,7 +1380,7 @@ impl AppController {
                     .topology
                     .bodies
                     .iter()
-                    .any(|b| b.id == i.body_id)
+                    .any(|b| b.id == old.topology.source_body_id(i.body_id))
             })
         {
             return Err(
@@ -1425,8 +1436,14 @@ impl AppController {
                 };
             }
         }
+        let revision = replacement.revision;
         if let Some(asset) = preview.assets.iter_mut().find(|a| a.id == id) {
             *asset = replacement;
+        }
+        if !keep_references {
+            for instance in preview.instances.iter_mut().filter(|i| i.asset_id == id) {
+                instance.body_id = old.topology.source_body_id(instance.body_id);
+            }
         }
         preview.validate()?;
         self.edit_document(move |doc| {
@@ -1436,8 +1453,16 @@ impl AppController {
             }
         });
         self.cad_selection.clear();
+        self.cad_revision_floor = self.cad_revision_floor.max(revision);
         self.invalidate();
         Ok(())
+    }
+
+    fn next_cad_revision(&self, previous: u64) -> Result<u64, String> {
+        previous
+            .max(self.cad_revision_floor)
+            .checked_add(1)
+            .ok_or_else(|| "CAD model revision exhausted".into())
     }
     pub fn remove_cad_asset(&mut self, id: u64) -> bool {
         if self.geometry_state().asset(id).is_none() {
@@ -1484,6 +1509,13 @@ impl AppController {
         let mut document = self.generate_document(seed_ops);
         document.geometry.drawing_regions = self.regions.clone();
         document.geometry.drawing_paths = self.open_paths.clone();
+        if !self.regions.is_empty() || !self.open_paths.is_empty() {
+            document.drawings.push(cam_model::Drawing {
+                name: self.source_name.clone(),
+                regions: self.regions.len(),
+                paths: self.open_paths.len(),
+            });
+        }
         self.operation_cache = Default::default();
         self.toolpath_fingerprints.clear();
         self.saved_verification.clear();
@@ -1564,6 +1596,7 @@ impl AppController {
         document.operation_id_floor = 0;
         document.setup_id_floor = 0;
         document.asset_id_floor = 0;
+        document.cad_revision_floor = 0;
         document.instance_id_floor = 0;
         document.pattern_id_floor = 0;
         ProjectSnapshot {
@@ -1592,6 +1625,7 @@ impl AppController {
         let op_floor = self.operation_id_floor;
         let setup_floor = self.setup_id_floor;
         let asset_floor = self.asset_id_floor;
+        let cad_revision_floor = self.cad_revision_floor;
         let instance_floor = self.instance_id_floor;
         let pattern_floor = self.pattern_id_floor;
         self.document.update_view(|doc| {
@@ -1599,6 +1633,7 @@ impl AppController {
             doc.operation_id_floor = doc.operation_id_floor.max(op_floor);
             doc.setup_id_floor = doc.setup_id_floor.max(setup_floor);
             doc.asset_id_floor = doc.asset_id_floor.max(asset_floor);
+            doc.cad_revision_floor = doc.cad_revision_floor.max(cad_revision_floor);
             doc.instance_id_floor = doc.instance_id_floor.max(instance_floor);
             doc.pattern_id_floor = doc.pattern_id_floor.max(pattern_floor);
         });
@@ -1657,8 +1692,6 @@ impl AppController {
         }
         self.cancel_cad_import();
         self.cad_selection.clear();
-        self.regions = project.regions;
-        self.open_paths = project.open_paths;
         self.defaults = project.defaults;
         self.setup_defaults = default_setup(&self.defaults);
         self.source_name = project.source_name;
@@ -1688,6 +1721,15 @@ impl AppController {
         self.toolpath_fingerprints = project.toolpaths.fingerprints;
         self.saved_verification = project.toolpaths.verification;
         self.document = History::new(project.document);
+        self.cad_revision_floor = self
+            .geometry_state()
+            .assets
+            .iter()
+            .map(|asset| asset.revision)
+            .max()
+            .unwrap_or(0)
+            .max(self.document().cad_revision_floor);
+        self.sync_drawing_geometry();
         self.active_setup_id = self.document.current().active_setup().map_or(0, |s| s.id);
         self.active_origin = self.setup().origin_index;
         self.pending_op = None;
@@ -3699,6 +3741,58 @@ mod tests {
 0\nLINE\n10\n20.0\n20\n20.0\n11\n30.0\n21\n40.0\n\
 0\nLINE\n10\n30.0\n20\n40.0\n11\n40.0\n21\n20.0\n\
 0\nENDSEC\n0\nEOF\n";
+
+    #[test]
+    fn drawing_scaling_preserves_import_boundaries_and_survives_project_round_trip() {
+        let mut app = AppController::new(machine());
+        app.open_dxf(PART_DXF, "legacy.dxf").unwrap();
+        app.document.update_view(|doc| doc.drawings.clear());
+        let drawing = temp_path("separate.dxf");
+        std::fs::write(&drawing, PART_WITH_STROKE_DXF).unwrap();
+        app.import_cad(&drawing).unwrap();
+        std::fs::remove_file(&drawing).unwrap();
+        let before = app.geometry_state().clone();
+
+        app.scale_drawing(0, [2., 3.]).unwrap();
+        assert_eq!(app.regions()[0].holes().len(), 1);
+        for (ring, original) in std::iter::once(app.regions()[0].outer())
+            .chain(app.regions()[0].holes())
+            .zip(
+                std::iter::once(before.drawing_regions[0].outer())
+                    .chain(before.drawing_regions[0].holes()),
+            )
+        {
+            for (point, original) in ring.points().iter().zip(original.points()) {
+                assert_eq!(*point, Point::new(original.x * 2., original.y * 3.));
+            }
+        }
+        assert_eq!(app.regions()[1], before.drawing_regions[1]);
+        assert_eq!(app.open_paths(), &before.drawing_paths);
+        assert!(app.undo());
+        assert_eq!(app.geometry_state(), &before);
+        assert!(app.redo());
+        let first = app.regions()[0].clone();
+
+        app.scale_drawing(1, [0.5, 2.]).unwrap();
+        assert_eq!(app.regions()[0], first);
+        for (point, original) in app.open_paths()[0]
+            .points()
+            .iter()
+            .zip(before.drawing_paths[0].points())
+        {
+            assert_eq!(*point, Point::new(original.x * 0.5, original.y * 2.));
+        }
+        let scaled = app.geometry_state().clone();
+        let path = temp_path("scaled.ocam");
+        app.save_project(&path).unwrap();
+        let mut reopened = AppController::new(machine());
+        reopened.open_project(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(reopened.geometry_state(), &scaled);
+        let sources = reopened.drawing_sources();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].name, "legacy.dxf");
+    }
 
     fn machine() -> Machine {
         Machine {

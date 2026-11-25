@@ -355,6 +355,52 @@ impl CadScene {
         self.bounds
     }
 
+    /// Preview an asset's scale in world coordinates using the display geometry.
+    pub fn with_asset_scale(&self, asset_id: u64, factors: Point) -> Self {
+        let mut scene = self.clone();
+        let transform = |point: &mut Point| {
+            for (coordinate, factor) in point.iter_mut().zip(factors) {
+                *coordinate *= factor;
+            }
+        };
+        for triangle in &mut scene.triangles {
+            if triangle.face.asset_id == asset_id {
+                triangle.points.iter_mut().for_each(transform);
+            }
+        }
+        for path in &mut scene.paths {
+            if path.entity.asset_id == asset_id {
+                path.points.iter_mut().for_each(transform);
+            }
+        }
+        for vertex in &mut scene.vertices {
+            if vertex.entity.asset_id == asset_id {
+                transform(&mut vertex.point);
+            }
+        }
+        // Keep the existing partition and refit its boxes from the leaves up.
+        for index in (0..scene.nodes.len()).rev() {
+            let node = &scene.nodes[index];
+            let mut bounds = [[f64::INFINITY; 3], [f64::NEG_INFINITY; 3]];
+            if let Some((left, right)) = node.children {
+                for child in [left, right] {
+                    for point in scene.nodes[child].bounds {
+                        include(&mut bounds, point);
+                    }
+                }
+            } else {
+                for &triangle in &node.triangles {
+                    for point in scene.triangles[triangle].points {
+                        include(&mut bounds, point);
+                    }
+                }
+            }
+            scene.nodes[index].bounds = bounds;
+        }
+        scene.bounds = scene.compute_bounds();
+        scene
+    }
+
     fn compute_bounds(&self) -> Option<([f32; 3], [f32; 3])> {
         let mut bounds = [[f64::INFINITY; 3], [f64::NEG_INFINITY; 3]];
         for t in &self.triangles {

@@ -2691,6 +2691,14 @@ fn default_origin_index() -> u32 {
     1
 }
 
+/// One import's consecutive ranges in the shared drawing geometry.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Drawing {
+    pub name: String,
+    pub regions: usize,
+    pub paths: usize,
+}
+
 /// The top-level document: shared geometry and an ordered collection of setups.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Document {
@@ -2711,6 +2719,8 @@ pub struct Document {
     /// Self-contained imported geometry and persistent operation selections.
     #[serde(default)]
     pub geometry: crate::GeometryState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drawings: Vec<Drawing>,
     /// Operation IDs whose cutting geometry is linked to persistent CAD topology.
     /// This remains separate from the binding map so a missing binding cannot
     /// silently turn a linked operation into an explicit-contour operation.
@@ -2729,6 +2739,9 @@ pub struct Document {
     pub setup_id_floor: u64,
     #[serde(default)]
     pub asset_id_floor: u64,
+    /// Highest CAD revision issued, including revisions discarded by undo.
+    #[serde(default)]
+    pub cad_revision_floor: u64,
     #[serde(default)]
     pub instance_id_floor: u64,
     #[serde(default)]
@@ -2744,12 +2757,14 @@ impl PartialEq for Document {
             && self.rotary_indexes == other.rotary_indexes
             && self.setups == other.setups
             && self.geometry == other.geometry
+            && self.drawings == other.drawings
             && self.cad_linked_operations == other.cad_linked_operations
             && self.excluded_operations == other.excluded_operations
             && self.disabled_origins == other.disabled_origins
             && self.operation_id_floor == other.operation_id_floor
             && self.setup_id_floor == other.setup_id_floor
             && self.asset_id_floor == other.asset_id_floor
+            && self.cad_revision_floor == other.cad_revision_floor
             && self.instance_id_floor == other.instance_id_floor
             && self.pattern_id_floor == other.pattern_id_floor
     }
@@ -2803,12 +2818,14 @@ impl Document {
             active_setup_id: 0,
             setups: Vec::new(),
             geometry: crate::GeometryState::default(),
+            drawings: Vec::new(),
             cad_linked_operations: Default::default(),
             excluded_operations: Default::default(),
             disabled_origins: Default::default(),
             operation_id_floor: 0,
             setup_id_floor: 0,
             asset_id_floor: 0,
+            cad_revision_floor: 0,
             instance_id_floor: 0,
             pattern_id_floor: 0,
         }

@@ -225,6 +225,7 @@ impl App {
 
     fn tree_edit_blocked(&mut self) -> bool {
         if self.move_draft.is_some()
+            || self.scale_draft.is_some()
             || self.controller.pending_op().is_some()
             || self.pattern_draft.is_some()
             || self.cad_pending_kind.is_some()
@@ -395,7 +396,10 @@ impl App {
                             let _ = self.update(Message::SelectSetup(*id));
                         }
                     }
-                    TreeNode::Asset(_) | TreeNode::Model(_) | TreeNode::Pattern(_) => {
+                    TreeNode::Asset(_)
+                    | TreeNode::Drawing(_)
+                    | TreeNode::Model(_)
+                    | TreeNode::Pattern(_) => {
                         let _ = self.select_tree_node(&node);
                     }
                     _ => {}
@@ -637,7 +641,7 @@ impl App {
             .is_some_and(|(hover, _)| hover == &node);
         let depth = match node {
             TreeNode::Models | TreeNode::Setups => 0,
-            TreeNode::Asset(_) | TreeNode::Setup(_) => 1,
+            TreeNode::Asset(_) | TreeNode::Drawing(_) | TreeNode::Setup(_) => 1,
             TreeNode::Model(_) | TreeNode::Pattern(_) => 2,
             TreeNode::Operation(id) => {
                 if self
@@ -678,6 +682,7 @@ impl App {
     pub(super) fn project_browser_height(&self) -> f32 {
         let mut height = 3. * (TREE_ROW_H + 2.) + 46.; // groups and project title
         if !self.models_collapsed {
+            height += self.controller.drawing_sources().len() as f32 * (TREE_ROW_H + 2.);
             let geometry = self.controller.geometry_state();
             for asset in &geometry.assets {
                 let count = geometry
@@ -746,6 +751,26 @@ impl App {
         .spacing(2);
 
         let geometry = self.controller.geometry_state();
+        if !self.models_collapsed {
+            for (index, drawing) in self.controller.drawing_sources().into_iter().enumerate() {
+                let node = TreeNode::Drawing(index);
+                list = list.push(
+                    self.tree_row(
+                        node,
+                        row![
+                            icon_svg(Icon::Profile, 16.),
+                            text(drawing.name)
+                                .size(TREE_TEXT_SIZE)
+                                .width(Length::Shrink)
+                        ]
+                        .spacing(5)
+                        .align_y(Alignment::Center)
+                        .into(),
+                        self.model_view == Some(node),
+                    ),
+                );
+            }
+        }
         for asset in geometry.assets.iter().filter(|_| !self.models_collapsed) {
             let instances: Vec<_> = geometry
                 .instances
@@ -1260,11 +1285,21 @@ impl App {
                         Message::MoveOpen(TreeNode::Asset(*id)),
                     ))
                     .push(item(
+                        "Scale…".into(),
+                        Message::Scale(ScaleEdit::Open(*node)),
+                    ))
+                    .push(item(
                         "Reload model from file".into(),
                         Message::ReloadCadAsset(*id),
                     ))
                     .push(item("Replace model…".into(), Message::ReplaceCadAsset(*id)))
                     .push(item("Remove model".into(), Message::RemoveCadAsset(*id)));
+            }
+            TreeNode::Drawing(_) => {
+                items = items.push(item(
+                    "Scale…".into(),
+                    Message::Scale(ScaleEdit::Open(*node)),
+                ));
             }
             TreeNode::Model(id) => {
                 let hidden = self.cad_hidden.contains(id)
@@ -1479,6 +1514,7 @@ fn operation_icon(op: &Operation) -> Icon {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scale_view::ScaleField;
 
     fn send(app: &mut App, message: Message) {
         let _task = app.update(message);
@@ -1624,6 +1660,168 @@ mod tests {
                     .any(|candidate| candidate.entity.instance_id == *id)
             })
             .collect()
+    }
+
+    fn open_scale_menu(app: &mut App, target: TreeNode) {
+        send(app, Message::Tree(TreeMessage::Open(target)));
+        assert!(app.tree_menu_overlay().is_some());
+        send(
+            app,
+            Message::Tree(TreeMessage::Command(Box::new(Message::Scale(
+                ScaleEdit::Open(target),
+            )))),
+        );
+        assert!(app.tree_menu.is_none());
+        assert!(app.pane_handle(Pane::Inspector).is_some());
+    }
+
+    fn scale_value(app: &mut App, field: ScaleField, axis: usize, value: &str) {
+        send(
+            app,
+            Message::Scale(ScaleEdit::Value(field, axis, value.into())),
+        );
+    }
+
+    #[test]
+    fn model_scale_inspector_applies_to_the_selected_asset_and_uses_world_axes() {
+        let (mut app, _) = tree_app();
+        add_browser_models(&mut app);
+        app.controller
+            .place_cad_instance(
+                2,
+                cam_model::RigidTransform {
+                    rotation: [[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]],
+                    translation: [20., 0., 0.],
+                },
+            )
+            .unwrap();
+        let before = app.controller.geometry_state().clone();
+        open_scale_menu(&mut app, TreeNode::Asset(1));
+        let factors = |app: &App| app.scale_draft.as_ref().unwrap().factors();
+        let original_bounds = app.machining_viewport().cad_scene.bounds();
+        assert_eq!(factors(&app), Some([1.; 3]));
+        scale_value(&mut app, ScaleField::Percent, 2, "300");
+        assert_eq!(factors(&app), Some([3.; 3]));
+        assert_eq!(
+            app.machining_viewport().cad_scene.bounds(),
+            Some(([0.; 3], [60., 30., 0.]))
+        );
+        assert_eq!(app.controller.geometry_state(), &before);
+        send(&mut app, Message::Scale(ScaleEdit::Lock(false)));
+        scale_value(&mut app, ScaleField::Size, 0, "40");
+        assert_eq!(factors(&app), Some([2., 3., 3.]));
+        send(&mut app, Message::Scale(ScaleEdit::Lock(true)));
+        assert_eq!(factors(&app), Some([2.; 3]));
+        send(&mut app, Message::Scale(ScaleEdit::Cancel));
+        assert_eq!(app.controller.geometry_state(), &before);
+        assert_eq!(app.machining_viewport().cad_scene.bounds(), original_bounds);
+        assert!(app.pane_handle(Pane::Inspector).is_none());
+
+        open_scale_menu(&mut app, TreeNode::Asset(1));
+        send(&mut app, Message::Scale(ScaleEdit::Lock(false)));
+        scale_value(&mut app, ScaleField::Percent, 0, "200");
+        scale_value(&mut app, ScaleField::Percent, 1, "300");
+        send(&mut app, Message::Scale(ScaleEdit::Preset(25.4)));
+        assert_eq!(factors(&app), Some([25.4; 3]));
+        send(&mut app, Message::Scale(ScaleEdit::Preset(1. / 25.4)));
+        assert_eq!(factors(&app), Some([1. / 25.4; 3]));
+        for (axis, value) in ["200", "300", "400"].into_iter().enumerate() {
+            scale_value(&mut app, ScaleField::Percent, axis, value);
+        }
+        let preview_mesh = app.machining_viewport().mesh_vertices.clone();
+        send(&mut app, Message::Scale(ScaleEdit::Apply));
+        assert!(app.scale_draft.is_none(), "{}", app.status);
+        assert_eq!(app.machining_viewport().mesh_vertices, preview_mesh);
+        let scaled = app.controller.geometry_state().clone();
+        assert_eq!(scaled.asset(2), before.asset(2));
+        let topology = &scaled.asset(1).unwrap().topology;
+        assert_ne!(
+            scaled.instance(1).unwrap().body_id,
+            scaled.instance(2).unwrap().body_id
+        );
+        for id in [1, 2] {
+            let original = before.instance(id).unwrap();
+            let current = scaled.instance(id).unwrap();
+            let source = &before.asset(1).unwrap().topology;
+            for (from, to) in source.vertices.iter().zip(
+                topology
+                    .vertices
+                    .iter()
+                    .filter(|v| v.body_id == current.body_id),
+            ) {
+                let [x, y, z] = original.placement.transform_point(from.point);
+                assert_eq!(
+                    current.placement.transform_point(to.point),
+                    [x * 2., y * 3., z * 4.]
+                );
+            }
+        }
+        assert!(app.controller.undo());
+        assert_eq!(app.controller.geometry_state(), &before);
+        assert!(app.controller.redo());
+        assert_eq!(app.controller.geometry_state(), &scaled);
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("scaled.ocam");
+        app.controller.save_project(&path).unwrap();
+        let mut reopened = AppController::new(crate::default_machine());
+        reopened.open_project(&path).unwrap();
+        assert_eq!(reopened.geometry_state(), &scaled);
+        reopened
+            .replace_cad_asset(1, before.asset(1).unwrap().clone())
+            .unwrap();
+        assert_eq!(reopened.geometry_state().instance(2).unwrap().body_id, 1);
+
+        assert!(app.controller.undo());
+        app.controller.save_project(&path).unwrap();
+        reopened.open_project(&path).unwrap();
+        reopened.scale_cad_asset(1, [5.; 3]).unwrap();
+        assert_ne!(
+            reopened.geometry_state().asset(1).unwrap().revision,
+            scaled.asset(1).unwrap().revision
+        );
+    }
+
+    #[test]
+    fn drawing_scale_inspector_exposes_only_xy_and_rejects_invalid_factors() {
+        let (mut app, _) = tree_app();
+        app.controller.open_dxf(SAMPLE_DXF, "sample.dxf").unwrap();
+        app.end_setup_draft();
+        app.refresh_fields();
+        let before = app.controller.regions().to_vec();
+        open_scale_menu(&mut app, TreeNode::Drawing(0));
+        let revision = app.controller.revision();
+        scale_value(&mut app, ScaleField::Size, 0, "30");
+        assert_eq!(
+            app.scale_draft.as_ref().unwrap().factors(),
+            Some([0.5, 0.5, 1.])
+        );
+        assert_eq!(
+            app.machining_viewport().bounds,
+            Some(([5., 5., 0.], [35., 25., 0.]))
+        );
+        assert_eq!(app.controller.revision(), revision);
+        send(&mut app, Message::Scale(ScaleEdit::Preset(1. / 25.4)));
+        let draft = app.scale_draft.as_ref().unwrap();
+        assert_eq!(draft.factors(), Some([1. / 25.4, 1. / 25.4, 1.]));
+        let last_preview = app.machining_viewport().vertices.clone();
+        scale_value(&mut app, ScaleField::Percent, 0, "0");
+        send(&mut app, Message::Scale(ScaleEdit::Apply));
+        assert!(app.scale_draft.is_some());
+        assert_eq!(app.controller.regions(), &before);
+        assert_eq!(app.machining_viewport().vertices, last_preview);
+        send(&mut app, Message::Scale(ScaleEdit::Preset(25.4)));
+        let preview = app.machining_viewport().vertices.clone();
+        send(&mut app, Message::Scale(ScaleEdit::Apply));
+        assert!(app.scale_draft.is_none(), "{}", app.status);
+        assert_eq!(app.machining_viewport().vertices, preview);
+        for (point, scaled) in before[0]
+            .outer()
+            .points()
+            .iter()
+            .zip(app.controller.regions()[0].outer().points())
+        {
+            assert_eq!(*scaled, cam_geo::Point::new(point.x * 25.4, point.y * 25.4));
+        }
     }
 
     #[test]
@@ -2475,7 +2673,6 @@ mod tests {
             .iter()
             .any(|s| s.op == Some(ids[2])));
     }
-
 
     #[test]
     fn processing_time_is_scoped_to_the_requested_operation_and_cancelled_runs_show_nothing() {

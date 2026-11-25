@@ -636,6 +636,9 @@ pub struct TopologySnapshot {
     pub mesh: CadMesh,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projection: Option<CadProjectionMesh>,
+    /// Source body IDs for instances whose placements require distinct scaled topology.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub body_sources: Vec<(BodyId, BodyId)>,
 }
 impl Default for TopologySnapshot {
     fn default() -> Self {
@@ -648,6 +651,7 @@ impl Default for TopologySnapshot {
             vertices: vec![],
             mesh: CadMesh::default(),
             projection: None,
+            body_sources: vec![],
         }
     }
 }
@@ -964,6 +968,13 @@ thread_local! {
 }
 
 impl TopologySnapshot {
+    pub fn source_body_id(&self, body_id: BodyId) -> BodyId {
+        self.body_sources
+            .iter()
+            .find_map(|&(id, source)| (id == body_id).then_some(source))
+            .unwrap_or(body_id)
+    }
+
     /// Validate an immutable shared snapshot once per thread. Reference revisions,
     /// placements and selections still need validation on every request.
     pub fn validate_cached(self: &Arc<Self>) -> Result<(), String> {
@@ -995,6 +1006,23 @@ impl TopologySnapshot {
         let bodies: BTreeSet<_> = self.bodies.iter().map(|b| b.id).collect();
         if bodies.len() != self.bodies.len() {
             return Err("duplicate CAD body ID".into());
+        }
+        let mut variants = BTreeSet::new();
+        for &(body, source) in &self.body_sources {
+            if body == source
+                || !bodies.contains(&body)
+                || !bodies.contains(&source)
+                || !variants.insert(body)
+            {
+                return Err("invalid CAD source body mapping".into());
+            }
+        }
+        if self
+            .body_sources
+            .iter()
+            .any(|(_, source)| variants.contains(source))
+        {
+            return Err("invalid CAD source body mapping".into());
         }
         let unique = |ids: Vec<EntityId>| {
             let count = ids.len();

@@ -85,6 +85,9 @@ mod thread_parameters;
 use operation_tabs::OperationTab;
 #[path = "gui_move.rs"]
 mod move_view;
+#[path = "gui_scale.rs"]
+mod scale_view;
+use scale_view::ScaleEdit;
 #[path = "gui_project_tree.rs"]
 mod project_tree_view;
 use project_tree_view::{TreeDrag, TreeMessage, TreeNode};
@@ -2331,6 +2334,7 @@ struct App {
     /// draft survives tab changes; only the footer can commit or discard it.
     setup_draft: Option<cam_model::Setup>,
     move_draft: Option<move_view::MoveDraft>,
+    scale_draft: Option<scale_view::ScaleDraft>,
     pattern_draft: Option<PatternDraft>,
     pattern_tab: pattern_editor_view::PatternTab,
     setup_model_selection: Option<InstanceId>,
@@ -2966,6 +2970,7 @@ enum Message {
     MoveHandleInput(String),
     MoveCancel,
     MoveApply,
+    Scale(ScaleEdit),
     Rotary(rotary_view::Action),
     PollMcp,
     TraverseFocus(bool),
@@ -4073,6 +4078,7 @@ impl App {
             notice_filters: [true; 3],
             status_messages: StatusMessages::default(),
             move_draft: None,
+            scale_draft: None,
             setup_draft: None,
             pattern_draft: None,
             pattern_tab: pattern_editor_view::PatternTab::Placement,
@@ -4374,9 +4380,43 @@ impl App {
                     | Message::CadModelFileChosen { reload: true, .. }
                     | Message::RemoveCadAsset(_)
                     | Message::MoveOpen(_)
+                    | Message::Scale(ScaleEdit::Open(_))
             )
         {
             self.status = "Apply or cancel the move first.".into();
+            return iced::Task::none();
+        }
+        if self.scale_draft.is_some()
+            && matches!(
+                &message,
+                Message::Select(_)
+                    | Message::CadPicked(_)
+                    | Message::CadSelect(_)
+                    | Message::PickWorld(..)
+                    | Message::SelectSetup(_)
+                    | Message::EditSetup(_)
+                    | Message::ClickOp(_)
+                    | Message::BeginOp(_)
+                    | Message::Undo
+                    | Message::Redo
+                    | Message::RunJob
+                    | Message::ExportNc
+                    | Message::ToolpathCommand(_, _)
+                    | Message::ImportCad
+                    | Message::CadToImport(Some(_))
+                    | Message::ReplaceCadAsset(_)
+                    | Message::ReloadCadAsset(_)
+                    | Message::CadModelFileChosen { path: Some(_), .. }
+                    | Message::RemoveCadAsset(_)
+                    | Message::MoveOpen(_)
+                    | Message::OpenSample
+                    | Message::NewProject
+                    | Message::OpenProject
+                    | Message::ProjectToOpen(Some(_))
+                    | Message::Scale(ScaleEdit::Open(_))
+            )
+        {
+            self.status = "Apply or cancel scaling first.".into();
             return iced::Task::none();
         }
         if self.pattern_draft.is_some()
@@ -4511,6 +4551,10 @@ impl App {
         }
         if self.move_draft.is_some() && matches!(message, Message::CadEscape) {
             self.cancel_move();
+            return iced::Task::none();
+        }
+        if self.scale_draft.is_some() && matches!(message, Message::CadEscape) {
+            self.edit_scale(ScaleEdit::Cancel);
             return iced::Task::none();
         }
         if self.tool_info.is_some()
@@ -5349,6 +5393,7 @@ impl App {
             }
             Message::MoveCancel => self.cancel_move(),
             Message::MoveApply => self.apply_move(),
+            Message::Scale(edit) => self.edit_scale(edit),
             Message::Tree(message) => return self.update_tree(message),
             Message::ShowStatus(target) => {
                 let fingerprints = self.controller.current_toolpath_fingerprints();
@@ -9647,6 +9692,7 @@ impl App {
     /// Creation and geometry picking belong to the active operation editor.
     fn sync_inspector_visibility(&mut self) {
         let editing = self.move_draft.is_some()
+            || self.scale_draft.is_some()
             || self.simulation.is_some()
             || self.pattern_draft.is_some()
             || self.library_mode()
@@ -15084,6 +15130,7 @@ impl Viewport {
         cached_cad_scene: Option<Arc<CadScene>>,
         stock_draft: Option<&cam_model::Setup>,
         tree_body: Option<InstanceId>,
+        scale_preview: Option<scale_view::ScalePreview>,
     ) -> Self {
         let cad_hover = cad_hover.filter(|reference| {
             preview.is_none()
@@ -15097,7 +15144,7 @@ impl Viewport {
         let pick_z = controller.inspection_setup().heights.top_of_stock as f32;
         // After a run, show the full backplot; before it, at least show the
         // imported part outlines so opening a file is visibly reflected.
-        let outcome = if editor_geometry.is_some() {
+        let outcome = if editor_geometry.is_some() || scale_preview.is_some() {
             None
         } else {
             preview
@@ -15117,21 +15164,10 @@ impl Viewport {
                 .or(operation_preview)
                 .or_else(|| controller.outcome())
         };
-        let mut scene = match outcome {
-            Some(outcome) => outcome.scene.clone(),
-            None => {
-                let mut scene = Scene::new();
-                for region in controller.regions() {
-                    scene.add_region(region, PART);
-                }
-                // Open imported strokes too, or an engravable path is invisible until
-                // (and unless) a run happens to include it.
-                for path in controller.open_paths() {
-                    scene.add_open_path(path.points(), PART);
-                }
-                scene
-            }
-        };
+        let mut scene = outcome.map_or_else(
+            || scale_view::imported_drawing_scene(controller, scale_preview),
+            |outcome| outcome.scene.clone(),
+        );
         let show_run_preview = focus_ops.is_empty()
             && outcome
                 .zip(controller.run_preview())
@@ -15180,9 +15216,18 @@ impl Viewport {
                 &controller.inspection_setup().frame,
             ))
         });
+        let cad_scene = match scale_preview {
+            Some(scale_view::ScalePreview { target: TreeNode::Asset(id), factors })
+                if factors != [1.; 3] =>
+            {
+                Arc::new(cad_scene.with_asset_scale(id, factors))
+            }
+            _ => cad_scene,
+        };
         let bounds = union_bounds(
-            controller
-                .outcome()
+            (scale_preview.is_none())
+                .then(|| controller.outcome())
+                .flatten()
                 .and_then(|outcome| outcome.scene.bounds())
                 .or_else(|| scene.bounds()),
             cad_scene.bounds(),

@@ -934,6 +934,7 @@ mod tests {
                 vertices: vec![],
                 mesh: CadMesh::default(),
                 projection: None,
+                body_sources: vec![],
             };
             (face, topology)
         };
@@ -1024,6 +1025,7 @@ mod tests {
             vertices: vec![],
             mesh: CadMesh::default(),
             projection: None,
+            body_sources: vec![],
         };
         let domain = closed_vertical_cylinder_domain(&face, &topology, RigidTransform::default())
             .unwrap()

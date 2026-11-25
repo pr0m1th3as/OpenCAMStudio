@@ -28,6 +28,7 @@ impl App {
             || self.inspector_dirty()
             || self.any_field_invalid()
             || self.pattern_draft.is_some()
+            || self.scale_draft.is_some()
             || self.creating_operation()
             || self.cad_editing_op.is_some()
             || self.drawing_editing_op.is_some()

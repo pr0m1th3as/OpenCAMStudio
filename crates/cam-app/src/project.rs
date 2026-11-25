@@ -209,6 +209,7 @@ pub enum TreeNode {
     Models,
     Setups,
     Asset(u64),
+    Drawing(usize),
     Model(u64),
     Setup(u64),
     Pattern(u64),

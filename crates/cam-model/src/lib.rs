@@ -42,8 +42,10 @@ pub use profile_parameters::*;
 mod operation_heights;
 pub use operation_heights::*;
 mod cad_curves;
+mod cad_scale;
 mod geometry;
 pub use cad_curves::*;
+pub use cad_scale::scale_cad_topology;
 mod history;
 pub mod migrate;
 mod reconcile;
@@ -52,9 +54,9 @@ mod validate;
 pub use cam_cldata::Point3;
 pub use document::{
     AdaptiveContainment, AdaptiveOp, AdaptiveParams, Axis, CarveClearing, CarveOp, ChamferFace,
-    ChamferOp, CircularDistribution, ClearParams, Clearing, Comp, Document, DrillGeometry, DrillOp,
-    EngraveOp, ExecutionItem, FaceOp, Hand, Heights, Lead, LinearPatternDirection, Operation,
-    OperationPattern, Origin, ParallelOp, PatternDirection, PatternKind, PatternOptions,
+    ChamferOp, CircularDistribution, ClearParams, Clearing, Comp, Document, Drawing, DrillGeometry,
+    DrillOp, EngraveOp, ExecutionItem, FaceOp, Hand, Heights, Lead, LinearPatternDirection,
+    Operation, OperationPattern, Origin, ParallelOp, PatternDirection, PatternKind, PatternOptions,
     PatternOrder, PatternSpacing, Plunge, PocketOp, ProfileContour, ProfileOp, ProfileTabs, Setup,
     Side, SpiralOp, Stock, StockAxis, StockAxisReference, StockOriginAxis, StockToLeave, ThreadOp,
     SCHEMA_VERSION,

@@ -11,6 +11,9 @@ const ESTLCAM_OUTPUT_CHOICES: &[&str] = &[
 
 impl App {
     pub(super) fn inspector(&self) -> Element<'_, Message> {
+        if let Some(draft) = &self.scale_draft {
+            return self.scale_inspector(draft);
+        }
         if self.move_draft.is_some() {
             return self.move_inspector();
         }
